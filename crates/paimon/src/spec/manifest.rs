@@ -125,7 +125,7 @@ mod tests {
         use crate::spec::ManifestEntry;
 
         fn entry(kind: FileKind, file_name: &str, level: i32) -> ManifestEntry {
-            let stats = BinaryTableStats::new(vec![], vec![], vec![]);
+            let stats = BinaryTableStats::empty();
             let file = DataFileMeta {
                 file_name: file_name.to_string(),
                 file_size: 100,

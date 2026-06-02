@@ -18,7 +18,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 
-use super::{extract_datum_from_arrow, BinaryRowBuilder, DataType, Datum};
+use super::{extract_datum_from_arrow, BinaryRowBuilder, DataType, Datum, EMPTY_SERIALIZED_ROW};
 use arrow_array::RecordBatch;
 
 /// Deserialize `_NULL_COUNTS` which in Avro is `["null", {"type":"array","items":["null","long"]}]`.
@@ -94,6 +94,21 @@ impl BinaryTableStats {
             null_counts,
         }
     }
+
+    /// Stats with empty (arity=0) BinaryRow bytes for min/max and no null counts.
+    ///
+    /// Use this whenever there are no columns to collect stats for (e.g. a non-partitioned
+    /// table's `partition_stats`, or a writer producing no key/value stats columns). Writing
+    /// `Vec::new()` here breaks the Java reader: `SerializationUtils.deserializeBinaryRow`
+    /// requires at least the 4-byte BE arity prefix and throws `BufferUnderflowException` on
+    /// zero-length input.
+    pub fn empty() -> BinaryTableStats {
+        Self {
+            min_values: EMPTY_SERIALIZED_ROW.clone(),
+            max_values: EMPTY_SERIALIZED_ROW.clone(),
+            null_counts: Vec::new(),
+        }
+    }
 }
 
 impl Display for BinaryTableStats {
@@ -153,4 +168,39 @@ pub fn compute_column_stats(
         max_builder.build_serialized(),
         null_counts,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::BinaryRow;
+
+    /// Empty stats must produce min/max bytes that the Java side's
+    /// `SerializationUtils.deserializeBinaryRow` accepts: at minimum a 4-byte BE
+    /// arity prefix. A bare `Vec::new()` would trigger `BufferUnderflowException`
+    /// when Spark/Flink read manifests written for a non-partitioned table.
+    #[test]
+    fn empty_stats_carries_arity_prefix_parseable_by_reader() {
+        let stats = BinaryTableStats::empty();
+        assert!(
+            stats.min_values().len() >= 4,
+            "min_values must contain at least the 4-byte arity prefix"
+        );
+        assert!(
+            stats.max_values().len() >= 4,
+            "max_values must contain at least the 4-byte arity prefix"
+        );
+        assert!(
+            stats.null_counts().is_empty(),
+            "null_counts stays empty so the Java reader short-circuits to EMPTY_STATS"
+        );
+
+        // Round-trip through the same parser the Java reader uses (4-byte BE arity).
+        let min_row = BinaryRow::from_serialized_bytes(stats.min_values())
+            .expect("min_values must decode as a BinaryRow");
+        let max_row = BinaryRow::from_serialized_bytes(stats.max_values())
+            .expect("max_values must decode as a BinaryRow");
+        assert_eq!(min_row.arity(), 0);
+        assert_eq!(max_row.arity(), 0);
+    }
 }

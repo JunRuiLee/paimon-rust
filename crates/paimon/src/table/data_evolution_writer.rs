@@ -670,7 +670,7 @@ mod tests {
         write_cols: Option<Vec<String>>,
     ) -> DataFileMeta {
         use crate::spec::stats::BinaryTableStats;
-        let empty_stats = BinaryTableStats::new(vec![], vec![], vec![]);
+        let empty_stats = BinaryTableStats::empty();
         DataFileMeta {
             file_name: file_name.to_string(),
             file_size: 0,

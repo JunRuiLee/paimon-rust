@@ -72,7 +72,7 @@ impl AvroRecordDecode for ManifestFileMeta {
             file_size.unwrap_or(0),
             num_added_files.unwrap_or(0),
             num_deleted_files.unwrap_or(0),
-            partition_stats.unwrap_or_else(|| BinaryTableStats::new(vec![], vec![], vec![])),
+            partition_stats.unwrap_or_else(BinaryTableStats::empty),
             schema_id.unwrap_or(0),
             min_bucket,
             max_bucket,
