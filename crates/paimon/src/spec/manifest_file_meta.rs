@@ -51,6 +51,43 @@ pub struct ManifestFileMeta {
     #[serde(rename = "_SCHEMA_ID")]
     schema_id: i64,
 
+    /// minimum bucket covered by entries in this manifest, used by the Java reader to
+    /// prune manifests that do not overlap a requested bucket. Always `None` together
+    /// with `max_bucket` for back-compat manifests written before bucket statistics
+    /// were introduced (apache/paimon#5345).
+    #[serde(
+        rename = "_MIN_BUCKET",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    min_bucket: Option<i32>,
+
+    /// maximum bucket covered by entries in this manifest. See `min_bucket`.
+    #[serde(
+        rename = "_MAX_BUCKET",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_bucket: Option<i32>,
+
+    /// minimum LSM level covered by entries in this manifest, used by the Java reader
+    /// for level-based pruning (e.g. compaction's level filter). Same back-compat note
+    /// as `min_bucket`.
+    #[serde(
+        rename = "_MIN_LEVEL",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    min_level: Option<i32>,
+
+    /// maximum LSM level covered by entries in this manifest. See `min_level`.
+    #[serde(
+        rename = "_MAX_LEVEL",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_level: Option<i32>,
+
     /// minimum row id covered by this manifest, when row tracking is enabled.
     #[serde(
         rename = "_MIN_ROW_ID",
@@ -110,6 +147,31 @@ impl ManifestFileMeta {
         self.version
     }
 
+    /// Get the minimum bucket covered by this manifest (None when bucket stats are absent,
+    /// e.g. manifests written before the field was introduced).
+    #[inline]
+    pub fn min_bucket(&self) -> Option<i32> {
+        self.min_bucket
+    }
+
+    /// Get the maximum bucket covered by this manifest (None when bucket stats are absent).
+    #[inline]
+    pub fn max_bucket(&self) -> Option<i32> {
+        self.max_bucket
+    }
+
+    /// Get the minimum LSM level covered by this manifest (None when level stats are absent).
+    #[inline]
+    pub fn min_level(&self) -> Option<i32> {
+        self.min_level
+    }
+
+    /// Get the maximum LSM level covered by this manifest (None when level stats are absent).
+    #[inline]
+    pub fn max_level(&self) -> Option<i32> {
+        self.max_level
+    }
+
     /// Get the minimum row id covered by this manifest (None when row tracking is disabled).
     #[inline]
     pub fn min_row_id(&self) -> Option<i64> {
@@ -120,6 +182,27 @@ impl ManifestFileMeta {
     #[inline]
     pub fn max_row_id(&self) -> Option<i64> {
         self.max_row_id
+    }
+
+    /// Attach bucket / level statistics aggregated from manifest entries.
+    ///
+    /// Use this in writers that have access to the entries that the manifest covers.
+    /// Setting all four to `None` is equivalent to leaving the stats absent (the Java
+    /// reader treats `null` here as "no information; do not prune").
+    #[inline]
+    #[must_use]
+    pub fn with_bucket_level_stats(
+        mut self,
+        min_bucket: Option<i32>,
+        max_bucket: Option<i32>,
+        min_level: Option<i32>,
+        max_level: Option<i32>,
+    ) -> Self {
+        self.min_bucket = min_bucket;
+        self.max_bucket = max_bucket;
+        self.min_level = min_level;
+        self.max_level = max_level;
+        self
     }
 
     #[inline]
@@ -139,6 +222,10 @@ impl ManifestFileMeta {
             num_deleted_files,
             partition_stats,
             schema_id,
+            min_bucket: None,
+            max_bucket: None,
+            min_level: None,
+            max_level: None,
             min_row_id: None,
             max_row_id: None,
         }
@@ -154,6 +241,10 @@ impl ManifestFileMeta {
         num_deleted_files: i64,
         partition_stats: BinaryTableStats,
         schema_id: i64,
+        min_bucket: Option<i32>,
+        max_bucket: Option<i32>,
+        min_level: Option<i32>,
+        max_level: Option<i32>,
         min_row_id: Option<i64>,
         max_row_id: Option<i64>,
     ) -> ManifestFileMeta {
@@ -165,6 +256,10 @@ impl ManifestFileMeta {
             num_deleted_files,
             partition_stats,
             schema_id,
+            min_bucket,
+            max_bucket,
+            min_level,
+            max_level,
             min_row_id,
             max_row_id,
         }
@@ -192,6 +287,10 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
             ]
         }], "default": null},
         {"name": "_SCHEMA_ID", "type": "long"},
+        {"name": "_MIN_BUCKET", "type": ["null", "int"], "default": null},
+        {"name": "_MAX_BUCKET", "type": ["null", "int"], "default": null},
+        {"name": "_MIN_LEVEL", "type": ["null", "int"], "default": null},
+        {"name": "_MAX_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
         {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null}
     ]

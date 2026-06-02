@@ -33,6 +33,10 @@ impl AvroRecordDecode for ManifestFileMeta {
         let mut num_deleted_files: Option<i64> = None;
         let mut partition_stats: Option<BinaryTableStats> = None;
         let mut schema_id: Option<i64> = None;
+        let mut min_bucket: Option<i32> = None;
+        let mut max_bucket: Option<i32> = None;
+        let mut min_level: Option<i32> = None;
+        let mut max_level: Option<i32> = None;
         let mut min_row_id: Option<i64> = None;
         let mut max_row_id: Option<i64> = None;
 
@@ -52,6 +56,10 @@ impl AvroRecordDecode for ManifestFileMeta {
                         decode_nullable_binary_table_stats(cursor, &field.schema, field.nullable)?;
                 }
                 "_SCHEMA_ID" => schema_id = Some(read_long_field(cursor, field.nullable)?),
+                "_MIN_BUCKET" => min_bucket = read_optional_int(cursor, field.nullable)?,
+                "_MAX_BUCKET" => max_bucket = read_optional_int(cursor, field.nullable)?,
+                "_MIN_LEVEL" => min_level = read_optional_int(cursor, field.nullable)?,
+                "_MAX_LEVEL" => max_level = read_optional_int(cursor, field.nullable)?,
                 "_MIN_ROW_ID" => min_row_id = read_optional_long(cursor, field.nullable)?,
                 "_MAX_ROW_ID" => max_row_id = read_optional_long(cursor, field.nullable)?,
                 _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
@@ -66,10 +74,24 @@ impl AvroRecordDecode for ManifestFileMeta {
             num_deleted_files.unwrap_or(0),
             partition_stats.unwrap_or_else(|| BinaryTableStats::new(vec![], vec![], vec![])),
             schema_id.unwrap_or(0),
+            min_bucket,
+            max_bucket,
+            min_level,
+            max_level,
             min_row_id,
             max_row_id,
         ))
     }
+}
+
+fn read_optional_int(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<i32>> {
+    if nullable {
+        let idx = cursor.read_union_index()?;
+        if idx == 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(cursor.read_int()?))
 }
 
 fn read_optional_long(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<i64>> {

@@ -520,11 +520,24 @@ impl TableCommit {
 
         let mut added_file_count: i64 = 0;
         let mut deleted_file_count: i64 = 0;
+        // Bucket / level pruning stats; left as None when entries is empty so back-compat
+        // readers (Java < apache/paimon#5345 or older Rust writers) see the same shape
+        // they would for a pre-feature manifest.
+        let mut min_bucket: Option<i32> = None;
+        let mut max_bucket: Option<i32> = None;
+        let mut min_level: Option<i32> = None;
+        let mut max_level: Option<i32> = None;
         for entry in entries {
             match entry.kind() {
                 FileKind::Add => added_file_count += 1,
                 FileKind::Delete => deleted_file_count += 1,
             }
+            let b = entry.bucket();
+            min_bucket = Some(min_bucket.map_or(b, |cur| cur.min(b)));
+            max_bucket = Some(max_bucket.map_or(b, |cur| cur.max(b)));
+            let l = entry.file().level;
+            min_level = Some(min_level.map_or(l, |cur| cur.min(l)));
+            max_level = Some(max_level.map_or(l, |cur| cur.max(l)));
         }
 
         // Get file size
@@ -539,7 +552,8 @@ impl TableCommit {
             deleted_file_count,
             partition_stats,
             self.table.schema().id(),
-        ))
+        )
+        .with_bucket_level_stats(min_bucket, max_bucket, min_level, max_level))
     }
 
     /// Check if this commit was already completed (idempotency).
@@ -1821,5 +1835,45 @@ mod tests {
             err_msg.contains("Delete conflict"),
             "Expected 'Delete conflict' error, got: {err_msg}"
         );
+    }
+
+    /// `write_manifest_file` must aggregate min/max bucket and level across entries so the
+    /// Java reader can prune manifests by bucket / level (see apache/paimon#5345). This
+    /// drives a real commit so all the call-site plumbing is exercised end to end.
+    #[tokio::test]
+    async fn test_commit_writes_bucket_and_level_stats_into_manifest_list() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_bucket_level_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        fn data_file_at_level(name: &str, level: i32) -> DataFileMeta {
+            let mut f = test_data_file(name, 1);
+            f.level = level;
+            f
+        }
+
+        // Two commit messages on different buckets, each carrying a file at a different
+        // level. Expected aggregate: bucket [0, 3], level [0, 2].
+        let messages = vec![
+            CommitMessage::new(vec![], 0, vec![data_file_at_level("data-b0.parquet", 0)]),
+            CommitMessage::new(vec![], 3, vec![data_file_at_level("data-b3.parquet", 2)]),
+        ];
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        let delta_path = format!("{table_path}/manifest/{}", snapshot.delta_manifest_list());
+        let metas = ManifestList::read(&file_io, &delta_path).await.unwrap();
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected a single manifest covering both entries"
+        );
+        assert_eq!(metas[0].min_bucket(), Some(0));
+        assert_eq!(metas[0].max_bucket(), Some(3));
+        assert_eq!(metas[0].min_level(), Some(0));
+        assert_eq!(metas[0].max_level(), Some(2));
     }
 }
