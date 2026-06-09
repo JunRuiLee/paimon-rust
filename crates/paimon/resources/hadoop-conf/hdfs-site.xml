@@ -1,0 +1,173 @@
+<configuration>
+
+    <property>
+      <name>dfs.blocksize</name>
+      <value>268435456</value>
+    </property>
+
+    <property>
+      <name>dfs.client.block.write.locateFollowingBlock.retries</name>
+      <value>10</value>
+    </property>
+
+    <property>
+      <name>dfs.client.block.write.retries</name>
+      <value>10</value>
+    </property>
+
+    <property>
+      <name>dfs.client.domain.socket.data.traffic</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.client.limiting.lease.enable</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.client.read.shortcircuit</name>
+      <value>true</value>
+    </property>
+
+    <property>
+      <name>dfs.client.read.shortcircuit.skip.checksum</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.client.use.datanode.hostname</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.client.use.legacy.blockreader</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.datanode.hdfs-blocks-metadata.enabled</name>
+      <value>true</value>
+    </property>
+
+    <property>
+      <name>dfs.domain.socket.path</name>
+      <value>/home/var/lib/hdfs/hdfs-sockets/dn</value>
+    </property>
+
+    <property>
+      <name>dfs.namenode.acls.enabled</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.replication</name>
+      <value>3</value>
+    </property>
+
+    <property>
+      <name>fs.permissions.umask-mode</name>
+      <value>022</value>
+    </property>
+
+    <property>
+      <name>ipc.client.rpc-timeout.ms</name>
+      <value>600000</value>
+    </property>
+
+    <property>
+      <name>raid.distraid.intel.style</name>
+      <value>true</value>
+    </property>
+
+    <property>
+      <name>viewfs.skip.close.fs</name>
+      <value>true</value>
+    </property>
+
+    <property>
+      <name>dfs.client.global.router.enabled</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>dfs.nameservices</name>
+      <value>lt-router.sy</value>
+    </property>
+
+    <property>
+      <name>dfs.client.failover.proxy.provider.lt-router.sy</name>
+      <value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value>
+    </property>
+
+    <property>
+      <name>dfs.ha.automatic-failover.enabled.lt-router.sy</name>
+      <value>true</value>
+    </property>
+
+    <property>
+			<name>dfs.ha.namenodes.lt-router.sy</name>
+			<value>domain1,domain2,domain3,domain4,domain5,domain6,domain7,domain8,domain9,domain10,domain11,domain12,domain13,domain14,domain15</value>
+		</property>
+
+    <property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain1</name>
+			<value>hdfs-offline-router-r1.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain2</name>
+			<value>hdfs-offline-router-r2.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain3</name>
+			<value>hdfs-offline-router-r3.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain4</name>
+			<value>hdfs-offline-router-r4.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain5</name>
+			<value>hdfs-offline-router-r5.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain6</name>
+			<value>hdfs-offline-router-r6.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain7</name>
+			<value>hdfs-offline-router-r7.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain8</name>
+			<value>hdfs-offline-router-r8.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain9</name>
+			<value>hdfs-offline-router-r9.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain10</name>
+			<value>hdfs-offline-router-r10.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain11</name>
+			<value>hdfs-offline-router-r11.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain12</name>
+			<value>hdfs-offline-router-r12.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain13</name>
+			<value>hdfs-offline-router-r13.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain14</name>
+			<value>hdfs-offline-router-r14.internal:8888</value>
+		</property>
+		<property>
+			<name>dfs.namenode.rpc-address.lt-router.sy.domain15</name>
+			<value>hdfs-offline-router-r15.internal:8888</value>
+		</property>
+</configuration>

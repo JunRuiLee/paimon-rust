@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <!-- The viewfs mount table is inlined below
+       (fs.viewfs.mounttable.hadoop-lt-cluster.*); the original
+       <xi:include href="mountTable.xml"/> was removed so this file is
+       self-contained for hdfs-native, which does not process XInclude. -->
+    <property>
+      <name>fs.defaultFS</name>
+      <value>viewfs://hadoop-lt-cluster</value>
+    </property>
+    
+    <property>
+        <name>fs.hdfs.impl</name>
+        <value>org.apache.hadoop.hdfs.DistributedRaidFileSystem</value>
+    </property>
+
+    <property>
+      <name>fs.trash.interval</name>
+      <value>1</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.flume.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.flume.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hdfs.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hdfs.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hive.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hive.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.HTTP.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.HTTP.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.httpfs.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.httpfs.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hue.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.hue.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.mapred.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.mapred.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.oozie.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.oozie.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.yarn.groups</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.proxyuser.yarn.hosts</name>
+      <value>*</value>
+    </property>
+
+    <property>
+      <name>hadoop.rpc.protection</name>
+      <value>authentication</value>
+    </property>
+
+    <property>
+      <name>hadoop.security.auth_to_local</name>
+      <value>DEFAULT</value>
+    </property>
+
+    <property>
+      <name>hadoop.security.authentication</name>
+      <value>simple</value>
+    </property>
+
+    <property>
+      <name>hadoop.security.authorization</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>hadoop.security.group.mapping</name>
+      <value>org.apache.hadoop.security.ShellBasedUnixGroupsMapping</value>
+    </property>
+
+    <property>
+      <name>hadoop.security.instrumentation.requires.admin</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>hadoop.ssl.client.conf</name>
+      <value>ssl-client.xml</value>
+    </property>
+
+    <property>
+      <name>hadoop.ssl.enabled</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>hadoop.ssl.keystores.factory.class</name>
+      <value>org.apache.hadoop.security.ssl.FileBasedKeyStoresFactory</value>
+    </property>
+
+    <property>
+      <name>hadoop.ssl.require.client.cert</name>
+      <value>false</value>
+    </property>
+
+    <property>
+      <name>hadoop.ssl.server.conf</name>
+      <value>ssl-server.xml</value>
+    </property>
+
+    <property>
+      <name>hadoop.user.group.static.mapping.overrides</name>
+      <value>rinf=rinf;abtest=abtest;acfun=acfun;ad=ad;apm_testing=apm_testing;app=app;audit_admin=audit_admin;budget=budget;business=business;camus=camus;cc=cc;cdn=cdn;dp=dp;druid=druid;ds=ds;finance=finance;flink=flink;gamecloud=gamecloud;gamelive=gamelive;growth=growth;grpr=grpr;hbase=hbase;hbase_bulkload=hbase_bulkload;hdp=hdp;hiveserver=hiveserver;imcloud=imcloud;impala=impala;infra=infra;jy=jy;kudu=kudu;market=market;mmu=mmu;new_product=new_product;nova=nova;op=op;operation=operation;oversea=oversea;overseas-growth=overseas-growth;overseas-rc=overseas-rc;overseas-video=overseas-video;plateco=plateco;pm=pm;presto=presto;rc=rc;reco=reco;rl=rl;sa=sa;security=security;server=server;sre=sre;strategy=strategy;system=system;ub=ub;video=video;yarn=yarn;ylab=ylab;yz=yz;strategy_x3=strategy_x3;econ=econ;xlab=xlab;race=race;hr=hr;publicgroup=publicgroup;ai_platform=ai_platform;</value>
+    </property>
+
+    <property>
+      <name>io.compression.codecs</name>
+      <value>org.apache.hadoop.io.compress.DefaultCodec,org.apache.hadoop.io.compress.GzipCodec,org.apache.hadoop.io.compress.BZip2Codec,org.apache.hadoop.io.compress.DeflateCodec,org.apache.hadoop.io.compress.SnappyCodec,org.apache.hadoop.io.compress.Lz4Codec</value>
+    </property>
+
+    <property>
+      <name>io.file.buffer.size</name>
+      <value>65536</value>
+    </property>
+
+
+  <property>
+    <name>fs.viewfs.mounttable.hadoop-lt-cluster.link./home</name>
+    <value>hdfs://lt-router.sy/home</value>
+  </property>
+  <property>
+    <name>fs.viewfs.mounttable.hadoop-lt-cluster.link./user</name>
+    <value>hdfs://lt-router.sy/user</value>
+  </property>
+  <property>
+    <name>fs.viewfs.mounttable.hadoop-lt-cluster.link./tmp</name>
+    <value>hdfs://lt-router.sy/tmp</value>
+  </property>
+  <property>
+    <name>fs.viewfs.mounttable.hadoop-lt-cluster.linkFallback</name>
+    <value>hdfs://lt-router.sy/</value>
+  </property>
+</configuration>

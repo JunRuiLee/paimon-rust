@@ -52,6 +52,74 @@ pub(crate) fn hdfs_relative_path(path: &str) -> Result<&str> {
     }
 }
 
+/// Built-in Hadoop configuration baked into the binary, so that ViewFS works
+/// out of the box without the deployer setting up `HADOOP_CONF_DIR`.
+///
+/// These are the `core-site.xml` (with the viewfs mount table + `linkFallback`
+/// inlined) and `hdfs-site.xml` (with the target nameservice's HA config) that
+/// hdfs-native needs. They are materialized to a process-private directory on
+/// first ViewFS use; see [`ensure_builtin_hadoop_conf`].
+const BUILTIN_CORE_SITE: &str = include_str!("../../resources/hadoop-conf/core-site.xml");
+const BUILTIN_HDFS_SITE: &str = include_str!("../../resources/hadoop-conf/hdfs-site.xml");
+
+/// Environment flag to opt back into an external Hadoop config.
+///
+/// By default the built-in config is used for `viewfs://` and any external
+/// `HADOOP_CONF_DIR` / `HADOOP_HOME` is ignored. Set this to a truthy value
+/// (`1` / `true` / `yes` / `on`) to instead defer to the external config.
+const EXTERNAL_HADOOP_CONF_FLAG: &str = "PAIMON_USE_EXTERNAL_HADOOP_CONF";
+
+/// Whether the deployer opted into using an external Hadoop config.
+fn external_hadoop_conf_enabled() -> bool {
+    std::env::var(EXTERNAL_HADOOP_CONF_FLAG)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Make hdfs-native use the built-in Hadoop config for ViewFS.
+///
+/// By default this materializes the embedded `core-site.xml` / `hdfs-site.xml`
+/// to a process-private directory and forces `HADOOP_CONF_DIR` to point at it,
+/// **overriding any external `HADOOP_CONF_DIR` / `HADOOP_HOME`**, so deployment
+/// needs no Hadoop config on disk.
+///
+/// Opt out by setting [`EXTERNAL_HADOOP_CONF_FLAG`] to a truthy value: then this
+/// is a no-op and hdfs-native reads the external `HADOOP_CONF_DIR` /
+/// `HADOOP_HOME` as usual. Called only for `viewfs://` paths (see
+/// [`hdfs_config_build`]); plain `hdfs://` single-NameNode access needs no mount
+/// table and is never affected.
+fn ensure_builtin_hadoop_conf() -> Result<()> {
+    if external_hadoop_conf_enabled() {
+        // Deployer opted into their own HADOOP_CONF_DIR / HADOOP_HOME.
+        return Ok(());
+    }
+
+    let dir = std::env::temp_dir().join("paimon-builtin-hadoop-conf");
+    let write = |name: &str, content: &str| -> Result<()> {
+        std::fs::write(dir.join(name), content).map_err(|e| Error::ConfigInvalid {
+            message: format!("Failed to write built-in hadoop conf {name} to {dir:?}: {e}"),
+        })
+    };
+
+    std::fs::create_dir_all(&dir).map_err(|e| Error::ConfigInvalid {
+        message: format!("Failed to create built-in hadoop conf dir {dir:?}: {e}"),
+    })?;
+    write("core-site.xml", BUILTIN_CORE_SITE)?;
+    write("hdfs-site.xml", BUILTIN_HDFS_SITE)?;
+
+    // Force HADOOP_CONF_DIR to the built-in dir, overriding any external value.
+    // hdfs-native reads it when the client is built; this runs under the HDFS
+    // operator's init lock (see storage.rs), so it is serialized with operator
+    // construction and never races a concurrent build.
+    std::env::set_var("HADOOP_CONF_DIR", &dir);
+    Ok(())
+}
+
 /// Configuration key for HDFS name node URL.
 ///
 /// Example: "hdfs://namenode:8020" or "hdfs://nameservice1" (HA).
@@ -94,6 +162,13 @@ pub(crate) fn hdfs_config_parse(props: HashMap<String, String>) -> Result<HdfsNa
 /// - "hdfs://namenode:8020/warehouse/db/table"
 /// - "viewfs://cluster/warehouse/db/table"
 pub(crate) fn hdfs_config_build(cfg: &HdfsNativeConfig, path: &str) -> Result<Operator> {
+    // ViewFS needs a mount table, which hdfs-native loads from Hadoop xml. Drop
+    // the built-in conf in place (unless the deployer set HADOOP_CONF_DIR) so
+    // viewfs:// works without external setup. Plain hdfs:// does not need this.
+    if path.starts_with("viewfs://") {
+        ensure_builtin_hadoop_conf()?;
+    }
+
     let mut cfg = cfg.clone();
 
     if cfg.name_node.is_none() {
