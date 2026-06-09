@@ -26,7 +26,7 @@ use crate::spec::FileKind;
 use crate::spec::{
     datums_to_binary_row, extract_datum, BinaryRow, CommitKind, CoreOptions, DataType, Datum,
     IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList,
-    PartitionStatistics, Snapshot,
+    PartitionStatistics, Snapshot, EMPTY_SERIALIZED_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
@@ -918,7 +918,14 @@ impl TableCommit {
         let num_fields = partition_fields.len();
 
         if num_fields == 0 || entries.is_empty() {
-            return Ok(BinaryTableStats::new(vec![], vec![], vec![]));
+            // Use a serialized empty BinaryRow ([0,0,0,0] arity prefix) rather than
+            // a raw empty Vec — Java's SerializationUtils.deserializeBinaryRow reads a
+            // 4-byte arity header first and throws BufferUnderflowException on 0 bytes.
+            return Ok(BinaryTableStats::new(
+                EMPTY_SERIALIZED_ROW.clone(),
+                EMPTY_SERIALIZED_ROW.clone(),
+                vec![],
+            ));
         }
 
         let data_types: Vec<_> = partition_fields
@@ -1310,6 +1317,54 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].kind(), FileKind::Add);
         assert_eq!(entries[0].file().file_name, "data-0.parquet");
+    }
+
+    /// Regression: an unpartitioned table's manifest-list `_PARTITION_STATS`
+    /// min/max must be a serialized empty BinaryRow (`[0,0,0,0]`, a 4-byte arity
+    /// prefix), never a raw empty `Vec`. Java's `SerializationUtils
+    /// .deserializeBinaryRow` reads a 4-byte arity header first and throws
+    /// `BufferUnderflowException` on 0 bytes, so empty stats made every
+    /// Rust-written unpartitioned table unreadable by paimon-java.
+    #[tokio::test]
+    async fn test_unpartitioned_partition_stats_have_arity_prefix() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partition_stats_arity";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let messages = vec![CommitMessage::new(
+            vec![],
+            0,
+            vec![test_data_file("data-0.parquet", 100)],
+        )];
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        let manifest_dir = format!("{table_path}/manifest");
+        let delta_path = format!("{manifest_dir}/{}", snapshot.delta_manifest_list());
+        let delta_metas = ManifestList::read(&file_io, &delta_path).await.unwrap();
+        assert_eq!(delta_metas.len(), 1);
+
+        let stats = delta_metas[0].partition_stats();
+        // Must carry the 4-byte arity prefix (== serialized empty BinaryRow),
+        // not raw empty bytes.
+        assert_eq!(
+            stats.min_values(),
+            EMPTY_SERIALIZED_ROW.as_slice(),
+            "partition_stats min_values must be a serialized empty BinaryRow"
+        );
+        assert_eq!(
+            stats.max_values(),
+            EMPTY_SERIALIZED_ROW.as_slice(),
+            "partition_stats max_values must be a serialized empty BinaryRow"
+        );
+        // Must round-trip exactly like Java's deserializeBinaryRow (reads a
+        // 4-byte arity then points into the rest): arity 0, no underflow.
+        let min_row = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        assert_eq!(min_row.arity(), 0);
+        let max_row = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!(max_row.arity(), 0);
     }
 
     #[tokio::test]
