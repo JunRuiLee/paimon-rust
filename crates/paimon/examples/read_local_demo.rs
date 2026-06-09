@@ -101,6 +101,11 @@ struct Args {
     /// dropped the library default to 1024 (Java parity). Use `0` to skip
     /// the alter and respect whatever the table already has persisted.
     batch_size: usize,
+    /// `source.split.target-size` to apply to each table before reading.
+    /// `None` skips the alter (table keeps whatever it has persisted; lib
+    /// default is 128 MiB). Accepts the same string format as the option
+    /// itself (`"2gb"`, `"128mb"`, raw bytes, etc.).
+    target_size: Option<String>,
 }
 
 /// Stat for one read pass. `residual_dropped` is the number of rows that
@@ -145,6 +150,10 @@ fn print_usage(argv0: &str) {
     eprintln!("    alter_table before reading. Default 8192 (matches the demo's");
     eprintln!("    prior hardcoded perf baseline). Pass 0 to skip the alter and");
     eprintln!("    respect the persisted option (lib default 1024).");
+    eprintln!("  --target-size SIZE: apply `source.split.target-size=SIZE` to");
+    eprintln!("    each table via alter_table before reading. Accepts \"2gb\",");
+    eprintln!("    \"128mb\", raw bytes, etc. Default unset → no alter (lib");
+    eprintln!("    default 128 MiB applies).");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -156,6 +165,7 @@ fn parse_args() -> Result<Args, String> {
     let mut columns: Option<Vec<String>> = None;
     let mut filters_raw: Vec<String> = Vec::new();
     let mut batch_size: usize = 8192;
+    let mut target_size: Option<String> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -216,6 +226,16 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<usize>()
                     .map_err(|_| format!("--batch-size must be a non-negative integer, got: {v}"))?;
             }
+            "--target-size" => {
+                i += 1;
+                let v = argv
+                    .get(i)
+                    .ok_or_else(|| "--target-size needs an argument (e.g. 2gb)".to_string())?;
+                if v.is_empty() {
+                    return Err("--target-size value is empty".to_string());
+                }
+                target_size = Some(v.clone());
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -238,6 +258,7 @@ fn parse_args() -> Result<Args, String> {
         columns,
         filters,
         batch_size,
+        target_size,
     })
 }
 
@@ -891,38 +912,53 @@ async fn process_one_table(args: &Args, table_path: &str) -> Result<TableSummary
         .await
         .map_err(|e| format!("failed to create FileSystemCatalog: {e}"))?;
 
-    // Apply `read.batch-size` via alter_table when --batch-size > 0 and the
-    // table's persisted value differs. Idempotent — no schema bump if the
-    // option is already at the requested value. Lib default (no alter) is
-    // 1024 to match Java; demo default 8192 restores the pre-plumbing perf.
-    if args.batch_size > 0 {
+    // Pre-read alter: apply any --batch-size / --target-size requested by
+    // the caller via a single alter_table call. Idempotent — only alter for
+    // option values that actually differ from the persisted ones, so reruns
+    // don't churn schema versions.
+    let need_alter = args.batch_size > 0 || args.target_size.is_some();
+    if need_alter {
         let ident = paimon::catalog::Identifier::new(&db, &tbl);
         let table = catalog
             .get_table(&ident)
             .await
             .map_err(|e| format!("get_table failed for {db}.{tbl}: {e}"))?;
-        let target = args.batch_size.to_string();
-        let current = table
-            .schema()
-            .options()
-            .get("read.batch-size")
-            .cloned();
-        if current.as_deref() != Some(target.as_str()) {
-            catalog
-                .alter_table(
-                    &ident,
-                    vec![SchemaChange::set_option(
-                        "read.batch-size".to_string(),
-                        target.clone(),
-                    )],
-                    /*ignore_if_not_exists=*/ false,
-                )
-                .await
-                .map_err(|e| format!("alter_table read.batch-size on {db}.{tbl}: {e}"))?;
-            println!(
-                "applied read.batch-size={} (was {:?})",
-                target, current
+        let mut changes: Vec<SchemaChange> = Vec::new();
+        let mut applied_msgs: Vec<String> = Vec::new();
+
+        let consider = |key: &str, target: String, applied: &mut Vec<String>, ch: &mut Vec<SchemaChange>| {
+            let current = table.schema().options().get(key).cloned();
+            if current.as_deref() != Some(target.as_str()) {
+                applied.push(format!("{key}={target} (was {current:?})"));
+                ch.push(SchemaChange::set_option(key.to_string(), target));
+            }
+        };
+
+        if args.batch_size > 0 {
+            consider(
+                "read.batch-size",
+                args.batch_size.to_string(),
+                &mut applied_msgs,
+                &mut changes,
             );
+        }
+        if let Some(ref ts) = args.target_size {
+            consider(
+                "source.split.target-size",
+                ts.clone(),
+                &mut applied_msgs,
+                &mut changes,
+            );
+        }
+
+        if !changes.is_empty() {
+            catalog
+                .alter_table(&ident, changes, /*ignore_if_not_exists=*/ false)
+                .await
+                .map_err(|e| format!("alter_table on {db}.{tbl}: {e}"))?;
+            for m in applied_msgs {
+                println!("applied {m}");
+            }
         }
     }
 
