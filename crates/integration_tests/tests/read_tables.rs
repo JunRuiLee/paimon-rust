@@ -18,8 +18,8 @@
 //! Integration tests for reading Paimon tables provisioned by Spark.
 
 use arrow_array::{
-    Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrowPrimitiveType, Int32Array, Int64Array, ListArray, MapArray, PrimitiveArray,
+    RecordBatch, StringArray, StructArray,
 };
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
@@ -1152,6 +1152,128 @@ async fn test_read_schema_evolution_type_promotion() {
     );
 }
 
+fn assert_plan_file_formats(plan: &Plan, expected_formats: &[&str], table_name: &str) {
+    let formats: HashSet<&str> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
+        .collect();
+    assert_eq!(
+        formats,
+        expected_formats.iter().copied().collect(),
+        "{table_name} should scan the expected data file formats"
+    );
+}
+
+fn assert_plan_has_multiple_schema_ids(plan: &Plan, table_name: &str) {
+    let schema_ids: HashSet<i64> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .map(|file| file.schema_id)
+        .collect();
+    assert!(
+        schema_ids.len() >= 2,
+        "{table_name} should scan files from multiple schema versions, got {schema_ids:?}"
+    );
+}
+
+/// Test reading mixed-format files after ALTER TABLE ADD COLUMNS.
+/// Old Parquet files lack the new column; newer ORC/Avro files contain it.
+#[tokio::test]
+async fn test_read_format_schema_evolution_add_column() {
+    let table_name = "format_schema_evolution_add_column";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+    assert_plan_has_multiple_schema_ids(&plan, table_name);
+
+    let mut rows: Vec<(i32, String, Option<i32>)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        let age = batch
+            .column_by_name("age")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("age");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                id.value(i),
+                name.value(i).to_string(),
+                (!age.is_null(i)).then(|| age.value(i)),
+            ));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".into(), None),
+            (2, "bob".into(), None),
+            (3, "carol".into(), Some(30)),
+            (4, "dave".into(), Some(40)),
+            (5, "eve".into(), Some(50)),
+            (6, "frank".into(), Some(60)),
+        ],
+        "Old Parquet rows should have null age and new ORC/Avro rows should keep age values"
+    );
+}
+
+/// Test reading mixed-format files after ALTER TABLE ALTER COLUMN TYPE (INT -> BIGINT).
+/// Old Parquet files have INT; newer ORC/Avro files have BIGINT.
+#[tokio::test]
+async fn test_read_format_schema_evolution_type_promotion() {
+    let table_name = "format_schema_evolution_type_promotion";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+    assert_plan_has_multiple_schema_ids(&plan, table_name);
+
+    for batch in &batches {
+        let value_col = batch.column_by_name("value").expect("value column");
+        assert_eq!(
+            value_col.data_type(),
+            &arrow_array::types::Int64Type::DATA_TYPE,
+            "value column should be Int64 after mixed-format type promotion"
+        );
+    }
+
+    let mut rows: Vec<(i32, i64)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let value = batch
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("value as Int64Array");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), value.value(i)));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, 100),
+            (2, 200),
+            (3, 3_000_000_000),
+            (4, 4_000_000_000),
+            (5, 5_000_000_000),
+            (6, 6_000_000_000),
+        ],
+        "Old Parquet INT rows should be cast to BIGINT and new ORC/Avro BIGINT rows should match"
+    );
+}
+
 /// Stats pruning should treat a newly added column as all-NULL for old files.
 #[tokio::test]
 async fn test_stats_pruning_schema_evolution_added_column_eq_prunes_old_files() {
@@ -1376,6 +1498,88 @@ async fn test_read_schema_evolution_drop_column() {
             (4, "dave".into()),
         ],
         "Old rows should be readable after DROP COLUMN, with only remaining columns"
+    );
+}
+
+/// Test reading a table after ALTER TABLE RENAME COLUMN across mixed file formats.
+/// Old files have the old physical field name; reader should map by field id.
+#[tokio::test]
+async fn test_read_schema_evolution_rename_column() {
+    let (plan, batches) =
+        scan_and_read_with_fs_catalog("schema_evolution_rename_column", None).await;
+
+    let formats: HashSet<&str> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
+        .collect();
+    assert_eq!(
+        formats,
+        HashSet::from(["avro", "orc", "parquet"]),
+        "schema_evolution_rename_column should scan all provisioned file formats"
+    );
+
+    let mut rows: Vec<(i32, String)> = Vec::new();
+    for batch in &batches {
+        assert!(
+            batch.column_by_name("payload").is_none(),
+            "Old column name 'payload' should not appear in output"
+        );
+
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let renamed_payload = batch
+            .column_by_name("renamed_payload")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("renamed_payload");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), renamed_payload.value(i).to_string()));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "parquet-old".into()),
+            (2, "parquet-old-2".into()),
+            (3, "orc-new".into()),
+            (4, "avro-new".into()),
+        ],
+        "Renamed column should read old and new files by field id under the new column name"
+    );
+
+    let (_, projected_batches) =
+        scan_and_read_with_fs_catalog("schema_evolution_rename_column", Some(&["renamed_payload"]))
+            .await;
+    let mut projected_values = Vec::new();
+    for batch in &projected_batches {
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "Projection should return only the renamed column"
+        );
+        let renamed_payload = batch
+            .column_by_name("renamed_payload")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("projected renamed_payload");
+        for i in 0..batch.num_rows() {
+            projected_values.push(renamed_payload.value(i).to_string());
+        }
+    }
+    projected_values.sort();
+    assert_eq!(
+        projected_values,
+        vec![
+            "avro-new".to_string(),
+            "orc-new".to_string(),
+            "parquet-old".to_string(),
+            "parquet-old-2".to_string(),
+        ],
+        "Projection on renamed column should still use field-id mapping"
     );
 }
 
@@ -2637,4 +2841,420 @@ async fn test_read_full_types_table() {
     assert_eq!(r.16, vec![6]); // array
     assert_eq!(r.17, vec![("d".into(), 40), ("e".into(), 50)]); // map
     assert_eq!(r.18, ("carol".into(), 300)); // struct
+}
+
+#[tokio::test]
+async fn test_read_full_types_boundary_table() {
+    use arrow_array::{
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int64Array, Int8Array, ListArray, MapArray, StructArray,
+        TimestampMicrosecondArray,
+    };
+
+    #[derive(Debug, PartialEq)]
+    struct BoundaryRow {
+        id: i32,
+        col_boolean: Option<bool>,
+        col_tinyint: Option<i8>,
+        col_smallint: Option<i16>,
+        col_int: Option<i32>,
+        col_bigint: Option<i64>,
+        col_float: Option<f32>,
+        col_double: Option<f64>,
+        col_decimal: Option<i128>,
+        col_decimal5: Option<i128>,
+        col_decimal38: Option<i128>,
+        col_string: Option<String>,
+        col_binary: Option<Vec<u8>>,
+        col_date: Option<i32>,
+        col_timestamp: Option<i64>,
+        col_timestamp_ltz: Option<i64>,
+        col_array: Option<Vec<Option<i32>>>,
+        col_map: Option<Vec<(String, Option<i32>)>>,
+        col_struct: Option<(Option<String>, Option<i32>)>,
+    }
+
+    fn primitive_value<T: ArrowPrimitiveType>(
+        array: &PrimitiveArray<T>,
+        row: usize,
+    ) -> Option<T::Native> {
+        (!array.is_null(row)).then(|| array.value(row))
+    }
+
+    fn bool_value(array: &BooleanArray, row: usize) -> Option<bool> {
+        (!array.is_null(row)).then(|| array.value(row))
+    }
+
+    fn string_value(array: &StringArray, row: usize) -> Option<String> {
+        (!array.is_null(row)).then(|| array.value(row).to_string())
+    }
+
+    fn binary_value(array: &BinaryArray, row: usize) -> Option<Vec<u8>> {
+        (!array.is_null(row)).then(|| array.value(row).to_vec())
+    }
+
+    fn list_i32_value(array: &ListArray, row: usize) -> Option<Vec<Option<i32>>> {
+        if array.is_null(row) {
+            return None;
+        }
+        let values = array.value(row);
+        let values = values
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("list element as Int32Array");
+        Some(
+            (0..values.len())
+                .map(|i| (!values.is_null(i)).then(|| values.value(i)))
+                .collect(),
+        )
+    }
+
+    fn map_string_i32_value(array: &MapArray, row: usize) -> Option<Vec<(String, Option<i32>)>> {
+        if array.is_null(row) {
+            return None;
+        }
+        let entries = array.value(row);
+        let entries = entries
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("map entries as StructArray");
+        let keys = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("map keys");
+        let values = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("map values");
+        let mut result: Vec<(String, Option<i32>)> = (0..keys.len())
+            .map(|i| {
+                (
+                    keys.value(i).to_string(),
+                    (!values.is_null(i)).then(|| values.value(i)),
+                )
+            })
+            .collect();
+        result.sort_by(|left, right| left.0.cmp(&right.0));
+        Some(result)
+    }
+
+    fn struct_string_i32_value(
+        array: &StructArray,
+        row: usize,
+    ) -> Option<(Option<String>, Option<i32>)> {
+        if array.is_null(row) {
+            return None;
+        }
+        let names = array
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("struct name");
+        let values = array
+            .column_by_name("value")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("struct value");
+        Some((
+            (!names.is_null(row)).then(|| names.value(row).to_string()),
+            (!values.is_null(row)).then(|| values.value(row)),
+        ))
+    }
+
+    let (plan, batches) = scan_and_read_with_fs_catalog("full_types_boundary_table", None).await;
+    let formats: HashSet<&str> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .filter_map(|file| file.file_name.rsplit_once('.').map(|(_, ext)| ext))
+        .collect();
+    assert_eq!(
+        formats,
+        HashSet::from(["avro", "orc", "parquet"]),
+        "full_types_boundary_table should scan all provisioned file formats"
+    );
+
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 6,
+        "full_types_boundary_table should have 6 rows"
+    );
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col_boolean = batch
+            .column_by_name("col_boolean")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let col_tinyint = batch
+            .column_by_name("col_tinyint")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        let col_smallint = batch
+            .column_by_name("col_smallint")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let col_int = batch
+            .column_by_name("col_int")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let col_bigint = batch
+            .column_by_name("col_bigint")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let col_float = batch
+            .column_by_name("col_float")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let col_double = batch
+            .column_by_name("col_double")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let col_decimal = batch
+            .column_by_name("col_decimal")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_decimal5 = batch
+            .column_by_name("col_decimal5")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_decimal38 = batch
+            .column_by_name("col_decimal38")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        let col_string = batch
+            .column_by_name("col_string")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let col_binary = batch
+            .column_by_name("col_binary")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let col_date = batch
+            .column_by_name("col_date")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let col_timestamp = batch
+            .column_by_name("col_timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let col_timestamp_ltz = batch
+            .column_by_name("col_timestamp_ltz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let col_array = batch
+            .column_by_name("col_array")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let col_map = batch
+            .column_by_name("col_map")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let col_struct = batch
+            .column_by_name("col_struct")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            rows.push(BoundaryRow {
+                id: id.value(i),
+                col_boolean: bool_value(col_boolean, i),
+                col_tinyint: primitive_value(col_tinyint, i),
+                col_smallint: primitive_value(col_smallint, i),
+                col_int: primitive_value(col_int, i),
+                col_bigint: primitive_value(col_bigint, i),
+                col_float: primitive_value(col_float, i),
+                col_double: primitive_value(col_double, i),
+                col_decimal: primitive_value(col_decimal, i),
+                col_decimal5: primitive_value(col_decimal5, i),
+                col_decimal38: primitive_value(col_decimal38, i),
+                col_string: string_value(col_string, i),
+                col_binary: binary_value(col_binary, i),
+                col_date: primitive_value(col_date, i),
+                col_timestamp: primitive_value(col_timestamp, i),
+                col_timestamp_ltz: primitive_value(col_timestamp_ltz, i),
+                col_array: list_i32_value(col_array, i),
+                col_map: map_string_i32_value(col_map, i),
+                col_struct: struct_string_i32_value(col_struct, i),
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.id);
+
+    assert_eq!(
+        rows,
+        vec![
+            BoundaryRow {
+                id: 1,
+                col_boolean: Some(false),
+                col_tinyint: Some(i8::MIN),
+                col_smallint: Some(i16::MIN),
+                col_int: Some(i32::MIN),
+                col_bigint: Some(i64::MIN),
+                col_float: Some(-0.5),
+                col_double: Some(-1.25),
+                col_decimal: Some(-9_999_999_999),
+                col_decimal5: Some(-99999),
+                col_decimal38: Some(-99_999_999_999_999_999_999_999_999_999_999_999_999),
+                col_string: Some(String::new()),
+                col_binary: Some(Vec::new()),
+                col_date: Some(-1),
+                col_timestamp: Some(1),
+                col_timestamp_ltz: Some(1),
+                col_array: Some(vec![None, Some(i32::MIN), Some(0)]),
+                col_map: Some(vec![
+                    ("negative".into(), Some(i32::MIN)),
+                    ("zero".into(), None)
+                ]),
+                col_struct: Some((None, Some(-1))),
+            },
+            BoundaryRow {
+                id: 2,
+                col_boolean: None,
+                col_tinyint: None,
+                col_smallint: None,
+                col_int: None,
+                col_bigint: None,
+                col_float: None,
+                col_double: None,
+                col_decimal: None,
+                col_decimal5: None,
+                col_decimal38: None,
+                col_string: None,
+                col_binary: None,
+                col_date: None,
+                col_timestamp: None,
+                col_timestamp_ltz: None,
+                col_array: None,
+                col_map: None,
+                col_struct: None,
+            },
+            BoundaryRow {
+                id: 3,
+                col_boolean: Some(true),
+                col_tinyint: Some(i8::MAX),
+                col_smallint: Some(i16::MAX),
+                col_int: Some(i32::MAX),
+                col_bigint: Some(i64::MAX),
+                col_float: Some(0.25),
+                col_double: Some(0.5),
+                col_decimal: Some(9_999_999_999),
+                col_decimal5: Some(99999),
+                col_decimal38: Some(99_999_999_999_999_999_999_999_999_999_999_999_999),
+                col_string: Some("orc-boundary".into()),
+                col_binary: Some(vec![0x00, 0xFF]),
+                col_date: Some(0),
+                col_timestamp: Some(0),
+                col_timestamp_ltz: Some(0),
+                col_array: Some(vec![]),
+                col_map: Some(vec![]),
+                col_struct: Some((Some("orc".into()), None)),
+            },
+            BoundaryRow {
+                id: 4,
+                col_boolean: None,
+                col_tinyint: None,
+                col_smallint: None,
+                col_int: None,
+                col_bigint: None,
+                col_float: None,
+                col_double: None,
+                col_decimal: None,
+                col_decimal5: None,
+                col_decimal38: None,
+                col_string: None,
+                col_binary: None,
+                col_date: None,
+                col_timestamp: None,
+                col_timestamp_ltz: None,
+                col_array: None,
+                col_map: None,
+                col_struct: None,
+            },
+            BoundaryRow {
+                id: 5,
+                col_boolean: Some(false),
+                col_tinyint: Some(0),
+                col_smallint: Some(0),
+                col_int: Some(0),
+                col_bigint: Some(0),
+                col_float: Some(0.0),
+                col_double: Some(0.0),
+                col_decimal: Some(0),
+                col_decimal5: Some(0),
+                col_decimal38: Some(0),
+                col_string: Some("avro-boundary".into()),
+                col_binary: Some(vec![0x01, 0x02]),
+                col_date: Some(1),
+                col_timestamp: Some(999_999),
+                col_timestamp_ltz: Some(999_999),
+                col_array: Some(vec![Some(7)]),
+                col_map: Some(vec![("seven".into(), Some(7))]),
+                col_struct: Some((Some("avro".into()), Some(7))),
+            },
+            BoundaryRow {
+                id: 6,
+                col_boolean: None,
+                col_tinyint: None,
+                col_smallint: None,
+                col_int: None,
+                col_bigint: None,
+                col_float: None,
+                col_double: None,
+                col_decimal: None,
+                col_decimal5: None,
+                col_decimal38: None,
+                col_string: None,
+                col_binary: None,
+                col_date: None,
+                col_timestamp: None,
+                col_timestamp_ltz: None,
+                col_array: None,
+                col_map: None,
+                col_struct: None,
+            },
+        ]
+    );
 }

@@ -112,4 +112,148 @@ mod tests {
         let decoded = ManifestList::read(&file_io, path).await.unwrap();
         assert!(decoded.is_empty());
     }
+
+    /// Round-trip bucket / level statistics through Avro so future schema drift is caught
+    /// here, not in production. Matches the fields added in apache/paimon#5345.
+    #[tokio::test]
+    async fn test_manifest_list_roundtrip_preserves_bucket_level_stats() {
+        let file_io = test_file_io();
+        let path = "memory:/test_manifest_list_bucket_level/manifest-list-0";
+        file_io
+            .mkdirs("memory:/test_manifest_list_bucket_level/")
+            .await
+            .unwrap();
+
+        let value_bytes = vec![
+            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129,
+        ];
+        let original = vec![ManifestFileMeta::new(
+            "manifest-bucket-level".to_string(),
+            4096,
+            3,
+            0,
+            BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(0)]),
+            0,
+        )
+        .with_bucket_level_stats(Some(-1), Some(7), Some(0), Some(5))];
+
+        ManifestList::write(&file_io, path, &original)
+            .await
+            .unwrap();
+        let decoded = ManifestList::read(&file_io, path).await.unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].min_bucket(), Some(-1));
+        assert_eq!(decoded[0].max_bucket(), Some(7));
+        assert_eq!(decoded[0].min_level(), Some(0));
+        assert_eq!(decoded[0].max_level(), Some(5));
+        // Sanity: nothing else changed.
+        assert_eq!(decoded[0].file_name(), "manifest-bucket-level");
+        assert_eq!(decoded[0].num_added_files(), 3);
+    }
+
+    /// Back-compat: a manifest list written without the bucket / level fields (e.g. by an
+    /// older Rust writer or any Java writer pre apache/paimon#5345) must decode into
+    /// `None` rather than failing or yielding bogus values.
+    #[tokio::test]
+    async fn test_manifest_list_decodes_legacy_without_bucket_level_fields() {
+        use apache_avro::{Codec, Schema, Writer};
+        use std::collections::HashMap;
+
+        let file_io = test_file_io();
+        let path = "memory:/test_manifest_list_legacy/manifest-list-0";
+        file_io
+            .mkdirs("memory:/test_manifest_list_legacy/")
+            .await
+            .unwrap();
+
+        // Avro schema with the pre-5345 shape: no _MIN/_MAX_BUCKET/LEVEL fields.
+        let legacy_schema = r#"["null", {
+            "type": "record",
+            "name": "record",
+            "namespace": "org.apache.paimon.avro.generated",
+            "fields": [
+                {"name": "_VERSION", "type": "int"},
+                {"name": "_FILE_NAME", "type": "string"},
+                {"name": "_FILE_SIZE", "type": "long"},
+                {"name": "_NUM_ADDED_FILES", "type": "long"},
+                {"name": "_NUM_DELETED_FILES", "type": "long"},
+                {"name": "_PARTITION_STATS", "type": ["null", {
+                    "type": "record",
+                    "name": "record__PARTITION_STATS",
+                    "fields": [
+                        {"name": "_MIN_VALUES", "type": "bytes"},
+                        {"name": "_MAX_VALUES", "type": "bytes"},
+                        {"name": "_NULL_COUNTS", "type": ["null", {"type": "array", "items": ["null", "long"]}], "default": null}
+                    ]
+                }], "default": null}
+            ]
+        }]"#;
+        let schema = Schema::parse_str(legacy_schema).unwrap();
+        let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+        let value_bytes = vec![0u8; 12];
+        let mut record: HashMap<String, apache_avro::types::Value> = HashMap::new();
+        record.insert("_VERSION".to_string(), apache_avro::types::Value::Int(2));
+        record.insert(
+            "_FILE_NAME".to_string(),
+            apache_avro::types::Value::String("manifest-legacy".to_string()),
+        );
+        record.insert(
+            "_FILE_SIZE".to_string(),
+            apache_avro::types::Value::Long(1024),
+        );
+        record.insert(
+            "_NUM_ADDED_FILES".to_string(),
+            apache_avro::types::Value::Long(2),
+        );
+        record.insert(
+            "_NUM_DELETED_FILES".to_string(),
+            apache_avro::types::Value::Long(0),
+        );
+        record.insert(
+            "_PARTITION_STATS".to_string(),
+            apache_avro::types::Value::Union(
+                1,
+                Box::new(apache_avro::types::Value::Record(vec![
+                    (
+                        "_MIN_VALUES".to_string(),
+                        apache_avro::types::Value::Bytes(value_bytes.clone()),
+                    ),
+                    (
+                        "_MAX_VALUES".to_string(),
+                        apache_avro::types::Value::Bytes(value_bytes.clone()),
+                    ),
+                    (
+                        "_NULL_COUNTS".to_string(),
+                        apache_avro::types::Value::Union(
+                            0,
+                            Box::new(apache_avro::types::Value::Null),
+                        ),
+                    ),
+                ])),
+            ),
+        );
+        let value = apache_avro::types::Value::Union(
+            1,
+            Box::new(apache_avro::types::Value::Record(
+                record.into_iter().collect(),
+            )),
+        );
+        let resolved = value.resolve(&schema).unwrap();
+        writer.append(resolved).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(bytes::Bytes::from(bytes))
+            .await
+            .unwrap();
+
+        let decoded = ManifestList::read(&file_io, path).await.unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file_name(), "manifest-legacy");
+        assert_eq!(decoded[0].min_bucket(), None);
+        assert_eq!(decoded[0].max_bucket(), None);
+        assert_eq!(decoded[0].min_level(), None);
+        assert_eq!(decoded[0].max_level(), None);
+    }
 }

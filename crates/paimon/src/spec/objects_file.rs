@@ -83,6 +83,10 @@ mod tests {
             0,
             BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(1)]),
             0,
+            None,
+            None,
+            None,
+            None,
             Some(100),
             Some(199),
         )];

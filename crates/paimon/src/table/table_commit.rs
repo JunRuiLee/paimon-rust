@@ -24,9 +24,9 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    datums_to_binary_row, extract_datum, BinaryRow, CommitKind, CoreOptions, DataType, Datum,
-    IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList,
-    PartitionStatistics, Snapshot,
+    datums_to_binary_row, extract_datum, BinaryRow, BinaryRowBuilder, CommitKind, CoreOptions,
+    DataType, Datum, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta,
+    ManifestList, PartitionStatistics, Snapshot,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
@@ -520,11 +520,24 @@ impl TableCommit {
 
         let mut added_file_count: i64 = 0;
         let mut deleted_file_count: i64 = 0;
+        // Bucket / level pruning stats; left as None when entries is empty so back-compat
+        // readers (Java < apache/paimon#5345 or older Rust writers) see the same shape
+        // they would for a pre-feature manifest.
+        let mut min_bucket: Option<i32> = None;
+        let mut max_bucket: Option<i32> = None;
+        let mut min_level: Option<i32> = None;
+        let mut max_level: Option<i32> = None;
         for entry in entries {
             match entry.kind() {
                 FileKind::Add => added_file_count += 1,
                 FileKind::Delete => deleted_file_count += 1,
             }
+            let b = entry.bucket();
+            min_bucket = Some(min_bucket.map_or(b, |cur| cur.min(b)));
+            max_bucket = Some(max_bucket.map_or(b, |cur| cur.max(b)));
+            let l = entry.file().level;
+            min_level = Some(min_level.map_or(l, |cur| cur.min(l)));
+            max_level = Some(max_level.map_or(l, |cur| cur.max(l)));
         }
 
         // Get file size
@@ -539,7 +552,8 @@ impl TableCommit {
             deleted_file_count,
             partition_stats,
             self.table.schema().id(),
-        ))
+        )
+        .with_bucket_level_stats(min_bucket, max_bucket, min_level, max_level))
     }
 
     /// Check if this commit was already completed (idempotency).
@@ -918,7 +932,7 @@ impl TableCommit {
         let num_fields = partition_fields.len();
 
         if num_fields == 0 || entries.is_empty() {
-            return Ok(BinaryTableStats::new(vec![], vec![], vec![]));
+            return Ok(BinaryTableStats::empty());
         }
 
         let data_types: Vec<_> = partition_fields
@@ -956,11 +970,8 @@ impl TableCommit {
             }
         }
 
-        let min_datums: Vec<_> = mins.iter().zip(data_types.iter()).collect();
-        let max_datums: Vec<_> = maxs.iter().zip(data_types.iter()).collect();
-
-        let min_bytes = datums_to_binary_row(&min_datums);
-        let max_bytes = datums_to_binary_row(&max_datums);
+        let min_bytes = build_partition_stats_row(&mins, &data_types);
+        let max_bytes = build_partition_stats_row(&maxs, &data_types);
         let null_counts = null_counts.into_iter().map(Some).collect();
 
         Ok(BinaryTableStats::new(min_bytes, max_bytes, null_counts))
@@ -1113,6 +1124,20 @@ impl TableCommit {
     }
 }
 
+/// Serialized BinaryRow for partition stats; unlike `datums_to_binary_row`, returns a
+/// valid arity-N row even when every datum is `None` (the all-null case must still
+/// decode on the Java side).
+fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) -> Vec<u8> {
+    let mut builder = BinaryRowBuilder::new(datums.len() as i32);
+    for (pos, (datum_opt, data_type)) in datums.iter().zip(data_types.iter()).enumerate() {
+        match datum_opt {
+            Some(d) => builder.write_datum(pos, d, data_type),
+            None => builder.set_null_at(pos),
+        }
+    }
+    builder.build_serialized()
+}
+
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
@@ -1220,8 +1245,8 @@ mod tests {
             row_count,
             min_key: vec![],
             max_key: vec![],
-            key_stats: BinaryTableStats::new(vec![], vec![], vec![]),
-            value_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
             min_sequence_number: 0,
             max_sequence_number: 0,
             schema_id: 0,
@@ -1821,5 +1846,114 @@ mod tests {
             err_msg.contains("Delete conflict"),
             "Expected 'Delete conflict' error, got: {err_msg}"
         );
+    }
+
+    /// Regression: a non-partitioned table (e.g. `CREATE TABLE test_pk (... PRIMARY KEY ...)`)
+    /// must still emit `_PARTITION_STATS._MIN_VALUES`/`_MAX_VALUES` carrying the 4-byte BE
+    /// arity prefix; otherwise Java readers like Spark/Flink hit
+    /// `BufferUnderflowException` inside `SerializationUtils.deserializeBinaryRow`.
+    #[test]
+    fn compute_partition_stats_no_partition_fields_returns_decodable_empty() {
+        let file_io = test_file_io();
+        let commit = setup_commit(&file_io, "memory:/test_no_partition_stats");
+
+        let entry = ManifestEntry::new(
+            FileKind::Add,
+            vec![],
+            0,
+            1,
+            test_data_file("data-0.parquet", 1),
+            2,
+        );
+
+        let stats = commit.compute_partition_stats(&[entry]).unwrap();
+        BinaryRow::from_serialized_bytes(stats.min_values())
+            .expect("min_values must decode via the same protocol as Java's deserializeBinaryRow");
+        BinaryRow::from_serialized_bytes(stats.max_values())
+            .expect("max_values must decode via the same protocol as Java's deserializeBinaryRow");
+        assert!(stats.null_counts().is_empty());
+    }
+
+    /// Regression: when there are no entries at all, the empty stats we return must also
+    /// satisfy the protocol — same Java reader path runs on it.
+    #[test]
+    fn compute_partition_stats_empty_entries_returns_decodable_empty() {
+        let file_io = test_file_io();
+        let commit = setup_partitioned_commit(&file_io, "memory:/test_no_entries_stats");
+
+        let stats = commit.compute_partition_stats(&[]).unwrap();
+        BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert!(stats.null_counts().is_empty());
+    }
+
+    /// Regression: partitioned table with an all-null partition row must still emit
+    /// decodable min/max bytes (otherwise Java hits `BufferUnderflowException`).
+    #[test]
+    fn compute_partition_stats_all_null_partition_values_returns_decodable_bytes() {
+        let file_io = test_file_io();
+        let commit = setup_partitioned_commit(&file_io, "memory:/test_all_null_partition_stats");
+
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.set_null_at(0);
+        let null_partition = builder.build_serialized();
+
+        let entry = ManifestEntry::new(
+            FileKind::Add,
+            null_partition,
+            0,
+            1,
+            test_data_file("data-null-pt.parquet", 1),
+            2,
+        );
+
+        let stats = commit.compute_partition_stats(&[entry]).unwrap();
+        let min_row = BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        let max_row = BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!(min_row.arity(), 1);
+        assert_eq!(max_row.arity(), 1);
+        assert!(min_row.is_null_at(0));
+        assert!(max_row.is_null_at(0));
+        assert_eq!(stats.null_counts(), &vec![Some(1)]);
+    }
+
+    /// `write_manifest_file` must aggregate min/max bucket and level across entries so the
+    /// Java reader can prune manifests by bucket / level (see apache/paimon#5345). This
+    /// drives a real commit so all the call-site plumbing is exercised end to end.
+    #[tokio::test]
+    async fn test_commit_writes_bucket_and_level_stats_into_manifest_list() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_bucket_level_stats";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        fn data_file_at_level(name: &str, level: i32) -> DataFileMeta {
+            let mut f = test_data_file(name, 1);
+            f.level = level;
+            f
+        }
+
+        // Two commit messages on different buckets, each carrying a file at a different
+        // level. Expected aggregate: bucket [0, 3], level [0, 2].
+        let messages = vec![
+            CommitMessage::new(vec![], 0, vec![data_file_at_level("data-b0.parquet", 0)]),
+            CommitMessage::new(vec![], 3, vec![data_file_at_level("data-b3.parquet", 2)]),
+        ];
+        commit.commit(messages).await.unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
+        let delta_path = format!("{table_path}/manifest/{}", snapshot.delta_manifest_list());
+        let metas = ManifestList::read(&file_io, &delta_path).await.unwrap();
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected a single manifest covering both entries"
+        );
+        assert_eq!(metas[0].min_bucket(), Some(0));
+        assert_eq!(metas[0].max_bucket(), Some(3));
+        assert_eq!(metas[0].min_level(), Some(0));
+        assert_eq!(metas[0].max_level(), Some(2));
     }
 }

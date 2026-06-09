@@ -40,7 +40,7 @@ datafusion = "53.0.0"
 datafusion-ffi = "53.0.0"
 paimon = { version = "0.3.0", path = "crates/paimon" }
 parquet = "58.0"
-constant_time_eq = ">=0.4.0, <0.4.3"
+constant_time_eq = ">=0.4.0, <0.5.1"
 tokio = "1.39.2"
 tokio-util = "0.7"
 
