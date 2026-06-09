@@ -15,3 +15,9 @@
 
 [target.x86_64-pc-windows-gnu]
 linker = "rust-lld"
+
+# Use the system `git` CLI for fetching git dependencies so the internal
+# hdfs-native fork (git.corp.kuaishou.com, patched in the root Cargo.toml)
+# can reuse the local git credentials / ssh config.
+[net]
+git-fetch-with-cli = true

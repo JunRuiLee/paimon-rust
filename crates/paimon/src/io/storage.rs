@@ -268,7 +268,10 @@ impl Storage {
             "memory" => Ok(Scheme::Memory),
             "file" | "" => Ok(Scheme::Fs),
             "s3" | "s3a" => Ok(Scheme::S3),
-            "hdfs" => Ok(Scheme::HdfsNative),
+            // `viewfs` is routed through the same hdfs-native backend: the
+            // native client resolves the viewfs mount table (from Hadoop xml
+            // discovered via HADOOP_CONF_DIR / HADOOP_HOME) to real clusters.
+            "hdfs" | "viewfs" => Ok(Scheme::HdfsNative),
             s => Ok(s.parse::<Scheme>()?),
         }
     }
