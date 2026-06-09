@@ -38,13 +38,32 @@ paimon = { version = "0.1.0", features = ["storage-s3"] }
 
 Available storage features:
 
-| Feature          | Backend          |
-|------------------|------------------|
-| `storage-fs`     | Local filesystem |
-| `storage-memory` | In-memory        |
-| `storage-s3`     | Amazon S3        |
-| `storage-oss`    | Alibaba Cloud OSS|
-| `storage-all`    | All of the above |
+| Feature          | Backend                                      |
+|------------------|----------------------------------------------|
+| `storage-fs`     | Local filesystem                             |
+| `storage-memory` | In-memory                                    |
+| `storage-s3`     | Amazon S3                                     |
+| `storage-oss`    | Alibaba Cloud OSS                            |
+| `storage-hdfs`   | HDFS / ViewFS (native protocol, no JVM)      |
+| `storage-all`    | All of the above                             |
+
+### HDFS and ViewFS
+
+The `storage-hdfs` backend talks the HDFS RPC protocol directly via
+[`hdfs-native`](https://crates.io/crates/hdfs-native) — no JVM and no `libhdfs`
+required. Both `hdfs://` and `viewfs://` table paths are supported:
+
+- `hdfs://namenode:8020/warehouse/db/table` — single NameNode or, without a
+  port, an HA nameservice.
+- `viewfs://cluster/warehouse/db/table` — a ViewFS mount table that federates
+  multiple HDFS clusters.
+
+For `viewfs://` (and HA nameservices), the mount table / nameservice wiring is
+read from the Hadoop configuration. Point `HADOOP_CONF_DIR` (or `HADOOP_HOME`)
+at a directory containing `core-site.xml` / `hdfs-site.xml`; `hdfs-native`
+loads them automatically when the operator is built. A ViewFS mount table must
+include a fallback mount (`fs.viewfs.mounttable.<cluster>.linkFallback`),
+otherwise initialization fails with `No viewfs fallback mount found`.
 
 ## Catalog Management
 
