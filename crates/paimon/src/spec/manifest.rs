@@ -147,6 +147,8 @@ mod tests {
                 external_path: None,
                 first_row_id: None,
                 write_cols: None,
+                commit_snapshot_id: None,
+                merge_mode: None,
             };
             ManifestEntry::new(kind, vec![], 0, 1, file, 2)
         }

@@ -56,6 +56,7 @@ mod table_scan;
 pub(crate) mod table_write;
 mod tag_manager;
 mod vector_search_builder;
+mod versioned_partial_update;
 mod write_builder;
 
 use crate::Result;

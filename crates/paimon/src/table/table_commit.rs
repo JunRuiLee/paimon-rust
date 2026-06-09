@@ -379,6 +379,17 @@ impl TableCommit {
             next_row_id = Some(nrid);
         }
 
+        // Commit-snapshot-id assignment (Java parity:
+        // FileStoreCommitImpl.assignCommitSnapshotId).
+        //
+        // For every ADD entry whose file has either no commit_snapshot_id
+        // (legacy / non-versioned-PU writers) or the writer-side
+        // "to-be-assigned" sentinel `Some(i64::MAX)`, fill in the snapshot
+        // id we are about to commit. Real pre-set ids (e.g. from compaction
+        // reschedule that knows the originating snapshot) are preserved.
+        // DELETE entries are not touched.
+        resolved.entries = assign_commit_snapshot_id(resolved.entries, new_snapshot_id);
+
         let file_io = self.snapshot_manager.file_io();
         let manifest_dir = self.snapshot_manager.manifest_dir();
 
@@ -1138,6 +1149,42 @@ fn build_partition_stats_row(datums: &[Option<Datum>], data_types: &[DataType]) 
     builder.build_serialized()
 }
 
+/// Free helper: rewrite each ADD entry's `DataFileMeta.commit_snapshot_id` to
+/// `new_snapshot_id` when the field is `None` or carries the writer-side
+/// "to-be-assigned" sentinel [`crate::spec::COMMIT_SNAPSHOT_ID_PENDING`]
+/// (= `i64::MAX`, mirrors Java `Long.MAX_VALUE`). Pre-set ids (e.g. from a
+/// compaction reschedule that already knows the originating snapshot) are
+/// preserved. DELETE entries are not touched.
+///
+/// Mirrors paimon-java's `FileStoreCommitImpl.assignCommitSnapshotId`. Java
+/// applies this unconditionally to every commit (it lives in the generic
+/// commit pipeline, not behind a `versioned-partial-update`-specific gate),
+/// so paimon-rust does the same for Java parity. The visible side effect for
+/// non-VPU tables is that ADD entries now carry a non-null
+/// `_COMMIT_SNAPSHOT_ID` in the manifest rather than `null`. This matches
+/// Java byte layout; readers that ignore the field are unaffected.
+fn assign_commit_snapshot_id(
+    mut entries: Vec<ManifestEntry>,
+    new_snapshot_id: i64,
+) -> Vec<ManifestEntry> {
+    use crate::spec::COMMIT_SNAPSHOT_ID_PENDING;
+
+    for entry in entries.iter_mut() {
+        if *entry.kind() != FileKind::Add {
+            continue;
+        }
+        let needs_assign = match entry.file.commit_snapshot_id {
+            None => true,
+            Some(v) if v == COMMIT_SNAPSHOT_ID_PENDING => true,
+            Some(_) => false,
+        };
+        if needs_assign {
+            entry.file.commit_snapshot_id = Some(new_snapshot_id);
+        }
+    }
+    entries
+}
+
 /// Plan for resolving commit entries.
 enum CommitEntriesPlan {
     /// Caller-provided entries. May contain `FileKind::Delete` entries from CoW
@@ -1264,6 +1311,8 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            commit_snapshot_id: None,
+            merge_mode: None,
         }
     }
 
@@ -1955,5 +2004,88 @@ mod tests {
         assert_eq!(metas[0].max_bucket(), Some(3));
         assert_eq!(metas[0].min_level(), Some(0));
         assert_eq!(metas[0].max_level(), Some(2));
+    }
+
+    /// Commit-snapshot-id assignment matrix: covers the four cases
+    /// exercised by `assign_commit_snapshot_id`. Mirrors Java
+    /// `FileStoreCommitImpl.assignCommitSnapshotId`. The function is
+    /// **engine-agnostic** — non-VPU tables also have their ADD entries'
+    /// `_COMMIT_SNAPSHOT_ID` populated (the field starts as `None` from
+    /// `kv_file_writer.rs`'s default branch and gets stamped here at
+    /// commit time). The matrix's first row exercises that path: a fresh
+    /// ADD entry with `None` is upgraded to `Some(new_snap)`.
+    #[test]
+    fn test_assign_commit_snapshot_id_matrix() {
+        use crate::spec::COMMIT_SNAPSHOT_ID_PENDING;
+
+        let new_snap = 42i64;
+
+        // Build four entries:
+        //  - ADD with commit_snapshot_id = None        → assigned to new_snap
+        //  - ADD with commit_snapshot_id = i64::MAX    → assigned to new_snap
+        //  - ADD with commit_snapshot_id = Some(7)     → preserved (not new_snap)
+        //  - DELETE with commit_snapshot_id = None     → not touched
+        let mut add_none = test_data_file("add_none.parquet", 1);
+        add_none.commit_snapshot_id = None;
+
+        let mut add_pending = test_data_file("add_pending.parquet", 1);
+        add_pending.commit_snapshot_id = Some(COMMIT_SNAPSHOT_ID_PENDING);
+
+        let mut add_real = test_data_file("add_real.parquet", 1);
+        add_real.commit_snapshot_id = Some(7);
+
+        let mut del = test_data_file("del.parquet", 1);
+        del.commit_snapshot_id = None;
+
+        let entries = vec![
+            ManifestEntry::new(FileKind::Add, vec![], 0, 1, add_none, 2),
+            ManifestEntry::new(FileKind::Add, vec![], 0, 1, add_pending, 2),
+            ManifestEntry::new(FileKind::Add, vec![], 0, 1, add_real, 2),
+            ManifestEntry::new(FileKind::Delete, vec![], 0, 1, del, 2),
+        ];
+
+        let assigned = super::assign_commit_snapshot_id(entries, new_snap);
+
+        assert_eq!(assigned[0].file().commit_snapshot_id, Some(new_snap));
+        assert_eq!(assigned[1].file().commit_snapshot_id, Some(new_snap));
+        assert_eq!(assigned[2].file().commit_snapshot_id, Some(7));
+        assert_eq!(assigned[3].file().commit_snapshot_id, None);
+    }
+
+    /// Stage-2 schema-level round-trip: serialise a `DataFileMeta` carrying
+    /// the new `commit_snapshot_id` + `merge_mode` fields through the
+    /// manifest-entry Avro path and confirm both values survive.
+    #[test]
+    fn test_data_file_meta_schema_roundtrip_for_versioned_fields() {
+        use crate::spec::{from_avro_bytes, to_avro_bytes, MANIFEST_ENTRY_SCHEMA};
+
+        let mut file = test_data_file("rt.parquet", 3);
+        file.commit_snapshot_id = Some(99);
+        file.merge_mode = Some(1); // IGNORE
+        let entry = ManifestEntry::new(FileKind::Add, vec![1, 2, 3], 0, 1, file, 2);
+
+        let bytes = to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &[entry]).unwrap();
+        let decoded: Vec<ManifestEntry> = from_avro_bytes(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file().commit_snapshot_id, Some(99));
+        assert_eq!(decoded[0].file().merge_mode, Some(1));
+    }
+
+    /// Old manifests (written before _COMMIT_SNAPSHOT_ID / _MERGE_MODE)
+    /// must round-trip cleanly with both fields ending up `None`.
+    #[test]
+    fn test_data_file_meta_schema_roundtrip_legacy_none() {
+        use crate::spec::{from_avro_bytes, to_avro_bytes, MANIFEST_ENTRY_SCHEMA};
+
+        let file = test_data_file("legacy.parquet", 1);
+        // Both fields default to None per Stage-2 struct change.
+        assert_eq!(file.commit_snapshot_id, None);
+        assert_eq!(file.merge_mode, None);
+        let entry = ManifestEntry::new(FileKind::Add, vec![], 0, 1, file, 2);
+
+        let bytes = to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &[entry]).unwrap();
+        let decoded: Vec<ManifestEntry> = from_avro_bytes(&bytes).unwrap();
+        assert_eq!(decoded[0].file().commit_snapshot_id, None);
+        assert_eq!(decoded[0].file().merge_mode, None);
     }
 }

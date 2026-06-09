@@ -1490,6 +1490,41 @@ impl RowType {
     }
 }
 
+/// Return `true` if `data_type` is the structural shape of a paimon
+/// **multi-version (MV) column** at the spec level: `RowType<latest_version
+/// VarChar, latest_value T, all_versioned_values Map<VarChar, T>>` with `T`
+/// equal across positions 1 and 2's value type up to top-level nullable.
+///
+/// Mirrors Java
+/// `VersionedPartialUpdateMergeFunction.Factory.isMultiVersionType`
+/// (paimon-core/.../mergetree/compact/VersionedPartialUpdateMergeFunction.java
+/// :438-457). The Arrow-side equivalent lives in
+/// `crates/paimon/src/table/versioned_partial_update.rs`.
+pub fn is_multi_version_type(data_type: &DataType) -> bool {
+    let DataType::Row(row) = data_type else {
+        return false;
+    };
+    let fields = row.fields();
+    if fields.len() != 3 {
+        return false;
+    }
+    if !matches!(fields[0].data_type(), DataType::VarChar(_)) {
+        return false;
+    }
+    let DataType::Map(map) = fields[2].data_type() else {
+        return false;
+    };
+    if !matches!(map.key_type(), DataType::VarChar(_)) {
+        return false;
+    }
+    // Top-level nullable normalize then derived-eq, mirroring Java's
+    // `equalsIgnoreFieldId` which treats two types as equal when their
+    // structures match (paimon-rust does not carry field IDs through here).
+    let lhs = fields[1].data_type().copy_with_nullable(true).ok();
+    let rhs = map.value_type().copy_with_nullable(true).ok();
+    matches!((lhs, rhs), (Some(a), Some(b)) if a == b)
+}
+
 mod serde_utils {
     // We use name like `BOOLEAN` by design to avoid conflict.
     #![allow(clippy::upper_case_acronyms)]
@@ -2275,5 +2310,44 @@ mod tests {
         length_token
             .parse::<i32>()
             .expect("VARBINARY length must parse as Java int");
+    }
+
+    #[test]
+    fn test_is_multi_version_type() {
+        let varchar = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
+        let int_t = DataType::Int(IntType::new());
+
+        let mv = DataType::Row(RowType::new(vec![
+            DataField::new(0, "latest_version".to_string(), varchar.clone()),
+            DataField::new(1, "latest_value".to_string(), int_t.clone()),
+            DataField::new(
+                2,
+                "all_versioned_values".to_string(),
+                DataType::Map(MapType::new(varchar.clone(), int_t.clone())),
+            ),
+        ]));
+        assert!(is_multi_version_type(&mv));
+
+        // Wrong field count.
+        let two_fields = DataType::Row(RowType::new(vec![
+            DataField::new(0, "latest_version".to_string(), varchar.clone()),
+            DataField::new(1, "latest_value".to_string(), int_t.clone()),
+        ]));
+        assert!(!is_multi_version_type(&two_fields));
+
+        // Mismatched value type (Int vs BigInt).
+        let mismatched = DataType::Row(RowType::new(vec![
+            DataField::new(0, "latest_version".to_string(), varchar.clone()),
+            DataField::new(1, "latest_value".to_string(), int_t.clone()),
+            DataField::new(
+                2,
+                "all_versioned_values".to_string(),
+                DataType::Map(MapType::new(varchar, DataType::BigInt(BigIntType::new()))),
+            ),
+        ]));
+        assert!(!is_multi_version_type(&mismatched));
+
+        // Plain non-MV column.
+        assert!(!is_multi_version_type(&int_t));
     }
 }

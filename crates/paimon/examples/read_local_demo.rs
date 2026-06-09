@@ -65,7 +65,7 @@ use futures::TryStreamExt;
 
 use paimon::catalog::Identifier;
 use paimon::common::{CatalogOptions, Options};
-use paimon::spec::{Datum, Predicate, PredicateBuilder, SchemaChange};
+use paimon::spec::{Datum, Predicate, PredicateBuilder};
 use paimon::{Catalog, CatalogFactory, DataSplit};
 
 /// Worker-thread count for the tokio runtime AND the per-pass split fan-out.
@@ -115,15 +115,17 @@ struct Args {
     limit: Option<usize>,
     columns: Option<Vec<String>>,
     filters: Vec<FilterArg>,
-    /// `read.batch-size` to apply to each table before reading. Default 8192
-    /// preserves the demo's prior throughput when the option-plumbing change
-    /// dropped the library default to 1024 (Java parity). Use `0` to skip
-    /// the alter and respect whatever the table already has persisted.
+    /// `read.batch-size` for this run only. Applied via
+    /// `Table::copy_with_options` so the catalog/schema is not mutated.
+    /// Default 8192 preserves the demo's prior throughput when the
+    /// option-plumbing change dropped the library default to 1024 (Java
+    /// parity). Use `0` to respect whatever the table already has persisted.
     batch_size: usize,
-    /// `source.split.target-size` to apply to each table before reading.
-    /// `None` skips the alter (table keeps whatever it has persisted; lib
-    /// default is 128 MiB). Accepts the same string format as the option
-    /// itself (`"2gb"`, `"128mb"`, raw bytes, etc.).
+    /// `source.split.target-size` for this run only. Applied via
+    /// `Table::copy_with_options` so the catalog/schema is not mutated.
+    /// `None` respects whatever the table has persisted (lib default
+    /// 128 MiB). Accepts the same string format as the option itself
+    /// (`"2gb"`, `"128mb"`, raw bytes, etc.).
     target_size: Option<String>,
 }
 
@@ -165,14 +167,14 @@ fn print_usage(argv0: &str) {
     eprintln!("  --filter syntax: <field>:<TYPE><op><value>");
     eprintln!("    <TYPE> ∈ INT|BIGINT|DOUBLE|STRING; <op> ∈ =, !=, <, <=, >, >=");
     eprintln!("    repeatable; multiple filters AND-combined.");
-    eprintln!("  --batch-size N: apply `read.batch-size=N` to each table via");
-    eprintln!("    alter_table before reading. Default 8192 (matches the demo's");
-    eprintln!("    prior hardcoded perf baseline). Pass 0 to skip the alter and");
-    eprintln!("    respect the persisted option (lib default 1024).");
-    eprintln!("  --target-size SIZE: apply `source.split.target-size=SIZE` to");
-    eprintln!("    each table via alter_table before reading. Accepts \"2gb\",");
-    eprintln!("    \"128mb\", raw bytes, etc. Default unset → no alter (lib");
-    eprintln!("    default 128 MiB applies).");
+    eprintln!("  --batch-size N: per-run `read.batch-size=N` override applied via");
+    eprintln!("    `Table::copy_with_options` (does NOT mutate the catalog).");
+    eprintln!("    Default 8192 (matches the demo's prior hardcoded perf baseline).");
+    eprintln!("    Pass 0 to respect the persisted option (lib default 1024).");
+    eprintln!("  --target-size SIZE: per-run `source.split.target-size=SIZE` override");
+    eprintln!("    applied via `Table::copy_with_options` (does NOT mutate the");
+    eprintln!("    catalog). Accepts \"2gb\", \"128mb\", raw bytes, etc.");
+    eprintln!("    Default unset → respects the persisted option (lib default 128 MiB).");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -710,6 +712,24 @@ async fn run_one_pass(
     let t_plan = Instant::now();
     let table = catalog.get_table(&Identifier::new(db, tbl)).await?;
 
+    // `--batch-size` and `--target-size` are per-run read-time overrides,
+    // not persisted schema options. Apply via `copy_with_options` so this
+    // run sees the override values without mutating the catalog.
+    let table = {
+        let mut extra = std::collections::HashMap::new();
+        if args.batch_size > 0 {
+            extra.insert("read.batch-size".to_string(), args.batch_size.to_string());
+        }
+        if let Some(ref ts) = args.target_size {
+            extra.insert("source.split.target-size".to_string(), ts.clone());
+        }
+        if extra.is_empty() {
+            table
+        } else {
+            table.copy_with_options(extra)
+        }
+    };
+
     let mut read_builder = table.new_read_builder();
     if let Some(cols) = &args.columns {
         let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
@@ -973,55 +993,9 @@ async fn process_one_table(args: &Args, table_path: &str) -> Result<TableSummary
         .await
         .map_err(|e| format!("failed to create FileSystemCatalog: {e}"))?;
 
-    // Pre-read alter: apply any --batch-size / --target-size requested by
-    // the caller via a single alter_table call. Idempotent — only alter for
-    // option values that actually differ from the persisted ones, so reruns
-    // don't churn schema versions.
-    let need_alter = args.batch_size > 0 || args.target_size.is_some();
-    if need_alter {
-        let ident = paimon::catalog::Identifier::new(&db, &tbl);
-        let table = catalog
-            .get_table(&ident)
-            .await
-            .map_err(|e| format!("get_table failed for {db}.{tbl}: {e}"))?;
-        let mut changes: Vec<SchemaChange> = Vec::new();
-        let mut applied_msgs: Vec<String> = Vec::new();
-
-        let consider = |key: &str, target: String, applied: &mut Vec<String>, ch: &mut Vec<SchemaChange>| {
-            let current = table.schema().options().get(key).cloned();
-            if current.as_deref() != Some(target.as_str()) {
-                applied.push(format!("{key}={target} (was {current:?})"));
-                ch.push(SchemaChange::set_option(key.to_string(), target));
-            }
-        };
-
-        if args.batch_size > 0 {
-            consider(
-                "read.batch-size",
-                args.batch_size.to_string(),
-                &mut applied_msgs,
-                &mut changes,
-            );
-        }
-        if let Some(ref ts) = args.target_size {
-            consider(
-                "source.split.target-size",
-                ts.clone(),
-                &mut applied_msgs,
-                &mut changes,
-            );
-        }
-
-        if !changes.is_empty() {
-            catalog
-                .alter_table(&ident, changes, /*ignore_if_not_exists=*/ false)
-                .await
-                .map_err(|e| format!("alter_table on {db}.{tbl}: {e}"))?;
-            for m in applied_msgs {
-                println!("applied {m}");
-            }
-        }
-    }
+    // `--batch-size` and `--target-size` are per-run overrides applied
+    // inside `run_one_pass` via `Table::copy_with_options`; the catalog
+    // schema is intentionally not altered here.
 
     let mut all_stats: Vec<RunStats> = Vec::with_capacity(args.repeat);
     for i in 0..args.repeat {

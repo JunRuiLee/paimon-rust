@@ -26,7 +26,7 @@
 //! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
 //! - Arrow-row: `RowConverter` for efficient key comparison
 
-use crate::spec::{PartialUpdateConfig, RowKind};
+use crate::spec::{PartialUpdateConfig, RowKind, VersionedMergeMode};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
@@ -53,7 +53,7 @@ pub(crate) enum BufferedBatch {
 }
 
 impl BufferedBatch {
-    fn column_for_output<'a>(
+    pub(crate) fn column_for_output<'a>(
         &'a self,
         output_col_idx: usize,
         source_output_col_indices: &[usize],
@@ -72,10 +72,37 @@ pub(crate) struct MergeRow {
     /// Index into the shared batch buffer.
     pub batch_idx: usize,
     pub row_idx: usize,
+    /// Commit snapshot id of the file this row came from. Used by
+    /// `versioned-partial-update` merge to apply same-PK rows in
+    /// `(snapshot_id, sequence_number)` order. Set to `0` when the
+    /// engine doesn't care (Deduplicate / PartialUpdate).
+    pub snapshot_id: i64,
     pub sequence_number: i64,
     pub value_kind: i8,
     /// User-defined sequence values from `sequence.field` (empty if not configured).
     pub user_sequences: Vec<Option<i128>>,
+    /// Per-file merge mode (UPSERT / IGNORE) carried via `DataFileMeta._MERGE_MODE`.
+    /// `Upsert` for engines other than `versioned-partial-update`.
+    pub merge_mode: VersionedMergeMode,
+}
+
+/// Per-stream metadata shared by all rows from one input stream. Aligned by
+/// stream index with `SortMergeReaderBuilder.streams`. Stage-3 introduces
+/// this to drive `versioned-partial-update` ordering and per-file mode
+/// dispatch; other engines pass an array of defaults.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamMeta {
+    pub snapshot_id: i64,
+    pub merge_mode: VersionedMergeMode,
+}
+
+impl Default for StreamMeta {
+    fn default() -> Self {
+        Self {
+            snapshot_id: 0,
+            merge_mode: VersionedMergeMode::Upsert,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +488,9 @@ pub(crate) struct SortMergeReaderBuilder {
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    /// Per-stream metadata aligned by index with `streams`. Empty (default
+    /// fallback applied) for engines that don't need it.
+    stream_metas: Vec<StreamMeta>,
 }
 
 impl SortMergeReaderBuilder {
@@ -487,11 +517,19 @@ impl SortMergeReaderBuilder {
             output_schema,
             merge_function,
             batch_size: 1024,
+            stream_metas: Vec::new(),
         }
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Override per-stream metadata. Length must equal `streams.len()`.
+    /// When unset, every stream gets [`StreamMeta::default()`].
+    pub(crate) fn with_stream_metas(mut self, metas: Vec<StreamMeta>) -> Self {
+        self.stream_metas = metas;
         self
     }
 
@@ -508,8 +546,24 @@ impl SortMergeReaderBuilder {
             source: Some(Box::new(e)),
         })?;
 
+        let stream_metas = if self.stream_metas.is_empty() {
+            vec![StreamMeta::default(); self.streams.len()]
+        } else if self.stream_metas.len() == self.streams.len() {
+            self.stream_metas
+        } else {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "stream_metas length {} does not match streams length {}",
+                    self.stream_metas.len(),
+                    self.streams.len()
+                ),
+                source: None,
+            });
+        };
+
         sort_merge_stream(
             self.streams,
+            stream_metas,
             row_converter,
             self.key_indices,
             self.seq_index,
@@ -561,6 +615,7 @@ fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> O
 #[allow(clippy::too_many_arguments)]
 fn sort_merge_stream(
     mut streams: Vec<ArrowRecordBatchStream>,
+    stream_metas: Vec<StreamMeta>,
     mut row_converter: RowConverter,
     key_indices: Vec<usize>,
     seq_index: usize,
@@ -658,12 +713,15 @@ fn sort_merge_stream(
                 {
                     let cursor = cursors[current_winner].as_ref().unwrap();
                     let buf_idx = stream_batch_idx[current_winner].unwrap();
+                    let meta = stream_metas[current_winner];
                     same_key_rows.push(MergeRow {
                         batch_idx: buf_idx,
                         row_idx: cursor.offset,
+                        snapshot_id: meta.snapshot_id,
                         sequence_number: cursor.sequence_number(seq_index),
                         value_kind: cursor.value_kind(value_kind_index),
                         user_sequences: user_sequence_indices.iter().map(|&idx| cursor.user_sequence(idx)).collect(),
+                        merge_mode: meta.merge_mode,
                     });
                 }
 

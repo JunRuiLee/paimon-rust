@@ -30,9 +30,9 @@ use crate::arrow::format::create_format_writer;
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    extract_datum_from_arrow, BinaryRowBuilder, DataFileMeta, DataType, MergeEngine,
-    PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME,
-    VALUE_KIND_FIELD_NAME,
+    extract_datum_from_arrow, BinaryRowBuilder, CoreOptions, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, RowKind, COMMIT_SNAPSHOT_ID_PENDING, EMPTY_SERIALIZED_ROW,
+    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::prepared_files::PreparedFiles;
 use crate::Result;
@@ -423,6 +423,24 @@ impl KeyValueFileWriter {
             &self.config.primary_key_types,
         )?;
 
+        // For versioned-partial-update tables we stamp:
+        //   * commit_snapshot_id = COMMIT_SNAPSHOT_ID_PENDING (i64::MAX), to be
+        //     replaced at snapshot-commit time by FileStoreCommitImpl-equivalent
+        //     `assign_commit_snapshot_id`. Mirrors Java MergeTreeWriter.
+        //   * merge_mode: UPSERT writes `None` (Java `DataFileMetaSerializer`
+        //     null-encodes the default), IGNORE writes `Some(1)`. Read-path
+        //     `VersionedMergeMode::from_optional_byte` mirrors this asymmetry
+        //     so byte-level layout stays identical to Java.
+        // Other engines leave both fields `None`.
+        let (commit_snapshot_id, merge_mode) =
+            if self.config.merge_engine == MergeEngine::VersionedPartialUpdate {
+                let core = CoreOptions::new(&self.config.table_options);
+                let mode = core.versioned_partial_update_merge_mode()?;
+                (Some(COMMIT_SNAPSHOT_ID_PENDING), mode.to_optional_byte())
+            } else {
+                (None, None)
+            };
+
         Ok(DataFileMeta {
             file_name,
             file_size,
@@ -448,6 +466,8 @@ impl KeyValueFileWriter {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            commit_snapshot_id,
+            merge_mode,
         })
     }
 
@@ -498,7 +518,7 @@ impl KeyValueFileWriter {
             MergeEngine::Deduplicate | MergeEngine::FirstRow => {
                 self.dedup_sorted_indices(batch, sorted_indices)
             }
-            MergeEngine::PartialUpdate => Ok((0..sorted_indices.len())
+            MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate => Ok((0..sorted_indices.len())
                 .map(|idx| sorted_indices.value(idx))
                 .collect()),
         }
@@ -558,8 +578,8 @@ impl KeyValueFileWriter {
                     MergeEngine::Deduplicate => group_winner = cur,
                     // FirstRow: keep first (lowest seq), so don't update.
                     MergeEngine::FirstRow => {}
-                    MergeEngine::PartialUpdate => unreachable!(
-                        "partial-update should use select_flush_indices and skip dedup"
+                    MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate => unreachable!(
+                        "partial-update / versioned-partial-update should use select_flush_indices and skip dedup"
                     ),
                 }
             } else {

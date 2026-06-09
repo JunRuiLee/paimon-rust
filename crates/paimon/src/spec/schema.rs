@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
-use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType};
-use crate::spec::{ColumnMove, ColumnMoveType, PartialUpdateConfig};
+use crate::spec::types::{is_multi_version_type, ArrayType, DataType, MapType, MultisetType, RowType};
+use crate::spec::{ChangelogProducer, ColumnMove, ColumnMoveType, MergeEngine, PartialUpdateConfig};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
@@ -275,6 +275,11 @@ impl TableSchema {
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
 
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        Schema::validate_versioned_partial_update(
+            &new_schema.fields,
+            &new_schema.primary_keys,
+            &new_schema.options,
+        )?;
         Ok(new_schema)
     }
 
@@ -521,6 +526,7 @@ impl Schema {
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
         Self::validate_first_row_changelog_producer(&options)?;
+        Self::validate_versioned_partial_update(&fields, &primary_keys, &options)?;
 
         Ok(Self {
             fields,
@@ -761,6 +767,111 @@ impl Schema {
         })
     }
 
+    /// Validate `merge-engine=versioned-partial-update` constraints, mirroring
+    /// Java `SchemaValidation.java:249-266` (snapshot-ordering / changelog
+    /// producer / ignore-mode → needLookup) and the
+    /// `VersionedPartialUpdateMergeFunction.Factory:407-432` constructor checks
+    /// (PK required, no `sequence.field`, MV columns reject aggregator
+    /// configs).
+    fn validate_versioned_partial_update(
+        fields: &[DataField],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        let merge_engine = core
+            .merge_engine()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if merge_engine != MergeEngine::VersionedPartialUpdate {
+            return Ok(());
+        }
+
+        if !core.snapshot_sequence_ordering() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "merge-engine=versioned-partial-update requires \
+                          sequence.snapshot-ordering=true."
+                    .to_string(),
+            });
+        }
+        if primary_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "merge-engine=versioned-partial-update requires a primary key."
+                    .to_string(),
+            });
+        }
+        if !core.sequence_fields().is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "merge-engine=versioned-partial-update cannot be used together \
+                          with sequence.field. Snapshot ordering determines record \
+                          precedence by commit order; sequence.field would override \
+                          this behavior."
+                    .to_string(),
+            });
+        }
+
+        let cp = core
+            .try_changelog_producer()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if !matches!(cp, ChangelogProducer::None | ChangelogProducer::Lookup) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "merge-engine=versioned-partial-update only supports changelog-producer \
+                     none or lookup, but found {}",
+                    cp.as_str()
+                ),
+            });
+        }
+
+        if core.versioned_partial_update_ignore_mode_enabled() {
+            let need_lookup = core
+                .need_lookup()
+                .map_err(Self::options_error_to_config_invalid)?;
+            if !need_lookup {
+                return Err(crate::Error::ConfigInvalid {
+                    message: "merge-engine=versioned-partial-update with \
+                              versioned-partial-update.ignore-mode.enabled=true requires \
+                              lookup capability. Enable one of: \
+                              deletion-vectors.enabled=true, changelog-producer=lookup, \
+                              or force-lookup=true."
+                        .to_string(),
+                });
+            }
+        }
+
+        // Multi-version columns: reject `fields.default-aggregate-function`
+        // and per-MV-column `fields.<name>.aggregate-function`.
+        let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        let mv_field_names: Vec<&str> = fields
+            .iter()
+            .filter(|f| !pk_set.contains(f.name()))
+            .filter(|f| is_multi_version_type(f.data_type()))
+            .map(|f| f.name())
+            .collect();
+        if !mv_field_names.is_empty() {
+            if core.fields_default_aggregate_function().is_some() {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "fields.default-aggregate-function is not supported when \
+                         multi-version fields exist in versioned-partial-update merge \
+                         engine. Multi-version fields: {mv_field_names:?}."
+                    ),
+                });
+            }
+            for name in &mv_field_names {
+                if core.field_aggregate_function(name).is_some() {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Aggregation function is not supported for multi-version \
+                             field '{name}' in versioned-partial-update merge engine."
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn options_error_to_config_invalid(error: crate::Error) -> crate::Error {
         match error {
             crate::Error::Unsupported { message } => crate::Error::ConfigInvalid { message },
@@ -978,7 +1089,7 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, IntType};
+    use crate::spec::{BlobType, IntType, VarCharType};
 
     use super::*;
 
@@ -1388,5 +1499,213 @@ mod tests {
         } else {
             panic!("expected Row type");
         }
+    }
+
+    // ===========================================================================
+    // versioned-partial-update schema validation (Stage 5)
+    // ===========================================================================
+
+    /// Build a baseline VPU schema with snapshot-ordering=true plus a
+    /// lookup capability (DV) so the default `ignore-mode.enabled=true`
+    /// passes rule #3. Subtests override individual options to exercise
+    /// each rule in isolation.
+    fn vpu_baseline() -> SchemaBuilder {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .option("deletion-vectors.enabled", "true")
+    }
+
+    /// Returns the MV-shaped Row<Utf8, Int, Map<Utf8, Int>> as a paimon
+    /// `DataType` for use in MV column tests.
+    fn mv_int_data_type() -> DataType {
+        DataType::Row(RowType::new(vec![
+            DataField::new(
+                100,
+                "latest_version".to_string(),
+                DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+            ),
+            DataField::new(101, "latest_value".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                102,
+                "all_versioned_values".to_string(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+                    DataType::Int(IntType::new()),
+                )),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn test_vpu_happy_path() {
+        vpu_baseline().build().unwrap();
+    }
+
+    #[test]
+    fn test_vpu_requires_snapshot_ordering() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence.snapshot-ordering")));
+    }
+
+    #[test]
+    fn test_vpu_rejects_invalid_changelog_producer() {
+        let err = vpu_baseline()
+            .option("changelog-producer", "full-compaction")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("changelog-producer")
+                    && message.contains("none or lookup")));
+    }
+
+    #[test]
+    fn test_vpu_accepts_lookup_changelog() {
+        vpu_baseline()
+            .option("changelog-producer", "lookup")
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_vpu_requires_pk() {
+        // No primary_key call; merge-engine + snapshot-ordering still set.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("primary key")));
+    }
+
+    #[test]
+    fn test_vpu_rejects_sequence_field() {
+        let err = vpu_baseline()
+            .option("sequence.field", "val")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence.field")));
+    }
+
+    #[test]
+    fn test_vpu_ignore_mode_requires_lookup_capability() {
+        // Default ignore-mode.enabled=true; default changelog-producer=none;
+        // no DV / force-lookup → must reject. Cannot use vpu_baseline()
+        // because it enables DV; build the schema explicitly.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("ignore-mode") && message.contains("lookup")));
+    }
+
+    #[test]
+    fn test_vpu_ignore_mode_accepted_with_dv() {
+        // vpu_baseline already enables DV.
+        vpu_baseline().build().unwrap();
+    }
+
+    #[test]
+    fn test_vpu_ignore_mode_accepted_with_force_lookup() {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .option("force-lookup", "true")
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_vpu_ignore_mode_disabled_does_not_require_lookup() {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("val", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .option("versioned-partial-update.ignore-mode.enabled", "false")
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_vpu_rejects_default_agg_func_with_mv_column() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("mv", mv_int_data_type())
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .option("deletion-vectors.enabled", "true")
+            .option("fields.default-aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("fields.default-aggregate-function")
+                    && message.contains("multi-version")));
+    }
+
+    #[test]
+    fn test_vpu_rejects_per_field_agg_func_on_mv_column() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("mv", mv_int_data_type())
+            .primary_key(["id"])
+            .option("merge-engine", "versioned-partial-update")
+            .option("sequence.snapshot-ordering", "true")
+            .option("deletion-vectors.enabled", "true")
+            .option("fields.mv.aggregate-function", "max")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("Aggregation function")
+                    && message.contains("multi-version")));
+    }
+
+    #[test]
+    fn test_vpu_apply_changes_rejects_incompatible_options() {
+        // Build a non-VPU table first…
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::with_nullable(false)))
+                .column("val", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .build()
+                .unwrap(),
+        );
+        // …then flip merge-engine via SetOption, which must trigger the
+        // VPU validator on the resulting state (snapshot-ordering is still
+        // missing so this is expected to fail-loud).
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "merge-engine".to_string(),
+                "versioned-partial-update".to_string(),
+            )])
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence.snapshot-ordering")));
     }
 }

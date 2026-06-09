@@ -49,8 +49,15 @@ const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
+const VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION: &str =
+    "versioned-partial-update.merge-mode";
+const VERSIONED_PARTIAL_UPDATE_IGNORE_MODE_ENABLED_OPTION: &str =
+    "versioned-partial-update.ignore-mode.enabled";
 const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
+const SNAPSHOT_SEQUENCE_ORDERING_OPTION: &str = "sequence.snapshot-ordering";
+const FORCE_LOOKUP_OPTION: &str = "force-lookup";
+const FIELDS_DEFAULT_AGG_FUNC_OPTION: &str = "fields.default-aggregate-function";
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
 const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
@@ -73,6 +80,9 @@ const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 
 /// Merge engine for primary-key tables.
 ///
+/// Merge engine choice for a primary-key table — controls how same-key rows
+/// are combined at read time (and during compaction).
+///
 /// Reference: Java `CoreOptions.MergeEngine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeEngine {
@@ -82,6 +92,87 @@ pub enum MergeEngine {
     PartialUpdate,
     /// Keep the first row for each key (ignore later updates).
     FirstRow,
+    /// Versioned partial-update — same as `PartialUpdate` semantics but
+    /// requires `(commit_snapshot_id, sequence_number)` ordering and
+    /// supports per-file UPSERT/IGNORE merge mode + multi-version columns
+    /// (`ROW<latest_version, latest_value, all_versioned_values MAP>`).
+    /// See `docs/versioned-partial-update-impl-plan.md`.
+    VersionedPartialUpdate,
+}
+
+/// Per-file merge-mode flag carried on `DataFileMeta._MERGE_MODE` for
+/// `versioned-partial-update` tables. Aligns with Java `VersionedMergeMode`
+/// (`UPSERT=0` / `IGNORE=1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionedMergeMode {
+    /// Newer values overwrite existing ones (single-version columns) /
+    /// MV map `put` always replaces (multi-version columns).
+    Upsert,
+    /// Newer values fill in only when current is null (single-version) /
+    /// MV map `put` only when key absent (multi-version).
+    Ignore,
+}
+
+impl VersionedMergeMode {
+    /// Byte representation used in `DataFileMeta._MERGE_MODE`.
+    pub fn to_byte(self) -> i8 {
+        match self {
+            VersionedMergeMode::Upsert => 0,
+            VersionedMergeMode::Ignore => 1,
+        }
+    }
+
+    /// Write-path helper: UPSERT serialises as `None` (Java's
+    /// `DataFileMetaSerializer` null-encodes the default UPSERT case),
+    /// IGNORE serialises as `Some(1)`. Pairs with [`Self::from_optional_byte`]
+    /// so byte layout stays identical to Java.
+    pub fn to_optional_byte(self) -> Option<i8> {
+        match self {
+            VersionedMergeMode::Upsert => None,
+            VersionedMergeMode::Ignore => Some(self.to_byte()),
+        }
+    }
+
+    /// Inverse of [`Self::to_byte`]. Unknown bytes are rejected so callers
+    /// must opt into a fallback explicitly.
+    pub fn from_byte(byte: i8) -> crate::Result<Self> {
+        match byte {
+            0 => Ok(VersionedMergeMode::Upsert),
+            1 => Ok(VersionedMergeMode::Ignore),
+            other => Err(crate::Error::Unsupported {
+                message: format!("Unsupported versioned-partial-update merge mode byte: {other}"),
+            }),
+        }
+    }
+
+    /// Read-path helper: `None` means the on-disk value was absent (legacy
+    /// or Java-side-omitted UPSERT) and falls back to [`Self::Upsert`];
+    /// `Some(b)` is parsed strictly via [`Self::from_byte`] so unknown bytes
+    /// become an integrity error rather than a silent UPSERT downgrade.
+    /// Mirrors Java `DataFileMetaSerializer` which writes null for UPSERT
+    /// and `VersionedMergeMode.fromByteValue` for any other value.
+    pub fn from_optional_byte(byte: Option<i8>) -> crate::Result<Self> {
+        match byte {
+            None => Ok(VersionedMergeMode::Upsert),
+            Some(b) => Self::from_byte(b),
+        }
+    }
+}
+
+impl std::str::FromStr for VersionedMergeMode {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "upsert" => Ok(VersionedMergeMode::Upsert),
+            "ignore" => Ok(VersionedMergeMode::Ignore),
+            other => Err(crate::Error::Unsupported {
+                message: format!(
+                    "Unsupported versioned-partial-update.merge-mode: '{other}' (expected 'upsert' or 'ignore')"
+                ),
+            }),
+        }
+    }
 }
 
 /// Changelog producer for table writes.
@@ -173,6 +264,7 @@ impl<'a> CoreOptions<'a> {
                 "deduplicate" => Ok(MergeEngine::Deduplicate),
                 "partial-update" => Ok(MergeEngine::PartialUpdate),
                 "first-row" => Ok(MergeEngine::FirstRow),
+                "versioned-partial-update" => Ok(MergeEngine::VersionedPartialUpdate),
                 other => Err(crate::Error::Unsupported {
                     message: format!("Unsupported merge-engine: '{other}'"),
                 }),
@@ -247,6 +339,82 @@ impl<'a> CoreOptions<'a> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_READ_BATCH_SIZE)
+    }
+
+    /// `versioned-partial-update.merge-mode` — per-job intent for which
+    /// merge mode newly written files should be stamped with. Persisted to
+    /// each new file's `DataFileMeta._MERGE_MODE` at write time. Default
+    /// `Upsert`. Aligns with Java
+    /// `CoreOptions.VERSIONED_PARTIAL_UPDATE_MERGE_MODE`.
+    pub fn versioned_partial_update_merge_mode(&self) -> crate::Result<VersionedMergeMode> {
+        match self.options.get(VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION) {
+            None => Ok(VersionedMergeMode::Upsert),
+            Some(v) => v.parse::<VersionedMergeMode>(),
+        }
+    }
+
+    /// `versioned-partial-update.ignore-mode.enabled` — whether IGNORE-mode
+    /// files are *allowed* to be written/read against this table. When
+    /// `true`, the table must have lookup capability (DV / force-lookup /
+    /// changelog=lookup), enforced by [`Schema`] validation in stage 5.
+    /// Default `true` (Java parity). Aligns with Java
+    /// `CoreOptions.VERSIONED_PARTIAL_UPDATE_IGNORE_MODE_ENABLED`.
+    pub fn versioned_partial_update_ignore_mode_enabled(&self) -> bool {
+        self.options
+            .get(VERSIONED_PARTIAL_UPDATE_IGNORE_MODE_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
+    /// `sequence.snapshot-ordering` — whether record precedence is determined
+    /// by commit (snapshot) order. Default `false`. Required `true` by the
+    /// `versioned-partial-update` merge engine.
+    pub fn snapshot_sequence_ordering(&self) -> bool {
+        self.options
+            .get(SNAPSHOT_SEQUENCE_ORDERING_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// `force-lookup` — force the lookup pathway during compaction. Default
+    /// `false`. Aligns with Java `CoreOptions.FORCE_LOOKUP`.
+    pub fn force_lookup(&self) -> bool {
+        self.options
+            .get(FORCE_LOOKUP_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Mirrors Java `LookupStrategy.needLookup` (paimon-api/.../lookup/
+    /// LookupStrategy.java:40): true iff any of `produceChangelog`
+    /// (`changelog-producer=lookup`), `deletionVector`
+    /// (`deletion-vectors.enabled=true`), `isFirstRow`
+    /// (`merge-engine=first-row`), or `forceLookup` (`force-lookup=true`)
+    /// holds.
+    pub fn need_lookup(&self) -> crate::Result<bool> {
+        let produce_changelog =
+            matches!(self.try_changelog_producer()?, ChangelogProducer::Lookup);
+        let deletion_vector = self.deletion_vectors_enabled();
+        let is_first_row = matches!(self.merge_engine()?, MergeEngine::FirstRow);
+        let force_lookup = self.force_lookup();
+        Ok(produce_changelog || deletion_vector || is_first_row || force_lookup)
+    }
+
+    /// `fields.default-aggregate-function` — the default aggregator applied
+    /// to non-PK columns under the `aggregate` merge engine. Returns `None`
+    /// when unset. Aligns with Java `CoreOptions.FIELDS_DEFAULT_AGG_FUNC`.
+    pub fn fields_default_aggregate_function(&self) -> Option<&str> {
+        self.options
+            .get(FIELDS_DEFAULT_AGG_FUNC_OPTION)
+            .map(String::as_str)
+    }
+
+    /// `fields.<field_name>.aggregate-function` — per-column aggregator
+    /// override. Returns `None` when unset. Aligns with Java
+    /// `CoreOptions.fieldAggFunc`.
+    pub fn field_aggregate_function(&self, field_name: &str) -> Option<&str> {
+        let key = format!("fields.{field_name}.aggregate-function");
+        self.options.get(&key).map(String::as_str)
     }
 
     /// The default partition name for null/blank partition values.
@@ -654,6 +822,107 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_engine_accepts_versioned_partial_update() {
+        let options = HashMap::from([(
+            MERGE_ENGINE_OPTION.to_string(),
+            "versioned-partial-update".into(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(
+            core.merge_engine().unwrap(),
+            MergeEngine::VersionedPartialUpdate
+        );
+    }
+
+    #[test]
+    fn test_versioned_merge_mode_default_is_upsert() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert_eq!(
+            core.versioned_partial_update_merge_mode().unwrap(),
+            VersionedMergeMode::Upsert
+        );
+        // Default `ignore-mode.enabled` mirrors Java parity (true);
+        // Stage 5 validation will reject `true` until lookup capability lands.
+        assert!(core.versioned_partial_update_ignore_mode_enabled());
+    }
+
+    #[test]
+    fn test_versioned_merge_mode_parses_ignore_and_rejects_unknown() {
+        let mut opts = HashMap::new();
+        opts.insert(
+            VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION.to_string(),
+            "ignore".into(),
+        );
+        let core = CoreOptions::new(&opts);
+        assert_eq!(
+            core.versioned_partial_update_merge_mode().unwrap(),
+            VersionedMergeMode::Ignore
+        );
+
+        let mut bad = HashMap::new();
+        bad.insert(
+            VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION.to_string(),
+            "weird".into(),
+        );
+        let core = CoreOptions::new(&bad);
+        assert!(core.versioned_partial_update_merge_mode().is_err());
+    }
+
+    #[test]
+    fn test_versioned_merge_mode_byte_round_trip() {
+        for mode in [VersionedMergeMode::Upsert, VersionedMergeMode::Ignore] {
+            assert_eq!(VersionedMergeMode::from_byte(mode.to_byte()).unwrap(), mode);
+        }
+        assert!(VersionedMergeMode::from_byte(7).is_err());
+    }
+
+    /// Read-path parity with Java `DataFileMetaSerializer`: missing field
+    /// (`None`) falls back to UPSERT; valid bytes parse strictly; unknown
+    /// bytes are an error (no silent downgrade).
+    #[test]
+    fn test_versioned_merge_mode_from_optional_byte() {
+        assert_eq!(
+            VersionedMergeMode::from_optional_byte(None).unwrap(),
+            VersionedMergeMode::Upsert
+        );
+        assert_eq!(
+            VersionedMergeMode::from_optional_byte(Some(0)).unwrap(),
+            VersionedMergeMode::Upsert
+        );
+        assert_eq!(
+            VersionedMergeMode::from_optional_byte(Some(1)).unwrap(),
+            VersionedMergeMode::Ignore
+        );
+        let err = VersionedMergeMode::from_optional_byte(Some(7)).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains('7')));
+    }
+
+    /// Write-path parity with Java `DataFileMetaSerializer`: UPSERT writes
+    /// null, IGNORE writes the byte. Round-trips with `from_optional_byte`.
+    #[test]
+    fn test_versioned_merge_mode_to_optional_byte() {
+        assert_eq!(VersionedMergeMode::Upsert.to_optional_byte(), None);
+        assert_eq!(VersionedMergeMode::Ignore.to_optional_byte(), Some(1));
+        for mode in [VersionedMergeMode::Upsert, VersionedMergeMode::Ignore] {
+            let round_tripped =
+                VersionedMergeMode::from_optional_byte(mode.to_optional_byte()).unwrap();
+            assert_eq!(round_tripped, mode);
+        }
+    }
+
+    #[test]
+    fn test_ignore_mode_enabled_parses_false() {
+        let opts = HashMap::from([(
+            VERSIONED_PARTIAL_UPDATE_IGNORE_MODE_ENABLED_OPTION.to_string(),
+            "false".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert!(!core.versioned_partial_update_ignore_mode_enabled());
+    }
+
+    #[test]
     fn test_changelog_producer_defaults_to_none() {
         let options = HashMap::new();
         let core = CoreOptions::new(&options);
@@ -812,5 +1081,105 @@ mod tests {
         )]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.write_parquet_buffer_size(), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_snapshot_sequence_ordering_default_false() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert!(!core.snapshot_sequence_ordering());
+    }
+
+    #[test]
+    fn test_snapshot_sequence_ordering_true() {
+        let options = HashMap::from([(
+            SNAPSHOT_SEQUENCE_ORDERING_OPTION.to_string(),
+            "true".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert!(core.snapshot_sequence_ordering());
+    }
+
+    #[test]
+    fn test_force_lookup_default_false() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert!(!core.force_lookup());
+    }
+
+    #[test]
+    fn test_force_lookup_true() {
+        let options = HashMap::from([(FORCE_LOOKUP_OPTION.to_string(), "true".to_string())]);
+        let core = CoreOptions::new(&options);
+        assert!(core.force_lookup());
+    }
+
+    #[test]
+    fn test_need_lookup_false_by_default() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert!(!core.need_lookup().unwrap());
+    }
+
+    #[test]
+    fn test_need_lookup_true_for_force_lookup() {
+        let options = HashMap::from([(FORCE_LOOKUP_OPTION.to_string(), "true".to_string())]);
+        let core = CoreOptions::new(&options);
+        assert!(core.need_lookup().unwrap());
+    }
+
+    #[test]
+    fn test_need_lookup_true_for_dv() {
+        let options = HashMap::from([(
+            DELETION_VECTORS_ENABLED_OPTION.to_string(),
+            "true".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert!(core.need_lookup().unwrap());
+    }
+
+    #[test]
+    fn test_need_lookup_true_for_lookup_changelog() {
+        let options =
+            HashMap::from([(CHANGELOG_PRODUCER_OPTION.to_string(), "lookup".to_string())]);
+        let core = CoreOptions::new(&options);
+        assert!(core.need_lookup().unwrap());
+    }
+
+    #[test]
+    fn test_need_lookup_true_for_first_row_engine() {
+        let options =
+            HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "first-row".to_string())]);
+        let core = CoreOptions::new(&options);
+        assert!(core.need_lookup().unwrap());
+    }
+
+    #[test]
+    fn test_fields_default_aggregate_function() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert_eq!(core.fields_default_aggregate_function(), None);
+
+        let options = HashMap::from([(
+            FIELDS_DEFAULT_AGG_FUNC_OPTION.to_string(),
+            "sum".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.fields_default_aggregate_function(), Some("sum"));
+    }
+
+    #[test]
+    fn test_field_aggregate_function() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert_eq!(core.field_aggregate_function("price"), None);
+
+        let options = HashMap::from([(
+            "fields.price.aggregate-function".to_string(),
+            "max".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.field_aggregate_function("price"), Some("max"));
+        assert_eq!(core.field_aggregate_function("other"), None);
     }
 }

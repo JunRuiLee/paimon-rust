@@ -1078,6 +1078,8 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            commit_snapshot_id: None,
+            merge_mode: None,
         };
         let entry = ManifestEntry::new(FileKind::Add, vec![0u8; 12], 0, 1, data_file, 2);
         Manifest::write(&file_io, &manifest_path, &[entry])

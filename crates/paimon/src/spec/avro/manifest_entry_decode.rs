@@ -221,6 +221,8 @@ fn decode_data_file_meta(
     let mut external_path: Option<String> = None;
     let mut first_row_id: Option<i64> = None;
     let mut write_cols: Option<Vec<String>> = None;
+    let mut commit_snapshot_id: Option<i64> = None;
+    let mut merge_mode: Option<i8> = None;
 
     for field in &writer_schema.fields {
         match field.name.as_str() {
@@ -260,6 +262,16 @@ fn decode_data_file_meta(
             "_EXTERNAL_PATH" => external_path = decode_nullable_string(cursor, field.nullable)?,
             "_FIRST_ROW_ID" => first_row_id = decode_nullable_long(cursor, field.nullable)?,
             "_WRITE_COLS" => write_cols = decode_nullable_string_array(cursor, field.nullable)?,
+            "_COMMIT_SNAPSHOT_ID" => {
+                commit_snapshot_id = decode_nullable_long(cursor, field.nullable)?
+            }
+            "_MERGE_MODE" => {
+                // Java stores _MERGE_MODE as tinyint in RowType but the on-disk
+                // Avro encoding is `int`; coerce down to i8. Out-of-range values
+                // are unexpected; truncating with `as i8` keeps the byte that
+                // VersionedMergeMode::from_byte will validate.
+                merge_mode = decode_nullable_int(cursor, field.nullable)?.map(|v| v as i8);
+            }
             _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
         }
     }
@@ -285,6 +297,8 @@ fn decode_data_file_meta(
         external_path,
         first_row_id,
         write_cols,
+        commit_snapshot_id,
+        merge_mode,
     })
 }
 
@@ -406,5 +420,7 @@ fn default_data_file_meta() -> DataFileMeta {
         external_path: None,
         first_row_id: None,
         write_cols: None,
+        commit_snapshot_id: None,
+        merge_mode: None,
     }
 }

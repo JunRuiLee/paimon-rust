@@ -826,6 +826,8 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            commit_snapshot_id: None,
+            merge_mode: None,
         }
     }
 
@@ -904,6 +906,8 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            commit_snapshot_id: None,
+            merge_mode: None,
         }
     }
 

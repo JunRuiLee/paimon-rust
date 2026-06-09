@@ -220,7 +220,9 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
                 {"name": "_VALUE_STATS_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null},
                 {"name": "_EXTERNAL_PATH", "type": ["null", "string"], "default": null},
                 {"name": "_FIRST_ROW_ID", "type": ["null", "long"], "default": null},
-                {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+                {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+                {"name": "_COMMIT_SNAPSHOT_ID", "type": ["null", "long"], "default": null},
+                {"name": "_MERGE_MODE", "type": ["null", "int"], "default": null}
             ]
         }], "default": null},
         {"name": "_VERSION", "type": "int"}

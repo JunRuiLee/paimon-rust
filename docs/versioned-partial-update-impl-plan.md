@@ -379,15 +379,33 @@ Rust 当前现状：
 | **runtime ignore reject** | 表 `ignore-mode.enabled=false` 但 job 设 `merge-mode=ignore` | 写入 fail-loud（即便表允许，job 强行 ignore 也跟 Java 一致地拒绝当前实现） |
 | **`sequence.field` 非空 reject** | versioned-partial-update 表配 `sequence.field=ts` | schema validation reject |
 
-**未来阶段补做的测试（不作为本计划 gate）**：
-- 混合 UPSERT / IGNORE 文件串行（依赖 IGNORE mode 解锁）；
-- IGNORE existing-key 不覆盖语义；
-- `MergeResult` 的 streaming/CDC tombstone 输出；
-- Rust 写 → Java 读的全量行级 round-trip（依赖 M1/M2 manifest schema 全量对齐）。
-
 **MV 列性能基线**：
 - 1 / 10 / 100 / 1000 versions per PK，单 PK 集 ~10K，记录 read wall + peak RSS；
 - 跟 Java 同等设置下做相对对比，确认无数量级差距即可（不追求绝对数值打平）。
+
+### Stage 6 实际落地范围（2026-06-10 调整）
+
+实际 commit 中以下子项落地：
+
+- **merge-function 单测扩展**（`crates/paimon/src/table/versioned_partial_update.rs`）：3 条 ordering / tombstone 矩阵 case
+  - `test_cross_snapshot_same_seq_uses_later_snapshot`（plan 案例 6）
+  - `test_cross_snapshot_diff_seq_snapshot_id_dominates`（plan 案例 7）
+  - `test_delete_with_lower_level_old_row_in_same_merge`（plan 案例 8，**核心 tombstone 测试**）
+
+- **DataFusion SQL E2E**（新文件 `crates/integrations/datafusion/tests/versioned_partial_update_tables.rs`）：3 条 single-version-only case
+  - `test_vpu_basic_round_trip`：跨 snapshot UPSERT 写读
+  - `test_vpu_projection_pk_only`：仅投影 PK，merge 仍折叠 same-PK 行
+  - `test_vpu_validation_rejects_invalid_config`：snapshot-ordering / sequence.field / ignore-mode-without-lookup 三条 reject
+
+**未来阶段补做的测试（明确 deferred、不作为本计划 gate）**：
+- **MV 列 SQL E2E**：DataFusion SQL `INSERT INTO ... VALUES` 不支持嵌套 `Struct<Utf8, T, Map<...>>` literal。需要走 lower-level `WriteBuilder` + `TableWrite` API 或 Java 写出的 fixture。
+- **Java parity 行级对比**：依赖能访问 paimon-java 写入环境。
+- **MV 1/10/100/1000 version 性能基线**：独立 bench harness 任务，不入 commit gate。
+- **`read_local_demo` 上跑 VPU 表**：依赖上面 MV 写路径或 Java fixture。
+- **混合 UPSERT / IGNORE 文件串行**：依赖 IGNORE-mode lookup capability 解锁。
+- **IGNORE existing-key 不覆盖**的 E2E 验证：merge function 单测已覆盖（`test_single_version_ignore_does_not_overwrite`、`test_mv_existing_key_ignore`）；E2E 走 SQL 路径需要 IGNORE 文件，同上需 lookup 解锁。
+- **`MergeResult::Omit` 的 streaming/CDC tombstone 输出**：本计划设计的 merge function 是 batch SELECT 专用，streaming/CDC 通路单独立项。
+- **Rust 写 → Java 读全量行级 round-trip**：依赖 M1/M2 manifest schema 全量对齐。
 
 
 

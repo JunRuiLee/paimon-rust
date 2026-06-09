@@ -1567,6 +1567,8 @@ mod tests {
             external_path: None,
             first_row_id: Some(first_row_id),
             write_cols: write_cols.map(|cols| cols.into_iter().map(str::to_string).collect()),
+            commit_snapshot_id: None,
+            merge_mode: None,
         }
     }
 

@@ -268,6 +268,8 @@ impl DataFileWriter {
             external_path: None,
             first_row_id,
             write_cols,
+            commit_snapshot_id: None,
+            merge_mode: None,
         }
     }
 }

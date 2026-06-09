@@ -106,7 +106,46 @@ pub struct DataFileMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub write_cols: Option<Vec<String>>,
+
+    /// Snapshot id assigned at commit time. `None` on old manifests written
+    /// before this field existed; `Some(i64::MAX)` is the writer-side
+    /// "pending assignment" sentinel that gets replaced during snapshot
+    /// commit (mirrors Java `FileStoreCommitImpl.assignCommitSnapshotId`).
+    /// Required for `versioned-partial-update` tables to provide the
+    /// `(commit_snapshot_id, sequence_number)` ordering at merge time.
+    #[serde(
+        rename = "_COMMIT_SNAPSHOT_ID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub commit_snapshot_id: Option<i64>,
+
+    /// Per-file merge-mode flag for `versioned-partial-update` tables
+    /// (`UPSERT=0` / `IGNORE=1`). `None` for non-versioned tables and for
+    /// old manifests written before this field existed. Java stores this
+    /// as `tinyint` in `RowType` but encodes as `int` in Avro — paimon-rust
+    /// keeps Avro `int` compatibility (see plan stage 2).
+    #[serde(
+        rename = "_MERGE_MODE",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merge_mode: Option<i8>,
 }
+
+/// Writer-side sentinel for `DataFileMeta.commit_snapshot_id`: the file has
+/// been written but not yet assigned a real snapshot id. The commit path
+/// rewrites both `None` and `Some(COMMIT_SNAPSHOT_ID_PENDING)` to the
+/// current snapshot id at commit time. Mirrors Java `Long.MAX_VALUE`.
+pub const COMMIT_SNAPSHOT_ID_PENDING: i64 = i64::MAX;
+
+/// Reader-side fallback for missing `_COMMIT_SNAPSHOT_ID` on old manifests.
+/// Must be smaller than every legitimate snapshot id so a "no commit
+/// snapshot info" row always loses to any row with a real snapshot id during
+/// `versioned-partial-update` merge ordering. **Not** the same concept as
+/// [`COMMIT_SNAPSHOT_ID_PENDING`] (`i64::MAX`) — that is a write-side
+/// "to-be-assigned" sentinel; this is a read-side legacy fallback.
+pub const COMMIT_SNAPSHOT_ID_UNKNOWN: i64 = -1;
 
 impl Display for DataFileMeta {
     fn fmt(&self, _: &mut Formatter<'_>) -> std::fmt::Result {
