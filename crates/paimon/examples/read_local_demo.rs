@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Example: read a paimon table from a local filesystem path.
+//! Example: read a paimon table from a filesystem-style path (local / HDFS /
+//! viewfs / S3 / OSS — anything `FileSystemCatalog` + opendal can resolve).
 //!
 //! Modeled on `paimon-cpp/examples/read_hdfs_demo.cpp` but adapted to the Rust
 //! `Catalog → Table → ReadBuilder → Scan/Read` API. The Rust API exposes a
@@ -24,9 +25,27 @@
 //!
 //! # Path layout
 //!
-//! `<table_path>` is the absolute or relative directory of a paimon table on
-//! local disk, e.g. `/tmp/warehouse/mydb.db/users`. The demo splits that into
-//! warehouse (`/tmp/warehouse`), database (`mydb`), and table (`users`).
+//! `<table_path>` is the directory of a paimon table. Accepted forms:
+//! * Local absolute path: `/tmp/warehouse/mydb.db/users`
+//! * HDFS / viewfs URI: `hdfs://nn:8020/user/me/warehouse/mydb.db/users`
+//! * S3 / OSS URI: `s3://bucket/warehouse/mydb.db/users`
+//!
+//! The demo splits the path into warehouse, database (last `.db`-suffixed
+//! segment, with the suffix stripped), and table (final segment).
+//!
+//! # Building & running on HDFS
+//!
+//! `paimon-rust`'s default features only enable local FS / OSS / memory.
+//! For HDFS add the `storage-hdfs` feature:
+//! ```bash
+//! cargo run -p paimon --example read_local_demo --release \
+//!     --features storage-hdfs -- \
+//!     hdfs://nn:8020/user/me/warehouse/mydb.db/users
+//! ```
+//! Authentication / cluster config flows through opendal's hdfs-native client;
+//! set `HADOOP_CONF_DIR`, `HADOOP_HOME` etc. in the environment per the
+//! cluster's normal client setup. For Kerberos: `kinit` first, or wire a
+//! ticket-cache path via opendal's hdfs config.
 //!
 //! # Usage
 //! ```bash
@@ -479,42 +498,84 @@ fn compare_op<T: PartialOrd>(op: &str, lhs: T, rhs: T) -> bool {
 
 /// Split `<table_path>` into (warehouse, database, table).
 ///
-/// `path` is expected to look like `[…]/<warehouse>/<db>.db/<table>`. We strip
-/// trailing slashes, then peel off the last two path components. The penultimate
-/// must end with `.db` — that's how paimon's filesystem layout names a database
-/// directory under a warehouse (see `FileSystemCatalog`).
+/// `path` is expected to look like `[…]/<warehouse>/<db>.db/<table>`. We peel
+/// off the last two `/`-separated segments via byte-level `rsplit_once`,
+/// which keeps URI prefixes (`hdfs://nn:8020`, `viewfs://`, `s3://bucket`)
+/// intact in the warehouse string — `std::path::Path` would mangle the `://`.
+/// The penultimate segment must end with `.db` per paimon's filesystem layout.
 fn split_table_path(path: &str) -> Result<(String, String, String), String> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(format!("invalid table_path: {path}"));
     }
-    let p = std::path::Path::new(trimmed);
-    let table = p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("cannot extract table name from: {path}"))?;
-    let parent = p
-        .parent()
+    let (rest, table) = trimmed
+        .rsplit_once('/')
         .ok_or_else(|| format!("table_path has no parent (db dir): {path}"))?;
-    let db_dir = parent
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("cannot extract db dir from: {path}"))?;
+    if table.is_empty() {
+        return Err(format!("empty table name in: {path}"));
+    }
+    let (warehouse, db_dir) = rest
+        .rsplit_once('/')
+        .ok_or_else(|| format!("table_path's db dir has no parent (warehouse): {path}"))?;
     let db = db_dir
         .strip_suffix(".db")
         .ok_or_else(|| format!("expected db directory ending in '.db', got: {db_dir}"))?;
     if db.is_empty() {
         return Err(format!("empty db name parsed from: {path}"));
     }
-    let warehouse = parent
-        .parent()
-        .ok_or_else(|| format!("table_path's db dir has no parent (warehouse): {path}"))?
-        .to_str()
-        .ok_or_else(|| format!("warehouse path is not valid UTF-8: {path}"))?;
     if warehouse.is_empty() {
         return Err(format!("empty warehouse parsed from: {path}"));
     }
     Ok((warehouse.to_string(), db.to_string(), table.to_string()))
+}
+
+#[cfg(test)]
+mod split_table_path_tests {
+    use super::split_table_path;
+
+    #[test]
+    fn local_absolute() {
+        let (w, d, t) = split_table_path("/tmp/warehouse/mydb.db/users").unwrap();
+        assert_eq!(w, "/tmp/warehouse");
+        assert_eq!(d, "mydb");
+        assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn hdfs_uri() {
+        let (w, d, t) =
+            split_table_path("hdfs://nn:8020/user/me/wh/mydb.db/users").unwrap();
+        assert_eq!(w, "hdfs://nn:8020/user/me/wh");
+        assert_eq!(d, "mydb");
+        assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn viewfs_uri() {
+        let (w, d, _) =
+            split_table_path("viewfs://cluster/wh/db.db/t").unwrap();
+        assert_eq!(w, "viewfs://cluster/wh");
+        assert_eq!(d, "db");
+    }
+
+    #[test]
+    fn s3_uri() {
+        let (w, d, _) = split_table_path("s3://bucket/path/db.db/t").unwrap();
+        assert_eq!(w, "s3://bucket/path");
+        assert_eq!(d, "db");
+    }
+
+    #[test]
+    fn trailing_slash_is_trimmed() {
+        let (w, _, t) = split_table_path("/wh/db.db/t/").unwrap();
+        assert_eq!(w, "/wh");
+        assert_eq!(t, "t");
+    }
+
+    #[test]
+    fn missing_db_suffix_rejected() {
+        assert!(split_table_path("/wh/db/t").is_err());
+    }
 }
 
 /// Touch every cell of every column so the read-pipeline benchmark measures
