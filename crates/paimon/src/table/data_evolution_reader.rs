@@ -73,6 +73,9 @@ pub(crate) struct DataEvolutionReader {
     output_schema: Arc<arrow_schema::Schema>,
     blob_as_descriptor: bool,
     blob_descriptor_fields: HashSet<String>,
+    /// Rows per batch for the inner format reader. Sourced from
+    /// `CoreOptions::read_batch_size()` by callers.
+    batch_size: usize,
 }
 
 impl DataEvolutionReader {
@@ -84,6 +87,7 @@ impl DataEvolutionReader {
         read_type: Vec<DataField>,
         blob_as_descriptor: bool,
         blob_descriptor_fields: HashSet<String>,
+        batch_size: usize,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -103,6 +107,7 @@ impl DataEvolutionReader {
             output_schema,
             blob_as_descriptor,
             blob_descriptor_fields,
+            batch_size,
         })
     }
 
@@ -118,6 +123,7 @@ impl DataEvolutionReader {
                 self.table_fields.clone(),
                 self.file_read_type.clone(),
                 Vec::new(),
+                self.batch_size,
             );
 
             for split in splits {
@@ -259,8 +265,7 @@ impl DataEvolutionReader {
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
-        // Batch size for column-merge output. Matches the default Parquet reader batch size.
-        const MERGE_BATCH_SIZE: usize = 1024;
+        let batch_size = self.batch_size;
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
@@ -284,7 +289,7 @@ impl DataEvolutionReader {
             if active_source_indices.is_empty() {
                 let mut emitted = 0usize;
                 while emitted < expected_output_rows {
-                    let rows_to_emit = (expected_output_rows - emitted).min(MERGE_BATCH_SIZE);
+                    let rows_to_emit = (expected_output_rows - emitted).min(batch_size);
                     let columns: Vec<Arc<dyn arrow_array::Array>> = target_schema
                         .fields()
                         .iter()
@@ -325,6 +330,7 @@ impl DataEvolutionReader {
                             table_schema_id,
                             table_fields.clone(),
                             blob_as_descriptor,
+                            batch_size,
                         )
                         .map(Some)
                     }
@@ -396,7 +402,7 @@ impl DataEvolutionReader {
                     })?;
                 }
 
-                let rows_to_emit = remaining.min(MERGE_BATCH_SIZE);
+                let rows_to_emit = remaining.min(batch_size);
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> =
                     Vec::with_capacity(source_plan.column_plan.len());
 
@@ -486,6 +492,7 @@ fn open_source_stream(
     table_schema_id: i64,
     table_fields: Vec<DataField>,
     blob_as_descriptor: bool,
+    batch_size: usize,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let file_reader = DataFileReader::new(
         file_io,
@@ -494,6 +501,7 @@ fn open_source_stream(
         table_fields,
         source.read_fields().to_vec(),
         Vec::new(),
+        batch_size,
     )
     .with_blob_as_descriptor(blob_as_descriptor);
 

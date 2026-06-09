@@ -22,6 +22,7 @@ const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
+const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const BUCKET_KEY_OPTION: &str = "bucket-key";
@@ -58,6 +59,9 @@ pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
+/// Default rows per batch on the read path. Aligned with paimon-java's
+/// `CoreOptions.READ_BATCH_SIZE` default (1024).
+const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -231,6 +235,18 @@ impl<'a> CoreOptions<'a> {
             .get(SOURCE_SPLIT_OPEN_FILE_COST_OPTION)
             .and_then(|value| parse_memory_size(value))
             .unwrap_or(DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST)
+    }
+
+    /// Rows per batch on the read path. Drives both the format reader's
+    /// per-batch row count (parquet `with_batch_size`) and the sort-merge
+    /// reader's output batch size. Corresponds to Java
+    /// `CoreOptions.READ_BATCH_SIZE` (`read.batch-size`).
+    pub fn read_batch_size(&self) -> usize {
+        self.options
+            .get(READ_BATCH_SIZE_OPTION)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_READ_BATCH_SIZE)
     }
 
     /// The default partition name for null/blank partition values.
