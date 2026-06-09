@@ -43,3 +43,16 @@ parquet = "58.0"
 constant_time_eq = ">=0.4.0, <0.4.3"
 tokio = "1.39.2"
 tokio-util = "0.7"
+
+# Override the crates.io hdfs-native (pulled in transitively via opendal's
+# services-hdfs-native feature) with Kuaishou's internal fork. [patch] only
+# takes effect from the workspace root.
+#
+# The URL is https so online build servers can fetch it with their token/CI
+# credentials. Local developers who only have ssh access should rewrite it via
+# global git config (cargo fetches under ~/.cargo/git, so it must be --global):
+#   git config --global url."ssh://git@git.corp.kuaishou.com/".insteadOf \
+#                          "https://git.corp.kuaishou.com/"
+# Both paths also need net.git-fetch-with-cli = true (see .cargo/config.toml).
+[patch.crates-io]
+hdfs-native = { git = "https://git.corp.kuaishou.com/ks-dataarc/kwailake/hdfs-native.git", rev = "5e2d2a8e" }
