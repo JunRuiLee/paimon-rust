@@ -42,6 +42,9 @@ pub(crate) struct DataFileReader {
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
     blob_as_descriptor: bool,
+    /// Rows per batch passed to the format reader. Sourced from
+    /// `CoreOptions::read_batch_size()` by callers.
+    batch_size: usize,
 }
 
 impl DataFileReader {
@@ -52,6 +55,7 @@ impl DataFileReader {
         table_fields: Vec<DataField>,
         read_type: Vec<DataField>,
         predicates: Vec<Predicate>,
+        batch_size: usize,
     ) -> Self {
         Self {
             file_io,
@@ -61,6 +65,7 @@ impl DataFileReader {
             read_type,
             predicates,
             blob_as_descriptor: false,
+            batch_size,
         }
     }
 
@@ -152,6 +157,7 @@ impl DataFileReader {
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
+        let batch_size = self.batch_size;
         let blob_as_descriptor = self.blob_as_descriptor;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -213,7 +219,7 @@ impl DataFileReader {
                 file_meta.file_size as u64,
                 &projected_read_fields,
                 file_predicates.as_ref(),
-                None,
+                Some(batch_size),
                 row_selection,
             ).await?;
 

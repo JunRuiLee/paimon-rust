@@ -153,6 +153,7 @@ impl<'a> TableRead<'a> {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                batch_size: core_options.read_batch_size(),
             },
         );
         reader.read(splits)
@@ -172,6 +173,7 @@ impl<'a> TableRead<'a> {
             self.read_type().to_vec(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
+            core_options.read_batch_size(),
         )?;
         reader.read(data_splits)
     }
@@ -182,6 +184,7 @@ impl<'a> TableRead<'a> {
     }
 
     fn new_data_file_reader(&self) -> DataFileReader {
+        let core_options = CoreOptions::new(self.table.schema.options());
         DataFileReader::new(
             self.table.file_io.clone(),
             self.table.schema_manager().clone(),
@@ -189,6 +192,7 @@ impl<'a> TableRead<'a> {
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
             self.data_predicates.clone(),
+            core_options.read_batch_size(),
         )
     }
 }

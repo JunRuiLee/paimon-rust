@@ -62,6 +62,9 @@ pub(crate) struct KeyValueReadConfig {
     pub primary_keys: Vec<String>,
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
+    /// Rows per batch for both the inner parquet reader and the sort-merge
+    /// output. Sourced from `CoreOptions::read_batch_size()` by callers.
+    pub batch_size: usize,
 }
 
 impl KeyValueFileReader {
@@ -264,6 +267,7 @@ impl KeyValueFileReader {
         let table_name = self.config.table_name;
         let table_options = self.config.table_options;
         let predicates = self.config.predicates;
+        let batch_size = self.config.batch_size;
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -301,6 +305,7 @@ impl KeyValueFileReader {
                         table_fields.clone(),
                         internal_read_type.clone(),
                         predicates.clone(),
+                        batch_size,
                     );
 
                     let stream = reader.read_single_file_stream(
@@ -330,6 +335,7 @@ impl KeyValueFileReader {
                     merge_output_schema.clone(),
                     Self::new_merge_function(merge_engine, &table_options, &table_name)?,
                 )
+                .with_batch_size(batch_size)
                 .build()?;
 
                 while let Some(batch) = merge_stream.next().await {
