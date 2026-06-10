@@ -226,11 +226,13 @@ impl FileIO {
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let (op, relative_path) = self.storage.create(path)?;
 
-        op.remove_all(relative_path)
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to delete directory '{path}'"),
-            })?;
+        // Treat the argument as a directory by ensuring a trailing slash, so a
+        // prefix-sibling directory is not matched by `remove_all` (e.g. deleting
+        // `branch-dev` must not also wipe `branch-dev2`). Mirrors `mkdirs`.
+        let dir_path = normalize_root(relative_path);
+        op.remove_all(&dir_path).await.context(IoUnexpectedSnafu {
+            message: format!("Failed to delete directory '{path}'"),
+        })?;
 
         Ok(())
     }
@@ -276,6 +278,53 @@ impl FileIO {
                 message: format!("Failed to rename '{src}' to '{dst}'"),
             })?;
 
+        Ok(())
+    }
+
+    /// Renames a directory subtree from src to dst.
+    ///
+    /// opendal `rename` only moves single files and rejects directory paths
+    /// (`IsADirectory`); object stores have no server-side directory move. So we
+    /// try the backend's native rename (atomic on local fs / HDFS) and VERIFY it
+    /// actually relocated the tree; otherwise we fall back to a portable
+    /// recursive copy + delete — mirroring what Hadoop / pyarrow do internally
+    /// for object stores. Single-file [`Self::rename`] is unaffected.
+    pub async fn rename_dir(&self, src: &str, dst: &str) -> Result<()> {
+        let src_bare = src.trim_end_matches('/');
+        let dst_bare = dst.trim_end_matches('/');
+        let src_dir = format!("{src_bare}/");
+        let dst_dir = format!("{dst_bare}/");
+
+        // Fast path: local fs / HDFS can move a directory atomically. opendal
+        // sees no trailing slash, treats the path as a file, and the backend
+        // renames the real directory. We still verify because object stores
+        // "succeed" by moving only the directory marker, not the subtree.
+        match self.rename(src_bare, dst_bare).await {
+            Ok(()) if self.exists(&dst_dir).await? && !self.exists(&src_dir).await? => {
+                return Ok(())
+            }
+            Ok(()) => {}
+            Err(Error::IoUnexpected { ref source, .. })
+                if matches!(
+                    source.kind(),
+                    opendal::ErrorKind::Unsupported
+                        | opendal::ErrorKind::IsADirectory
+                        | opendal::ErrorKind::NotFound
+                ) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Portable fallback: copy every file under src to the mirrored dst path,
+        // then remove the source subtree.
+        for f in self.list_status_recursive(src_bare).await? {
+            let rel = f
+                .path
+                .trim_start_matches('/')
+                .strip_prefix(src_dir.trim_start_matches('/'))
+                .unwrap_or(f.path.as_str());
+            self.copy_file(&f.path, &format!("{dst_dir}{rel}")).await?;
+        }
+        self.delete_dir(src_bare).await?;
         Ok(())
     }
 }
@@ -595,6 +644,68 @@ mod file_action_test {
     async fn test_delete_file_memory() {
         let file_io = setup_memory_file_io();
         common_test_delete_file(&file_io, "memory:/test_file_delete_mem").await;
+    }
+
+    async fn write_file(file_io: &FileIO, path: &str, data: &str) {
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(data.to_owned()))
+            .await
+            .unwrap();
+    }
+
+    /// `delete_dir` must not over-delete a prefix-sibling directory: removing
+    /// `.../d` must leave `.../d2` intact. opendal `remove_all` is prefix-based,
+    /// so the directory path needs a trailing slash.
+    #[tokio::test]
+    async fn test_delete_dir_does_not_touch_prefix_sibling_memory() {
+        let file_io = setup_memory_file_io();
+        let base = "memory:/del_prefix";
+        write_file(&file_io, &format!("{base}/d/a.txt"), "x").await;
+        write_file(&file_io, &format!("{base}/d2/b.txt"), "y").await;
+
+        file_io.delete_dir(&format!("{base}/d")).await.unwrap();
+
+        assert!(!file_io.exists(&format!("{base}/d/")).await.unwrap());
+        assert!(
+            file_io.exists(&format!("{base}/d2/")).await.unwrap(),
+            "prefix-sibling directory must survive"
+        );
+        assert!(file_io.exists(&format!("{base}/d2/b.txt")).await.unwrap());
+    }
+
+    /// `rename_dir` must relocate the whole subtree on an object-store-like
+    /// backend (no server-side directory move), and must not clobber a
+    /// prefix-sibling of the source.
+    #[tokio::test]
+    async fn test_rename_dir_moves_subtree_memory() {
+        let file_io = setup_memory_file_io();
+        let base = "memory:/rename_dir_mem";
+        write_file(&file_io, &format!("{base}/src/x/a.txt"), "aaa").await;
+        write_file(&file_io, &format!("{base}/src/b.txt"), "bbb").await;
+        // prefix-sibling that must be untouched by the rename of `src`.
+        write_file(&file_io, &format!("{base}/src2/c.txt"), "ccc").await;
+
+        file_io
+            .rename_dir(&format!("{base}/src"), &format!("{base}/dst"))
+            .await
+            .unwrap();
+
+        // Source gone, destination has the full subtree.
+        assert!(!file_io.exists(&format!("{base}/src/")).await.unwrap());
+        assert_eq!(
+            file_io
+                .new_input(&format!("{base}/dst/x/a.txt"))
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            Bytes::from("aaa")
+        );
+        assert!(file_io.exists(&format!("{base}/dst/b.txt")).await.unwrap());
+        // Prefix-sibling untouched.
+        assert!(file_io.exists(&format!("{base}/src2/c.txt")).await.unwrap());
     }
 
     #[tokio::test]

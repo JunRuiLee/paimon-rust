@@ -410,7 +410,7 @@ impl Catalog for FileSystemCatalog {
             });
         }
 
-        self.file_io.rename(&from_path, &to_path).await?;
+        self.file_io.rename_dir(&from_path, &to_path).await?;
         Ok(())
     }
 
@@ -676,6 +676,33 @@ mod tests {
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
         assert!(!escaped_path.exists());
         assert!(catalog.get_table(&source).await.is_ok());
+    }
+
+    /// Regression for object-store directory rename: on a real local fs the
+    /// table subtree (schema files) must end up at the new identifier and the
+    /// old one must be gone. (The object-store recursive-copy path of
+    /// `FileIO::rename_dir` is covered directly by the FileIO unit tests on the
+    /// in-memory backend.)
+    #[tokio::test]
+    async fn test_rename_table_moves_subtree() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let from = Identifier::new("db1", "t1");
+        let to = Identifier::new("db1", "t2");
+        catalog
+            .create_table(&from, testing_schema(), false)
+            .await
+            .unwrap();
+
+        catalog.rename_table(&from, &to, false).await.unwrap();
+
+        assert!(!catalog.table_exists(&from).await.unwrap());
+        assert!(catalog.table_exists(&to).await.unwrap());
+        let table = catalog.get_table(&to).await.unwrap();
+        assert_eq!(table.schema().fields().len(), 1);
     }
 
     #[tokio::test]
