@@ -18,6 +18,7 @@
 use super::data_evolution_reader::DataEvolutionReader;
 use super::data_file_reader::DataFileReader;
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
+use super::merge_tree_split_generator::{split_requires_merge, KeyComparator};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::filtering::reader_pruning_predicates;
@@ -76,9 +77,12 @@ impl<'a> TableRead<'a> {
         let core_options = CoreOptions::new(self.table.schema.options());
         let merge_engine = core_options.merge_engine()?;
 
-        // PK table with Deduplicate engine: splits containing level-0 files
-        // need KeyValueFileReader for sort-merge dedup; splits with only
-        // compacted files (level > 0) can use the faster DataFileReader.
+        // PK table with Deduplicate engine: splits that may hold multiple
+        // versions of a key (level-0 files or key-overlapping compacted
+        // files) need KeyValueFileReader for sort-merge dedup; splits of
+        // disjoint compacted files — and all compacted files of
+        // deletion-vector tables, where DVs mask stale versions — use the
+        // faster DataFileReader.
         if has_primary_keys
             && matches!(
                 merge_engine,
@@ -97,8 +101,13 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Read PK table with Deduplicate engine: level-0 splits go through
-    /// KeyValueFileReader for sort-merge dedup, compacted splits use DataFileReader.
+    /// Read PK table with Deduplicate engine: splits that may hold multiple
+    /// versions of a key (any level-0 file, or compacted files with
+    /// overlapping key ranges) go through KeyValueFileReader for sort-merge
+    /// dedup; splits of disjoint compacted files use the faster
+    /// DataFileReader. Deletion-vector tables are exempt from the overlap
+    /// check: their stale versions are masked by DVs, and KeyValueFileReader
+    /// does not support DVs.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
@@ -116,10 +125,26 @@ impl<'a> TableRead<'a> {
             return self.read_kv(data_splits, core_options);
         }
 
+        // Deletion-vector tables read raw by design: stale versions of a key
+        // are masked by DVs, not merged, and KeyValueFileReader does not
+        // support DVs. Keep the plain level-0 dispatch for them.
+        let dv_enabled = core_options.deletion_vectors_enabled();
+        // No comparator means no usable trimmed PK — fall back to merging
+        // everything rather than risk raw-reading duplicate keys.
+        let comparator = KeyComparator::from_table_schema(self.table.schema());
+
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
-            if split.data_files().iter().any(|f| f.level == 0) {
+            let needs_merge = if dv_enabled {
+                split.data_files().iter().any(|f| f.level == 0)
+            } else {
+                match comparator {
+                    Some(ref comparator) => split_requires_merge(split.data_files(), comparator),
+                    None => true,
+                }
+            };
+            if needs_merge {
                 kv_splits.push(split.clone());
             } else {
                 raw_splits.push(split.clone());

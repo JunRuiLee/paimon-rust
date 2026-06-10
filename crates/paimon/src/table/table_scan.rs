@@ -35,6 +35,7 @@ use crate::spec::{
     TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
+use crate::table::merge_tree_split_generator::{interval_partition, pack_sections, KeyComparator};
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
@@ -627,6 +628,24 @@ impl<'a> TableScan<'a> {
             None
         };
 
+        // Primary-key tables must keep key-overlapping files in one split so the
+        // sort-merge reader sees every version of a key. The comparator decodes
+        // the trimmed-PK min/max keys written by the kv writer.
+        //
+        // Deletion-vector and first-row tables read without merging (stale rows
+        // are masked by DVs / level-0 is skipped), so they keep plain size-based
+        // packing like Java's MergeTreeSplitGenerator fast path.
+        let read_merges_overlapping_keys = !core_options.deletion_vectors_enabled()
+            && !matches!(
+                core_options.merge_engine(),
+                Ok(crate::spec::MergeEngine::FirstRow)
+            );
+        let pk_comparator = if read_merges_overlapping_keys {
+            KeyComparator::from_table_schema(self.table.schema())
+        } else {
+            None
+        };
+
         // Read deletion vector index manifest once (like Java generateSplits / scanDvIndex).
         let (deletion_files_map, effective_row_ranges) =
             if let Some(index_manifest_name) = snapshot.index_manifest() {
@@ -721,6 +740,14 @@ impl<'a> TableScan<'a> {
                 }
 
                 result
+            } else if let Some(ref comparator) = pk_comparator {
+                // Merge-tree path: section files by key-range overlap first, then
+                // bin-pack whole sections. Overlapping files always share a split.
+                pack_sections(
+                    interval_partition(data_files, comparator),
+                    target_split_size,
+                    open_file_cost,
+                )
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
             };
