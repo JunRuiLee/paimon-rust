@@ -439,8 +439,26 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
-        let new_schema = current.apply_changes(changes, &identifier.full_name())?;
+        let new_schema = current
+            .apply_changes(changes)
+            .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
+    }
+}
+
+/// `TableSchema::apply_changes` returns column errors without a table name;
+/// fill in the identifier's full name so the message identifies the table.
+fn fill_table_name(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::ColumnNotExist { column, .. } => Error::ColumnNotExist {
+            full_name: identifier.full_name(),
+            column,
+        },
+        Error::ColumnAlreadyExist { column, .. } => Error::ColumnAlreadyExist {
+            full_name: identifier.full_name(),
+            column,
+        },
+        other => other,
     }
 }
 

@@ -128,16 +128,18 @@ impl TableSchema {
 
     /// Apply a list of schema changes and return a new schema with incremented ID.
     ///
-    /// `full_name` is the table's `db.table` name, used only to build column
-    /// error messages. Column-level changes operate on **top-level** columns
-    /// only: a `field_names` path with more than one element (a nested struct
-    /// field) is rejected with [`crate::Error::Unsupported`].
-    pub fn apply_changes(
-        &self,
-        changes: Vec<crate::spec::SchemaChange>,
-        full_name: &str,
-    ) -> crate::Result<Self> {
+    /// Column-level changes operate on **top-level** columns only: a
+    /// `field_names` path with more than one element (a nested struct field) is
+    /// rejected with [`crate::Error::Unsupported`].
+    ///
+    /// Column errors ([`crate::Error::ColumnNotExist`] /
+    /// [`crate::Error::ColumnAlreadyExist`]) are returned with an empty table
+    /// name; the calling catalog fills in the table's full name.
+    pub fn apply_changes(&self, changes: Vec<crate::spec::SchemaChange>) -> crate::Result<Self> {
         use crate::spec::SchemaChange;
+
+        // Column errors carry no table name here; the catalog layer fills it in.
+        let full_name = "";
 
         let mut new_schema = self.clone();
         new_schema.id += 1;
@@ -1292,13 +1294,10 @@ mod tests {
 
         for producer in ["input", "full-compaction"] {
             let err = table_schema
-                .apply_changes(
-                    vec![crate::spec::SchemaChange::set_option(
-                        "changelog-producer".to_string(),
-                        producer.to_string(),
-                    )],
-                    "db.t",
-                )
+                .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                    "changelog-producer".to_string(),
+                    producer.to_string(),
+                )])
                 .unwrap_err();
 
             assert!(
@@ -1325,13 +1324,10 @@ mod tests {
         );
 
         let err = table_schema
-            .apply_changes(
-                vec![crate::spec::SchemaChange::set_option(
-                    "merge-engine".to_string(),
-                    "first-row".to_string(),
-                )],
-                "db.t",
-            )
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "merge-engine".to_string(),
+                "first-row".to_string(),
+            )])
             .unwrap_err();
 
         assert!(
@@ -1343,19 +1339,16 @@ mod tests {
         );
 
         let new_schema = table_schema
-            .apply_changes(
-                vec![
-                    crate::spec::SchemaChange::set_option(
-                        "merge-engine".to_string(),
-                        "first-row".to_string(),
-                    ),
-                    crate::spec::SchemaChange::set_option(
-                        "changelog-producer".to_string(),
-                        "lookup".to_string(),
-                    ),
-                ],
-                "db.t",
-            )
+            .apply_changes(vec![
+                crate::spec::SchemaChange::set_option(
+                    "merge-engine".to_string(),
+                    "first-row".to_string(),
+                ),
+                crate::spec::SchemaChange::set_option(
+                    "changelog-producer".to_string(),
+                    "lookup".to_string(),
+                ),
+            ])
             .unwrap();
 
         assert_eq!(
