@@ -20,13 +20,15 @@ use crate::arrow::format::create_format_reader;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, Predicate};
+use crate::spec::{DataField, DataFileMeta, Predicate, RowKind, VALUE_KIND_FIELD_ID};
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
 use crate::{DataSplit, Error};
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch};
 use arrow_cast::cast;
+use arrow_schema::Schema as ArrowSchema;
+use arrow_select::filter::filter_record_batch;
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -42,6 +44,11 @@ pub(crate) struct DataFileReader {
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
     blob_as_descriptor: bool,
+    /// When true, batches are post-filtered to keep only `RowKind::is_add()`
+    /// rows (mirrors Java `DropDeleteReader`). Caller MUST include the
+    /// `_VALUE_KIND` field in `read_type`; the column is consumed by the
+    /// filter and dropped from the yielded batch. Defaults to `false`.
+    drop_deletes: bool,
     /// Rows per batch passed to the format reader. Sourced from
     /// `CoreOptions::read_batch_size()` by callers.
     batch_size: usize,
@@ -65,12 +72,34 @@ impl DataFileReader {
             read_type,
             predicates,
             blob_as_descriptor: false,
+            drop_deletes: false,
             batch_size,
         }
     }
 
     pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
         self.blob_as_descriptor = blob_as_descriptor;
+        self
+    }
+
+    /// Enable post-decode `RowKind::is_add()` filter on yielded batches
+    /// (mirrors Java `DropDeleteReader`).
+    ///
+    /// **Caller contract**: when `drop_deletes=true`, the `read_type` passed
+    /// to [`new`] MUST include the `_VALUE_KIND` field
+    /// ([`crate::spec::VALUE_KIND_FIELD_ID`], `TinyInt`); the column is
+    /// consumed by the filter and dropped from the yielded batch. If the
+    /// field is missing, [`read_single_file_stream`] returns an error
+    /// instead of silently keeping every row.
+    ///
+    /// Used by Stage 4a of `dv-impl-plan.md` (PK raw-read short-circuit) to
+    /// strip residual DELETE / UPDATE_BEFORE physical rows that the
+    /// sort-merge path would otherwise drop via
+    /// [`crate::spec::RowKind::is_add`]. Other DataFileReader callers
+    /// (KV reader, data evolution, append, system tables) keep the default
+    /// `false` so their `_VALUE_KIND` semantics stay untouched.
+    pub(crate) fn with_drop_deletes(mut self, drop_deletes: bool) -> Self {
+        self.drop_deletes = drop_deletes;
         self
     }
 
@@ -159,8 +188,35 @@ impl DataFileReader {
         let split = split.clone();
         let batch_size = self.batch_size;
         let blob_as_descriptor = self.blob_as_descriptor;
+        let drop_deletes = self.drop_deletes;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
+
+        // When `drop_deletes` is enabled, find the `_VALUE_KIND` column once
+        // up front and pre-build the user-visible output schema (without that
+        // column). Caller contract: read_type MUST contain `_VALUE_KIND`.
+        let drop_deletes_ctx: Option<(usize, Arc<ArrowSchema>)> = if drop_deletes {
+            let vk_idx = read_type
+                .iter()
+                .position(|f| f.id() == VALUE_KIND_FIELD_ID)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "DataFileReader::with_drop_deletes(true) requires _VALUE_KIND in read_type"
+                        .to_string(),
+                    source: None,
+                })?;
+            let output_fields: Vec<arrow_schema::FieldRef> = target_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != vk_idx)
+                .map(|(_, f)| f.clone())
+                .collect();
+            let output_schema = Arc::new(ArrowSchema::new(output_fields));
+            Some((vk_idx, output_schema))
+        } else {
+            None
+        };
+
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
 
         // Compute index mapping and determine which columns to read from the file.
@@ -295,7 +351,63 @@ impl DataFileReader {
                         source: Some(Box::new(e)),
                     }
                 })?;
-                yield result;
+
+                // Stage 4a: drop_deletes filters out rows whose RowKind is not
+                // `is_add()` (i.e. DELETE / UPDATE_BEFORE) and removes the
+                // `_VALUE_KIND` column from the user-visible output. NULL
+                // values fall back to INSERT (mirrors `sort_merge.rs:336-342`).
+                let yielded = if let Some((vk_idx, ref output_schema)) = drop_deletes_ctx {
+                    let vk_col = result.column(vk_idx);
+                    let vk_array = vk_col.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                        Error::DataInvalid {
+                            message: format!(
+                                "_VALUE_KIND column expected Int8, got {:?}",
+                                vk_col.data_type()
+                            ),
+                            source: None,
+                        }
+                    })?;
+                    let mask: BooleanArray = (0..vk_array.len())
+                        .map(|i| {
+                            if vk_array.is_null(i) {
+                                Some(true)
+                            } else {
+                                let v = vk_array.value(i);
+                                Some(RowKind::from_value(v).map(|rk| rk.is_add()).unwrap_or(true))
+                            }
+                        })
+                        .collect();
+                    let filtered = filter_record_batch(&result, &mask).map_err(|e| {
+                        Error::UnexpectedError {
+                            message: format!("Failed to filter RowKind from batch: {e}"),
+                            source: Some(Box::new(e)),
+                        }
+                    })?;
+                    let kept_columns: Vec<Arc<dyn Array>> = filtered
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != vk_idx)
+                        .map(|(_, c)| c.clone())
+                        .collect();
+                    let row_count = filtered.num_rows();
+                    if kept_columns.is_empty() {
+                        RecordBatch::try_new_with_options(
+                            output_schema.clone(),
+                            kept_columns,
+                            &arrow_array::RecordBatchOptions::new().with_row_count(Some(row_count)),
+                        )
+                    } else {
+                        RecordBatch::try_new(output_schema.clone(), kept_columns)
+                    }
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to drop _VALUE_KIND column: {e}"),
+                        source: Some(Box::new(e)),
+                    })?
+                } else {
+                    result
+                };
+                yield yielded;
             }
         }
         .boxed())

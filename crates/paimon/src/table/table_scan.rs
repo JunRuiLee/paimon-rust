@@ -35,7 +35,9 @@ use crate::spec::{
     TimeTravelSelector,
 };
 use crate::table::bin_pack::split_for_batch;
-use crate::table::merge_tree_split_generator::{interval_partition, pack_sections, KeyComparator};
+use crate::table::merge_tree_split_generator::{
+    interval_partition, is_raw_convertible_file_group, pack_sections, KeyComparator,
+};
 use crate::table::source::{
     any_range_overlaps_file, intersect_ranges_with_file, merge_row_ranges, DataSplit,
     DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
@@ -77,7 +79,13 @@ async fn read_manifest_list(
 /// - Manifest-file-level partition stats pruning (skip entire manifest files)
 /// - Level-0 filtering per entry (DV mode or FirstRow engine)
 /// - Partition predicate filtering per entry
-/// - Data-level stats pruning per entry (current schema only, cross-schema fail-open)
+/// - Data-level stats pruning per entry, **gated** by
+///   [`should_apply_value_stats_to_entry`] so L0 entries that the planner
+///   intentionally keeps (FRESHNESS or non-DV PK Dedup/PU/VPU) bypass
+///   value-stats pruning — see `dv-impl-plan.md` SECTION-RISKS #3 (C4 fix).
+///   Cross-schema entries fail open (kept) and re-checked later in
+///   `plan_snapshot` via `data_file_matches_predicates_for_table`, which
+///   also honors the gate.
 #[allow(clippy::too_many_arguments)]
 async fn read_all_manifest_entries(
     file_io: &FileIO,
@@ -93,6 +101,9 @@ async fn read_all_manifest_entries(
     schema_fields: &[DataField],
     bucket_predicate: Option<&Predicate>,
     bucket_key_fields: &[DataField],
+    deletion_vectors_enabled: bool,
+    dv_read_mode: crate::spec::DvReadMode,
+    merge_engine: Option<crate::spec::MergeEngine>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let (mut manifest_files, delta) = futures::try_join!(
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
@@ -169,10 +180,18 @@ async fn read_all_manifest_entries(
                 let filtered: Vec<ManifestEntry> = entries
                     .into_iter()
                     .filter(|entry| {
-                        if skip_level_zero && has_primary_keys && entry.file().level == 0 {
+                        let level = entry.file().level;
+                        if skip_level_zero && has_primary_keys && level == 0 {
                             return false;
                         }
                         if !data_predicates.is_empty()
+                            && super::stats_filter::should_apply_value_stats_to_entry(
+                                level,
+                                has_primary_keys,
+                                deletion_vectors_enabled,
+                                dv_read_mode,
+                                merge_engine,
+                            )
                             && !data_file_matches_predicates(
                                 entry.file(),
                                 data_predicates,
@@ -282,6 +301,7 @@ fn should_skip_level_zero_for_scan(
     scan_all_files: bool,
     has_primary_keys: bool,
     deletion_vectors_enabled: bool,
+    dv_read_mode: crate::spec::DvReadMode,
     merge_engine: crate::Result<crate::spec::MergeEngine>,
 ) -> bool {
     if scan_all_files {
@@ -290,8 +310,26 @@ fn should_skip_level_zero_for_scan(
     if !has_primary_keys {
         return false;
     }
-
-    deletion_vectors_enabled || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+    // FirstRow has historically stripped L0 (the engine semantics intentionally
+    // discard later versions, so L0 unmerged duplicates are useless to the
+    // reader); preserve.
+    if merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow) {
+        return true;
+    }
+    // DV + PERFORMANCE: strip L0 (Java
+    // `paimon-core/.../table/source/DataTableBatchScan.java:75-77@e8938f347`).
+    // DV + FRESHNESS: keep L0 — Java only enables value filter without a
+    // level filter (`DataTableBatchScan.java:71-74@e8938f347`); the L0 entries
+    // skip value-stats pruning at filter time via
+    // `should_apply_value_stats_to_entry`.
+    if deletion_vectors_enabled {
+        return matches!(dv_read_mode, crate::spec::DvReadMode::Performance);
+    }
+    // Non-DV PK: keep L0 visible for sort-merge (Deduplicate / PartialUpdate /
+    // VPU need the full PK group; the C4 fix in
+    // `should_apply_value_stats_to_entry` ensures stats pruning does not
+    // silently break sort-merge inputs).
+    false
 }
 
 /// TableScan for full table scan (no incremental, no predicate).
@@ -474,13 +512,27 @@ impl<'a> TableScan<'a> {
 
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let dv_read_mode = core_options.deletion_vectors_read_mode()?;
+        // Fail fast on invalid `merge-engine` option: an unparseable value
+        // would otherwise silently fall back to Deduplicate semantics in
+        // helpers that take `Option<MergeEngine>`, masking config bugs.
+        let merge_engine = core_options.merge_engine()?;
+        let merge_engine_opt = Some(merge_engine);
 
         // Skip level-0 files for PK tables when:
-        // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
-        // - FirstRow engine without DV: reads go through DataFileReader (no merge),
-        //   so only compacted (level > 0) files are safe to read directly
-        // Deduplicate engine always uses KeyValueFileReader which handles level-0
-        // via sort-merge, so level-0 files must remain visible.
+        // - DV + PERFORMANCE: planner strips L0 (Java
+        //   `DataTableBatchScan.java:75-77@e8938f347`); reader sees only L1+.
+        // - DV + FRESHNESS: keep L0 (Java
+        //   `DataTableBatchScan.java:71-74@e8938f347`); L0 entries skip
+        //   value-stats pruning at filter time via
+        //   `should_apply_value_stats_to_entry`.
+        // - FirstRow without DV: reads go through DataFileReader (no merge),
+        //   so only compacted (level > 0) files are safe to read directly.
+        // - Non-DV PK Deduplicate / PartialUpdate / VPU: keep L0 visible —
+        //   sort-merge needs the full PK group; the C4 fix in
+        //   `should_apply_value_stats_to_entry` ensures predicate pruning
+        //   does not break sort-merge inputs (`dv-impl-plan.md` SECTION-RISKS
+        //   #3).
         //
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
@@ -488,7 +540,8 @@ impl<'a> TableScan<'a> {
             self.scan_all_files,
             has_primary_keys,
             deletion_vectors_enabled,
-            core_options.merge_engine(),
+            dv_read_mode,
+            Ok(merge_engine),
         );
 
         let partition_fields = self.table.schema().partition_fields();
@@ -537,6 +590,9 @@ impl<'a> TableScan<'a> {
             self.table.schema().fields(),
             self.bucket_predicate.as_ref(),
             &bucket_key_fields,
+            deletion_vectors_enabled,
+            dv_read_mode,
+            merge_engine_opt,
         )
         .await?;
         Ok(merge_manifest_entries(entries))
@@ -572,11 +628,29 @@ impl<'a> TableScan<'a> {
             if !has_cross_schema {
                 entries
             } else {
+                // Mirror the gating in `read_all_manifest_entries`: L0 entries
+                // that the planner intentionally keeps (FRESHNESS or non-DV PK
+                // Dedup/PU/VPU) bypass value-stats pruning here as well, so the
+                // cross-schema path stays symmetric with the in-schema path.
+                let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+                let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+                let dv_read_mode = core_options.deletion_vectors_read_mode()?;
+                // Fail fast on invalid `merge-engine` (see plan_manifest_entries).
+                let merge_engine_opt = Some(core_options.merge_engine()?);
                 let mut kept = Vec::with_capacity(entries.len());
                 let mut schema_cache: HashMap<i64, Option<Arc<ResolvedStatsSchema>>> =
                     HashMap::new();
                 for entry in entries {
+                    let level = entry.file().level;
+                    let stats_apply = super::stats_filter::should_apply_value_stats_to_entry(
+                        level,
+                        has_primary_keys,
+                        deletion_vectors_enabled,
+                        dv_read_mode,
+                        merge_engine_opt,
+                    );
                     if entry.file().schema_id == current_schema_id
+                        || !stats_apply
                         || data_file_matches_predicates_for_table(
                             self.table,
                             entry.file(),
@@ -621,19 +695,22 @@ impl<'a> TableScan<'a> {
             None
         };
 
-        // Primary-key tables must keep key-overlapping files in one split so the
-        // sort-merge reader sees every version of a key. The comparator decodes
-        // the trimmed-PK min/max keys written by the kv writer.
-        //
-        // Deletion-vector and first-row tables read without merging (stale rows
-        // are masked by DVs / level-0 is skipped), so they keep plain size-based
-        // packing like Java's MergeTreeSplitGenerator fast path.
-        let read_merges_overlapping_keys = !core_options.deletion_vectors_enabled()
-            && !matches!(
-                core_options.merge_engine(),
-                Ok(crate::spec::MergeEngine::FirstRow)
-            );
-        let pk_comparator = if read_merges_overlapping_keys {
+        // Primary-key tables need a comparator to detect key-overlap when the
+        // raw-convertible fast path does not apply. Mirror Java
+        // `MergeTreeSplitGenerator.java:60-114@e8938f347`: `rawConvertible` +
+        // (`deletionVectorsEnabled || mergeEngine == FIRST_ROW || oneLevel`)
+        // → packForOrdered (size-based bin-pack); otherwise IntervalPartition
+        // section grouping. Computing the comparator unconditionally for PK
+        // tables ensures DV+FRESHNESS (which keeps L0 visible) still falls
+        // through to overlap grouping when the fast path's rawConvertible
+        // predicate fails.
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        let dv_enabled = core_options.deletion_vectors_enabled();
+        // Fail fast on invalid `merge-engine` (mirrors plan_manifest_entries
+        // contract — see :526). Used both for the FirstRow gate below and as
+        // the rawConvertible-fast-path engine check.
+        let is_first_row = core_options.merge_engine()? == crate::spec::MergeEngine::FirstRow;
+        let pk_comparator = if has_primary_keys {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
             None
@@ -733,14 +810,35 @@ impl<'a> TableScan<'a> {
                 }
 
                 result
-            } else if let Some(ref comparator) = pk_comparator {
-                // Merge-tree path: section files by key-range overlap first, then
-                // bin-pack whole sections. Overlapping files always share a split.
-                pack_sections(
-                    interval_partition(data_files, comparator),
-                    target_split_size,
-                    open_file_cost,
-                )
+            } else if has_primary_keys {
+                // PK tables follow Java `MergeTreeSplitGenerator.java:69-114@e8938f347`:
+                // - rawConvertible + (DV || FirstRow || oneLevel) → BinPacking.packForOrdered
+                //   (size-based bin-pack, equivalent to `split_for_batch`).
+                // - Otherwise → IntervalPartition + packSplits (key-range section
+                //   grouping). DV+FRESHNESS lands here whenever any L0 file is
+                //   present (rawConvertible=false), preserving sort-merge inputs
+                //   across overlapping L0/L1+ files.
+                let raw_convertible = is_raw_convertible_file_group(&data_files);
+                let one_level = data_files
+                    .iter()
+                    .map(|f| f.level)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == 1;
+                if raw_convertible && (dv_enabled || is_first_row || one_level) {
+                    split_for_batch(data_files, target_split_size, open_file_cost)
+                } else if let Some(ref comparator) = pk_comparator {
+                    pack_sections(
+                        interval_partition(data_files, comparator),
+                        target_split_size,
+                        open_file_cost,
+                    )
+                } else {
+                    // PK comparator unavailable (unsupported PK type); fall back
+                    // to bin-pack. Reader-side gate (P0-2) re-checks
+                    // rawConvertibility and routes overlap to KV merge anyway.
+                    split_for_batch(data_files, target_split_size, open_file_cost)
+                }
             } else {
                 split_for_batch(data_files, target_split_size, open_file_cost)
             };
@@ -1066,6 +1164,7 @@ mod tests {
             false,
             true,
             false,
+            crate::spec::DvReadMode::Performance,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
     }
@@ -1076,8 +1175,153 @@ mod tests {
             true,
             true,
             false,
+            crate::spec::DvReadMode::Performance,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
+    }
+
+    /// scan_all_files=true short-circuits the entire decision (overwrite /
+    /// truncate / writer-restore paths must see every file regardless of
+    /// merge_engine and DV settings).
+    #[test]
+    fn test_scan_all_files_short_circuits_for_dedup() {
+        assert!(!should_skip_level_zero_for_scan(
+            true,
+            true,
+            false,
+            crate::spec::DvReadMode::Performance,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// Non-PK tables never strip L0 (no sort-merge concern).
+    #[test]
+    fn test_non_pk_table_keeps_level_zero() {
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            false,
+            true,
+            crate::spec::DvReadMode::Performance,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// DV + PERFORMANCE: planner strips L0 (mirrors Java
+    /// `DataTableBatchScan.java:75-77@e8938f347` `withLevelFilter(level > 0)`).
+    #[test]
+    fn test_dv_performance_strips_level_zero() {
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            crate::spec::DvReadMode::Performance,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// DV + FRESHNESS: planner keeps L0 (mirrors Java
+    /// `DataTableBatchScan.java:71-74@e8938f347` — only `enableValueFilter`,
+    /// no level filter). Critical invariant; without it the L0 freshness
+    /// guarantee silently degrades to PERFORMANCE behavior.
+    #[test]
+    fn test_dv_freshness_keeps_level_zero() {
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            crate::spec::DvReadMode::Freshness,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// Non-DV PK Deduplicate: keep L0 visible for sort-merge. The C4 fix in
+    /// `should_apply_value_stats_to_entry` handles the value-stats pruning
+    /// concern at the entry level.
+    #[test]
+    fn test_non_dv_dedup_keeps_level_zero() {
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            false,
+            crate::spec::DvReadMode::Performance,
+            Ok(crate::spec::MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// Non-DV PK PartialUpdate: same as Deduplicate — sort-merge needs the
+    /// full PK group; L0 stays visible.
+    #[test]
+    fn test_non_dv_partial_update_keeps_level_zero() {
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            false,
+            crate::spec::DvReadMode::Performance,
+            Ok(crate::spec::MergeEngine::PartialUpdate),
+        ));
+    }
+
+    /// Fail-fast: an invalid `merge-engine` option must surface as
+    /// `Error::Unsupported` from `plan_manifest_entries` rather than silently
+    /// falling back to Deduplicate semantics. This guards against config bugs
+    /// where a typo'd engine would otherwise read with the wrong merge logic.
+    /// Schemas constructed via `Schema::builder()` reject the bad engine up
+    /// front (`ConfigInvalid`); this test bypasses the builder via serde_json
+    /// to mirror the on-disk-load path that does not re-validate.
+    #[tokio::test]
+    async fn test_plan_manifest_entries_invalid_merge_engine_errors() {
+        use crate::spec::{CommitKind, Snapshot};
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        // Bypass `Schema::builder` validation: deserialize TableSchema from
+        // JSON with a bad merge-engine option. This exercises the planner's
+        // own `?` rather than the up-front schema validator.
+        let schema_json = serde_json::json!({
+            "version": 3,
+            "id": 0,
+            "fields": [
+                {"id": 0, "name": "k", "type": "INT NOT NULL"},
+                {"id": 1, "name": "v", "type": "INT"},
+            ],
+            "highestFieldId": 1,
+            "partitionKeys": [],
+            "primaryKeys": ["k"],
+            "options": {"merge-engine": "totally-invalid-engine"},
+            "comment": null,
+            "timeMillis": 0,
+        });
+        let table_schema: TableSchema = serde_json::from_value(schema_json).unwrap();
+        let table = crate::table::Table::new(
+            file_io,
+            Identifier::new("default", "bad_engine_t"),
+            "memory:/test-bad-merge-engine".to_string(),
+            table_schema,
+            None,
+        );
+        let scan = TableScan::new(&table, None, vec![], None, None, None);
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000)
+            .build();
+
+        let err = scan.plan_manifest_entries(&snapshot).await.unwrap_err();
+        // `core_options.merge_engine()?` propagates `Error::Unsupported`
+        // BEFORE any manifest IO is attempted (the bogus manifest-list path
+        // would otherwise fail later with a different error variant).
+        assert!(
+            matches!(
+                &err,
+                crate::Error::Unsupported { message }
+                if message.contains("merge-engine") && message.contains("totally-invalid-engine")
+            ),
+            "expected Unsupported merge-engine error, got: {err:?}"
+        );
     }
 
     #[test]

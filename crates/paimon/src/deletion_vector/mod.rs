@@ -18,6 +18,10 @@
 mod core;
 
 pub use core::DeletionVector;
+#[cfg(test)]
+pub(crate) use core::MAGIC_NUMBER;
+#[cfg(test)]
+pub(crate) use core::MAGIC_NUMBER_V2;
 mod factory;
 
 pub use factory::DeletionVectorFactory;

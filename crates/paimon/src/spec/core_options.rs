@@ -18,6 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
+const DELETION_VECTORS_BITMAP64_OPTION: &str = "deletion-vectors.bitmap64";
+const DELETION_VECTORS_READ_MODE_OPTION: &str = "deletion-vectors.read-mode";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -98,6 +100,27 @@ pub enum MergeEngine {
     /// (`ROW<latest_version, latest_value, all_versioned_values MAP>`).
     /// See `docs/versioned-partial-update-impl-plan.md`.
     VersionedPartialUpdate,
+}
+
+/// Read-time policy for deletion vector tables, controlling whether the planner
+/// strips L0 files for PK + DV-enabled tables and whether L0 entries skip
+/// `value-stats` predicate pruning.
+///
+/// Mirrors Java `org.apache.paimon.CoreOptions.DvReadMode`:
+/// - option declaration: `paimon-api/.../CoreOptions.java:1880-1889@e8938f347`
+/// - enum definition: `paimon-api/.../CoreOptions.java:4144-4155@e8938f347`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DvReadMode {
+    /// Only read compacted data (level >= 1). Plan-time `skip_level_zero=true`.
+    /// Best read performance; relies on the DV writer keeping L0 changes mirrored
+    /// into L1+ via deletion vectors. **Default** (matches Java).
+    Performance,
+    /// Read all levels including level-0 for better data freshness.
+    /// Plan-time `skip_level_zero=false`; `value-stats` predicate pruning is
+    /// **skipped on L0 entries** to avoid the "stats pruning over PK-overlapping
+    /// L0 files breaks sort-merge" trap (mirror Java
+    /// `KeyValueFileStoreScan.java:154-162@e8938f347`).
+    Freshness,
 }
 
 /// Per-file merge-mode flag carried on `DataFileMeta._MERGE_MODE` for
@@ -244,6 +267,40 @@ impl<'a> CoreOptions<'a> {
             .get(DELETION_VECTORS_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Whether the table is configured to write 64-bit deletion vectors
+    /// (`Bitmap64DeletionVector` / `OptimizedRoaringBitmap64`). Required for
+    /// row-tracking tables and Iceberg compatibility; the read side dispatches
+    /// on the per-blob magic number regardless of this option, so it is
+    /// currently consulted only for schema introspection and forward-compat
+    /// with the future writer path. Default: `false` (matches Java).
+    pub fn deletion_vectors_bitmap64(&self) -> bool {
+        self.options
+            .get(DELETION_VECTORS_BITMAP64_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Read mode for deletion-vector tables (PERFORMANCE / FRESHNESS).
+    ///
+    /// Defaults to `Performance` to match Java
+    /// (`paimon-api/.../CoreOptions.java:1880-1889@e8938f347`). PR-mode
+    /// behavior is consumed by the planner: see [DvReadMode] for the contract
+    /// each variant imposes on `skip_level_zero` and L0 value-stats pruning.
+    pub fn deletion_vectors_read_mode(&self) -> crate::Result<DvReadMode> {
+        match self.options.get(DELETION_VECTORS_READ_MODE_OPTION) {
+            None => Ok(DvReadMode::Performance),
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "performance" => Ok(DvReadMode::Performance),
+                "freshness" => Ok(DvReadMode::Freshness),
+                other => Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Unsupported deletion-vectors.read-mode: '{other}' (expected 'performance' or 'freshness')"
+                    ),
+                }),
+            },
+        }
     }
 
     /// Returns the user-specified sequence field names, if configured.
@@ -831,6 +888,57 @@ mod tests {
         assert_eq!(
             core.merge_engine().unwrap(),
             MergeEngine::VersionedPartialUpdate
+        );
+    }
+
+    #[test]
+    fn test_deletion_vectors_read_mode_default_is_performance() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert_eq!(
+            core.deletion_vectors_read_mode().unwrap(),
+            DvReadMode::Performance
+        );
+    }
+
+    #[test]
+    fn test_deletion_vectors_read_mode_accepts_performance() {
+        let opts = HashMap::from([(
+            DELETION_VECTORS_READ_MODE_OPTION.to_string(),
+            "performance".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert_eq!(
+            core.deletion_vectors_read_mode().unwrap(),
+            DvReadMode::Performance
+        );
+    }
+
+    #[test]
+    fn test_deletion_vectors_read_mode_accepts_freshness_case_insensitive() {
+        let opts = HashMap::from([(
+            DELETION_VECTORS_READ_MODE_OPTION.to_string(),
+            "FRESHNESS".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert_eq!(
+            core.deletion_vectors_read_mode().unwrap(),
+            DvReadMode::Freshness
+        );
+    }
+
+    #[test]
+    fn test_deletion_vectors_read_mode_rejects_unknown() {
+        let opts = HashMap::from([(
+            DELETION_VECTORS_READ_MODE_OPTION.to_string(),
+            "balanced".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        let err = core.deletion_vectors_read_mode().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Unsupported deletion-vectors.read-mode"),
+            "expected unsupported-mode error, got: {msg}"
         );
     }
 

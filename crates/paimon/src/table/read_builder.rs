@@ -723,7 +723,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_direct_table_read_rejects_partial_update_with_deletion_vectors() {
+    async fn test_direct_table_read_partial_update_with_dv_no_longer_rejected() {
+        // Java `KeyValueFileReaderFactory.java:173-187@e8938f347` applies DV at
+        // the file-level reader, before any merge function. PartialUpdate/VPU
+        // + DV is supported on the read path; the previous "Unsupported"
+        // short-circuit has been removed. End-to-end PU+DV correctness is
+        // covered by `kv_file_reader::tests::
+        // test_kv_reader_partial_update_with_deletion_vector` which uses real
+        // parquet + real DV bytes; here we only assert the dispatch no longer
+        // rejects with `Error::Unsupported` before any IO.
         let table = partial_update_dv_pk_table();
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -740,16 +748,21 @@ mod tests {
             ))])
             .build()
             .unwrap();
-        let err = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
+        let result = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new())
             .to_arrow(&[split])
             .unwrap()
             .try_collect::<Vec<_>>()
-            .await
-            .unwrap_err();
+            .await;
 
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion vectors")),
-            "expected partial-update+DV read to fail fast with Unsupported, got {err:?}"
-        );
+        // The fake bucket / DV paths still cannot be opened, so the read
+        // eventually fails with an IO-layer error; what matters is that the
+        // `Error::Unsupported { message: "...deletion vectors..." }` short-
+        // circuit is gone.
+        if let Err(crate::Error::Unsupported { ref message }) = result {
+            assert!(
+                !message.contains("deletion vectors"),
+                "PU+DV should no longer be rejected on the read path; got: {message}"
+            );
+        }
     }
 }

@@ -127,6 +127,13 @@ struct Args {
     /// 128 MiB). Accepts the same string format as the option itself
     /// (`"2gb"`, `"128mb"`, raw bytes, etc.).
     target_size: Option<String>,
+    /// `deletion-vectors.read-mode` for this run only. Applied via
+    /// `Table::copy_with_options` so the catalog/schema is not mutated.
+    /// `None` respects whatever the table has persisted (lib default
+    /// PERFORMANCE). Accepted values: `"performance"` / `"freshness"`
+    /// (case-insensitive — parsed by `core_options.deletion_vectors_read_mode`).
+    /// Only meaningful for tables with `deletion-vectors.enabled=true`.
+    read_mode: Option<String>,
 }
 
 /// Stat for one read pass. `residual_dropped` is the number of rows that
@@ -175,6 +182,11 @@ fn print_usage(argv0: &str) {
     eprintln!("    applied via `Table::copy_with_options` (does NOT mutate the");
     eprintln!("    catalog). Accepts \"2gb\", \"128mb\", raw bytes, etc.");
     eprintln!("    Default unset → respects the persisted option (lib default 128 MiB).");
+    eprintln!("  --read-mode {{performance|freshness}}: per-run override of");
+    eprintln!("    `deletion-vectors.read-mode` for DV-enabled tables. Default unset →");
+    eprintln!("    respects the persisted option (lib default PERFORMANCE).");
+    eprintln!("    Has no effect on non-DV tables. Use to A/B both modes against the");
+    eprintln!("    same table and confirm they return identical results.");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -187,6 +199,7 @@ fn parse_args() -> Result<Args, String> {
     let mut filters_raw: Vec<String> = Vec::new();
     let mut batch_size: usize = 8192;
     let mut target_size: Option<String> = None;
+    let mut read_mode: Option<String> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -257,6 +270,21 @@ fn parse_args() -> Result<Args, String> {
                 }
                 target_size = Some(v.clone());
             }
+            "--read-mode" => {
+                i += 1;
+                let v = argv
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--read-mode needs an argument (performance|freshness)".to_string()
+                    })?;
+                let lower = v.to_ascii_lowercase();
+                if lower != "performance" && lower != "freshness" {
+                    return Err(format!(
+                        "--read-mode must be 'performance' or 'freshness', got: {v}"
+                    ));
+                }
+                read_mode = Some(lower);
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -280,6 +308,7 @@ fn parse_args() -> Result<Args, String> {
         filters,
         batch_size,
         target_size,
+        read_mode,
     })
 }
 
@@ -712,9 +741,9 @@ async fn run_one_pass(
     let t_plan = Instant::now();
     let table = catalog.get_table(&Identifier::new(db, tbl)).await?;
 
-    // `--batch-size` and `--target-size` are per-run read-time overrides,
-    // not persisted schema options. Apply via `copy_with_options` so this
-    // run sees the override values without mutating the catalog.
+    // `--batch-size`, `--target-size`, and `--read-mode` are per-run read-time
+    // overrides, not persisted schema options. Apply via `copy_with_options`
+    // so this run sees the override values without mutating the catalog.
     let table = {
         let mut extra = std::collections::HashMap::new();
         if args.batch_size > 0 {
@@ -722,6 +751,10 @@ async fn run_one_pass(
         }
         if let Some(ref ts) = args.target_size {
             extra.insert("source.split.target-size".to_string(), ts.clone());
+        }
+        if let Some(ref rm) = args.read_mode {
+            // Option key matches `core_options.rs::DELETION_VECTORS_READ_MODE_OPTION`.
+            extra.insert("deletion-vectors.read-mode".to_string(), rm.clone());
         }
         if extra.is_empty() {
             table

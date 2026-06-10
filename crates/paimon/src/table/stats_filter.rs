@@ -22,7 +22,10 @@ use crate::arrow::schema_evolution::create_index_mapping;
 use crate::predicate_stats::{
     data_leaf_may_match, missing_field_may_match, predicates_may_match_with_schema, StatsAccessor,
 };
-use crate::spec::{extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate};
+use crate::spec::{
+    extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, DvReadMode, MergeEngine,
+    Predicate,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -155,11 +158,80 @@ fn normalize_field_mapping(mapping: Option<Vec<i32>>, num_fields: usize) -> Vec<
         .unwrap_or_else(|| identity_field_mapping(num_fields))
 }
 
-/// Check whether a data file *may* contain rows matching all `predicates`.
+/// Whether [`data_file_matches_predicates`] should run for a given manifest entry.
 ///
+/// Returning `false` means **skip the value-stats filter and keep the entry
+/// unconditionally**, mirroring Java
+/// `paimon-core/.../KeyValueFileStoreScan.java:154-162@e8938f347` "FRESHNESS:
+/// keep L0 unconditionally; stats pruning only applies to L1+".
+///
+/// Stage 3 of `docs/dv-impl-plan.md` unifies three concerns through this
+/// helper:
+///
+/// 1. **C7** — DV + FRESHNESS L0 must skip the stats filter (Java contract;
+///    L0 in FRESHNESS reaches the reader for data freshness).
+/// 2. **C4** — non-DV PK Deduplicate / PartialUpdate / VersionedPartialUpdate
+///    L0 must skip the stats filter. Multiple L0 files with PK overlap can
+///    have non-overlapping `value_stats`; if a predicate prunes the file
+///    holding the *newer* version while keeping the file with the older
+///    version, sort-merge sees a partial PK group and **returns the stale
+///    value**. See `dv-impl-plan.md` SECTION-RISKS #3 (note: triggers only
+///    when L0 stats are non-overlapping; same-stats prunes are wasteful but
+///    safe).
+/// 3. **L1+ stats pruning is always preserved** — compacted files do not
+///    have PK overlap by construction, so stats are trustworthy and the
+///    pruning is a performance invariant that this helper must not regress.
+///
+/// `merge_engine` takes [`Option<MergeEngine>`] so the caller can convert a
+/// `Result<MergeEngine>` parse outcome once with `.ok()` and pass the result
+/// through filter closures (the `crate::Error` half of `Result` is not `Copy`,
+/// so threading the `Result` itself through closures is awkward). `None`
+/// falls open to `Deduplicate` semantics, matching the safe-default style of
+/// `should_skip_level_zero_for_scan`.
+pub(crate) fn should_apply_value_stats_to_entry(
+    level: i32,
+    has_primary_keys: bool,
+    dv_enabled: bool,
+    dv_read_mode: DvReadMode,
+    merge_engine: Option<MergeEngine>,
+) -> bool {
+    // L1+ files are always safe — compacted, no PK overlap → stats are
+    // trustworthy and pruning is a performance invariant.
+    if level > 0 {
+        return true;
+    }
+    // Non-PK tables: L0 stats pruning is safe (no sort-merge concern).
+    if !has_primary_keys {
+        return true;
+    }
+    // PK + DV enabled: PERFORMANCE strips L0 in the plan upper layer (helper
+    // unreachable on L0); FRESHNESS keeps L0 but must skip the stats filter to
+    // mirror Java's "unconditional keep" contract.
+    if dv_enabled {
+        return match dv_read_mode {
+            DvReadMode::Performance => true,
+            DvReadMode::Freshness => false,
+        };
+    }
+    // PK + non-DV: C4 fix.
+    // FirstRow strips L0 in the plan upper layer (helper unreachable on L0);
+    // other engines (Deduplicate / PartialUpdate / VersionedPartialUpdate)
+    // keep L0 visible and must skip the stats filter to preserve the
+    // sort-merge inputs (otherwise C4 stale-value bug surfaces).
+    let engine = merge_engine.unwrap_or(MergeEngine::Deduplicate);
+    !matches!(
+        engine,
+        MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate
+    )
+}
+
 /// Pruning is evaluated per file and fails open when stats cannot be
 /// interpreted safely, including schema mismatches, incompatible stats arity,
 /// and missing or corrupted stats.
+///
+/// L0 PK / FRESHNESS / non-DV-Dedup gating is **separate** — see
+/// [`should_apply_value_stats_to_entry`] for whether this function should be
+/// called at all for a given entry.
 pub(super) fn data_file_matches_predicates(
     file: &DataFileMeta,
     predicates: &[Predicate],
@@ -451,4 +523,172 @@ pub(crate) fn group_by_overlapping_row_id(mut files: Vec<DataFileMeta>) -> Vec<V
         result.push(current_group);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L1+ files always run stats pruning (performance invariant; compacted
+    /// files do not have PK overlap, stats are trustworthy).
+    #[test]
+    fn test_should_apply_value_stats_l1_always_true() {
+        for engine in [
+            MergeEngine::Deduplicate,
+            MergeEngine::PartialUpdate,
+            MergeEngine::VersionedPartialUpdate,
+            MergeEngine::FirstRow,
+        ] {
+            for dv_enabled in [false, true] {
+                for mode in [DvReadMode::Performance, DvReadMode::Freshness] {
+                    assert!(
+                        should_apply_value_stats_to_entry(1, true, dv_enabled, mode, Some(engine)),
+                        "L1 must always apply stats (engine={engine:?}, dv={dv_enabled}, mode={mode:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-PK tables: L0 stats pruning is safe (no sort-merge concern).
+    #[test]
+    fn test_should_apply_value_stats_non_pk_l0_always_true() {
+        assert!(should_apply_value_stats_to_entry(
+            0,
+            false,
+            false,
+            DvReadMode::Performance,
+            Some(MergeEngine::Deduplicate),
+        ));
+        assert!(should_apply_value_stats_to_entry(
+            0,
+            false,
+            true,
+            DvReadMode::Freshness,
+            Some(MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// DV + FRESHNESS + L0 must skip the stats filter (Java keep-L0
+    /// unconditionally contract). This is the corrected matrix row vs.
+    /// `dv-impl-plan.md` line 324 which originally wrote `true`.
+    #[test]
+    fn test_should_apply_value_stats_dv_freshness_l0_is_false() {
+        assert!(!should_apply_value_stats_to_entry(
+            0,
+            true,
+            true,
+            DvReadMode::Freshness,
+            Some(MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// DV + PERFORMANCE + L0: helper is unreachable in practice because the
+    /// planner already strips L0; the safe default is `true` (run pruning if
+    /// somehow reached).
+    #[test]
+    fn test_should_apply_value_stats_dv_performance_l0_safe_default() {
+        assert!(should_apply_value_stats_to_entry(
+            0,
+            true,
+            true,
+            DvReadMode::Performance,
+            Some(MergeEngine::Deduplicate),
+        ));
+    }
+
+    /// **C4 fix** — non-DV PK + (Deduplicate / PartialUpdate / VPU) + L0 must
+    /// skip the stats filter to keep the full PK overlap group reachable for
+    /// sort-merge. Pruning here would surface stale values when L0 stats
+    /// are non-overlapping (see `dv-impl-plan.md` SECTION-RISKS #3).
+    #[test]
+    fn test_should_apply_value_stats_non_dv_pk_l0_dedup_skips() {
+        for engine in [
+            MergeEngine::Deduplicate,
+            MergeEngine::PartialUpdate,
+            MergeEngine::VersionedPartialUpdate,
+        ] {
+            assert!(
+                !should_apply_value_stats_to_entry(
+                    0,
+                    true,
+                    false,
+                    DvReadMode::Performance,
+                    Some(engine),
+                ),
+                "C4: PK + non-DV + {engine:?} + L0 must skip value-stats filter"
+            );
+        }
+    }
+
+    /// FirstRow + L0: helper is unreachable in practice because the planner
+    /// strips L0 for FirstRow. Safe default is `true`.
+    #[test]
+    fn test_should_apply_value_stats_first_row_l0_safe_default() {
+        assert!(should_apply_value_stats_to_entry(
+            0,
+            true,
+            false,
+            DvReadMode::Performance,
+            Some(MergeEngine::FirstRow),
+        ));
+    }
+
+    /// merge_engine = None (parse error → caller passes `.ok()`): helper
+    /// falls open to Deduplicate semantics. L0 + PK + non-DV → skip stats.
+    #[test]
+    fn test_should_apply_value_stats_merge_engine_none_falls_open() {
+        assert!(!should_apply_value_stats_to_entry(
+            0,
+            true,
+            false,
+            DvReadMode::Performance,
+            None,
+        ));
+    }
+
+    /// **C4 trigger scenario** (`dv-impl-plan.md` SECTION-RISKS #3 minimal
+    /// repro): two L0 files for PK k=1 with non-overlapping `value_stats`
+    /// (file_old covers OLD_V, file_new covers NEW_V). Without the C4 fix a
+    /// per-file value-stats prune would drop one side and leak the other's
+    /// stale value through sort-merge. This test asserts the helper returns
+    /// `false` for both files at L0 — i.e. neither is gated out — so the
+    /// sort-merge pipeline sees both versions and the latest seq wins.
+    /// Mirrors Java `KeyValueFileStoreScan.java:154-162@e8938f347`'s
+    /// keep-L0-unfiltered behavior.
+    #[test]
+    fn test_should_apply_value_stats_overlapping_l0_pk_dedup_skips_both_files() {
+        // Both entries share the helper inputs (level=0, has_pk=true,
+        // dv=false, performance, dedup) — the helper is per-entry and only
+        // reads (level, table-shape, mode), not the file's value_stats.
+        // The C4 fix lives in the gate, not in stats inspection.
+        let apply = should_apply_value_stats_to_entry(
+            0,
+            true,
+            false,
+            DvReadMode::Performance,
+            Some(MergeEngine::Deduplicate),
+        );
+        assert!(
+            !apply,
+            "C4: both L0 entries with disjoint stats must skip value-stats prune; \
+             pruning either side would expose stale values through sort-merge"
+        );
+
+        // Same scenario at L1+ MUST still apply stats — pruning here is a
+        // performance invariant (compacted files have no PK overlap, stats
+        // are trustworthy). This guards against a regression that would
+        // turn off the prune everywhere just to fix C4.
+        let apply_l1 = should_apply_value_stats_to_entry(
+            1,
+            true,
+            false,
+            DvReadMode::Performance,
+            Some(MergeEngine::Deduplicate),
+        );
+        assert!(
+            apply_l1,
+            "C4 fix must NOT regress L1+ stats pruning (performance invariant)"
+        );
+    }
 }

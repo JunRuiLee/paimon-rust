@@ -63,15 +63,33 @@ impl DeletionVectorFactory {
 
     /// Read a single DeletionVector from storage using DeletionFile (path/offset/length).
     /// Same as Java's DeletionVector.read(FileIO, DeletionFile).
+    ///
+    /// Java's `DeletionVectorMeta.length` is the return value of
+    /// `serializeTo(...)` and has different semantics for the two variants:
+    /// - 32-bit: `length = magic + roaring32_bytes` — physical blob occupies
+    ///   `length + 8` bytes on disk (outer length field + crc are extra)
+    /// - 64-bit: `length = bytes.length` of the whole serialized buffer —
+    ///   physical blob occupies exactly `length` bytes
+    ///
+    /// We can't dispatch on the magic before reading, so we always request
+    /// `length + 8` bytes (the 32-bit upper bound) and clamp to the file size
+    /// for the 64-bit case (where +8 over-reads). `read_from_bytes` ignores
+    /// trailing bytes via the inner length field.
     async fn read(file_io: &FileIO, df: &crate::DeletionFile) -> Result<DeletionVector> {
         let input = file_io.new_input(df.path())?;
+        let file_size = input.metadata().await?.size;
         let reader = input.reader().await?;
         let offset = df.offset() as u64;
         let len = df.length() as u64;
-        let bytes = reader
-            // 4 bytes for bitmap length, 4 bytes for magic number
-            .read(offset..offset.saturating_add(len).saturating_add(8))
-            .await?;
+        // 32-bit: physical blob is len + 8 bytes (outer length + crc frame not counted in len).
+        // 64-bit: physical blob is len bytes (outer length + crc frame already counted).
+        // Clamp to file size so 64-bit reads don't over-read past EOF when the
+        // DV is the last blob in the file.
+        let end = offset
+            .saturating_add(len)
+            .saturating_add(8)
+            .min(file_size);
+        let bytes = reader.read(offset..end).await?;
         DeletionVector::read_from_bytes(&bytes, Some(len))
     }
 }

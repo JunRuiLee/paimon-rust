@@ -256,6 +256,20 @@ pub(crate) fn split_requires_merge(files: &[DataFileMeta], comparator: &KeyCompa
     files.iter().any(|f| f.level == 0) || has_key_overlap(files, comparator)
 }
 
+/// Mirror of Java `MergeTreeSplitGenerator` rawConvertible per-file predicate
+/// (`MergeTreeSplitGenerator.java:69-81@e8938f347`) plus `withoutDeleteRow`
+/// (`MergeTreeSplitGenerator.java:151-154@e8938f347`): every file must be at
+/// `level > 0` AND have no residual DELETE rows.
+///
+/// `delete_row_count == None` falls open to "no deletes" matching Java's
+/// `dataFileMeta.deleteRowCount().map(count -> count == 0L).orElse(true)`
+/// null-to-true behavior (older writers did not populate the field).
+pub(crate) fn is_raw_convertible_file_group(files: &[DataFileMeta]) -> bool {
+    files
+        .iter()
+        .all(|f| f.level != 0 && f.delete_row_count.map(|c| c == 0).unwrap_or(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +489,47 @@ mod tests {
             keyed_file("l2", 31, 90, 100, 2),
         ];
         assert!(!split_requires_merge(&disjoint_compacted, &comparator));
+    }
+
+    /// Mirror Java `MergeTreeSplitGenerator.java:69-81@e8938f347` rawConvertible
+    /// per-file predicate (`level != 0 && withoutDeleteRow(file)`). Used by the
+    /// Rust planner / reader to decide raw vs sort-merge dispatch in alignment
+    /// with Java.
+    #[test]
+    fn is_raw_convertible_file_group_all_l1_plus_no_deletes() {
+        let mut a = keyed_file("a", 1, 10, 100, 1);
+        a.delete_row_count = Some(0);
+        let mut b = keyed_file("b", 11, 20, 100, 2);
+        b.delete_row_count = Some(0);
+        assert!(is_raw_convertible_file_group(&[a, b]));
+    }
+
+    #[test]
+    fn is_raw_convertible_file_group_rejects_any_level_zero() {
+        let l0 = keyed_file("l0", 1, 10, 100, 0);
+        let mut l1 = keyed_file("l1", 11, 20, 100, 1);
+        l1.delete_row_count = Some(0);
+        assert!(!is_raw_convertible_file_group(&[l0, l1]));
+    }
+
+    #[test]
+    fn is_raw_convertible_file_group_rejects_any_delete_rows() {
+        let mut clean = keyed_file("a", 1, 10, 100, 1);
+        clean.delete_row_count = Some(0);
+        let mut dirty = keyed_file("b", 11, 20, 100, 1);
+        dirty.delete_row_count = Some(3);
+        assert!(!is_raw_convertible_file_group(&[clean, dirty]));
+    }
+
+    /// `delete_row_count == None` matches Java `withoutDeleteRow`'s
+    /// `null-to-true` behavior so files written by older writers (which did not
+    /// populate the field) are still treated as raw-convertible.
+    #[test]
+    fn is_raw_convertible_file_group_treats_none_as_no_deletes() {
+        let mut a = keyed_file("a", 1, 10, 100, 1);
+        a.delete_row_count = None;
+        let mut b = keyed_file("b", 11, 20, 100, 2);
+        b.delete_row_count = None;
+        assert!(is_raw_convertible_file_group(&[a, b]));
     }
 }

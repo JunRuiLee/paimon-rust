@@ -28,6 +28,7 @@ use super::sort_merge::{
     DeduplicateMergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
 use crate::arrow::build_target_arrow_schema;
+use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
     BigIntType, DataField, DataType as PaimonDataType, MergeEngine, Predicate, TinyIntType,
@@ -266,15 +267,34 @@ impl KeyValueFileReader {
 
         Ok(try_stream! {
             for split in &splits {
-                // DV mode should not reach KeyValueFileReader.
-                if split
+                let split_has_dv = split
                     .data_deletion_files()
-                    .is_some_and(|files| files.iter().any(Option::is_some))
-                {
-                    Err(Error::Unsupported {
-                        message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                    })?;
-                }
+                    .is_some_and(|files| files.iter().any(Option::is_some));
+
+                // DV is applied at the parquet row_selection layer (inside
+                // `data_file_reader::read_single_file_stream`), strictly before
+                // the merge function. This mirrors Java
+                // `KeyValueFileReaderFactory.java:173-187@e8938f347`, where
+                // `ApplyDeletionVectorReader` wraps the file-level reader and
+                // is engine-agnostic — DV pre-filtering composes cleanly with
+                // Deduplicate / PartialUpdate / VersionedPartialUpdate alike.
+
+                // Build a per-split DV factory only when at least one data
+                // file in the split has a DeletionFile attached. Mirrors
+                // DataFileReader behavior; avoids loading deletion vectors
+                // for splits that don't need them.
+                let dv_factory = if split_has_dv {
+                    Some(
+                        DeletionVectorFactory::new(
+                            &file_io,
+                            split.data_files(),
+                            split.data_deletion_files(),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
 
                 // Create one stream per data file.
                 let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
@@ -323,11 +343,18 @@ impl KeyValueFileReader {
                         batch_size,
                     );
 
+                    // Look up the DV for this data file (if any). Cloning the
+                    // Arc is cheap; the inner bitmap is shared.
+                    let dv = dv_factory
+                        .as_ref()
+                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name))
+                        .cloned();
+
                     let stream = reader.read_single_file_stream(
                         split,
                         file_meta,
                         data_fields,
-                        None,
+                        dv,
                         None,
                     )?;
                     file_streams.push(stream);
@@ -428,10 +455,29 @@ fn compute_merge_read_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{IntType, MapType, RowType, VarCharType};
+    use crate::deletion_vector::MAGIC_NUMBER;
+    use crate::deletion_vector::MAGIC_NUMBER_V2;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{BinaryRow, DataFileMeta, IntType, MapType, RowType, VarCharType};
+    use crate::table::source::DataSplitBuilder;
+    use crate::DeletionFile;
+    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, Int8Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use bytes::BufMut;
+    use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use roaring::RoaringBitmap;
+    use roaring::RoaringTreemap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     fn pk_field(id: i32, name: &str) -> DataField {
-        DataField::new(id, name.to_string(), PaimonDataType::Int(IntType::with_nullable(false)))
+        DataField::new(
+            id,
+            name.to_string(),
+            PaimonDataType::Int(IntType::with_nullable(false)),
+        )
     }
 
     fn int_field(id: i32, name: &str) -> DataField {
@@ -568,5 +614,849 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = merged.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id", "mv", "seq"]);
+    }
+
+    // ========== Stage 1: KV reader DV wiring (C2) end-to-end tests ==========
+    //
+    // These tests exercise the full KV reader stack: parquet read → DV row
+    // selection → sort-merge dedup → reorder. The minimum input is a parquet
+    // file in KV physical layout `[_SEQUENCE_NUMBER:Int64, _VALUE_KIND:Int8,
+    // user_cols...]` plus a deletion-vector blob co-located with it. We
+    // stream the result through `KeyValueFileReader::read` (same path as
+    // production, no shortcuts).
+
+    /// Write a KV-physical parquet file: `[_SEQUENCE_NUMBER, _VALUE_KIND, k]`
+    /// with one row per (seq, vk, k) tuple. Always sets `_VALUE_KIND = INSERT`
+    /// (0) and uses ascending `_SEQUENCE_NUMBER` so sort-merge dedup is a no-op
+    /// when keys are unique — the only difference between input and output is
+    /// the DV-applied row selection.
+    fn write_kv_parquet_file(
+        path: &Path,
+        ks: Vec<i32>,
+        vks: Option<Vec<i8>>,
+        max_row_group_size: Option<usize>,
+    ) {
+        let n = ks.len();
+        let seqs: Vec<i64> = (1..=n as i64).collect();
+        let vks: Vec<i8> = vks.unwrap_or_else(|| vec![0; n]); // default: all Insert
+        assert_eq!(vks.len(), n, "vks length must match ks length");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_SEQUENCE_NUMBER", ArrowDataType::Int64, false),
+            ArrowField::new("_VALUE_KIND", ArrowDataType::Int8, false),
+            ArrowField::new("k", ArrowDataType::Int32, false),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(seqs)),
+            Arc::new(Int8Array::from(vks)),
+            Arc::new(Int32Array::from(ks)),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+
+        let props = max_row_group_size.map(|size| {
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(size))
+                .build()
+        });
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, props).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Construct a 32-bit DV blob mirroring Java `DeletionFileWriter` /
+    /// `BitmapDeletionVector.serializeTo` byte layout:
+    ///
+    /// ```text
+    /// [version:byte=1][bitmapLength:int32 BE][magic:int32 BE][roaring32 bytes][crc:int32 BE]
+    /// ```
+    ///
+    /// Returns `(file_path, offset, length)` suitable for `DeletionFile::new`:
+    /// - `offset = 1` (skip version byte; physical blob starts here)
+    /// - `length = bitmapLength` (Java metadata.length = `serializeTo()` return
+    ///   value = magic + roaring bytes, **excluding** outer length field and
+    ///   crc; physical blob occupies `length + 8` bytes)
+    fn write_test_dv_blob(dir: &Path, name: &str, deleted: &[u32]) -> (PathBuf, i64, i64) {
+        let mut bitmap = RoaringBitmap::new();
+        for &d in deleted {
+            bitmap.insert(d);
+        }
+
+        let mut roaring_bytes = Vec::new();
+        bitmap.serialize_into(&mut roaring_bytes).unwrap();
+        // Inner length includes magic (4) but excludes outer length field and crc
+        // (matches Java BitmapDeletionVector.serializeTo return value `size`).
+        let inner_size: i32 = (4 + roaring_bytes.len()) as i32;
+
+        let mut blob: Vec<u8> = Vec::with_capacity(1 + 4 + inner_size as usize + 4);
+        blob.put_u8(1); // version byte
+        blob.put_i32(inner_size); // outer length field (BE)
+        blob.put_i32(MAGIC_NUMBER as i32); // magic (BE)
+        blob.extend_from_slice(&roaring_bytes);
+        blob.put_i32(0); // CRC (read path skips verification)
+
+        let path = dir.join(name);
+        std::fs::write(&path, &blob).unwrap();
+        (path, 1i64, inner_size as i64)
+    }
+
+    /// Construct a 64-bit DV blob mirroring Java
+    /// `Bitmap64DeletionVector.serializeTo` byte layout:
+    ///
+    /// ```text
+    /// [version:byte=1][bitmapDataLength:int32 BE][magic:int32 LE][roaring64 LE bytes][crc:int32 BE]
+    /// ```
+    ///
+    /// Returns `(file_path, offset, length)` suitable for `DeletionFile::new`:
+    /// - `offset = 1` (skip version byte; physical blob starts here)
+    /// - `length = bitmapDataLength + 8` — Java's `DeletionVectorMeta.length`
+    ///   for the 64-bit variant **includes** the outer length+crc frame
+    ///   (mirrors `Bitmap64DeletionVector.serializeTo` returning `bytes.length`,
+    ///   not just the inner size). This is **different from** the 32-bit
+    ///   variant where length excludes the frame; see SECTION-RISKS #8 in
+    ///   `dv-impl-plan.md`.
+    fn write_test_dv64_blob(dir: &Path, name: &str, deleted: &[u64]) -> (PathBuf, i64, i64) {
+        let mut treemap = RoaringTreemap::new();
+        for &d in deleted {
+            treemap.insert(d);
+        }
+        let mut treemap_bytes = Vec::new();
+        treemap.serialize_into(&mut treemap_bytes).unwrap();
+        // bitmapDataLength = magic(4) + treemap bytes
+        let bitmap_data_length: i32 = (4 + treemap_bytes.len()) as i32;
+
+        let mut blob: Vec<u8> = Vec::with_capacity(1 + 4 + bitmap_data_length as usize + 4);
+        blob.put_u8(1); // version byte
+        blob.put_i32(bitmap_data_length); // outer length field (BE)
+                                          // Magic written as LE — Java side uses an LE buffer in
+                                          // OptimizedRoaringBitmap64.serializeBitmapData.
+        blob.extend_from_slice(&MAGIC_NUMBER_V2.to_le_bytes());
+        blob.extend_from_slice(&treemap_bytes);
+        blob.put_i32(0); // CRC (read path skips verification)
+
+        let path = dir.join(name);
+        std::fs::write(&path, &blob).unwrap();
+        // 64-bit metadata.length includes outer length(4) + crc(4) frame.
+        (path, 1i64, (bitmap_data_length as i64) + 8)
+    }
+
+    fn local_file_uri(path: &Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with('/') {
+            format!("file:{normalized}")
+        } else {
+            format!("file:/{normalized}")
+        }
+    }
+
+    fn make_kv_data_file(file_name: &str, row_count: i64, file_size: i64) -> DataFileMeta {
+        serde_json::from_value(serde_json::json!({
+            "_FILE_NAME": file_name,
+            "_FILE_SIZE": file_size,
+            "_ROW_COUNT": row_count,
+            "_MIN_KEY": [],
+            "_MAX_KEY": [],
+            "_KEY_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_VALUE_STATS": {
+                "_MIN_VALUES": [],
+                "_MAX_VALUES": [],
+                "_NULL_COUNTS": []
+            },
+            "_MIN_SEQUENCE_NUMBER": 0,
+            "_MAX_SEQUENCE_NUMBER": 0,
+            "_SCHEMA_ID": 0,
+            "_LEVEL": 1,
+            "_EXTRA_FILES": [],
+            "_CREATION_TIME": chrono::Utc::now().timestamp_millis(),
+            "_DELETE_ROW_COUNT": null,
+            "_EMBEDDED_FILE_INDEX": null,
+            "_FILE_SOURCE": null,
+            "_VALUE_STATS_COLS": null,
+            "_FIRST_ROW_ID": null,
+            "_WRITE_COLS": null,
+            "_EXTERNAL_PATH": null
+        }))
+        .unwrap()
+    }
+
+    fn make_kv_config_for_int_pk(table_path: &str) -> KeyValueReadConfig {
+        let pk_field = DataField::new(
+            0,
+            "k".to_string(),
+            PaimonDataType::Int(IntType::with_nullable(false)),
+        );
+        let table_fields = vec![pk_field.clone()];
+        let read_type = vec![pk_field];
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let schema_manager = SchemaManager::new(file_io, table_path.to_string());
+
+        KeyValueReadConfig {
+            table_name: "default.dv_kv_test".to_string(),
+            table_options: HashMap::new(),
+            schema_manager,
+            table_schema_id: 0,
+            table_fields,
+            read_type,
+            predicates: Vec::new(),
+            primary_keys: vec!["k".to_string()],
+            merge_engine: MergeEngine::Deduplicate,
+            sequence_fields: Vec::new(),
+            batch_size: 1024,
+        }
+    }
+
+    async fn collect_k_column(reader: KeyValueFileReader, splits: &[DataSplit]) -> Vec<i32> {
+        let stream = reader.read(splits).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b
+                    .column_by_name("k")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Smoke: 4 rows / single row group / DV{1,3} → output rows 0,2 (k=0,k=2).
+    #[tokio::test]
+    async fn test_kv_reader_applies_deletion_vector_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        write_kv_parquet_file(&parquet_path, vec![0, 1, 2, 3], None, None);
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-0", &[1, 3]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 4, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(2));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(file_io, make_kv_config_for_int_pk(&table_path));
+
+        let ks = collect_k_column(reader, &[split]).await;
+        assert_eq!(ks, vec![0, 2]);
+    }
+
+    /// Multi row-group invariant (the test that single-row-group fixtures cannot
+    /// prove): 6 rows across 2 row groups (3 each), DV deletes absolute row 1
+    /// (in RG 0) and absolute row 4 (in RG 1). Expected output uses absolute
+    /// file row positions, not RG-local offsets.
+    #[tokio::test]
+    async fn test_kv_reader_dv_across_row_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        // 6 rows, 2 row groups (3 each): [k=0,1,2 | k=3,4,5]
+        write_kv_parquet_file(&parquet_path, vec![0, 1, 2, 3, 4, 5], None, Some(3));
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        // DV deletes absolute row id 1 (k=1) and 4 (k=4).
+        // If DV were treated as RG-local, the result would be wrong: e.g.
+        // selecting rows 1,4 within each RG would delete k=1,k=4 and also
+        // mistakenly affect k=4 in RG 1 / cross-RG semantics drift.
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-0", &[1, 4]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 6, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(2));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(file_io, make_kv_config_for_int_pk(&table_path));
+
+        let ks = collect_k_column(reader, &[split]).await;
+        // Critical invariant: DV row id is the ABSOLUTE file row position.
+        assert_eq!(ks, vec![0, 2, 3, 5]);
+    }
+
+    /// Empty DV bitmap should pass all rows through (mirror Java
+    /// `KeyValueFileReaderFactory.java:174` skipping the wrap when
+    /// `dv.isEmpty()`). Rust's `dv_to_non_deleted_ranges` returns the full
+    /// row range when the bitmap is empty; this test guards that path.
+    #[tokio::test]
+    async fn test_kv_reader_empty_dv_returns_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        write_kv_parquet_file(&parquet_path, vec![0, 1, 2, 3], None, None);
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-0", &[]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 4, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(0));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(file_io, make_kv_config_for_int_pk(&table_path));
+
+        let ks = collect_k_column(reader, &[split]).await;
+        assert_eq!(ks, vec![0, 1, 2, 3]);
+    }
+
+    /// 64-bit DV end-to-end: 4 rows / single row group / 64-bit DV deleting
+    /// row 0 and row 2 → KV reader output rows 1 and 3. Exercises the full
+    /// stack with `RoaringTreemap`-encoded DV bytes (Stage 2 path).
+    ///
+    /// All deleted positions stay within [0, 4) so the underlying treemap
+    /// has a single high-32 container; cross-32-bit-boundary positions are
+    /// covered by the dedicated test in `core::tests` and the iterator path
+    /// is identical for KV vs raw.
+    #[tokio::test]
+    async fn test_kv_reader_applies_bitmap64_deletion_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        write_kv_parquet_file(&parquet_path, vec![0, 1, 2, 3], None, None);
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let (dv_path, dv_offset, dv_length) =
+            write_test_dv64_blob(dir.path(), "dv-0", &[0u64, 2u64]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 4, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(2));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(file_io, make_kv_config_for_int_pk(&table_path));
+
+        let ks = collect_k_column(reader, &[split]).await;
+        assert_eq!(ks, vec![1, 3]);
+    }
+
+    // ========== Stage 4a: PK raw-read drop_deletes ==========
+    //
+    // These tests cover the DataFileReader path used by `read_pk`'s
+    // raw-read short-circuit (full L1+ split + key non-overlapping). The
+    // important invariants:
+    //   1. Output is byte-equivalent to the sort-merge path for the same
+    //      input — `_VALUE_KIND` stays an internal column; DELETE /
+    //      UPDATE_BEFORE rows must be filtered.
+    //   2. Default `drop_deletes=false` does not change existing raw paths
+    //      (kv_file_reader internal use, data_evolution, append, system tables).
+
+    /// Build a `read_type` with `_VALUE_KIND` prepended (TinyInt). Mirrors
+    /// `table_read.rs::raw_read_type_with_value_kind` so the test does not
+    /// rely on private items.
+    fn raw_read_type_with_value_kind_for_test(user: &[DataField]) -> Vec<DataField> {
+        let mut fields = Vec::with_capacity(user.len() + 1);
+        fields.push(DataField::new(
+            VALUE_KIND_FIELD_ID,
+            VALUE_KIND_FIELD_NAME.to_string(),
+            PaimonDataType::TinyInt(TinyIntType::new()),
+        ));
+        fields.extend_from_slice(user);
+        fields
+    }
+
+    async fn collect_k_column_from_stream(stream: ArrowRecordBatchStream) -> Vec<i32> {
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b
+                    .column_by_name("k")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Stage 4a equivalence: with the same parquet (mixed RowKind) + DV +
+    /// L1+ split, the sort-merge path (`KeyValueFileReader`) and the
+    /// raw-read drop_deletes path (`DataFileReader.with_drop_deletes(true)`)
+    /// produce identical user-visible rows. This is the core correctness
+    /// guarantee for the C5 fix and the F9 batch-read short-circuit.
+    ///
+    /// Mixed RowKind exercises both DV row-selection (drop row 0 via DV) and
+    /// post-decode RowKind filtering (drop DELETE / UPDATE_BEFORE). Only
+    /// k=2 (UPDATE_AFTER) survives both paths.
+    #[tokio::test]
+    async fn test_pk_raw_drop_deletes_equivalent_to_sort_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        // 4 rows; RowKind: INSERT, DELETE, UPDATE_AFTER, UPDATE_BEFORE
+        write_kv_parquet_file(
+            &parquet_path,
+            vec![0, 1, 2, 3],
+            Some(vec![0, 3, 2, 1]),
+            None,
+        );
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        // DV deletes physical row 0 (k=0, INSERT) — verifies DV row-selection.
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-0", &[0]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 4, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(1));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+
+        // Path A: sort-merge (KeyValueFileReader)
+        let kv_reader =
+            KeyValueFileReader::new(file_io.clone(), make_kv_config_for_int_pk(&table_path));
+        let ks_via_kv = collect_k_column(kv_reader, std::slice::from_ref(&split)).await;
+
+        // Path B: raw-read with drop_deletes (DataFileReader)
+        // read_type must contain _VALUE_KIND so the parquet reader actually
+        // pulls the column; with_drop_deletes consumes it for filtering.
+        let user_read_type = vec![DataField::new(
+            0,
+            "k".to_string(),
+            PaimonDataType::Int(crate::spec::IntType::with_nullable(false)),
+        )];
+        let raw_read_type = raw_read_type_with_value_kind_for_test(&user_read_type);
+        let table_fields = vec![DataField::new(
+            0,
+            "k".to_string(),
+            PaimonDataType::Int(crate::spec::IntType::with_nullable(false)),
+        )];
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        let raw_reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            0,
+            table_fields,
+            raw_read_type,
+            Vec::new(),
+            1024,
+        )
+        .with_drop_deletes(true);
+        let stream_b = raw_reader.read(&[split]).unwrap();
+        let ks_via_raw = collect_k_column_from_stream(stream_b).await;
+
+        // Equivalence: byte-for-byte identical user-visible rows.
+        assert_eq!(ks_via_kv, ks_via_raw);
+        // Concrete expected output: DV strips row 0 (k=0). Of the remaining
+        // (k=1 DELETE, k=2 UPDATE_AFTER, k=3 UPDATE_BEFORE) only the
+        // UPDATE_AFTER survives `RowKind::is_add()`.
+        assert_eq!(ks_via_kv, vec![2]);
+    }
+
+    /// C5 reverse: default `drop_deletes=false` keeps DELETE / UPDATE_BEFORE
+    /// rows untouched. Without this guard, the new `with_drop_deletes`
+    /// builder could accidentally regress non-PK / append / system-table
+    /// reads that rely on raw `RowKind` semantics.
+    ///
+    /// `read_type` here intentionally contains `_VALUE_KIND` so the parquet
+    /// reader emits it; we observe the column is preserved end-to-end.
+    #[tokio::test]
+    async fn test_data_file_reader_default_keeps_delete_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        // RowKind: INSERT, DELETE, UPDATE_AFTER, UPDATE_BEFORE
+        write_kv_parquet_file(
+            &parquet_path,
+            vec![0, 1, 2, 3],
+            Some(vec![0, 3, 2, 1]),
+            None,
+        );
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let data_file = make_kv_data_file("data-0.parquet", 4, parquet_size);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+
+        let user_read_type = vec![DataField::new(
+            0,
+            "k".to_string(),
+            PaimonDataType::Int(crate::spec::IntType::with_nullable(false)),
+        )];
+        let read_type = raw_read_type_with_value_kind_for_test(&user_read_type);
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        // No .with_drop_deletes — default is false.
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            0,
+            user_read_type,
+            read_type,
+            Vec::new(),
+            1024,
+        );
+        let stream = reader.read(&[split]).unwrap();
+        let ks = collect_k_column_from_stream(stream).await;
+        // All 4 rows preserved — DELETE and UPDATE_BEFORE are NOT filtered.
+        assert_eq!(ks, vec![0, 1, 2, 3]);
+    }
+
+    /// Multi-column parquet helper for PU/VPU + DV tests. Writes a single
+    /// row group with the physical KV schema:
+    ///   `[_SEQUENCE_NUMBER, _VALUE_KIND, k, v_int, v_str]`.
+    /// `v_ints` / `v_strs` may contain `None` to model partial-update payloads
+    /// where one row leaves a column NULL.
+    fn write_multi_col_parquet_file(
+        path: &Path,
+        ks: Vec<i32>,
+        v_ints: Vec<Option<i32>>,
+        v_strs: Vec<Option<&str>>,
+    ) {
+        use arrow_array::StringArray;
+        let n = ks.len();
+        assert_eq!(v_ints.len(), n);
+        assert_eq!(v_strs.len(), n);
+        let seqs: Vec<i64> = (1..=n as i64).collect();
+        let vks: Vec<i8> = vec![0; n]; // all Insert
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_SEQUENCE_NUMBER", ArrowDataType::Int64, false),
+            ArrowField::new("_VALUE_KIND", ArrowDataType::Int8, false),
+            ArrowField::new("k", ArrowDataType::Int32, false),
+            ArrowField::new("v_int", ArrowDataType::Int32, true),
+            ArrowField::new("v_str", ArrowDataType::Utf8, true),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(seqs)),
+            Arc::new(Int8Array::from(vks)),
+            Arc::new(Int32Array::from(ks)),
+            Arc::new(Int32Array::from(v_ints)),
+            Arc::new(StringArray::from(v_strs)),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn make_kv_data_file_multi_col(
+        file_name: &str,
+        row_count: i64,
+        file_size: i64,
+    ) -> DataFileMeta {
+        // Same as `make_kv_data_file` but reused so test naming reads clearly.
+        make_kv_data_file(file_name, row_count, file_size)
+    }
+
+    fn make_kv_config_for_partial_update(
+        table_path: &str,
+        merge_engine: MergeEngine,
+    ) -> KeyValueReadConfig {
+        let pk = DataField::new(
+            0,
+            "k".to_string(),
+            PaimonDataType::Int(IntType::with_nullable(false)),
+        );
+        let v_int = DataField::new(1, "v_int".to_string(), PaimonDataType::Int(IntType::new()));
+        let v_str = DataField::new(
+            2,
+            "v_str".to_string(),
+            PaimonDataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+        );
+        let table_fields = vec![pk.clone(), v_int.clone(), v_str.clone()];
+        let read_type = vec![pk, v_int, v_str];
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let schema_manager = SchemaManager::new(file_io, table_path.to_string());
+
+        KeyValueReadConfig {
+            table_name: "default.dv_pu_test".to_string(),
+            table_options: HashMap::new(),
+            schema_manager,
+            table_schema_id: 0,
+            table_fields,
+            read_type,
+            predicates: Vec::new(),
+            primary_keys: vec!["k".to_string()],
+            merge_engine,
+            sequence_fields: Vec::new(),
+            batch_size: 1024,
+        }
+    }
+
+    /// PU + DV: two physical rows for PK k=1, the older row carries `v_str`
+    /// only and the newer row carries `v_int` only. DV deletes the older
+    /// physical row (row 0). After DV pre-filter the PartialUpdate merge
+    /// function sees only the newer row, so the user-visible result is just
+    /// `(k=1, v_int=Some(200), v_str=None)`. Without the reject, the read
+    /// pipeline succeeds; with DV stripping the row that owns `v_str`, PU
+    /// cannot synthesize a value for that column — proving DV-pre-filter
+    /// composes correctly with column-wise merge (mirrors Java
+    /// `KeyValueFileReaderFactory.java:173-187@e8938f347`).
+    #[tokio::test]
+    async fn test_kv_reader_partial_update_with_deletion_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        write_multi_col_parquet_file(
+            &parquet_path,
+            vec![1, 1],                  // same PK twice
+            vec![None, Some(200)],       // v_int: only newer row
+            vec![Some("old-str"), None], // v_str: only older row
+        );
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        // DV deletes row 0 (the older partial that owns `v_str`).
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-pu", &[0]);
+
+        let data_file = make_kv_data_file_multi_col("data-0.parquet", 2, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(1));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(
+            file_io,
+            make_kv_config_for_partial_update(&table_path, MergeEngine::PartialUpdate),
+        );
+        let stream = reader.read(&[split]).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut got: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+        for batch in &batches {
+            let ks = batch
+                .column_by_name("k")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let v_ints = batch
+                .column_by_name("v_int")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let v_strs = batch
+                .column_by_name("v_str")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                got.push((
+                    ks.value(i),
+                    if v_ints.is_null(i) {
+                        None
+                    } else {
+                        Some(v_ints.value(i))
+                    },
+                    if v_strs.is_null(i) {
+                        None
+                    } else {
+                        Some(v_strs.value(i).to_string())
+                    },
+                ));
+            }
+        }
+
+        // DV stripped row 0 → only row 1 reaches the PartialUpdate merge
+        // function. `v_str` therefore has no contributor and stays None;
+        // `v_int` is the row's own value 200.
+        assert_eq!(got, vec![(1, Some(200), None)]);
+    }
+
+    /// PU + DV smoke: `PartialUpdate` reader no longer rejects when a split
+    /// has a DV attached. Mirrors Java
+    /// `KeyValueFileReaderFactory.java:173-187@e8938f347` engine-agnostic DV
+    /// wrapping. Uses a single-row PU split + empty DV: DV is present but
+    /// strips no rows, so the row passes through to the merge function and
+    /// the read returns its lone row. The full DV → column-merge interaction
+    /// is covered by `test_kv_reader_partial_update_with_deletion_vector`.
+    #[tokio::test]
+    async fn test_kv_reader_partial_update_dispatch_no_longer_rejects_dv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        write_multi_col_parquet_file(&parquet_path, vec![7], vec![Some(70)], vec![Some("seven")]);
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-pu-empty", &[]);
+
+        let data_file = make_kv_data_file_multi_col("data-0.parquet", 1, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(0));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let reader = KeyValueFileReader::new(
+            file_io,
+            make_kv_config_for_partial_update(&table_path, MergeEngine::PartialUpdate),
+        );
+
+        let result = reader.read(&[split]);
+        assert!(
+            result.is_ok(),
+            "PU + DV split should no longer be rejected up-front; got: {:?}",
+            result.err()
+        );
+        let batches: Vec<RecordBatch> = result.unwrap().try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+    }
+
+    /// VPU + DV smoke: asserts the dispatch no longer rejects with
+    /// `Error::Unsupported`. Constructing a fully-populated MV column
+    /// (`<latest_version, latest_value, all_versioned_values>`) for an e2e
+    /// merge-correctness check is heavy; the structural argument that DV is
+    /// applied at the parquet row_selection layer (before the merge function)
+    /// — the same layer used by the PU+DV e2e test above — covers the
+    /// interaction. This smoke locks down the dispatch surface.
+    #[tokio::test]
+    async fn test_kv_reader_versioned_partial_update_dispatch_no_longer_rejects_dv() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket_dir = dir.path().join("bucket-0");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data-0.parquet");
+        // Use a single-column PK file; the VPU merge function only requires
+        // the MV column when the schema declares one. Without an MV column,
+        // VPU degrades to trivial behavior on a single row, which is enough
+        // to confirm the reject branch is gone. Returns whatever the file
+        // reader yields.
+        write_kv_parquet_file(&parquet_path, vec![42], None, None);
+        let parquet_size = parquet_path.metadata().unwrap().len() as i64;
+
+        let (dv_path, dv_offset, dv_length) = write_test_dv_blob(dir.path(), "dv-vpu-empty", &[]);
+
+        let data_file = make_kv_data_file("data-0.parquet", 1, parquet_size);
+        let deletion_file =
+            DeletionFile::new(local_file_uri(&dv_path), dv_offset, dv_length, Some(0));
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_uri(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file])
+            .with_data_deletion_files(vec![Some(deletion_file)])
+            .build()
+            .unwrap();
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_path = local_file_uri(dir.path());
+        let mut config = make_kv_config_for_int_pk(&table_path);
+        config.merge_engine = MergeEngine::VersionedPartialUpdate;
+        let reader = KeyValueFileReader::new(file_io, config);
+
+        let result = reader.read(&[split]);
+        assert!(
+            result.is_ok(),
+            "VPU + DV split should no longer be rejected up-front; got: {:?}",
+            result.err()
+        );
+        // Drive the stream so any post-dispatch error surfaces. We don't
+        // assert specific rows — the goal is "no Error::Unsupported about
+        // deletion vectors".
+        let stream_result = result.unwrap().try_collect::<Vec<_>>().await;
+        if let Err(crate::Error::Unsupported { ref message }) = stream_result {
+            assert!(
+                !message.contains("deletion vectors"),
+                "VPU+DV should no longer be rejected with Unsupported; got: {message}"
+            );
+        }
     }
 }
