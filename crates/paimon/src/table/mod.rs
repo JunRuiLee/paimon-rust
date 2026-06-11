@@ -38,6 +38,8 @@ pub(crate) mod global_index_scanner;
 mod kv_file_reader;
 mod kv_file_writer;
 pub(crate) mod merge_tree_split_generator;
+#[cfg(test)]
+mod multi_level_mor_tests;
 mod partition_filter;
 mod postpone_file_writer;
 mod prepared_files;

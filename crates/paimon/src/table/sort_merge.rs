@@ -1776,4 +1776,123 @@ mod tests {
             if message.contains("fields.price.aggregate-function")
         ));
     }
+
+    #[tokio::test]
+    async fn test_deduplicate_user_seq_tiebreak_falls_back_to_system_seq() {
+        // When user sequence fields are equal, the deduplicate merge must fall
+        // back to the system `_SEQUENCE_NUMBER` to pick the winner. This covers
+        // the `.then_with(sequence_number)` branch in `compare_sequence_order`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq1", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = make_output_schema();
+
+        // pk=1: both rows share user seq1=100, but s1 has a higher _SEQUENCE_NUMBER
+        // (9 > 5) → s1 must win via the system-sequence tie-breaker.
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![5])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec![Some("low_sys_seq")])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![9])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec![Some("high_sys_seq")])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],   // key: pk
+            1,         // seq index
+            2,         // value_kind index
+            vec![3],   // user sequence field: seq1
+            vec![4],   // value index
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec!["high_sys_seq"]);
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_non_nullable_missing_column_errors() {
+        // A non-nullable output column that no input row ever fills (all NULL)
+        // must surface a DataInvalid error rather than emitting a NULL.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("v_req", DataType::Int32, true),
+        ]));
+        // Output declares v_req as NON-nullable.
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("v_req", DataType::Int32, false),
+        ]));
+
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![None])),
+            ],
+        )
+        .unwrap()]);
+
+        let err = SortMergeReaderBuilder::new(
+            vec![s0],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3], // v_req
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::DataInvalid { message, .. }
+            if message.contains("non-nullable field 'v_req'")
+        ));
+    }
 }

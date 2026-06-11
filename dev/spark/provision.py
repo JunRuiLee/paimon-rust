@@ -20,11 +20,28 @@
 # Provisions Paimon tables into the warehouse (file:/tmp/paimon-warehouse)
 # for paimon-rust integration tests to read.
 
+import json
 import shutil
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from pyspark.sql import SparkSession
+
+
+def _dump_oracle(spark, warehouse_path: Path, name: str, query: str) -> None:
+    """Run ``query`` in Spark and persist the rows as a differential oracle.
+
+    The paimon-rust integration tests read the same table and compare their
+    result against this Java/Spark-produced output. The oracle lives under
+    ``<warehouse>/_rust_expected/<name>.json`` (not a ``*.db`` directory, so the
+    Rust FileSystemCatalog never mistakes it for a database). Each row is stored
+    as a list of values in the SELECT column order; callers must add a stable
+    ``ORDER BY`` so the file is deterministic.
+    """
+    rows = [list(r) for r in spark.sql(query).collect()]
+    out_dir = warehouse_path / "_rust_expected"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{name}.json").write_text(json.dumps({"rows": rows}))
 
 
 def _warehouse_path_from_spark_conf(spark: SparkSession) -> Path:
@@ -1067,6 +1084,122 @@ def main():
     )
     # Compact to promote level-0 files so the batch reader can see them.
     spark.sql("CALL sys.compact('default.first_row_pk_table')")
+
+
+    # ===== Multi-level MOR tables (Java-compacted differential fixtures) =====
+    # These exercise genuine cross-LSM-level merge-on-read: Spark runs a real
+    # compaction (promoting files to level >= 1), then a final un-compacted
+    # INSERT adds level-0 files that overlap the compacted keys. At read time
+    # the reader must sort-merge L0 + L1 and pick the correct winner. The
+    # paimon-rust read is diffed against the Spark-produced oracle dumped below.
+    # A high compaction trigger keeps auto-compaction from firing so the layout
+    # is driven solely by the explicit `sys.compact` call + the final INSERT.
+
+    # Deduplicate engine.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS mor_dedup_multi_level (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '1',
+            'merge-engine' = 'deduplicate',
+            'num-sorted-run.compaction-trigger' = '5'
+        )
+        """
+    )
+    spark.sql("INSERT INTO mor_dedup_multi_level VALUES (1, 10), (2, 20), (3, 30)")
+    spark.sql("INSERT INTO mor_dedup_multi_level VALUES (1, 11), (2, 21), (4, 40)")
+    spark.sql("INSERT INTO mor_dedup_multi_level VALUES (1, 12), (3, 31), (5, 50)")
+    # Full compaction promotes everything to level >= 1.
+    spark.sql("CALL sys.compact('default.mor_dedup_multi_level')")
+    # Fresh, un-compacted level-0 rows overlapping the compacted keys.
+    spark.sql("INSERT INTO mor_dedup_multi_level VALUES (1, 999), (2, 888)")
+    _dump_oracle(
+        spark,
+        warehouse_path,
+        "mor_dedup_multi_level",
+        "SELECT id, value FROM mor_dedup_multi_level ORDER BY id",
+    )
+
+    # Partial-update engine: per-column updates spread across levels.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS mor_partial_update_multi_level (
+            id INT,
+            a INT,
+            b INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '1',
+            'merge-engine' = 'partial-update',
+            'num-sorted-run.compaction-trigger' = '5'
+        )
+        """
+    )
+    spark.sql(
+        "INSERT INTO mor_partial_update_multi_level VALUES "
+        "(1, 10, CAST(NULL AS INT)), (2, 20, CAST(NULL AS INT))"
+    )
+    spark.sql(
+        "INSERT INTO mor_partial_update_multi_level VALUES "
+        "(1, CAST(NULL AS INT), 100), (2, CAST(NULL AS INT), 200)"
+    )
+    spark.sql("CALL sys.compact('default.mor_partial_update_multi_level')")
+    # Fresh level-0 row updates column `a` for id=1 only.
+    spark.sql(
+        "INSERT INTO mor_partial_update_multi_level VALUES "
+        "(1, 11, CAST(NULL AS INT))"
+    )
+    _dump_oracle(
+        spark,
+        warehouse_path,
+        "mor_partial_update_multi_level",
+        "SELECT id, a, b FROM mor_partial_update_multi_level ORDER BY id",
+    )
+
+    # Deduplicate engine combining TWO dimensions: cross-LSM-level merge AND
+    # schema-version evolution driven purely by an option change (no column
+    # change). The sequence is:
+    #   1. INSERT under schema-0, then `sys.compact` -> level >= 1 file at schema 0.
+    #   2. ALTER ... SET TBLPROPERTIES -> bumps the table to schema-1.
+    #   3. INSERT overlapping keys -> fresh level-0 file at schema-1.
+    # At read time one split holds a compacted file (schema_id=0) and an
+    # un-compacted file (schema_id=1) that overlap on keys, so the reader must
+    # sort-merge across BOTH levels and schema ids. Diffed against Spark.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS mor_dedup_schema_evolution (
+            id INT,
+            value INT
+        ) USING paimon
+        TBLPROPERTIES (
+            'primary-key' = 'id',
+            'bucket' = '1',
+            'merge-engine' = 'deduplicate',
+            'num-sorted-run.compaction-trigger' = '5'
+        )
+        """
+    )
+    spark.sql("INSERT INTO mor_dedup_schema_evolution VALUES (1, 10), (2, 20), (3, 30)")
+    # Compact the schema-0 data to a level >= 1 file (still tagged schema_id=0).
+    spark.sql("CALL sys.compact('default.mor_dedup_schema_evolution')")
+    # Option-only change -> schema-1 (columns unchanged).
+    spark.sql(
+        "ALTER TABLE mor_dedup_schema_evolution "
+        "SET TBLPROPERTIES ('source.split.open-file-cost' = '4mb')"
+    )
+    # Fresh level-0 rows written under schema-1, overlapping keys 1 and 2.
+    spark.sql("INSERT INTO mor_dedup_schema_evolution VALUES (1, 111), (2, 222)")
+    _dump_oracle(
+        spark,
+        warehouse_path,
+        "mor_dedup_schema_evolution",
+        "SELECT id, value FROM mor_dedup_schema_evolution ORDER BY id",
+    )
 
 
 if __name__ == "__main__":

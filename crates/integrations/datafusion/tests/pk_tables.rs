@@ -29,8 +29,8 @@
 mod common;
 
 use common::{
-    collect_id_name, collect_id_value, collect_int_int_str, create_sql_context, create_test_env,
-    row_count, setup_sql_context,
+    collect_id_name, collect_id_value, collect_int_int_str, collect_three_ints, create_sql_context,
+    create_test_env, row_count, setup_sql_context,
 };
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use paimon::catalog::Identifier;
@@ -2079,5 +2079,248 @@ async fn test_pk_partial_update_merges_across_tiny_splits() {
     assert_eq!(
         collect_int_int_str(&batches),
         vec![(1, 100, "hello".to_string())]
+    );
+}
+
+// ======================= read.batch-size boundary =======================
+
+/// A small `read.batch-size` forces the sort-merge reader to flush its output
+/// across multiple batches. The merged result must remain correct across those
+/// batch-flush boundaries (exercises the reader's batch buffer compaction):
+/// every key appears exactly once with its newest value.
+#[tokio::test]
+async fn test_pk_dedup_read_batch_size_boundary() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_batch_boundary (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '1', 'read.batch-size' = '2')",
+        )
+        .await
+        .unwrap();
+
+    // Two commits over the same five keys; the second carries newer values.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_batch_boundary VALUES \
+             (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_batch_boundary VALUES \
+             (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_batch_boundary",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, 100), (2, 200), (3, 300), (4, 400), (5, 500)],
+        "every key merged once with newest value across batch boundaries"
+    );
+}
+
+/// Same batch-boundary stress for the partial-update engine: per-column updates
+/// must combine correctly even when the merged output is split across multiple
+/// small read batches.
+#[tokio::test]
+async fn test_pk_partial_update_read_batch_size_boundary() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_batch_boundary_pu (
+                id INT NOT NULL, a INT, b INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'partial-update',
+                'read.batch-size' = '2'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // First commit fills `a`, second fills `b`, for four keys.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_batch_boundary_pu VALUES \
+             (1, 11, CAST(NULL AS INT)), (2, 22, CAST(NULL AS INT)), \
+             (3, 33, CAST(NULL AS INT)), (4, 44, CAST(NULL AS INT))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_batch_boundary_pu VALUES \
+             (1, CAST(NULL AS INT), 1), (2, CAST(NULL AS INT), 2), \
+             (3, CAST(NULL AS INT), 3), (4, CAST(NULL AS INT), 4)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, a, b FROM paimon.test_db.t_batch_boundary_pu")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    // collect_three_ints sorts by (b, id); here b == id so this is id order.
+    assert_eq!(
+        collect_three_ints(&batches),
+        vec![(1, 11, 1), (2, 22, 2), (3, 33, 3), (4, 44, 4)]
+    );
+}
+
+// ======================= schema version evolution (options) =======================
+
+/// Changing a table option via ALTER TABLE SET TBLPROPERTIES bumps the schema
+/// id (schema-0 -> schema-1) without touching columns. Data files written
+/// before and after the change carry different `schema_id`s. The MOR reader
+/// must still merge them correctly per key (exercises the
+/// `file_meta.schema_id != table_schema_id` path in `kv_file_reader.rs`).
+#[tokio::test]
+async fn test_pk_dedup_schema_evolution_via_options() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_schema_evo (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '1')",
+        )
+        .await
+        .unwrap();
+
+    // schema-0 data.
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_schema_evo VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Option-only change -> schema-1 (no column change). open-file-cost only
+    // affects split planning, so the merged result is unaffected by the bump.
+    sql_context
+        .sql(
+            "ALTER TABLE paimon.test_db.t_schema_evo \
+             SET TBLPROPERTIES ('source.split.open-file-cost' = '4mb')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // schema-1 data, overlapping keys 1 and 2 with newer values.
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_schema_evo VALUES (1, 100), (2, 200), (4, 40)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let rows = collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_schema_evo",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![(1, 100), (2, 200), (3, 30), (4, 40)],
+        "dedup must merge across schema_ids: newest value per key"
+    );
+}
+
+/// Same schema-version bump for the partial-update engine: per-column updates
+/// written under different schema ids must still combine into one row.
+#[tokio::test]
+async fn test_pk_partial_update_schema_evolution_via_options() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_schema_evo_pu (
+                id INT NOT NULL, a INT, b INT,
+                PRIMARY KEY (id)
+            ) WITH ('bucket' = '1', 'merge-engine' = 'partial-update')",
+        )
+        .await
+        .unwrap();
+
+    // schema-0: fill column `a`.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_schema_evo_pu VALUES \
+             (1, 10, CAST(NULL AS INT)), (2, 20, CAST(NULL AS INT))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "ALTER TABLE paimon.test_db.t_schema_evo_pu \
+             SET TBLPROPERTIES ('source.split.open-file-cost' = '4mb')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // schema-1: fill column `b` for the same keys.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_schema_evo_pu VALUES \
+             (1, CAST(NULL AS INT), 100), (2, CAST(NULL AS INT), 200)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, a, b FROM paimon.test_db.t_schema_evo_pu")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    // collect_three_ints sorts by (b, id); b differs per id so still id order.
+    assert_eq!(
+        collect_three_ints(&batches),
+        vec![(1, 10, 100), (2, 20, 200)],
+        "partial-update must merge columns across schema_ids"
     );
 }
