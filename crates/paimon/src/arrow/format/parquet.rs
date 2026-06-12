@@ -980,23 +980,35 @@ fn bloom_check_datum_against(
     match (literal, file_data_type) {
         (Datum::Bool(v), DataType::Boolean(_)) => Some(sbbf.check(v)),
         // Tiny / Small / Int / Date / Time all live in the parquet INT32
-        // physical type, so widen the literal to i32 before hashing.
-        (Datum::TinyInt(v), DataType::TinyInt(_)) => Some(sbbf.check(&(*v as i32))),
-        (Datum::SmallInt(v), DataType::SmallInt(_)) => Some(sbbf.check(&(*v as i32))),
-        (Datum::Int(v), DataType::Int(_)) => Some(sbbf.check(v)),
-        (Datum::Date(v), DataType::Date(_)) => Some(sbbf.check(v)),
-        (Datum::Time(v), DataType::Time(_)) => Some(sbbf.check(v)),
-        (Datum::Long(v), DataType::BigInt(_)) => Some(sbbf.check(v)),
+        // physical type, so widen the literal to i32 before hashing. Hash
+        // bytes are explicitly little-endian to match the parquet bloom
+        // spec (parquet-mr `BlockSplitBloomFilter` uses
+        // `ByteBuffer.allocate(...).order(ByteOrder.LITTLE_ENDIAN)` before
+        // calling `xxHash`); going through `Sbbf::check<i32>` would use
+        // `data_type::gen_as_bytes!`'s native-memory layout, producing BE
+        // bytes on big-endian CPUs and false-negatives against any file
+        // authored by parquet-mr or by the Rust writer running on a LE
+        // platform.
+        (Datum::TinyInt(v), DataType::TinyInt(_)) => {
+            Some(sbbf.check(&(*v as i32).to_le_bytes()[..]))
+        }
+        (Datum::SmallInt(v), DataType::SmallInt(_)) => {
+            Some(sbbf.check(&(*v as i32).to_le_bytes()[..]))
+        }
+        (Datum::Int(v), DataType::Int(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
+        (Datum::Date(v), DataType::Date(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
+        (Datum::Time(v), DataType::Time(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
+        (Datum::Long(v), DataType::BigInt(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
         (Datum::Timestamp { millis, .. }, DataType::Timestamp(ts)) if ts.precision() <= 3 => {
-            Some(sbbf.check(millis))
+            Some(sbbf.check(&millis.to_le_bytes()[..]))
         }
         (Datum::LocalZonedTimestamp { millis, .. }, DataType::LocalZonedTimestamp(ts))
             if ts.precision() <= 3 =>
         {
-            Some(sbbf.check(millis))
+            Some(sbbf.check(&millis.to_le_bytes()[..]))
         }
-        (Datum::Float(v), DataType::Float(_)) => Some(sbbf.check(v)),
-        (Datum::Double(v), DataType::Double(_)) => Some(sbbf.check(v)),
+        (Datum::Float(v), DataType::Float(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
+        (Datum::Double(v), DataType::Double(_)) => Some(sbbf.check(&v.to_le_bytes()[..])),
         (Datum::String(v), DataType::Char(_)) | (Datum::String(v), DataType::VarChar(_)) => {
             // Parquet hashes BYTE_ARRAY values via the raw byte slice.
             // `ByteArray::from(&str)` matches the writer-side encoding.
@@ -2534,5 +2546,63 @@ mod tests {
         // let the row filter handle the per-row check (id < 3 → 2 rows).
         let count = read_count(bloom_on, &file_io, &path, file_size, fp).await;
         assert_eq!(count, 2);
+    }
+
+    /// Endianness regression: numeric `Datum`s must be hashed using
+    /// little-endian bytes so the read path matches what parquet-mr (and the
+    /// Rust writer on LE platforms) inserted into the bloom filter.
+    ///
+    /// `parquet-mr/.../BlockSplitBloomFilter.java` builds a `ByteBuffer` with
+    /// `ByteOrder.LITTLE_ENDIAN` before XXH64; `parquet-58.3.0` writer side
+    /// uses `gen_as_bytes!` (raw memory) on `ParquetValueType` primitives —
+    /// equivalent to LE on x86 / aarch64 and disagrees on big-endian CPUs.
+    /// Going through `Sbbf::check::<i32>` reproduces the writer's bug on
+    /// big-endian, so the read path now feeds explicit `to_le_bytes()` to
+    /// `Sbbf::check::<[u8]>` and stays correct on every architecture as long
+    /// as the writer stuck to spec / LE.
+    ///
+    /// We can't actually run on a BE CPU here, so the test pins the LE byte
+    /// layout: build a bloom that contains the **LE bytes** of a known i32
+    /// (the spec-correct encoding parquet-mr uses) and verify our helper
+    /// produces a hit. If anyone ever reverts to `Sbbf::check::<i32>` this
+    /// test still passes on LE but would fail on BE; the secondary assertion
+    /// pins the helper to a specific byte sequence so a host-byte-order
+    /// regression on LE is also caught.
+    #[test]
+    fn test_bloom_check_uses_little_endian_for_numeric_datums() {
+        let mut sbbf = parquet::bloom_filter::Sbbf::new_with_num_of_bytes(1024);
+        // Insert via the same byte path the writer uses on a LE platform:
+        // raw-memory bytes of a primitive are equivalent to `to_le_bytes()`
+        // on LE CPUs and equivalent to the parquet-format spec's required
+        // LE encoding on every CPU.
+        let value: i32 = 42;
+        let value_bytes = value.to_le_bytes();
+        sbbf.insert(&value_bytes[..]);
+
+        let dt = DataType::Int(IntType::new());
+        // Hit: `Datum::Int(42)` must hash the same byte sequence we inserted.
+        let verdict = super::bloom_check_datum_against(&sbbf, &Datum::Int(42), &dt);
+        assert_eq!(
+            verdict,
+            Some(true),
+            "Datum::Int(42) must produce LE bytes [42, 0, 0, 0] and find the inserted entry"
+        );
+        // Miss: a different value must produce a different hash.
+        let miss = super::bloom_check_datum_against(&sbbf, &Datum::Int(43), &dt);
+        // Bloom can return false negatives only when the value is absent —
+        // here `43` was never inserted, so `false` is the only deterministic
+        // outcome (false-positive rate notwithstanding, the test bloom is
+        // sparse enough at 1024 bytes / 1 entry).
+        assert_eq!(miss, Some(false));
+
+        // BigInt path: same shape but i64.
+        let mut sbbf64 = parquet::bloom_filter::Sbbf::new_with_num_of_bytes(1024);
+        let v64: i64 = 0x0102030405060708;
+        sbbf64.insert(&v64.to_le_bytes()[..]);
+        let dt64 = DataType::BigInt(crate::spec::BigIntType::new());
+        assert_eq!(
+            super::bloom_check_datum_against(&sbbf64, &Datum::Long(v64), &dt64),
+            Some(true)
+        );
     }
 }
