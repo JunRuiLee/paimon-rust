@@ -62,6 +62,11 @@ pub(crate) struct ParquetFormatReader {
     /// page-level stats for additional `RowSelection` pruning. Sourced from
     /// `CoreOptions::parquet_page_index_enabled()` by callers.
     pub(crate) page_index_enabled: bool,
+    /// Whether to consult parquet bloom filters for `Eq` / `In` leaf
+    /// predicates and skip row groups proven absent. Sourced from
+    /// `CoreOptions::parquet_bloom_filter_enabled()` by callers; default
+    /// false because the writer does not currently emit bloom filters.
+    pub(crate) bloom_filter_enabled: bool,
 }
 
 /// Parquet implementation of [`FormatFileWriter`].
@@ -218,6 +223,22 @@ impl FormatFileReader for ParquetFormatReader {
                 file_fields,
             )?;
             combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
+        }
+
+        // Bloom-filter row-group prune (Eq / In leaves only). Off by default
+        // because the writer does not currently emit bloom filters; readers
+        // opt in when their data was authored with bloom support. Each
+        // bloom fetch is one extra async I/O per row group, so when the
+        // toggle is on we still skip the work for predicate-less reads.
+        if self.bloom_filter_enabled && !preds.is_empty() {
+            let skip = bloom_check_row_groups(&mut batch_stream_builder, preds, file_fields).await?;
+            if let Some(bloom_selection) = bloom_skipped_row_groups_selection(
+                batch_stream_builder.metadata().row_groups(),
+                &skip,
+            ) {
+                combined_selection =
+                    intersect_optional_row_selections(combined_selection, Some(bloom_selection));
+            }
         }
 
         if let Some(ref ranges) = row_selection {
@@ -937,6 +958,216 @@ fn build_predicate_page_selection(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Bloom filter row-group pruning (Stage 2 of P7)
+// ---------------------------------------------------------------------------
+
+/// Hash a paimon literal for `Sbbf::check` according to the parquet bloom
+/// filter spec: hashes are taken over the column's physical-type bytes, so
+/// each `(Datum, file DataType)` shape needs its own `check::<T>` call to
+/// dispatch into the right `parquet::data_type::AsBytes` impl. Returns
+/// `Some(true)` when the bloom filter says the value *may* be present (we
+/// keep the row group), `Some(false)` when bloom proves it absent (we can
+/// skip the row group), and `None` when the literal cannot be projected onto
+/// the column's physical type — in that case the caller must fall open
+/// (treat the row group as a possible match).
+fn bloom_check_datum_against(
+    sbbf: &parquet::bloom_filter::Sbbf,
+    literal: &Datum,
+    file_data_type: &DataType,
+) -> Option<bool> {
+    use parquet::data_type::ByteArray;
+    match (literal, file_data_type) {
+        (Datum::Bool(v), DataType::Boolean(_)) => Some(sbbf.check(v)),
+        // Tiny / Small / Int / Date / Time all live in the parquet INT32
+        // physical type, so widen the literal to i32 before hashing.
+        (Datum::TinyInt(v), DataType::TinyInt(_)) => Some(sbbf.check(&(*v as i32))),
+        (Datum::SmallInt(v), DataType::SmallInt(_)) => Some(sbbf.check(&(*v as i32))),
+        (Datum::Int(v), DataType::Int(_)) => Some(sbbf.check(v)),
+        (Datum::Date(v), DataType::Date(_)) => Some(sbbf.check(v)),
+        (Datum::Time(v), DataType::Time(_)) => Some(sbbf.check(v)),
+        (Datum::Long(v), DataType::BigInt(_)) => Some(sbbf.check(v)),
+        (Datum::Timestamp { millis, .. }, DataType::Timestamp(ts)) if ts.precision() <= 3 => {
+            Some(sbbf.check(millis))
+        }
+        (Datum::LocalZonedTimestamp { millis, .. }, DataType::LocalZonedTimestamp(ts))
+            if ts.precision() <= 3 =>
+        {
+            Some(sbbf.check(millis))
+        }
+        (Datum::Float(v), DataType::Float(_)) => Some(sbbf.check(v)),
+        (Datum::Double(v), DataType::Double(_)) => Some(sbbf.check(v)),
+        (Datum::String(v), DataType::Char(_)) | (Datum::String(v), DataType::VarChar(_)) => {
+            // Parquet hashes BYTE_ARRAY values via the raw byte slice.
+            // `ByteArray::from(&str)` matches the writer-side encoding.
+            let bytes = ByteArray::from(v.as_str());
+            Some(sbbf.check(&bytes))
+        }
+        (Datum::Bytes(v), DataType::Binary(_)) | (Datum::Bytes(v), DataType::VarBinary(_)) => {
+            let bytes = ByteArray::from(v.as_slice());
+            Some(sbbf.check(&bytes))
+        }
+        // Decimal, sub-millisecond timestamps, and any cross-type combinations
+        // (e.g. Datum::Int against a BigInt column) fall through to fail-open:
+        // bloom filter encoding is physical-type sensitive and we don't want
+        // to silently mis-hash.
+        _ => None,
+    }
+}
+
+/// Outcome of bloom-filtering one leaf predicate against one row group's
+/// column bloom filter:
+/// * `Skip` — bloom proves no row in this group can satisfy the leaf, the
+///   caller can drop the entire row group.
+/// * `Keep` — bloom says the value may be present (or bloom unavailable /
+///   literal not encodable); leave the row group to downstream filters.
+enum BloomVerdict {
+    Skip,
+    Keep,
+}
+
+async fn evaluate_bloom_for_leaf<'a, T: AsyncFileReader + Send + Sync + 'static>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    rg_idx: usize,
+    column_idx: usize,
+    op: PredicateOperator,
+    literals: &[Datum],
+    file_data_type: &DataType,
+) -> crate::Result<BloomVerdict> {
+    // Bloom only refutes equality. Any other op leaves the row group keep.
+    if !matches!(op, PredicateOperator::Eq | PredicateOperator::In) {
+        return Ok(BloomVerdict::Keep);
+    }
+    let sbbf = match builder
+        .get_row_group_column_bloom_filter(rg_idx, column_idx)
+        .await
+    {
+        Ok(Some(s)) => s,
+        // No bloom filter for this column or fetch failed: fall open.
+        Ok(None) => return Ok(BloomVerdict::Keep),
+        Err(e) => {
+            return Err(crate::Error::DataInvalid {
+                message: format!("Failed to read parquet bloom filter: {e}"),
+                source: Some(Box::new(e)),
+            });
+        }
+    };
+
+    let mut any_kept = false;
+    let mut any_unencodable = false;
+    for literal in literals {
+        match bloom_check_datum_against(&sbbf, literal, file_data_type) {
+            // Literal definitely absent — keep checking other literals (for
+            // `In`, all of them must say absent before we can skip).
+            Some(false) => continue,
+            // Literal may be present. For `Eq` (a single literal) this means
+            // keep; for `In` even one possible match means keep.
+            Some(true) => {
+                any_kept = true;
+                break;
+            }
+            None => {
+                // Couldn't encode the literal; we can't safely use bloom.
+                any_unencodable = true;
+                break;
+            }
+        }
+    }
+    if any_unencodable || any_kept {
+        Ok(BloomVerdict::Keep)
+    } else {
+        // Eq path with no match, or In path where every literal said absent.
+        Ok(BloomVerdict::Skip)
+    }
+}
+
+/// Walk the predicates and for each `Eq` / `In` leaf consult the matching
+/// column's bloom filter. A row group is skipped only when **some** leaf's
+/// bloom proves no match (AND of leaves over a single row group ⇒ a single
+/// proven-absent leaf is enough). All other ops, missing bloom filters, or
+/// unencodable literals fall open.
+///
+/// Returns the set of row group indices that should be skipped. Empty set
+/// means "no skips contributed by bloom" (caller leaves the existing
+/// row-group selection alone).
+async fn bloom_check_row_groups<T: AsyncFileReader + Send + Sync + 'static>(
+    builder: &mut ParquetRecordBatchStreamBuilder<T>,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<std::collections::HashSet<usize>> {
+    let mut skip = std::collections::HashSet::new();
+    let row_group_count = builder.metadata().row_groups().len();
+    if row_group_count == 0 || predicates.is_empty() || file_fields.is_empty() {
+        return Ok(skip);
+    }
+
+    // Resolve each file_field to the column index inside the row group's
+    // schema. The mapping is identical for every row group, so compute once.
+    let columns = builder.metadata().row_groups()[0].columns();
+    let column_indices = build_row_group_column_indices(columns, file_fields);
+
+    // Each conjunct must hold for a row group to be relevant; we therefore
+    // skip the row group as soon as *any* conjunct's bloom proves absent.
+    for rg_idx in 0..row_group_count {
+        for predicate in predicates {
+            let Predicate::Leaf {
+                index,
+                op,
+                literals,
+                ..
+            } = predicate
+            else {
+                continue;
+            };
+            let Some(column_idx) = column_indices.get(*index).copied().flatten() else {
+                continue;
+            };
+            let Some(file_data_type) = file_fields.get(*index).map(|f| f.data_type()) else {
+                continue;
+            };
+            match evaluate_bloom_for_leaf(
+                builder,
+                rg_idx,
+                column_idx,
+                *op,
+                literals,
+                file_data_type,
+            )
+            .await?
+            {
+                BloomVerdict::Skip => {
+                    skip.insert(rg_idx);
+                    break; // No need to check other leaves for this rg.
+                }
+                BloomVerdict::Keep => {}
+            }
+        }
+    }
+    Ok(skip)
+}
+
+/// Compose a `RowSelection` that skips exactly the row groups marked by
+/// bloom filtering. Returns `None` when nothing was skipped, so the caller
+/// can leave any existing selection alone.
+fn bloom_skipped_row_groups_selection(
+    row_groups: &[RowGroupMetaData],
+    skip: &std::collections::HashSet<usize>,
+) -> Option<RowSelection> {
+    if skip.is_empty() {
+        return None;
+    }
+    let mut selectors = Vec::with_capacity(row_groups.len());
+    for (idx, rg) in row_groups.iter().enumerate() {
+        let n = rg.num_rows() as usize;
+        if skip.contains(&idx) {
+            selectors.push(RowSelector::skip(n));
+        } else {
+            selectors.push(RowSelector::select(n));
+        }
+    }
+    Some(selectors.into())
+}
+
 fn build_row_group_column_indices(
     columns: &[parquet::file::metadata::ColumnChunkMetaData],
     file_fields: &[DataField],
@@ -1551,11 +1782,12 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::ParquetFormatWriter;
-    use crate::arrow::format::FormatFileWriter;
+    use crate::arrow::format::{FormatFileReader, FormatFileWriter};
     use crate::io::FileIOBuilder;
     use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::StreamExt;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::sync::Arc;
 
@@ -2107,5 +2339,200 @@ mod tests {
             sel.is_none(),
             "without page index loaded, helper must fall open (got {sel:?})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bloom filter row-group prune tests (Stage 2 of P7)
+    // -----------------------------------------------------------------------
+
+    /// Write a parquet file with bloom filters enabled on the `id` column.
+    /// Returns (file_io, path, file_size). One row group, 3 rows so the
+    /// helpers exercise per-row-group bloom checks.
+    async fn write_parquet_with_bloom(
+        ids: Vec<i32>,
+        values: Vec<i32>,
+    ) -> (crate::io::FileIO, String, u64) {
+        use parquet::arrow::AsyncArrowWriter;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_bloom.parquet".to_string();
+        let output = file_io.new_output(&path).unwrap();
+
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .build();
+
+        let async_write = output.async_writer().await.unwrap();
+        let mut writer = AsyncArrowWriter::try_new(async_write, schema.clone(), Some(props))
+            .expect("create async writer with bloom");
+        let batch = writer_test_batch(&schema, ids, values);
+        writer.write(&batch).await.expect("write batch");
+        writer.close().await.expect("close writer");
+
+        let metadata = file_io.new_input(&path).unwrap().metadata().await.unwrap();
+        (file_io, path, metadata.size)
+    }
+
+    fn int_eq_file_predicate(value: i32) -> super::FilePredicates {
+        let fields = vec![int_field("id"), int_field("value")];
+        super::FilePredicates {
+            predicates: vec![build_int_eq_predicate(value)],
+            file_fields: fields,
+        }
+    }
+
+    fn int_in_file_predicate(values: Vec<i32>) -> super::FilePredicates {
+        let fields = vec![int_field("id"), int_field("value")];
+        let literals = values.into_iter().map(Datum::Int).collect();
+        let pred = super::Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: super::PredicateOperator::In,
+            literals,
+        };
+        super::FilePredicates {
+            predicates: vec![pred],
+            file_fields: fields,
+        }
+    }
+
+    async fn read_count(
+        reader: super::ParquetFormatReader,
+        file_io: &crate::io::FileIO,
+        path: &str,
+        file_size: u64,
+        predicates: super::FilePredicates,
+    ) -> usize {
+        let read_fields = vec![int_field("id"), int_field("value")];
+        let input_reader = file_io.new_input(path).unwrap().reader().await.unwrap();
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(input_reader),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut total = 0;
+        while let Some(b) = stream.next().await {
+            total += b.unwrap().num_rows();
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_skips_row_group_when_value_absent() {
+        let (file_io, path, file_size) =
+            write_parquet_with_bloom(vec![1, 2, 3], vec![10, 20, 30]).await;
+        // Predicate Eq(999) cannot match — bloom should let us skip the
+        // whole row group with `bloom_filter_enabled = true`.
+        let bloom_on = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: true,
+        };
+        let bloom_off = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: false,
+        };
+        let count_on = read_count(bloom_on, &file_io, &path, file_size, int_eq_file_predicate(999))
+            .await;
+        let count_off = read_count(
+            bloom_off,
+            &file_io,
+            &path,
+            file_size,
+            int_eq_file_predicate(999),
+        )
+        .await;
+        // Bloom on must produce zero rows. Bloom off relies on per-row
+        // RowFilter to drop the rows; the row-group itself is read but the
+        // RowFilter rejects every row.
+        assert_eq!(count_on, 0, "bloom on: row group must be skipped");
+        assert_eq!(count_off, 0, "bloom off: row filter still rejects all rows");
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_keeps_row_group_when_value_present() {
+        let (file_io, path, file_size) =
+            write_parquet_with_bloom(vec![1, 2, 3], vec![10, 20, 30]).await;
+        let bloom_on = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: true,
+        };
+        // Eq(2) is in the data — bloom must say "may be present", and the
+        // row filter then keeps exactly the matching row.
+        let count = read_count(bloom_on, &file_io, &path, file_size, int_eq_file_predicate(2))
+            .await;
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_in_with_at_least_one_present_keeps_group() {
+        let (file_io, path, file_size) =
+            write_parquet_with_bloom(vec![1, 2, 3], vec![10, 20, 30]).await;
+        let bloom_on = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: true,
+        };
+        // In(999, 2) — 2 is in data, 999 is not. Bloom must keep the group
+        // because at least one literal may be present.
+        let count = read_count(
+            bloom_on,
+            &file_io,
+            &path,
+            file_size,
+            int_in_file_predicate(vec![999, 2]),
+        )
+        .await;
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_in_with_all_absent_skips_group() {
+        let (file_io, path, file_size) =
+            write_parquet_with_bloom(vec![1, 2, 3], vec![10, 20, 30]).await;
+        let bloom_on = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: true,
+        };
+        let count = read_count(
+            bloom_on,
+            &file_io,
+            &path,
+            file_size,
+            int_in_file_predicate(vec![100, 200, 300]),
+        )
+        .await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bloom_filter_lt_predicate_falls_open() {
+        let (file_io, path, file_size) =
+            write_parquet_with_bloom(vec![1, 2, 3], vec![10, 20, 30]).await;
+        let bloom_on = super::ParquetFormatReader {
+            page_index_enabled: false,
+            bloom_filter_enabled: true,
+        };
+        let fields = vec![int_field("id"), int_field("value")];
+        let pred = super::Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: super::PredicateOperator::Lt,
+            literals: vec![Datum::Int(3)],
+        };
+        let fp = super::FilePredicates {
+            predicates: vec![pred],
+            file_fields: fields,
+        };
+        // Bloom can only refute Eq/In; for Lt the helper must fall open and
+        // let the row filter handle the per-row check (id < 3 → 2 rows).
+        let count = read_count(bloom_on, &file_io, &path, file_size, fp).await;
+        assert_eq!(count, 2);
     }
 }

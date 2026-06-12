@@ -57,6 +57,10 @@ pub(crate) struct DataFileReader {
     /// from `CoreOptions::parquet_page_index_enabled()` by callers; ignored
     /// for non-parquet file formats.
     parquet_page_index_enabled: bool,
+    /// Whether the parquet format reader should consult bloom filters for
+    /// Eq / In leaf predicates. Sourced from
+    /// `CoreOptions::parquet_bloom_filter_enabled()` by callers.
+    parquet_bloom_filter_enabled: bool,
 }
 
 impl DataFileReader {
@@ -69,6 +73,7 @@ impl DataFileReader {
         predicates: Vec<Predicate>,
         batch_size: usize,
         parquet_page_index_enabled: bool,
+        parquet_bloom_filter_enabled: bool,
     ) -> Self {
         Self {
             file_io,
@@ -81,6 +86,7 @@ impl DataFileReader {
             drop_deletes: false,
             batch_size,
             parquet_page_index_enabled,
+            parquet_bloom_filter_enabled,
         }
     }
 
@@ -197,6 +203,7 @@ impl DataFileReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let drop_deletes = self.drop_deletes;
         let parquet_page_index_enabled = self.parquet_page_index_enabled;
+        let parquet_bloom_filter_enabled = self.parquet_bloom_filter_enabled;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
 
@@ -269,6 +276,7 @@ impl DataFileReader {
                 &path_to_read,
                 blob_as_descriptor,
                 parquet_page_index_enabled,
+                parquet_bloom_filter_enabled,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;

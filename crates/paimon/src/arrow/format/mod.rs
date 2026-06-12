@@ -90,17 +90,21 @@ pub(crate) trait FormatFileWriter: Send {
 /// Create a format reader based on the file extension.
 ///
 /// `parquet_page_index_enabled` controls whether the parquet reader loads
-/// `ColumnIndex` / `OffsetIndex` and applies page-level stats pruning. Other
-/// format readers ignore the flag.
+/// `ColumnIndex` / `OffsetIndex` and applies page-level stats pruning.
+/// `parquet_bloom_filter_enabled` controls whether Eq / In leaf predicates
+/// consult the parquet column bloom filter at row-group level. Other format
+/// readers ignore the flags.
 pub(crate) fn create_format_reader(
     path: &str,
     blob_as_descriptor: bool,
     parquet_page_index_enabled: bool,
+    parquet_bloom_filter_enabled: bool,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
         Ok(Box::new(parquet::ParquetFormatReader {
             page_index_enabled: parquet_page_index_enabled,
+            bloom_filter_enabled: parquet_bloom_filter_enabled,
         }))
     } else if lower.ends_with(".blob") {
         Ok(Box::new(blob::BlobFormatReader::new(

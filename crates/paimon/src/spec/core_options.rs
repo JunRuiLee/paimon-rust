@@ -26,6 +26,7 @@ const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_PAGE_INDEX_ENABLED_OPTION: &str = "read.parquet.page-index.enabled";
+const PARQUET_BLOOM_FILTER_ENABLED_OPTION: &str = "read.parquet.bloom-filter.enabled";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const BUCKET_KEY_OPTION: &str = "bucket-key";
@@ -416,6 +417,23 @@ impl<'a> CoreOptions<'a> {
             // Anything else is unparseable — fall back to the default rather
             // than silently flipping to off.
             Some(_) => true,
+        }
+    }
+
+    /// Whether to evaluate parquet row-group bloom filters for `Eq` / `In`
+    /// predicates and skip row groups that the bloom proves cannot match.
+    /// Default `false`: paimon-rust's writer does not currently emit bloom
+    /// filters (`ParquetFormatWriter::new` only sets compression on
+    /// `WriterProperties`), so files without bloom would pay an async fetch
+    /// per row group with no benefit. Set to `true` when reading files
+    /// authored by a writer that does emit bloom filters. Corresponds to the
+    /// Stage 2 option in `docs/parquet-pushdown-plan.md`.
+    pub fn parquet_bloom_filter_enabled(&self) -> bool {
+        match self.options.get(PARQUET_BLOOM_FILTER_ENABLED_OPTION) {
+            None => false,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(_) => false,
         }
     }
 
@@ -1357,5 +1375,43 @@ mod tests {
         // Unparseable values fall back to the default (true), not silently
         // flipping the toggle off.
         assert!(core.parquet_page_index_enabled());
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_default_is_disabled() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert!(!core.parquet_bloom_filter_enabled());
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_explicit_on() {
+        let opts = HashMap::from([(
+            PARQUET_BLOOM_FILTER_ENABLED_OPTION.to_string(),
+            "true".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert!(core.parquet_bloom_filter_enabled());
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_case_insensitive_on() {
+        let opts = HashMap::from([(
+            PARQUET_BLOOM_FILTER_ENABLED_OPTION.to_string(),
+            "TRUE".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert!(core.parquet_bloom_filter_enabled());
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_unparseable_falls_back_to_default() {
+        let opts = HashMap::from([(
+            PARQUET_BLOOM_FILTER_ENABLED_OPTION.to_string(),
+            "yes".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        // Unparseable values fall back to the default (false).
+        assert!(!core.parquet_bloom_filter_enabled());
     }
 }

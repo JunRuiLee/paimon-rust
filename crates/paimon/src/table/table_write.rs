@@ -900,7 +900,7 @@ mod tests {
         file_path: &str,
         file_size: i64,
     ) -> Vec<RecordBatch> {
-        let format_reader = create_format_reader(file_path, false, true).unwrap();
+        let format_reader = create_format_reader(file_path, false, true, false).unwrap();
         let input = file_io.new_input(file_path).unwrap();
         let file_reader = input.reader().await.unwrap();
         let read_fields = physical_key_value_fields();

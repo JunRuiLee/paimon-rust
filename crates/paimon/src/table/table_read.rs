@@ -221,6 +221,7 @@ impl<'a> TableRead<'a> {
                     .collect(),
                 batch_size: core_options.read_batch_size(),
                 parquet_page_index_enabled: core_options.parquet_page_index_enabled(),
+                parquet_bloom_filter_enabled: core_options.parquet_bloom_filter_enabled(),
             },
         );
         reader.read(splits)
@@ -242,6 +243,7 @@ impl<'a> TableRead<'a> {
             core_options.blob_descriptor_fields(),
             core_options.read_batch_size(),
             core_options.parquet_page_index_enabled(),
+            core_options.parquet_bloom_filter_enabled(),
         )?;
         reader.read(data_splits)
     }
@@ -278,6 +280,7 @@ impl<'a> TableRead<'a> {
             self.data_predicates.clone(),
             core_options.read_batch_size(),
             core_options.parquet_page_index_enabled(),
+            core_options.parquet_bloom_filter_enabled(),
         )
     }
 
@@ -298,6 +301,7 @@ impl<'a> TableRead<'a> {
             self.data_predicates.clone(),
             core_options.read_batch_size(),
             core_options.parquet_page_index_enabled(),
+            core_options.parquet_bloom_filter_enabled(),
         )
         .with_drop_deletes(true)
     }

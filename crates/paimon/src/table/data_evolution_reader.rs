@@ -80,6 +80,10 @@ pub(crate) struct DataEvolutionReader {
     /// (ColumnIndex / OffsetIndex) and apply page-level pruning. Sourced
     /// from `CoreOptions::parquet_page_index_enabled()` by callers.
     parquet_page_index_enabled: bool,
+    /// Whether the parquet format reader should consult bloom filters for
+    /// Eq / In leaf predicates. Sourced from
+    /// `CoreOptions::parquet_bloom_filter_enabled()` by callers.
+    parquet_bloom_filter_enabled: bool,
 }
 
 impl DataEvolutionReader {
@@ -93,6 +97,7 @@ impl DataEvolutionReader {
         blob_descriptor_fields: HashSet<String>,
         batch_size: usize,
         parquet_page_index_enabled: bool,
+        parquet_bloom_filter_enabled: bool,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -114,6 +119,7 @@ impl DataEvolutionReader {
             blob_descriptor_fields,
             batch_size,
             parquet_page_index_enabled,
+            parquet_bloom_filter_enabled,
         })
     }
 
@@ -131,6 +137,7 @@ impl DataEvolutionReader {
                 Vec::new(),
                 self.batch_size,
                 self.parquet_page_index_enabled,
+                self.parquet_bloom_filter_enabled,
             );
 
             for split in splits {
@@ -274,6 +281,7 @@ impl DataEvolutionReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
         let parquet_page_index_enabled = self.parquet_page_index_enabled;
+        let parquet_bloom_filter_enabled = self.parquet_bloom_filter_enabled;
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
@@ -340,6 +348,7 @@ impl DataEvolutionReader {
                             blob_as_descriptor,
                             batch_size,
                             parquet_page_index_enabled,
+                            parquet_bloom_filter_enabled,
                         )
                         .map(Some)
                     }
@@ -503,6 +512,7 @@ fn open_source_stream(
     blob_as_descriptor: bool,
     batch_size: usize,
     parquet_page_index_enabled: bool,
+    parquet_bloom_filter_enabled: bool,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let file_reader = DataFileReader::new(
         file_io,
@@ -513,6 +523,7 @@ fn open_source_stream(
         Vec::new(),
         batch_size,
         parquet_page_index_enabled,
+        parquet_bloom_filter_enabled,
     )
     .with_blob_as_descriptor(blob_as_descriptor);
 

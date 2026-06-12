@@ -71,6 +71,10 @@ pub(crate) struct KeyValueReadConfig {
     /// (ColumnIndex / OffsetIndex) and apply page-level pruning. Sourced
     /// from `CoreOptions::parquet_page_index_enabled()` by callers.
     pub parquet_page_index_enabled: bool,
+    /// Whether the parquet format reader should consult bloom filters for
+    /// Eq / In leaf predicates. Sourced from
+    /// `CoreOptions::parquet_bloom_filter_enabled()` by callers.
+    pub parquet_bloom_filter_enabled: bool,
 }
 
 impl KeyValueFileReader {
@@ -276,6 +280,7 @@ impl KeyValueFileReader {
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let parquet_page_index_enabled = self.config.parquet_page_index_enabled;
+        let parquet_bloom_filter_enabled = self.config.parquet_bloom_filter_enabled;
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -360,6 +365,7 @@ impl KeyValueFileReader {
                         predicates.clone(),
                         batch_size,
                         parquet_page_index_enabled,
+                        parquet_bloom_filter_enabled,
                     );
 
                     // Look up the DV for this data file (if any). Cloning the
@@ -842,6 +848,7 @@ mod tests {
             sequence_fields: Vec::new(),
             batch_size: 1024,
             parquet_page_index_enabled: true,
+            parquet_bloom_filter_enabled: false,
         }
     }
 
@@ -1137,6 +1144,7 @@ mod tests {
             Vec::new(),
             1024,
             true,
+            false,
         )
         .with_drop_deletes(true);
         let stream_b = raw_reader.read(&[split]).unwrap();
@@ -1204,6 +1212,7 @@ mod tests {
             Vec::new(),
             1024,
             true,
+            false,
         );
         let stream = reader.read(&[split]).unwrap();
         let ks = collect_k_column_from_stream(stream).await;
@@ -1291,6 +1300,7 @@ mod tests {
             sequence_fields: Vec::new(),
             batch_size: 1024,
             parquet_page_index_enabled: true,
+            parquet_bloom_filter_enabled: false,
         }
     }
 
