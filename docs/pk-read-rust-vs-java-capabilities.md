@@ -73,6 +73,11 @@ paimon-rust 在某些合法输入下**会返回错误结果或直接崩溃**。�
 - **代码位置**：
   - Rust：`crates/paimon/src/table/table_scan.rs:174-183` 对**所有** entry 调 `data_file_matches_predicates`，L0 短路只在 `skip_level_zero=true`（即 DV 模式或 FirstRow merge engine）才生效（`should_skip_level_zero_for_scan`，line 287-301）。stats 源是 `value_stats`（`stats_filter.rs:91-96`）。
   - Java：`paimon-core/.../KeyValueFileStoreScan.java:139-166` 显式跳过 L0 的 value-stats 裁剪（除非 `dvFreshnessReadEnabled`），代码里有长篇注释解释这个 hazard。
+- **修复状态（HEAD `b5cd3a5`）**：✓ 已闭合。
+  - 引入 entry 级 gate `should_apply_value_stats_to_entry`（`crates/paimon/src/table/stats_filter.rs:191-226`），矩阵在 PK + 非 DV + L0 + `Deduplicate` / `PartialUpdate` / `VersionedPartialUpdate` 下返回 `false` → 跳过 value-stats 裁剪。
+  - 常规 plan 路径在 `crates/paimon/src/table/table_scan.rs:188-194` 接入；cross-schema fallback 在 `crates/paimon/src/table/table_scan.rs:645-651` 对称接入。
+  - 单测：`stats_filter.rs::test_should_apply_value_stats_non_dv_pk_l0_dedup_skips`（line 605）+ `test_should_apply_value_stats_overlapping_l0_pk_dedup_skips_both_files`（line 660）。
+  - 端到端 manifest + parquet fixture 回归仍是 follow-up（与 [`pk-read-rust-status.md`](./pk-read-rust-status.md) 第 C4 行一致）。
 
 #### C5. raw L1+ 路径不剥 DELETE / UPDATE_BEFORE 行
 
@@ -315,7 +320,7 @@ paimon-java 有、paimon-rust **完全没实现**或**仅枚举占位**的能力
 | C1 | Split: IntervalPartition + section bin-pack | ✓ `MergeTreeSplitGenerator` | ✗（用 AppendOnly bin-pack） | C-HIGH | #1 |
 | C2 | KV 路径接受 DV split | ✓ `ApplyDeletionVectorReader` 包 reader | ✗ 直接 `Error::Unsupported` 报错 | C-HIGH | — |
 | C3 | KV reader 给 schema-evo mapper 喂 `[_SEQ, _VK, ...]` 字段 | ✓ `KeyValue.createKeyValueFields` | ✗ 喂用户视角 schema → mapper 找不到 `_SEQ`/`_VK` → panic | C-HIGH | — |
-| C4 | L0 跳过 value-stats 裁剪（避免漏最新版本） | ✓ 显式 skip L0 | ✗ 对 L0 也跑 value-stats → 可能裁掉含最新版本的文件 | C-HIGH | — |
+| C4 | L0 跳过 value-stats 裁剪（避免漏最新版本） | ✓ 显式 skip L0 | ✓ entry 级 gate（`should_apply_value_stats_to_entry`）已闭合；端到端 fixture 回归留作 follow-up | C-HIGH | — |
 | C5 | raw L1+ 路径剥 DELETE/UPDATE_BEFORE | ✓ `DropDeleteReader` | ✗ 不剥，幽灵行透出 | C-HIGH | — |
 | C6 | Bitmap64 DV 解码 | ✓ | ✗ 只识别 32-bit magic | C-HIGH | — |
 | C7 | `deletion-vectors.read-mode` 选项识别 | ✓ PERFORMANCE / FRESHNESS | ✗ 选项被静默忽略 | C-HIGH | — |
