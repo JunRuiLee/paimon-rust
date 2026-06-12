@@ -275,6 +275,17 @@ impl GlobalIndexScanner {
                 entry.meta.may_match_between(&from_key, &to_key, &cmp)
             });
 
+            // When a Between conjunct exists but the file does not overlap its
+            // range, the whole AND cannot match — drop the file regardless of
+            // how the remaining predicates evaluate. Without this guard, a file
+            // outside the Between range but matched by some remaining predicate
+            // (e.g. `BETWEEN 10 AND 20 AND id >= 0` on a file [30, 40]) would
+            // be retained because `file_result` is initialized from the
+            // remaining bitmap, silently dropping the Between conjunct.
+            if between.is_some() && !between_matches {
+                continue;
+            }
+
             if matching_predicates.is_empty() && !between_matches {
                 continue;
             }
@@ -966,5 +977,52 @@ mod tests {
             .unwrap();
         let ranges = result.unwrap();
         assert_eq!(ranges, vec![RowRange::new(22, 26)]);
+    }
+
+    /// Regression for the Between+remaining bug in `evaluate_leaf`. When a
+    /// native `Between` leaf is paired with another conjunct (e.g. `id >= 0`),
+    /// and the file's b-tree key range falls **outside** the Between range
+    /// but is still matched by the remaining predicate, the whole AND must
+    /// produce zero rows. Before the fix, `file_result` was initialized from
+    /// the remaining predicate's bitmap and the Between conjunct was silently
+    /// dropped — the test would observe the file's full row id set instead of
+    /// the empty set.
+    #[tokio::test]
+    async fn test_between_unmatched_file_drops_remaining_match() {
+        let (file_io, table_path, file_name, _tmp) =
+            setup_testdata_table("btree_int_100_no_compress.bin");
+        // File covers keys [0, 198] (row_ids 0..99). Pick a Between range
+        // entirely below 0 so `may_match_between` is false, and a `>= 0`
+        // conjunct that would otherwise scoop up every row in the file.
+        let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+        let entries = vec![make_global_index_entry(&file_name, 1, 0, 99, &meta)];
+        let fields = int_schema_fields();
+
+        let predicates = vec![Predicate::and(vec![
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(crate::spec::IntType::new()),
+                op: PredicateOperator::Between,
+                literals: vec![Datum::Int(-100), Datum::Int(-50)],
+            },
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(crate::spec::IntType::new()),
+                op: PredicateOperator::GtEq,
+                literals: vec![Datum::Int(0)],
+            },
+        ])];
+
+        let result = evaluate_global_index(&file_io, &table_path, &entries, &predicates, &fields)
+            .await
+            .unwrap();
+        let ranges = result.unwrap();
+        assert!(
+            ranges.is_empty(),
+            "Between(-100..-50) AND id>=0 must produce zero rows on a file \
+             whose key range is [0, 198] — got {ranges:?}"
+        );
     }
 }
