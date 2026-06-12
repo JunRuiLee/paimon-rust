@@ -280,11 +280,13 @@ paimon-java 有、paimon-rust **完全没实现**或**仅枚举占位**的能力
 
 ### P7. Parquet 多层下推深度未审计
 
-- **差距**：Java parquet 走 `RowGroupFilter` 多层级（`STATISTICS / DICTIONARY / BLOOMFILTER / COLUMN_INDEX`，见 `ParquetFileReader.java:408-421`）。Rust 走 arrow-rs `ParquetRecordBatchStreamBuilder` 的 `with_row_filter` + `with_row_selection`，**但 dictionary filter / column-index filter 是否真的开启 / 起作用未审计**。
+- **差距**：Java parquet 走 `RowGroupFilter` 多层级（`STATISTICS / DICTIONARY / BLOOMFILTER / COLUMN_INDEX`，见 `ParquetFileReader.java:408-421`）。Rust 走 arrow-rs `ParquetRecordBatchStreamBuilder` 的 `with_row_filter` + `with_row_selection`，**审计确认当前读路径未显式利用 Parquet COLUMN_INDEX、BLOOMFILTER、DICTIONARY 三类内部索引**。
 - **代码位置**：
   - Rust：`crates/paimon/src/arrow/format/parquet.rs:149-200`。
   - Java：`paimon-format/.../parquet/ParquetReaderFactory.java:95+` `withRecordFilter / ParquetReadOptions`。
 - **量化**：未实测。
+- **审计结论（HEAD `029a159`）**：paimon-rust 已具备 manifest stats prune、row-group STATISTICS prune、per-row RowFilter；**未在读路径显式利用 parquet COLUMN_INDEX (page-level)、BLOOMFILTER、DICTIONARY** 三类 parquet 内部索引。`ArrowReaderOptions` 默认 `PageIndexPolicy::Skip`，metadata 不加载 page index；`get_row_group_column_bloom_filter` 在仓库零调用；写端 `ParquetFormatWriter::new`（`parquet.rs:65-73`）只设 compression，未启用 bloom 写入。
+- **实施方案**：[`parquet-pushdown-plan.md`](./parquet-pushdown-plan.md) — Stage 1（Page-Index page-level prune，必做、复用 stats-safe 谓词语义，无法安全判断时 fail-open）+ Stage 2（Bloom Filter，对 Eq/In）+ Stage 3（Dictionary filter，follow-up）。完成后本条由 ❓ → ✓。
 
 ### P8. PlanCache 缺位
 
@@ -351,7 +353,7 @@ paimon-java 有、paimon-rust **完全没实现**或**仅枚举占位**的能力
 | P4 | File-index pruning（plan 阶段） | ✓ | ✗ | P | — |
 | P5 | Limit pushdown manifest-entry 级 | ✓ | ✗（仅 split 级） | P | — |
 | P6 | Whole-bucket value filter | ✓ | ✗ | P | — |
-| P7 | Parquet dictionary / column-index filter 透传 | ✓（多层级） | ❓ 仅 row-filter，深度未审计 | P | — |
+| P7 | Parquet dictionary / column-index filter 透传 | ✓（多层级） | ❓ 未显式利用 page-index / bloom / dictionary 三类 parquet 内部索引；方案见 [`parquet-pushdown-plan.md`](./parquet-pushdown-plan.md) | P | — |
 | P8 | PlanCache | ✓ | ✗ | P | — |
 | P9 | Manifest / file-index / partition cache | ✓ Caffeine + 多层 | ❓ 未审计 | P | — |
 | P10 | ORC async read | ✓ | ✗ | P | — |
