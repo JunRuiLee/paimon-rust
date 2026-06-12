@@ -76,6 +76,10 @@ pub(crate) struct DataEvolutionReader {
     /// Rows per batch for the inner format reader. Sourced from
     /// `CoreOptions::read_batch_size()` by callers.
     batch_size: usize,
+    /// Whether the parquet format reader should load page index
+    /// (ColumnIndex / OffsetIndex) and apply page-level pruning. Sourced
+    /// from `CoreOptions::parquet_page_index_enabled()` by callers.
+    parquet_page_index_enabled: bool,
 }
 
 impl DataEvolutionReader {
@@ -88,6 +92,7 @@ impl DataEvolutionReader {
         blob_as_descriptor: bool,
         blob_descriptor_fields: HashSet<String>,
         batch_size: usize,
+        parquet_page_index_enabled: bool,
     ) -> crate::Result<Self> {
         let row_id_index = read_type.iter().position(|f| f.name() == ROW_ID_FIELD_NAME);
         let file_read_type: Vec<DataField> = read_type
@@ -108,6 +113,7 @@ impl DataEvolutionReader {
             blob_as_descriptor,
             blob_descriptor_fields,
             batch_size,
+            parquet_page_index_enabled,
         })
     }
 
@@ -124,6 +130,7 @@ impl DataEvolutionReader {
                 self.file_read_type.clone(),
                 Vec::new(),
                 self.batch_size,
+                self.parquet_page_index_enabled,
             );
 
             for split in splits {
@@ -266,6 +273,7 @@ impl DataEvolutionReader {
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
+        let parquet_page_index_enabled = self.parquet_page_index_enabled;
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
@@ -331,6 +339,7 @@ impl DataEvolutionReader {
                             table_fields.clone(),
                             blob_as_descriptor,
                             batch_size,
+                            parquet_page_index_enabled,
                         )
                         .map(Some)
                     }
@@ -493,6 +502,7 @@ fn open_source_stream(
     table_fields: Vec<DataField>,
     blob_as_descriptor: bool,
     batch_size: usize,
+    parquet_page_index_enabled: bool,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let file_reader = DataFileReader::new(
         file_io,
@@ -502,6 +512,7 @@ fn open_source_stream(
         source.read_fields().to_vec(),
         Vec::new(),
         batch_size,
+        parquet_page_index_enabled,
     )
     .with_blob_as_descriptor(blob_as_descriptor);
 

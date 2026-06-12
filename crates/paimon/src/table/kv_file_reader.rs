@@ -67,6 +67,10 @@ pub(crate) struct KeyValueReadConfig {
     /// Rows per batch for both the inner parquet reader and the sort-merge
     /// output. Sourced from `CoreOptions::read_batch_size()` by callers.
     pub batch_size: usize,
+    /// Whether the parquet format reader should load page index
+    /// (ColumnIndex / OffsetIndex) and apply page-level pruning. Sourced
+    /// from `CoreOptions::parquet_page_index_enabled()` by callers.
+    pub parquet_page_index_enabled: bool,
 }
 
 impl KeyValueFileReader {
@@ -271,6 +275,7 @@ impl KeyValueFileReader {
         let batch_size = self.config.batch_size;
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
+        let parquet_page_index_enabled = self.config.parquet_page_index_enabled;
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -354,6 +359,7 @@ impl KeyValueFileReader {
                         internal_read_type.clone(),
                         predicates.clone(),
                         batch_size,
+                        parquet_page_index_enabled,
                     );
 
                     // Look up the DV for this data file (if any). Cloning the
@@ -835,6 +841,7 @@ mod tests {
             merge_engine: MergeEngine::Deduplicate,
             sequence_fields: Vec::new(),
             batch_size: 1024,
+            parquet_page_index_enabled: true,
         }
     }
 
@@ -1129,6 +1136,7 @@ mod tests {
             raw_read_type,
             Vec::new(),
             1024,
+            true,
         )
         .with_drop_deletes(true);
         let stream_b = raw_reader.read(&[split]).unwrap();
@@ -1195,6 +1203,7 @@ mod tests {
             read_type,
             Vec::new(),
             1024,
+            true,
         );
         let stream = reader.read(&[split]).unwrap();
         let ks = collect_k_column_from_stream(stream).await;
@@ -1281,6 +1290,7 @@ mod tests {
             merge_engine,
             sequence_fields: Vec::new(),
             batch_size: 1024,
+            parquet_page_index_enabled: true,
         }
     }
 

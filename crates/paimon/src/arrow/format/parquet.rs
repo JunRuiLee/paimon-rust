@@ -46,14 +46,23 @@ use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::ParquetMetaDataReader;
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::metadata::{ParquetMetaData, PageIndexPolicy, RowGroupMetaData};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(crate) struct ParquetFormatReader;
+/// Parquet implementation of [`FormatFileReader`].
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ParquetFormatReader {
+    /// Whether to load page index (ColumnIndex / OffsetIndex) and use
+    /// page-level stats for additional `RowSelection` pruning. Sourced from
+    /// `CoreOptions::parquet_page_index_enabled()` by callers.
+    pub(crate) page_index_enabled: bool,
+}
 
 /// Parquet implementation of [`FormatFileWriter`].
 /// Streams data directly to storage via `AsyncArrowWriter` + opendal.
@@ -151,8 +160,19 @@ impl FormatFileReader for ParquetFormatReader {
     ) -> crate::Result<ArrowRecordBatchStream> {
         let arrow_file_reader = ArrowFileReader::new(file_size, reader);
 
-        let mut batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?;
+        // Page index is loaded lazily by parquet-58 only when the reader
+        // options request it; when disabled we keep the previous footer-only
+        // metadata read path. `Optional` lets older files without page index
+        // fall through (Required would error, see
+        // `parquet-58.3.0/src/file/metadata/reader.rs:85-94`).
+        let mut batch_stream_builder = if self.page_index_enabled {
+            let arrow_options = ArrowReaderOptions::new()
+                .with_page_index_policy(PageIndexPolicy::Optional);
+            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
+                .await?
+        } else {
+            ParquetRecordBatchStreamBuilder::new(arrow_file_reader).await?
+        };
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
         let root_schema = parquet_schema.root_schema();
@@ -186,6 +206,19 @@ impl FormatFileReader for ParquetFormatReader {
             file_fields,
         )?;
         let mut combined_selection = predicate_row_selection;
+
+        // Page-level selection — only meaningful when page index was loaded
+        // (controlled by `self.page_index_enabled`). The helper itself returns
+        // `None` when ColumnIndex / OffsetIndex are missing, so a stale
+        // `page_index_enabled=true` on a file without page index is harmless.
+        if self.page_index_enabled {
+            let page_selection = build_predicate_page_selection(
+                batch_stream_builder.metadata(),
+                preds,
+                file_fields,
+            )?;
+            combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
+        }
 
         if let Some(ref ranges) = row_selection {
             let range_selection =
@@ -667,6 +700,241 @@ fn build_predicate_row_selection(
     } else {
         Ok(Some(selectors.into()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Page-level pruning (Parquet ColumnIndex / OffsetIndex)
+// ---------------------------------------------------------------------------
+
+/// Stats accessor for a single page within a row group's column chunk. The
+/// shared `predicate_stats::data_leaf_may_match` evaluator drives row-group,
+/// page, and bloom-filter pruning the same way; this just plugs page-level
+/// `ColumnIndex` + `OffsetIndex` metadata into the same `StatsAccessor` shape.
+///
+/// Each accessor instance is bound to one (row group, page) pair; callers
+/// instantiate one per page index they want to prune.
+struct ParquetPageStats<'a> {
+    /// Per-column page-index metadata for this row group, indexed by
+    /// `file_fields` order (entries are `None` when the column has no
+    /// page index for this row group).
+    column_indices: &'a [Option<&'a ColumnIndexMetaData>],
+    page_idx: usize,
+    /// Page row count, derived from `OffsetIndex.first_row_index` of this and
+    /// the next page (or `row_group.num_rows()` for the last page).
+    page_row_count: i64,
+}
+
+impl StatsAccessor for ParquetPageStats<'_> {
+    fn row_count(&self) -> i64 {
+        self.page_row_count
+    }
+
+    fn null_count(&self, index: usize) -> Option<i64> {
+        let column_index = self.column_indices.get(index).copied().flatten()?;
+        column_index.null_count(self.page_idx)
+    }
+
+    fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let column_index = self.column_indices.get(index).copied().flatten()?;
+        page_index_value_to_datum(column_index, self.page_idx, data_type, /* is_min */ true)
+    }
+
+    fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let column_index = self.column_indices.get(index).copied().flatten()?;
+        page_index_value_to_datum(column_index, self.page_idx, data_type, /* is_min */ false)
+    }
+}
+
+/// Convert a single page's min or max from a [`ColumnIndexMetaData`] enum into
+/// the matching paimon [`Datum`]. Returns `None` for the safe fail-open cases:
+/// missing index data, null page, type mismatch, or any conversion that the
+/// existing footer-side path already excludes (e.g. timestamps with
+/// sub-millisecond precision, decimal stats).
+fn page_index_value_to_datum(
+    column_index: &ColumnIndexMetaData,
+    page_idx: usize,
+    data_type: &DataType,
+    is_min: bool,
+) -> Option<Datum> {
+    if column_index.is_null_page(page_idx) {
+        return None;
+    }
+    match (column_index, data_type) {
+        (ColumnIndexMetaData::BOOLEAN(idx), DataType::Boolean(_)) => {
+            let value = if is_min {
+                idx.min_values().get(page_idx)
+            } else {
+                idx.max_values().get(page_idx)
+            };
+            value.copied().map(Datum::Bool)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::TinyInt(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.and_then(|v| i8::try_from(*v).ok()).map(Datum::TinyInt)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::SmallInt(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.and_then(|v| i16::try_from(*v).ok()).map(Datum::SmallInt)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Int(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Int)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Date(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Date)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Time(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Time)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::BigInt(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Long)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::Timestamp(ts)) if ts.precision() <= 3 => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(|millis| Datum::Timestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::LocalZonedTimestamp(ts)) if ts.precision() <= 3 => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(|millis| Datum::LocalZonedTimestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::FLOAT(idx), DataType::Float(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Float)
+        }
+        (ColumnIndexMetaData::DOUBLE(idx), DataType::Double(_)) => {
+            let value = if is_min { idx.min_values().get(page_idx) } else { idx.max_values().get(page_idx) };
+            value.copied().map(Datum::Double)
+        }
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Char(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarChar(_)) => {
+            let value = if is_min { idx.min_value(page_idx) } else { idx.max_value(page_idx) };
+            value
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(|s| Datum::String(s.to_string()))
+        }
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarBinary(_))
+        | (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::VarBinary(_)) => {
+            let value = if is_min { idx.min_value(page_idx) } else { idx.max_value(page_idx) };
+            value.map(|bytes| Datum::Bytes(bytes.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+fn build_predicate_page_selection(
+    metadata: &ParquetMetaData,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<Option<RowSelection>> {
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    // Page index / offset index are loaded lazily by the reader options. If
+    // either is absent (older files, writer didn't emit them, page-index
+    // disabled by config), fall through and let row-group + per-row filter
+    // do their job.
+    let column_index = metadata.column_index();
+    let offset_index = metadata.offset_index();
+    let (Some(column_index), Some(offset_index)) = (column_index, offset_index) else {
+        return Ok(None);
+    };
+
+    let row_groups = metadata.row_groups();
+    if row_groups.is_empty() {
+        return Ok(None);
+    }
+    let identity_mapping: Vec<Option<usize>> = (0..file_fields.len()).map(Some).collect();
+    let columns_in_first_rg = row_groups[0].columns();
+    let column_index_lookup = build_row_group_column_indices(columns_in_first_rg, file_fields);
+
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut total_rows: usize = 0;
+    let mut any_skipped = false;
+
+    for (rg_idx, row_group) in row_groups.iter().enumerate() {
+        let rg_base = total_rows;
+        let rg_rows = row_group.num_rows() as usize;
+        total_rows += rg_rows;
+
+        let rg_column_index = column_index.get(rg_idx);
+        let rg_offset_index = offset_index.get(rg_idx);
+        let (Some(rg_column_index), Some(rg_offset_index)) = (rg_column_index, rg_offset_index)
+        else {
+            // No page index for this row group: keep every row in the group
+            // (fail-open). Stats prune at row-group level still applied.
+            ranges.push(rg_base..rg_base + rg_rows);
+            continue;
+        };
+
+        // Collect a per-column-index ColumnIndex reference for the StatsAccessor.
+        // `column_index_lookup[i]` is the file column index in this RG for
+        // file_fields[i]; use it to fetch the ColumnIndexMetaData.
+        let per_column: Vec<Option<&ColumnIndexMetaData>> = column_index_lookup
+            .iter()
+            .map(|opt| opt.and_then(|cidx| rg_column_index.get(cidx)))
+            .collect();
+
+        // Use the offset index of any column that exists to drive page row
+        // boundaries. All columns have the same page row layout.
+        let Some(driver_col) = column_index_lookup.iter().find_map(|opt| *opt) else {
+            // No column resolved — keep group.
+            ranges.push(rg_base..rg_base + rg_rows);
+            continue;
+        };
+        let Some(driver_offset_index) = rg_offset_index.get(driver_col) else {
+            ranges.push(rg_base..rg_base + rg_rows);
+            continue;
+        };
+        let pages = match driver_offset_index {
+            OffsetIndexMetaData { page_locations, .. } => page_locations,
+        };
+        if pages.is_empty() {
+            ranges.push(rg_base..rg_base + rg_rows);
+            continue;
+        }
+
+        for (page_idx, page) in pages.iter().enumerate() {
+            let page_first_row = page.first_row_index as usize;
+            let page_end = if page_idx + 1 < pages.len() {
+                pages[page_idx + 1].first_row_index as usize
+            } else {
+                rg_rows
+            };
+            if page_end <= page_first_row {
+                continue;
+            }
+            let page_row_count = (page_end - page_first_row) as i64;
+            let stats = ParquetPageStats {
+                column_indices: &per_column,
+                page_idx,
+                page_row_count,
+            };
+            let may_match = predicates_may_match_with_schema(
+                predicates,
+                &stats,
+                &identity_mapping,
+                file_fields,
+            );
+            if may_match {
+                ranges.push(rg_base + page_first_row..rg_base + page_end);
+            } else {
+                any_skipped = true;
+            }
+        }
+    }
+
+    if !any_skipped {
+        return Ok(None);
+    }
+    Ok(Some(RowSelection::from_consecutive_ranges(
+        ranges.into_iter(),
+        total_rows,
+    )))
 }
 
 fn build_row_group_column_indices(
@@ -1157,14 +1425,27 @@ impl AsyncFileReader for ArrowFileReader {
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let metadata_opts = options.map(|o| o.metadata_options().clone());
+        // Page index / offset index policies live on `ArrowReaderOptions`
+        // directly (not inside `metadata_options`), so they have to be
+        // forwarded explicitly — same as the upstream default
+        // `AsyncFileReader::get_metadata` impl in
+        // `parquet-58.3.0/src/arrow/async_reader/mod.rs:162-180`. Without
+        // this, `with_page_index_policy(Optional)` would silently no-op.
+        let column_index_policy = options.map(|o| o.column_index_policy());
+        let offset_index_policy = options.map(|o| o.offset_index_policy());
         let prefetch_hint = Some(METADATA_SIZE_HINT);
         Box::pin(async move {
             let file_size = self.file_size;
-            let metadata = ParquetMetaDataReader::new()
+            let mut reader = ParquetMetaDataReader::new()
                 .with_prefetch_hint(prefetch_hint)
-                .with_metadata_options(metadata_opts)
-                .load_and_finish(self, file_size)
-                .await?;
+                .with_metadata_options(metadata_opts);
+            if let Some(p) = column_index_policy {
+                reader = reader.with_column_index_policy(p);
+            }
+            if let Some(p) = offset_index_policy {
+                reader = reader.with_offset_index_policy(p);
+            }
+            let metadata = reader.load_and_finish(self, file_size).await?;
             Ok(Arc::new(metadata))
         })
     }
@@ -1670,5 +1951,161 @@ mod tests {
             parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
         let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Page-index page-level pruning tests (Stage 1 of P7)
+    // -----------------------------------------------------------------------
+
+    /// Write a parquet file with a single row group split into multiple data
+    /// pages. `id` ranges 0..total_rows, `value` mirrors id*10. With
+    /// `page_row_limit` rows per page, 80 rows / 10 rows-per-page = 8 pages.
+    /// Returns the in-memory parquet bytes ready for `ParquetMetaDataReader`.
+    async fn write_multi_page_parquet(page_row_limit: usize, total_rows: i32) -> Vec<u8> {
+        use parquet::arrow::AsyncArrowWriter;
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(page_row_limit)
+            .set_write_batch_size(page_row_limit)
+            .set_max_row_group_size(total_rows as usize)
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
+                .expect("create writer");
+            let ids: Vec<i32> = (0..total_rows).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            let batch = writer_test_batch(&schema, ids, values);
+            writer.write(&batch).await.expect("write batch");
+            writer.close().await.expect("close writer");
+        }
+        buf
+    }
+
+    /// Load metadata from in-memory parquet bytes with the page-index policy
+    /// requested. Mirrors what `ParquetFormatReader::read_batch_stream` does
+    /// when `page_index_enabled = true`.
+    async fn load_metadata_with_page_index(
+        bytes: &[u8],
+        page_index: bool,
+    ) -> Arc<parquet::file::metadata::ParquetMetaData> {
+        use parquet::file::metadata::ParquetMetaDataReader;
+        let mut reader = ParquetMetaDataReader::new();
+        if page_index {
+            reader = reader
+                .with_column_index_policy(super::PageIndexPolicy::Optional)
+                .with_offset_index_policy(super::PageIndexPolicy::Optional);
+        }
+        let bytes_owned: bytes::Bytes = bytes.to_vec().into();
+        Arc::new(
+            reader
+                .parse_and_finish(&bytes_owned)
+                .expect("parse metadata"),
+        )
+    }
+
+    fn int_field(name: &str) -> DataField {
+        DataField::new(0, name.to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn build_int_eq_predicate(value: i32) -> super::Predicate {
+        super::Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: super::PredicateOperator::Eq,
+            literals: vec![Datum::Int(value)],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_keeps_only_matching_page() {
+        // 80 rows / 10 rows per page = 8 pages, each page covers id range
+        // [page_idx*10 .. page_idx*10 + 10).
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true).await;
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Eq(35) is in page 3 ([30, 40)) only.
+        let predicates = vec![build_int_eq_predicate(35)];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .expect("page selection")
+            .expect("must produce a selection");
+        // Selection retains exactly one 10-row page.
+        assert_eq!(sel.row_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_outside_all_pages_skips_everything() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true).await;
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // 1000 lies past every page's max (max == 79).
+        let predicates = vec![build_int_eq_predicate(1000)];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .expect("page selection")
+            .expect("must produce a selection");
+        assert_eq!(sel.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_between_keeps_overlapping_pages() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true).await;
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Between [25, 44] overlaps page 2 ([20,30)), page 3 ([30,40)),
+        // and page 4 ([40,50)) — 3 pages × 10 rows = 30 rows.
+        let predicates = vec![super::Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: super::PredicateOperator::Between,
+            literals: vec![Datum::Int(25), Datum::Int(44)],
+        }];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .expect("page selection")
+            .expect("must produce a selection");
+        assert_eq!(sel.row_count(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_neq_falls_open() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true).await;
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // NotEq is conservative under stats: every page contains other values
+        // even if it contains the literal, so no page can ever be excluded.
+        let predicates = vec![super::Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op: super::PredicateOperator::NotEq,
+            literals: vec![Datum::Int(35)],
+        }];
+        // No page is skipped → helper returns None to signal "selection
+        // unchanged from full row group".
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .expect("page selection");
+        assert!(sel.is_none(), "NotEq must not skip any page (got {sel:?})");
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_returns_none_when_page_index_disabled() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        // Load metadata WITHOUT page-index policy, simulating a reader where
+        // the toggle is off.
+        let metadata = load_metadata_with_page_index(&bytes, false).await;
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let predicates = vec![build_int_eq_predicate(35)];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .expect("page selection");
+        assert!(
+            sel.is_none(),
+            "without page index loaded, helper must fall open (got {sel:?})"
+        );
     }
 }

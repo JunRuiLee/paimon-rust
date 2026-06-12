@@ -25,6 +25,7 @@ const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
+const PARQUET_PAGE_INDEX_ENABLED_OPTION: &str = "read.parquet.page-index.enabled";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
 const BUCKET_KEY_OPTION: &str = "bucket-key";
@@ -399,6 +400,23 @@ impl<'a> CoreOptions<'a> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_READ_BATCH_SIZE)
+    }
+
+    /// Whether to load parquet page index (ColumnIndex / OffsetIndex) and use
+    /// page-level min/max for additional row-selection pruning. Default `true`
+    /// to mirror the upstream parquet-hadoop behaviour Java relies on; set to
+    /// `false` to opt out for files without page index where the metadata
+    /// load cost outweighs the prune benefit. Corresponds to the Stage 1
+    /// option in `docs/parquet-pushdown-plan.md`.
+    pub fn parquet_page_index_enabled(&self) -> bool {
+        match self.options.get(PARQUET_PAGE_INDEX_ENABLED_OPTION) {
+            None => true,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            // Anything else is unparseable — fall back to the default rather
+            // than silently flipping to off.
+            Some(_) => true,
+        }
     }
 
     /// `versioned-partial-update.merge-mode` — per-job intent for which
@@ -1300,5 +1318,44 @@ mod tests {
         let core = CoreOptions::new(&options);
         assert_eq!(core.field_aggregate_function("price"), Some("max"));
         assert_eq!(core.field_aggregate_function("other"), None);
+    }
+
+    #[test]
+    fn test_parquet_page_index_default_is_enabled() {
+        let opts = HashMap::new();
+        let core = CoreOptions::new(&opts);
+        assert!(core.parquet_page_index_enabled());
+    }
+
+    #[test]
+    fn test_parquet_page_index_explicit_off() {
+        let opts = HashMap::from([(
+            PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(),
+            "false".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert!(!core.parquet_page_index_enabled());
+    }
+
+    #[test]
+    fn test_parquet_page_index_case_insensitive_true() {
+        let opts = HashMap::from([(
+            PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(),
+            "TRUE".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        assert!(core.parquet_page_index_enabled());
+    }
+
+    #[test]
+    fn test_parquet_page_index_unparseable_falls_back_to_default() {
+        let opts = HashMap::from([(
+            PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(),
+            "yes".into(),
+        )]);
+        let core = CoreOptions::new(&opts);
+        // Unparseable values fall back to the default (true), not silently
+        // flipping the toggle off.
+        assert!(core.parquet_page_index_enabled());
     }
 }

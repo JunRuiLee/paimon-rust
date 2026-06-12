@@ -52,6 +52,11 @@ pub(crate) struct DataFileReader {
     /// Rows per batch passed to the format reader. Sourced from
     /// `CoreOptions::read_batch_size()` by callers.
     batch_size: usize,
+    /// Whether the parquet format reader should load page index
+    /// (ColumnIndex / OffsetIndex) and apply page-level pruning. Sourced
+    /// from `CoreOptions::parquet_page_index_enabled()` by callers; ignored
+    /// for non-parquet file formats.
+    parquet_page_index_enabled: bool,
 }
 
 impl DataFileReader {
@@ -63,6 +68,7 @@ impl DataFileReader {
         read_type: Vec<DataField>,
         predicates: Vec<Predicate>,
         batch_size: usize,
+        parquet_page_index_enabled: bool,
     ) -> Self {
         Self {
             file_io,
@@ -74,6 +80,7 @@ impl DataFileReader {
             blob_as_descriptor: false,
             drop_deletes: false,
             batch_size,
+            parquet_page_index_enabled,
         }
     }
 
@@ -189,6 +196,7 @@ impl DataFileReader {
         let batch_size = self.batch_size;
         let blob_as_descriptor = self.blob_as_descriptor;
         let drop_deletes = self.drop_deletes;
+        let parquet_page_index_enabled = self.parquet_page_index_enabled;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
 
@@ -257,7 +265,11 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader(&path_to_read, blob_as_descriptor)?;
+            let format_reader = create_format_reader(
+                &path_to_read,
+                blob_as_descriptor,
+                parquet_page_index_enabled,
+            )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
             let local_ranges = row_ranges.as_ref().map(|ranges| {

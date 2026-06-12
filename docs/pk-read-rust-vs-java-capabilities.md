@@ -287,6 +287,7 @@ paimon-java 有、paimon-rust **完全没实现**或**仅枚举占位**的能力
 - **量化**：未实测。
 - **审计结论（HEAD `029a159`）**：paimon-rust 已具备 manifest stats prune、row-group STATISTICS prune、per-row RowFilter；**未在读路径显式利用 parquet COLUMN_INDEX (page-level)、BLOOMFILTER、DICTIONARY** 三类 parquet 内部索引。`ArrowReaderOptions` 默认 `PageIndexPolicy::Skip`，metadata 不加载 page index；`get_row_group_column_bloom_filter` 在仓库零调用；写端 `ParquetFormatWriter::new`（`parquet.rs:65-73`）只设 compression，未启用 bloom 写入。
 - **实施方案**：[`parquet-pushdown-plan.md`](./parquet-pushdown-plan.md) — Stage 1（Page-Index page-level prune，必做、复用 stats-safe 谓词语义，无法安全判断时 fail-open）+ Stage 2（Bloom Filter，对 Eq/In）+ Stage 3（Dictionary filter，follow-up）。完成后本条由 ❓ → ✓。
+- **进度**：Stage 1 已落地 — `read.parquet.page-index.enabled` 默认 on；`build_predicate_page_selection` 用 ColumnIndex/OffsetIndex 在 row-group 之外补一层 page-level RowSelection，与现有 row-group / row_ranges selection 取交集；缺索引 / null page / 保守 op (NotEq/NotIn/EndsWith/Contains/general Like/NotBetween) 一律 fail-open。Stage 2 / Stage 3 待办。
 
 ### P8. PlanCache 缺位
 
@@ -353,7 +354,7 @@ paimon-java 有、paimon-rust **完全没实现**或**仅枚举占位**的能力
 | P4 | File-index pruning（plan 阶段） | ✓ | ✗ | P | — |
 | P5 | Limit pushdown manifest-entry 级 | ✓ | ✗（仅 split 级） | P | — |
 | P6 | Whole-bucket value filter | ✓ | ✗ | P | — |
-| P7 | Parquet dictionary / column-index filter 透传 | ✓（多层级） | ❓ 未显式利用 page-index / bloom / dictionary 三类 parquet 内部索引；方案见 [`parquet-pushdown-plan.md`](./parquet-pushdown-plan.md) | P | — |
+| P7 | Parquet dictionary / column-index filter 透传 | ✓（多层级） | ❓ Stage 1 (page-index) 已落地；bloom / dictionary 待办；方案见 [`parquet-pushdown-plan.md`](./parquet-pushdown-plan.md) | P | — |
 | P8 | PlanCache | ✓ | ✗ | P | — |
 | P9 | Manifest / file-index / partition cache | ✓ Caffeine + 多层 | ❓ 未审计 | P | — |
 | P10 | ORC async read | ✓ | ✗ | P | — |
