@@ -134,6 +134,9 @@ impl GlobalIndexScanner {
                     data_type,
                     ..
                 } => {
+                    if !is_btree_supported_op(*op) {
+                        return Ok(None);
+                    }
                     let field_id = self.find_field_id_by_name(column)?;
                     let field_id = match field_id {
                         Some(id) => id,
@@ -161,14 +164,16 @@ impl GlobalIndexScanner {
                             ..
                         } = child
                         {
-                            if let Some(field_id) = self.find_field_id_by_name(column)? {
-                                if self.entries_for_field(field_id).is_some() {
-                                    leaf_groups.entry(field_id).or_default().push((
-                                        *op,
-                                        literals.as_slice(),
-                                        data_type,
-                                    ));
-                                    continue;
+                            if is_btree_supported_op(*op) {
+                                if let Some(field_id) = self.find_field_id_by_name(column)? {
+                                    if self.entries_for_field(field_id).is_some() {
+                                        leaf_groups.entry(field_id).or_default().push((
+                                            *op,
+                                            literals.as_slice(),
+                                            data_type,
+                                        ));
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -381,6 +386,27 @@ impl GlobalIndexScanner {
             .find(|(id, _)| *id == field_id)
             .map(|(_, entries)| entries.as_slice())
     }
+}
+
+/// Whether the b-tree global index can evaluate this operator directly.
+/// Operators that fall outside this set bypass the index and are evaluated
+/// later in the read pipeline (stats prune + parquet row filter).
+fn is_btree_supported_op(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::Eq
+            | PredicateOperator::NotEq
+            | PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+            | PredicateOperator::In
+            | PredicateOperator::NotIn
+            | PredicateOperator::IsNull
+            | PredicateOperator::IsNotNull
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
+    )
 }
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).

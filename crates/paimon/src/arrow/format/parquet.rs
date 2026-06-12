@@ -22,14 +22,19 @@ use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Datum as ArrowDatum, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
+    StringArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
     neq as arrow_neq,
 };
 use arrow_schema::ArrowError;
+use arrow_string::like::{
+    contains as arrow_contains, ends_with as arrow_ends_with, like as arrow_like,
+    starts_with as arrow_starts_with,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -286,6 +291,12 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::GtEq
             | PredicateOperator::In
             | PredicateOperator::NotIn
+            | PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
+            | PredicateOperator::Like
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
     )
 }
 
@@ -308,6 +319,32 @@ fn parquet_row_filter_literals_supported(
             Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
         }
         PredicateOperator::In | PredicateOperator::NotIn => {
+            for literal in literals {
+                if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
+            // Substring kernels only run against string-typed columns; reject
+            // non-string file types early so the filter falls back to stats
+            // pruning + residual evaluation.
+            if !matches!(file_data_type, DataType::Char(_) | DataType::VarChar(_)) {
+                return Ok(false);
+            }
+            let Some(literal) = literals.first() else {
+                return Ok(false);
+            };
+            Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
+        }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            if literals.len() != 2 {
+                return Ok(false);
+            }
             for literal in literals {
                 if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
                     return Ok(false);
@@ -354,7 +391,11 @@ fn evaluate_exact_leaf_predicate(
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {
+        | PredicateOperator::GtEq
+        | PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
             let Some(literal) = literals.first() else {
                 return Ok(BooleanArray::from(vec![true; array.len()]));
             };
@@ -366,7 +407,46 @@ fn evaluate_exact_leaf_predicate(
             let result = evaluate_column_predicate(array, &scalar, op)?;
             Ok(sanitize_filter_mask(result))
         }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            evaluate_between_predicate(array, data_type, op, literals)
+        }
     }
+}
+
+/// `Between` / `NotBetween` translate to `gt_eq(col, low) & lt_eq(col, high)`
+/// (and its negation). `arrow_ord::cmp` produces nullable masks: any null
+/// row makes the comparison null, so a fully-built `Between` mask preserves
+/// nulls. `NotBetween` then negates valid rows and leaves nulls null —
+/// matching SQL three-valued logic; `sanitize_filter_mask` collapses nulls
+/// into `false` to match the predicate evaluator's "NULL → false" rule.
+fn evaluate_between_predicate(
+    array: &ArrayRef,
+    data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> Result<BooleanArray, ArrowError> {
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(low_scalar) = literal_scalar_for_parquet_filter(low, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(high_scalar) = literal_scalar_for_parquet_filter(high, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let lo_mask = arrow_gt_eq(array, &low_scalar)?;
+    let hi_mask = arrow_lt_eq(array, &high_scalar)?;
+    let between = arrow_arith::boolean::and_kleene(&lo_mask, &hi_mask)?;
+    let result = match op {
+        PredicateOperator::Between => between,
+        PredicateOperator::NotBetween => arrow_arith::boolean::not(&between)?,
+        _ => unreachable!(),
+    };
+    Ok(sanitize_filter_mask(result))
 }
 
 fn evaluate_set_membership_predicate(
@@ -423,11 +503,64 @@ fn evaluate_column_predicate(
         PredicateOperator::LtEq => arrow_lt_eq(column, scalar),
         PredicateOperator::Gt => arrow_gt(column, scalar),
         PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
+            let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
+            match op {
+                PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
+                PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
+                PredicateOperator::Contains => arrow_contains(column, &pattern),
+                PredicateOperator::Like => arrow_like(column, &pattern),
+                _ => unreachable!(),
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::NotIn
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
+}
+
+/// `arrow_string::like::*` kernels reject mismatched string types — Utf8 column
+/// against Utf8 pattern is fine, but a LargeUtf8 / Utf8View column needs a
+/// pattern of the same flavour. The shared scalar built upstream is always
+/// `StringArray` (Utf8); promote it to match the column when needed.
+fn pattern_scalar_for_string_kernel(
+    scalar: &Scalar<ArrayRef>,
+    column_type: &arrow_schema::DataType,
+) -> Result<Scalar<ArrayRef>, ArrowError> {
+    use arrow_array::{LargeStringArray, StringArray, StringViewArray};
+    use arrow_schema::DataType as ArrowDataType;
+
+    let arr = scalar.get().0;
+    let value = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .and_then(|s| (s.len() == 1 && s.is_valid(0)).then(|| s.value(0).to_string()));
+    let Some(value) = value else {
+        return Ok(scalar.clone());
+    };
+    Ok(match column_type {
+        ArrowDataType::Utf8 => Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef),
+        ArrowDataType::LargeUtf8 => {
+            Scalar::new(Arc::new(LargeStringArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Utf8View => {
+            Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Dictionary(_, value_type) if value_type.as_ref() == &ArrowDataType::Utf8 => {
+            Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef)
+        }
+        other => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "string predicate against non-string column type {other:?}"
+            )))
+        }
+    })
 }
 
 fn sanitize_filter_mask(mask: BooleanArray) -> BooleanArray {
@@ -1186,6 +1319,135 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // String predicate tests (StartsWith / EndsWith / Contains)
+    // -----------------------------------------------------------------------
+
+    fn run_string_op(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        pattern: &str,
+    ) -> arrow_array::BooleanArray {
+        use crate::spec::VarCharType;
+        let dt = DataType::VarChar(VarCharType::default());
+        super::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::String(pattern.to_string())],
+        )
+        .expect("string op should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_starts_with_string_array() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foo"),
+            Some("foobar"),
+            Some("baz"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::StartsWith, arr, "foo");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_ends_with_large_string_array() {
+        use arrow_array::LargeStringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            Some("ello"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::EndsWith, arr, "ello");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_contains_string_view_array() {
+        use arrow_array::StringViewArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("apple pie"),
+            Some("banana"),
+            Some("crab apple"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::Contains, arr, "apple");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_pattern_with_underscore_and_percent() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foobar"),
+            Some("foox"),
+            Some("zoobar"),
+            None,
+        ]));
+        // f_o% matches "foobar" (f-o-o then anything) and "foox" (f-o-o then x)
+        // but not "zoobar".
+        let mask = run_string_op(super::PredicateOperator::Like, arr, "f_o%");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_escaped_percent_treated_literally() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef =
+            Arc::new(StringArray::from(vec![Some("100%"), Some("1000"), None]));
+        let mask = run_string_op(super::PredicateOperator::Like, arr, r"100\%");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // BETWEEN / NOT BETWEEN row-filter tests
+    // -----------------------------------------------------------------------
+
+    fn run_between(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        low: i32,
+        high: i32,
+    ) -> arrow_array::BooleanArray {
+        let dt = DataType::Int(IntType::new());
+        super::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::Int(low), Datum::Int(high)],
+        )
+        .expect("BETWEEN should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_between_int_array() {
+        let arr: arrow_array::ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let mask = run_between(super::PredicateOperator::Between, arr, 5, 10);
+        let expected =
+            arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_not_between_treats_null_as_false() {
+        let arr: arrow_array::ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let mask = run_between(super::PredicateOperator::NotBetween, arr, 5, 10);
+        // NULL → false (residual filter convention; matches sanitize_filter_mask).
+        let expected =
+            arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
+        assert_eq!(mask, expected);
     }
 
     // -----------------------------------------------------------------------

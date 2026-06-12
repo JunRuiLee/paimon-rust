@@ -392,6 +392,30 @@ fn leaf_to_vortex_expr(
                 .collect::<Option<Vec<_>>>()?;
             and_collect(exprs)
         }
+        // Vortex expressions don't yet expose a substring/prefix predicate, so
+        // fall open: returning None causes the caller to evaluate these
+        // predicates outside the Vortex layer (stats prune + arrow row filter).
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => None,
+        PredicateOperator::Between => {
+            let lo = datum_to_vortex_lit(literals.first()?, file_field)?;
+            let hi = datum_to_vortex_lit(literals.get(1)?, file_field)?;
+            and_collect(vec![
+                gt_eq(col(file_field.name()), lo),
+                lt_eq(col(file_field.name()), hi),
+            ])
+        }
+        PredicateOperator::NotBetween => {
+            let lo = datum_to_vortex_lit(literals.first()?, file_field)?;
+            let hi = datum_to_vortex_lit(literals.get(1)?, file_field)?;
+            and_collect(vec![
+                gt_eq(col(file_field.name()), lo),
+                lt_eq(col(file_field.name()), hi),
+            ])
+            .map(not)
+        }
     }
 }
 
