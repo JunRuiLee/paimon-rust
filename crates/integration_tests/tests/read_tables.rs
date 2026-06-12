@@ -1583,6 +1583,98 @@ async fn test_read_schema_evolution_rename_column() {
     );
 }
 
+/// Test reading a mixed-format table after ALTER TABLE DROP COLUMN.
+/// Old Parquet/ORC data files have the dropped column; new Avro files do not.
+#[tokio::test]
+async fn test_read_mixed_format_schema_evolution_drop_column() {
+    let table_name = "mixed_format_schema_evolution_drop_column";
+    let (plan, batches) = scan_and_read_with_fs_catalog(table_name, None).await;
+    assert_plan_file_formats(&plan, &["avro", "orc", "parquet"], table_name);
+
+    for batch in &batches {
+        assert!(
+            batch.column_by_name("score").is_none(),
+            "Dropped column 'score' should not appear in output"
+        );
+    }
+
+    let mut rows: Vec<(i32, String)> = Vec::new();
+    for batch in &batches {
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("id");
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("name");
+        for i in 0..batch.num_rows() {
+            rows.push((id.value(i), name.value(i).to_string()));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "parquet-alice".into()),
+            (2, "parquet-bob".into()),
+            (3, "orc-carol".into()),
+            (4, "orc-dave".into()),
+            (5, "avro-eve".into()),
+            (6, "avro-frank".into()),
+        ],
+        "Mixed-format DROP COLUMN should expose only remaining columns from all file formats"
+    );
+
+    let (_, projected_batches) = scan_and_read_with_fs_catalog(
+        "mixed_format_schema_evolution_drop_column",
+        Some(&["name", "id"]),
+    )
+    .await;
+
+    let mut projected_rows: Vec<(i32, String)> = Vec::new();
+    for batch in &projected_batches {
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec!["name", "id"],
+            "Projection should preserve caller-specified order after DROP COLUMN"
+        );
+        assert!(
+            batch.column_by_name("score").is_none(),
+            "Dropped column 'score' should not appear in projected output"
+        );
+
+        let name = batch
+            .column_by_name("name")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .expect("projected name");
+        let id = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .expect("projected id");
+        for i in 0..batch.num_rows() {
+            projected_rows.push((id.value(i), name.value(i).to_string()));
+        }
+    }
+    projected_rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        projected_rows,
+        vec![
+            (1, "parquet-alice".into()),
+            (2, "parquet-bob".into()),
+            (3, "orc-carol".into()),
+            (4, "orc-dave".into()),
+            (5, "avro-eve".into()),
+            (6, "avro-frank".into()),
+        ],
+        "Projection should read remaining columns across old and new file schemas"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Complex type integration tests
 // ---------------------------------------------------------------------------
