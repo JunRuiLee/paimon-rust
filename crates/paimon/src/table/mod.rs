@@ -59,6 +59,7 @@ mod table_scan;
 mod table_update;
 pub(crate) mod table_write;
 mod tag_manager;
+pub(crate) mod time_travel;
 mod vector_search_builder;
 mod versioned_partial_update;
 mod write_builder;
@@ -91,7 +92,7 @@ pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::{DataField, TableSchema};
+use crate::spec::{DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -103,6 +104,13 @@ pub struct Table {
     schema: TableSchema,
     schema_manager: SchemaManager,
     rest_env: Option<RESTEnv>,
+    /// True when this table copy was switched to a historical schema by
+    /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
+    time_traveled: bool,
+    /// Snapshot resolved by [`Table::copy_with_time_travel`] from this copy's
+    /// options, so scans don't have to resolve the same selector again.
+    /// Cleared when [`Table::copy_with_options`] changes the selector.
+    travel_snapshot: Option<Snapshot>,
 }
 
 impl Table {
@@ -122,6 +130,8 @@ impl Table {
             schema,
             schema_manager,
             rest_env,
+            time_traveled: false,
+            travel_snapshot: None,
         }
     }
 
@@ -182,7 +192,19 @@ impl Table {
     }
 
     /// Create a copy of this table with extra options merged into the schema.
+    ///
+    /// This never switches the schema version; it corresponds to Java
+    /// `FileStoreTable.copyWithoutTimeTravel`. Use
+    /// [`Table::copy_with_time_travel`] when the options may select a
+    /// historical snapshot whose schema should be used for reading.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        // Changing the time-travel selector invalidates the resolved snapshot
+        // (a time-travelled schema then has no matching snapshot anymore, and
+        // scans of such a copy fail until `copy_with_time_travel` re-resolves
+        // it). Unrelated options keep the snapshot/schema pair intact.
+        let selector_changed = extra.keys().any(|k| {
+            k == crate::spec::SCAN_VERSION_OPTION || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+        });
         Self {
             file_io: self.file_io.clone(),
             identifier: self.identifier.clone(),
@@ -190,7 +212,56 @@ impl Table {
             schema: self.schema.copy_with_options(extra),
             schema_manager: self.schema_manager.clone(),
             rest_env: self.rest_env.clone(),
+            time_traveled: self.time_traveled,
+            travel_snapshot: if selector_changed {
+                None
+            } else {
+                self.travel_snapshot.clone()
+            },
         }
+    }
+
+    /// Create a copy of this table with extra options merged in, switching to
+    /// the schema of the time-travelled snapshot when the merged options
+    /// select one.
+    ///
+    /// Mirrors Java `AbstractFileStoreTable.copy(dynamicOptions)` →
+    /// `tryTimeTravel`: if the merged options contain a time-travel selector
+    /// (`scan.version` / `scan.timestamp-millis`) that resolves to a snapshot,
+    /// the table's fields and keys come from that snapshot's schema while the
+    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
+    /// Like Java, resolution failures fall back silently to the current
+    /// schema (the `if let Ok` below swallows them); an invalid selector
+    /// still fails later at scan planning.
+    pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
+        let mut table = self.copy_with_options(extra);
+        // travel_to_snapshot returns Ok(None) without IO when the merged
+        // options contain no selector.
+        if let Ok(Some(snapshot)) =
+            time_travel::travel_to_snapshot(&table.file_io, &table.location, table.schema.options())
+                .await
+        {
+            if snapshot.schema_id() != table.schema.id() {
+                let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
+                table.schema =
+                    snapshot_schema.copy_with_replaced_options(table.schema.options().clone());
+                table.time_traveled = true;
+            }
+            table.travel_snapshot = Some(snapshot);
+        }
+        Ok(table)
+    }
+
+    /// Whether this table copy reads a historical snapshot with its
+    /// historical schema (see [`Table::copy_with_time_travel`]).
+    pub fn is_time_traveled(&self) -> bool {
+        self.time_traveled
+    }
+
+    /// The snapshot resolved by [`Table::copy_with_time_travel`] from this
+    /// copy's options, if any. Lets scans skip re-resolving the selector.
+    pub(crate) fn travel_snapshot(&self) -> Option<&Snapshot> {
+        self.travel_snapshot.as_ref()
     }
 }
 

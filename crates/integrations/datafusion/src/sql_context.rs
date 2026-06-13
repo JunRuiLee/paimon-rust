@@ -509,7 +509,10 @@ impl SQLContext {
             let mut options = self.dynamic_options.read().unwrap().clone();
             options.insert(SCAN_VERSION_OPTION.to_string(), info.version.clone());
 
-            let table_with_options = paimon_table.copy_with_options(options);
+            let table_with_options = paimon_table
+                .copy_with_time_travel(options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
                 table_with_options,
                 self.blob_reader_registry.clone(),
@@ -538,7 +541,10 @@ impl SQLContext {
             let mut options = self.dynamic_options.read().unwrap().clone();
             options.insert(SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), millis.to_string());
 
-            let table_with_options = paimon_table.copy_with_options(options);
+            let table_with_options = paimon_table
+                .copy_with_time_travel(options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let provider = Arc::new(PaimonTableProvider::try_new_with_blob_reader_registry(
                 table_with_options,
                 self.blob_reader_registry.clone(),
@@ -944,7 +950,32 @@ impl SQLContext {
         ok_result(&self.ctx)
     }
 
+    /// Reject write statements while a session-level time-travel selector is
+    /// active.
+    ///
+    /// Writes always operate on the latest table state, but in the same
+    /// session reads resolve through the time-travelled snapshot schema (and
+    /// INSERT through the provider is rejected by the write builder), so
+    /// silently ignoring the selector here would be inconsistent. Failing
+    /// with a clear message is safer than writing against a different schema
+    /// than concurrent reads observe.
+    fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
+        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+
+        let options = self.dynamic_options.read().unwrap();
+        for key in [SCAN_VERSION_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION] {
+            if options.contains_key(key) {
+                return Err(DataFusionError::Plan(format!(
+                    "Cannot execute {operation} while time-travel option '{key}' is set; \
+                     RESET 'paimon.{key}' first"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_merge_into(&self, merge: &Merge) -> DFResult<DataFrame> {
+        self.ensure_no_time_travel_for_write("MERGE INTO")?;
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
             other => {
@@ -964,6 +995,7 @@ impl SQLContext {
     }
 
     async fn handle_update(&self, update: &Update) -> DFResult<DataFrame> {
+        self.ensure_no_time_travel_for_write("UPDATE")?;
         let table_name = match &update.table.relation {
             TableFactor::Table { name, .. } => name.clone(),
             other => {
@@ -983,6 +1015,7 @@ impl SQLContext {
     }
 
     async fn handle_delete(&self, delete: &Delete) -> DFResult<DataFrame> {
+        self.ensure_no_time_travel_for_write("DELETE")?;
         let tables = match &delete.from {
             FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
         };
@@ -1010,6 +1043,7 @@ impl SQLContext {
     }
 
     async fn handle_insert_overwrite_partition(&self, insert: &Insert) -> DFResult<DataFrame> {
+        self.ensure_no_time_travel_for_write("INSERT OVERWRITE")?;
         let table_name = match &insert.table {
             TableObject::TableName(name) => name.clone(),
             other => {
@@ -1141,6 +1175,7 @@ impl SQLContext {
     }
 
     async fn handle_truncate_table(&self, truncate: &Truncate) -> DFResult<DataFrame> {
+        self.ensure_no_time_travel_for_write("TRUNCATE TABLE")?;
         if truncate.table_names.len() > 1 {
             return Err(DataFusionError::Plan(
                 "TRUNCATE TABLE does not support multiple tables".to_string(),
