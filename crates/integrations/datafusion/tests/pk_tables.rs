@@ -19,8 +19,8 @@
 //!
 //! Covers: basic write+read, dedup within/across commits, partitioned PK tables,
 //! multi-bucket, column projection, FirstRow merge engine, sequence.field,
-//! INSERT OVERWRITE, filter pushdown, cross-split merge correctness, and
-//! error cases.
+//! INSERT OVERWRITE, filter pushdown, cross-split merge correctness,
+//! aggregation merge engine, and error cases.
 //!
 //! Dynamic bucket and cross-partition tests are in separate files:
 //! - `dynamic_bucket_tables.rs`
@@ -32,7 +32,7 @@ use common::{
     collect_id_name, collect_id_value, collect_int_int_str, collect_three_ints, create_sql_context,
     create_test_env, row_count, setup_sql_context,
 };
-use datafusion::arrow::array::{Array, Int32Array, StringArray};
+use datafusion::arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use paimon::catalog::Identifier;
 use paimon::Catalog;
 
@@ -2322,5 +2322,828 @@ async fn test_pk_partial_update_schema_evolution_via_options() {
         collect_three_ints(&batches),
         vec![(1, 10, 100), (2, 20, 200)],
         "partial-update must merge columns across schema_ids"
+    );
+}
+
+/// LIMIT must not be starved by merge-needed splits: the three versions of
+/// key 1 share one split whose physical row count (3) overstates its single
+/// logical row. Such splits report an unknown merged row count, so limit
+/// pushdown cannot stop before the split holding key 2.
+#[tokio::test]
+async fn test_pk_limit_not_starved_by_merge_splits() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_tiny_split_limit (
+                id INT NOT NULL, value INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'source.split.target-size' = '1b',
+                'source.split.open-file-cost' = '1b'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Three versions of key 1 (one overlapping section), then key 2.
+    for value in [10, 20, 30] {
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.t_tiny_split_limit VALUES (1, {value})"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_tiny_split_limit VALUES (2, 200)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Two logical rows exist; LIMIT 2 must return both.
+    let returned = row_count(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.t_tiny_split_limit LIMIT 2",
+    )
+    .await;
+    assert_eq!(returned, 2, "LIMIT 2 must yield 2 rows");
+
+    // COUNT(*) must reflect logical rows, not the physical (pre-merge) count
+    // that DataFusion could otherwise read from exact scan statistics.
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_tiny_split_limit")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "COUNT(*) must count merged rows");
+}
+
+/// Partial-update files can hold several physical rows of one key (the
+/// writer keeps all rows for read-side field-wise merge), so their splits
+/// must never report physical row counts as merged row counts: COUNT(*) has
+/// to count merged rows and LIMIT must not be starved.
+#[tokio::test]
+async fn test_pk_partial_update_count_and_limit_see_merged_rows() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_pu_count (
+                id INT NOT NULL, v_int INT, v_str STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'partial-update',
+                'source.split.target-size' = '1b',
+                'source.split.open-file-cost' = '1b'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // One INSERT writes three partial updates of key 1 into a single file,
+    // plus an independent key 2.
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_pu_count VALUES
+             (1, 10, CAST(NULL AS STRING)),
+             (1, CAST(NULL AS INT), 'hello'),
+             (1, 100, CAST(NULL AS STRING)),
+             (2, 200, 'world')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // COUNT(*) must count merged rows, not the physical rows a single file
+    // holds (DataFusion may answer COUNT(*) from exact scan statistics).
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_pu_count")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2, "COUNT(*) must count merged rows");
+
+    // Two logical rows exist; LIMIT 2 must not be starved by the
+    // multi-version file of key 1.
+    let returned = row_count(
+        &sql_context,
+        "SELECT id, v_int FROM paimon.test_db.t_pu_count LIMIT 2",
+    )
+    .await;
+    assert_eq!(returned, 2, "LIMIT 2 must yield 2 rows");
+}
+
+// ======================= Aggregation Engine =======================
+
+/// Basic: aggregation engine sums numeric column and concatenates string
+/// column across overlapping primary keys.
+#[tokio::test]
+async fn test_pk_aggregation_sum_and_listagg_fixed_bucket_e2e() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_sum (
+                id INT NOT NULL, amount INT, tag STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum',
+                'fields.tag.aggregate-function' = 'listagg',
+                'fields.tag.list-agg-delimiter' = '|'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_sum VALUES \
+             (1, 10, 'a'), (2, 20, 'x')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_sum VALUES \
+             (1, 5, 'b'), (2, 7, CAST(NULL AS STRING)), (3, 99, 'solo')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, amount, tag FROM paimon.test_db.t_agg_sum ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let mut rows: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let amounts = batch
+            .column_by_name("amount")
+            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+            .unwrap();
+        let tags = batch
+            .column_by_name("tag")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((
+                ids.value(i),
+                if amounts.is_null(i) {
+                    None
+                } else {
+                    Some(amounts.value(i))
+                },
+                if tags.is_null(i) {
+                    None
+                } else {
+                    Some(tags.value(i).to_string())
+                },
+            ));
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some(15), Some("a|b".to_string())),
+            (2, Some(27), Some("x".to_string())),
+            (3, Some(99), Some("solo".to_string())),
+        ]
+    );
+}
+
+/// `fields.default-aggregate-function` applies to any column without an
+/// explicit per-field aggregator.
+#[tokio::test]
+async fn test_pk_aggregation_default_function() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_default (
+                id INT NOT NULL, a INT, b STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.default-aggregate-function' = 'last_non_null_value'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_default VALUES (1, 10, 'old')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_default VALUES \
+             (1, CAST(NULL AS INT), 'new')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_default VALUES (1, 99, CAST(NULL AS STRING))")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, a, b FROM paimon.test_db.t_agg_default")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let batch = &batches[0];
+    let id = batch
+        .column_by_name("id")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    let a = batch
+        .column_by_name("a")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    let b = batch
+        .column_by_name("b")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .unwrap();
+    assert_eq!(id.value(0), 1);
+    assert_eq!(a.value(0), 99); // latest non-null int across the three commits
+    assert_eq!(b.value(0), "new"); // latest non-null string
+}
+
+/// Mixed aggregators in a single table: sum / max / bool_or / first_non_null_value.
+#[tokio::test]
+async fn test_pk_aggregation_mixed_aggregators() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_mixed (
+                id INT NOT NULL, total INT, peak INT, ok BOOLEAN, first_seen STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.total.aggregate-function' = 'sum',
+                'fields.peak.aggregate-function' = 'max',
+                'fields.ok.aggregate-function' = 'bool_or',
+                'fields.first_seen.aggregate-function' = 'first_non_null_value'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_mixed VALUES \
+             (1, 10, 5, false, 'a'), \
+             (1, 5, 8, true, 'b'), \
+             (1, 3, 7, false, 'c')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, total, peak, ok, first_seen FROM paimon.test_db.t_agg_mixed")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    use datafusion::arrow::array::BooleanArray;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let batch = &batches[0];
+    let total = batch
+        .column_by_name("total")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    let peak = batch
+        .column_by_name("peak")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    let ok = batch
+        .column_by_name("ok")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        .unwrap();
+    let first_seen = batch
+        .column_by_name("first_seen")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .unwrap();
+    assert_eq!(total.value(0), 18); // 10 + 5 + 3
+    assert_eq!(peak.value(0), 8); // max(5, 8, 7)
+    assert!(ok.value(0)); // bool_or = true if any is true
+    assert_eq!(first_seen.value(0), "a"); // first non-null wins
+}
+
+/// `sequence.field` forces the named column to `last_value`, even when the
+/// user explicitly configures another aggregator for it.
+#[tokio::test]
+async fn test_pk_aggregation_sequence_field_forced_last_value() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_seq (
+                id INT NOT NULL, amount INT, ts INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'sequence.field' = 'ts',
+                'fields.amount.aggregate-function' = 'sum',
+                'fields.ts.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_seq VALUES \
+             (1, 10, 100), (1, 20, 250)",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, amount, ts FROM paimon.test_db.t_agg_seq")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let batch = &batches[0];
+    let amount = batch
+        .column_by_name("amount")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    let ts = batch
+        .column_by_name("ts")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    assert_eq!(amount.value(0), 30); // sum still applies
+    assert_eq!(ts.value(0), 250); // forced last_value over sum
+}
+
+/// Aggregation engine reads must surface Unsupported when a DELETE/UPDATE
+/// row appears.
+#[tokio::test]
+async fn test_pk_aggregation_rejects_delete() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_del (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_del VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // DELETE may either fail at planning or surface Unsupported at execution.
+    // Either way the error must mention the aggregation engine refusing the
+    // retract row; we explicitly assert both branches so a future parser
+    // change cannot silently turn this into a no-op pass.
+    let plan_result = sql_context
+        .sql("DELETE FROM paimon.test_db.t_agg_del WHERE id = 1")
+        .await;
+    match plan_result {
+        Ok(df) => {
+            let exec = df.collect().await;
+            assert!(exec.is_err(), "DELETE on aggregation table should fail");
+            let msg = format!("{:?}", exec.err().unwrap());
+            assert!(
+                msg.contains("aggregation")
+                    || msg.contains("DELETE")
+                    || msg.contains("UPDATE_BEFORE"),
+                "expected aggregation engine to reject DELETE at execution, got {msg}"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("aggregation")
+                    || msg.contains("DELETE")
+                    || msg.contains("Unsupported"),
+                "expected aggregation engine to reject DELETE at planning, got {msg}"
+            );
+        }
+    }
+}
+
+/// `merge-engine=aggregation` with no per-field nor default aggregate-function
+/// should still work: each value column falls back to `last_non_null_value`,
+/// matching Java `AggregateMergeFunction#getAggFuncName`.
+#[tokio::test]
+async fn test_pk_aggregation_default_fallback_is_last_non_null_value() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_fallback (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_fallback VALUES (1, 10), (1, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, amount FROM paimon.test_db.t_agg_fallback")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let amount = batches[0]
+        .column_by_name("amount")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    assert_eq!(amount.value(0), 20); // last_non_null_value
+}
+
+/// CREATE TABLE should reject unsupported aggregation knobs in basic mode.
+#[tokio::test]
+async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_bad (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum',
+                'fields.amount.ignore-retract' = 'true'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with ignore-retract should fail in basic mode");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ignore-retract"),
+        "expected create-time rejection to mention ignore-retract, got {msg}"
+    );
+}
+
+/// CREATE TABLE should reject `fields.<typo>.aggregate-function` referring to
+/// a non-existent column, so misconfigured aggregation metadata cannot be
+/// persisted.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_unknown_field() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_typo (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amout.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with unknown field should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("amout") && msg.contains("amount"),
+        "expected unknown-field error to name the typo and surface the available \
+         columns, got {msg}"
+    );
+}
+
+/// CREATE TABLE should reject `fields.<col>.aggregate-function = '<unknown>'`
+/// at create time rather than only failing the first SELECT.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_unknown_function() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_badfn (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sume'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with unknown function should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sume"),
+        "expected unknown-function error to surface the bad name, got {msg}"
+    );
+}
+
+/// CREATE TABLE should reject aggregate-function/column type incompatibility
+/// (e.g. `sum` on a STRING column) at create time.  This is stricter than
+/// Java upstream, which defers the check to the first read/write.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_rejects_incompatible_type() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    let err = sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_badtype (
+                id INT NOT NULL, tag STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.tag.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect_err("CREATE TABLE with incompatible function/type should fail at create time");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sum") && msg.contains("tag"),
+        "expected incompatible-type error to mention the function and field, got {msg}"
+    );
+}
+
+/// CREATE TABLE must accept a function/type pair that the runtime would
+/// ignore: `sequence.field` columns are forced to `last_value` and primary-key
+/// columns get no aggregator, so type compatibility is not checked for them.
+#[tokio::test]
+async fn test_pk_aggregation_create_table_accepts_ignored_function_on_seq_and_pk() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    // `listagg` is incompatible with INT, but `amount` is the sequence field
+    // (forced to last_value) and `id` is a PK (copied through), so both
+    // configurations are usable at runtime and must pass CREATE TABLE.
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_seq_pk_ok (
+                id INT NOT NULL, amount INT, v INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'sequence.field' = 'amount',
+                'fields.amount.aggregate-function' = 'listagg',
+                'fields.id.aggregate-function' = 'listagg',
+                'fields.v.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .expect("CREATE TABLE with runtime-ignored function/type pairs should succeed");
+}
+
+/// All-NULL aggregation group on a nullable `sum` column should emit NULL
+/// rather than 0 or an error: nothing was observed, so there is no
+/// arithmetic result to surface.
+#[tokio::test]
+async fn test_pk_aggregation_sum_all_null_emits_null_for_nullable_column() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_null (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "INSERT INTO paimon.test_db.t_agg_null VALUES \
+             (1, CAST(NULL AS INT)), (1, CAST(NULL AS INT))",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT id, amount FROM paimon.test_db.t_agg_null")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let amount = batches[0]
+        .column_by_name("amount")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    assert!(amount.is_null(0), "sum over all-NULL group should be NULL");
+}
+
+/// Regression guard: end-to-end SELECT on an aggregation table must traverse
+/// the KeyValueFileReader path (TableRead::to_arrow → read_pk → read_kv),
+/// not silently fall through to read_raw.  The basic correctness assertion
+/// (sum aggregation) implies this routing — a fallthrough to read_raw would
+/// return the raw rows unmerged, breaking the sum.
+#[tokio::test]
+async fn test_pk_aggregation_routing_uses_kv_path() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_route (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Two rows with the same key in a single INSERT — read_raw would return 2
+    // rows; read_kv (with AggregateMergeFunction) collapses them into 1 with
+    // amount=30.
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_route VALUES (1, 10), (1, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let n = row_count(&sql_context, "SELECT * FROM paimon.test_db.t_agg_route").await;
+    assert_eq!(
+        n, 1,
+        "aggregation table must collapse same-PK rows; got {n} rows which suggests \
+         to_arrow fell through to read_raw"
+    );
+    let batches = sql_context
+        .sql("SELECT amount FROM paimon.test_db.t_agg_route")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let amount = batches[0]
+        .column_by_name("amount")
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+        .unwrap();
+    assert_eq!(amount.value(0), 30);
+}
+
+/// Regression: `COUNT(*)` pushes an empty projection down to the scan, so the
+/// KV merge read path must preserve the row count when reordering a batch with
+/// zero columns. Aggregation tables route through that path; without an
+/// explicit `with_row_count`, the reordered batch would report 0 rows and
+/// `COUNT(*)` would collapse to 0 even though the merge produced rows.
+#[tokio::test]
+async fn test_pk_aggregation_count_star_empty_projection() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_count (
+                id INT NOT NULL, amount INT,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.amount.aggregate-function' = 'sum'
+            )",
+        )
+        .await
+        .unwrap();
+
+    // Two commits with overlapping primary keys so the read path must merge:
+    // raw row count is 5, but the table holds 3 distinct keys (1, 2, 3).
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_count VALUES (1, 10), (2, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_count VALUES (1, 5), (2, 7), (3, 99)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT COUNT(*) FROM paimon.test_db.t_agg_count")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        count.value(0),
+        3,
+        "COUNT(*) over an aggregation table must reflect merged rows; a 0/wrong \
+         count means the empty-projection reorder dropped the row count"
     );
 }

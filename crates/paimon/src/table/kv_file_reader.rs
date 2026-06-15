@@ -25,7 +25,8 @@
 
 use super::data_file_reader::DataFileReader;
 use super::sort_merge::{
-    DeduplicateMergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
+    AggregateMergeFunction, DeduplicateMergeFunction, PartialUpdateMergeFunction,
+    SortMergeReaderBuilder,
 };
 use crate::arrow::build_target_arrow_schema;
 use crate::deletion_vector::DeletionVectorFactory;
@@ -106,6 +107,9 @@ impl KeyValueFileReader {
         merge_engine: MergeEngine,
         table_options: &HashMap<String, String>,
         table_name: &str,
+        merge_output_fields: &[DataField],
+        primary_keys: &[String],
+        sequence_fields: &[String],
     ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
         match merge_engine {
             MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
@@ -121,6 +125,13 @@ impl KeyValueFileReader {
                     table_options,
                 )?,
             )),
+            MergeEngine::Aggregation => Ok(Box::new(AggregateMergeFunction::new(
+                table_options,
+                table_name,
+                merge_output_fields,
+                primary_keys,
+                sequence_fields,
+            )?)),
         }
     }
 
@@ -258,6 +269,8 @@ impl KeyValueFileReader {
         let table_options = self.config.table_options;
         let predicates = self.config.predicates;
         let batch_size = self.config.batch_size;
+        let primary_keys = self.config.primary_keys;
+        let sequence_fields = self.config.sequence_fields;
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -375,7 +388,14 @@ impl KeyValueFileReader {
                     user_sequence_indices.clone(),
                     value_indices.clone(),
                     merge_output_schema.clone(),
-                    Self::new_merge_function(merge_engine, &table_options, &table_name)?,
+                    Self::new_merge_function(
+                        merge_engine,
+                        &table_options,
+                        &table_name,
+                        &merge_output_fields,
+                        &primary_keys,
+                        &sequence_fields,
+                    )?,
                 )
                 .with_batch_size(batch_size)
                 .with_stream_metas(stream_metas)
@@ -388,11 +408,21 @@ impl KeyValueFileReader {
                         .iter()
                         .map(|&src| batch.column(src).clone())
                         .collect();
-                    let reordered = RecordBatch::try_new(output_schema.clone(), columns)
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!("Failed to reorder merged RecordBatch: {e}"),
-                            source: Some(Box::new(e)),
-                        })?;
+                    // Preserve the merged row count explicitly: an empty
+                    // projection (e.g. `SELECT COUNT(*)`) yields zero columns,
+                    // and Arrow cannot infer the row count from a column-less
+                    // batch.
+                    let options = arrow_array::RecordBatchOptions::new()
+                        .with_row_count(Some(batch.num_rows()));
+                    let reordered = RecordBatch::try_new_with_options(
+                        output_schema.clone(),
+                        columns,
+                        &options,
+                    )
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to reorder merged RecordBatch: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
                     yield reordered;
                 }
             }

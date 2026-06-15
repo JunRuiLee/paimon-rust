@@ -427,6 +427,12 @@ pub struct DataSplit {
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Whether the split can be read raw, without the sort-merge reader: its
+    /// physical rows are exactly its logical (merged) rows, modulo deletion
+    /// files. `false` for merge-engine splits whose files may hold multiple
+    /// versions of a key, so `merged_row_count()` cannot be known without
+    /// actually merging. Mirrors Java `DataSplit#rawConvertible`.
+    raw_convertible: bool,
 }
 
 impl DataSplit {
@@ -457,6 +463,12 @@ impl DataSplit {
 
     pub fn row_ranges(&self) -> Option<&[RowRange]> {
         self.row_ranges.as_deref()
+    }
+
+    /// Whether this split can be read raw (no sort-merge needed); see the field
+    /// doc. Mirrors Java `DataSplit#rawConvertible`.
+    pub fn raw_convertible(&self) -> bool {
+        self.raw_convertible
     }
 
     /// Returns the deletion file for the data file at the given index, if any. `None` at that index means no deletion file.
@@ -501,6 +513,15 @@ impl DataSplit {
         // Try data evolution merged row count first (all files have first_row_id)
         if let Some(count) = self.data_evolution_merged_row_count() {
             return Some(count);
+        }
+
+        // Merge-engine splits whose files may hold multiple versions of a key
+        // have an unknown merged row count until they are actually merged: the
+        // physical row count overstates the logical one. Such splits are marked
+        // non-raw-convertible during scan planning, mirroring Java
+        // `DataSplit#rawMergedRowCount`.
+        if !self.raw_convertible {
+            return None;
         }
 
         // Fallback: row_count - deleted rows
@@ -567,6 +588,7 @@ pub struct DataSplitBuilder {
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    raw_convertible: bool,
 }
 
 impl DataSplitBuilder {
@@ -580,6 +602,11 @@ impl DataSplitBuilder {
             data_files: None,
             data_deletion_files: None,
             row_ranges: None,
+            // Default to raw-convertible (exact `merged_row_count`): non-merge
+            // tables (append, data-evolution) and direct test builders keep the
+            // existing exact-count behaviour. Scan planning explicitly marks
+            // merge-needed PK splits non-raw via `with_raw_convertible(false)`.
+            raw_convertible: true,
         }
     }
 
@@ -619,6 +646,14 @@ impl DataSplitBuilder {
 
     pub fn with_row_ranges(mut self, row_ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(row_ranges);
+        self
+    }
+
+    /// Marks whether the split can be read raw (physical rows == logical rows);
+    /// see [`DataSplit::raw_convertible`]. Set `false` for merge-needed PK
+    /// splits so `merged_row_count()` reports unknown.
+    pub fn with_raw_convertible(mut self, raw_convertible: bool) -> Self {
+        self.raw_convertible = raw_convertible;
         self
     }
 
@@ -674,6 +709,7 @@ impl DataSplitBuilder {
             data_files,
             data_deletion_files: self.data_deletion_files,
             row_ranges: self.row_ranges,
+            raw_convertible: self.raw_convertible,
         })
     }
 }

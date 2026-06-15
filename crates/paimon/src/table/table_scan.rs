@@ -705,7 +705,8 @@ impl<'a> TableScan<'a> {
         // Fail fast on invalid `merge-engine` (mirrors plan_manifest_entries
         // contract — see :526). Used both for the FirstRow gate below and as
         // the rawConvertible-fast-path engine check.
-        let is_first_row = core_options.merge_engine()? == crate::spec::MergeEngine::FirstRow;
+        let plan_merge_engine = core_options.merge_engine()?;
+        let is_first_row = plan_merge_engine == crate::spec::MergeEngine::FirstRow;
         let pk_comparator = if has_primary_keys {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
@@ -863,12 +864,37 @@ impl<'a> TableScan<'a> {
                     None
                 };
 
+                // A split is raw-convertible (its physical rows == logical rows,
+                // so `merged_row_count()` is exact) only when no read-side merge
+                // can drop or fold rows:
+                // - non-PK (append) tables never merge;
+                // - deletion-vector tables account for masked rows via deletion
+                //   cardinality, and first-row tables dedup on write;
+                // - deduplicate splits drawn from a single level hold disjoint,
+                //   already-deduplicated keys.
+                // Partial-update / versioned-partial-update / aggregation splits
+                // keep every version on write and fold them only on read, so
+                // their merged row count is unknown until merged → non-raw.
+                let split_one_level = file_group
+                    .iter()
+                    .map(|f| f.level)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    <= 1;
+                let split_raw_convertible = !has_primary_keys
+                    || dv_enabled
+                    || is_first_row
+                    || (plan_merge_engine == crate::spec::MergeEngine::Deduplicate
+                        && is_raw_convertible_file_group(&file_group)
+                        && split_one_level);
+
                 let mut builder = DataSplitBuilder::new()
                     .with_snapshot(snapshot_id)
                     .with_partition(partition_row.clone())
                     .with_bucket(bucket)
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
+                    .with_raw_convertible(split_raw_convertible)
                     .with_data_files(file_group);
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);

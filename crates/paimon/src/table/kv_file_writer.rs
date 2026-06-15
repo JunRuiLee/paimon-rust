@@ -30,9 +30,10 @@ use crate::arrow::format::create_format_writer;
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    extract_datum_from_arrow, BinaryRowBuilder, CoreOptions, DataFileMeta, DataType, MergeEngine,
-    PartialUpdateConfig, RowKind, COMMIT_SNAPSHOT_ID_PENDING, EMPTY_SERIALIZED_ROW,
-    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions, DataFileMeta,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, COMMIT_SNAPSHOT_ID_PENDING,
+    EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+
 };
 use crate::table::prepared_files::PreparedFiles;
 use crate::Result;
@@ -113,6 +114,20 @@ impl KeyValueFileWriter {
                 return Err(crate::Error::Unsupported {
                     message: format!(
                         "Table '{}' uses merge-engine=partial-update with deletion-vectors.enabled=true, which is not supported yet",
+                        config.table_name
+                    ),
+                });
+            }
+        }
+
+        if config.merge_engine == MergeEngine::Aggregation {
+            AggregationConfig::new(&config.table_options)
+                .validate_runtime_mode(true, &config.table_name)?;
+
+            if config.deletion_vectors_enabled {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Table '{}' uses merge-engine=aggregation with deletion-vectors.enabled=true, which is not supported yet",
                         config.table_name
                     ),
                 });
@@ -518,7 +533,11 @@ impl KeyValueFileWriter {
             MergeEngine::Deduplicate | MergeEngine::FirstRow => {
                 self.dedup_sorted_indices(batch, sorted_indices)
             }
-            MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate => Ok((0..sorted_indices.len())
+            // Aggregation and (versioned-)partial-update keep every row on flush
+            // and perform the per-field merge on the read side.
+            MergeEngine::PartialUpdate
+            | MergeEngine::VersionedPartialUpdate
+            | MergeEngine::Aggregation => Ok((0..sorted_indices.len())
                 .map(|idx| sorted_indices.value(idx))
                 .collect()),
         }
@@ -578,8 +597,11 @@ impl KeyValueFileWriter {
                     MergeEngine::Deduplicate => group_winner = cur,
                     // FirstRow: keep first (lowest seq), so don't update.
                     MergeEngine::FirstRow => {}
-                    MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate => unreachable!(
-                        "partial-update / versioned-partial-update should use select_flush_indices and skip dedup"
+                    MergeEngine::PartialUpdate
+                    | MergeEngine::VersionedPartialUpdate
+                    | MergeEngine::Aggregation => unreachable!(
+                        "{:?} should use select_flush_indices and skip dedup",
+                        self.config.merge_engine
                     ),
                 }
             } else {
@@ -653,8 +675,20 @@ mod tests {
 
     fn test_write_config(merge_engine: MergeEngine) -> KeyValueWriteConfig {
         let mut table_options = HashMap::new();
-        if merge_engine == MergeEngine::PartialUpdate {
-            table_options.insert("merge-engine".to_string(), "partial-update".to_string());
+        match merge_engine {
+            MergeEngine::PartialUpdate => {
+                table_options.insert("merge-engine".to_string(), "partial-update".to_string());
+            }
+            MergeEngine::Aggregation => {
+                table_options.insert("merge-engine".to_string(), "aggregation".to_string());
+            }
+            MergeEngine::VersionedPartialUpdate => {
+                table_options.insert(
+                    "merge-engine".to_string(),
+                    "versioned-partial-update".to_string(),
+                );
+            }
+            MergeEngine::Deduplicate | MergeEngine::FirstRow => {}
         }
 
         KeyValueWriteConfig {
@@ -805,6 +839,70 @@ mod tests {
             err,
             crate::Error::Unsupported { message }
             if message.contains("fields.price.aggregate-function")
+        ));
+    }
+
+    #[test]
+    fn test_select_flush_indices_keeps_all_rows_for_aggregation_engine() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
+            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow_array::Array>,
+            ],
+        )
+        .unwrap();
+        let sorted_indices = UInt32Array::from(vec![0, 1]);
+        let writer = KeyValueFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            test_write_config(MergeEngine::Aggregation),
+            0,
+        )
+        .unwrap();
+
+        let selected = writer
+            .select_flush_indices(&batch, &sorted_indices)
+            .unwrap();
+
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_new_rejects_aggregation_with_deletion_vectors() {
+        let mut config = test_write_config(MergeEngine::Aggregation);
+        config.deletion_vectors_enabled = true;
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("deletion-vectors.enabled=true")
+        ));
+    }
+
+    #[test]
+    fn test_new_rejects_unsupported_aggregation_options() {
+        let mut config = test_write_config(MergeEngine::Aggregation);
+        config.table_options.insert(
+            "fields.price.ignore-retract".to_string(),
+            "true".to_string(),
+        );
+
+        let err = KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err,
+            crate::Error::Unsupported { message }
+            if message.contains("fields.price.ignore-retract")
         ));
     }
 }

@@ -100,6 +100,8 @@ pub enum MergeEngine {
     /// (`ROW<latest_version, latest_value, all_versioned_values MAP>`).
     /// See `docs/versioned-partial-update-impl-plan.md`.
     VersionedPartialUpdate,
+    /// Apply per-field aggregate functions across rows sharing the same key.
+    Aggregation,
 }
 
 /// Read-time policy for deletion vector tables, controlling whether the planner
@@ -322,6 +324,7 @@ impl<'a> CoreOptions<'a> {
                 "partial-update" => Ok(MergeEngine::PartialUpdate),
                 "first-row" => Ok(MergeEngine::FirstRow),
                 "versioned-partial-update" => Ok(MergeEngine::VersionedPartialUpdate),
+                "aggregation" => Ok(MergeEngine::Aggregation),
                 other => Err(crate::Error::Unsupported {
                     message: format!("Unsupported merge-engine: '{other}'"),
                 }),
@@ -1028,6 +1031,14 @@ mod tests {
         )]);
         let core = CoreOptions::new(&opts);
         assert!(!core.versioned_partial_update_ignore_mode_enabled());
+    }
+
+    #[test]
+    fn test_merge_engine_accepts_aggregation() {
+        let options = HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "aggregation".into())]);
+        let core = CoreOptions::new(&options);
+
+        assert_eq!(core.merge_engine().unwrap(), MergeEngine::Aggregation);
     }
 
     #[test]

@@ -88,12 +88,15 @@ impl<'a> TableRead<'a> {
         // disjoint compacted files — and all compacted files of
         // deletion-vector tables, where DVs mask stale versions — use the
         // faster DataFileReader.
+        // PartialUpdate / VersionedPartialUpdate / Aggregation always go
+        // through KeyValueFileReader so per-key materialization runs on read.
         if has_primary_keys
             && matches!(
                 merge_engine,
                 MergeEngine::Deduplicate
                     | MergeEngine::PartialUpdate
                     | MergeEngine::VersionedPartialUpdate
+                    | MergeEngine::Aggregation
             )
         {
             return self.read_pk(data_splits, &core_options);
@@ -106,7 +109,8 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Read a PK table (Deduplicate / PartialUpdate / VersionedPartialUpdate).
+    /// Read a PK table (Deduplicate / PartialUpdate / VersionedPartialUpdate /
+    /// Aggregation).
     ///
     /// Routes splits to either KeyValueFileReader (sort-merge) or DataFileReader
     /// (raw read with `_VALUE_KIND` drop_deletes filter) using Java
@@ -116,22 +120,26 @@ impl<'a> TableRead<'a> {
     /// sort-merge — including DV-enabled splits with L0 files (DV+FRESHNESS),
     /// since Java does not treat those as rawConvertible regardless of DV mode.
     ///
-    /// PartialUpdate / VersionedPartialUpdate currently take a short-circuit
-    /// to sort-merge for *every* split — allowing L1+ raw splits would bypass
-    /// the partial-column / MV merge that produces the user-visible row.
+    /// PartialUpdate / VersionedPartialUpdate / Aggregation currently take a
+    /// short-circuit to sort-merge for *every* split — allowing L1+ raw splits
+    /// would bypass the partial-column / MV / per-key aggregate merge that
+    /// produces the user-visible row.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // Both PartialUpdate and VersionedPartialUpdate require sort-merge on
-        // *every* split (no raw fast path) — letting L1+ raw splits bypass
-        // sort-merge would expose un-merged partial columns / DELETE rows /
-        // MV intermediate state. Future optimisation should prove compacted
-        // files are fully materialised before opening that path.
+        // PartialUpdate / VersionedPartialUpdate / Aggregation require sort-merge
+        // on *every* split (no raw fast path) — letting L1+ raw splits bypass
+        // sort-merge would expose un-merged partial columns / DELETE rows / MV
+        // intermediate state / un-aggregated per-key rows. Future optimisation
+        // should prove compacted files are fully materialised before opening
+        // that path.
         if matches!(
             core_options.merge_engine()?,
-            MergeEngine::PartialUpdate | MergeEngine::VersionedPartialUpdate
+            MergeEngine::PartialUpdate
+                | MergeEngine::VersionedPartialUpdate
+                | MergeEngine::Aggregation
         ) {
             return self.read_kv(data_splits, core_options);
         }

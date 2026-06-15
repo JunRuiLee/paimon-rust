@@ -17,6 +17,7 @@
 
 use crate::spec::core_options::{first_row_supports_changelog_producer, CoreOptions};
 use crate::spec::types::{is_multi_version_type, ArrayType, DataType, MapType, MultisetType, RowType};
+use crate::spec::AggregationConfig;
 use crate::spec::{ChangelogProducer, ColumnMove, ColumnMoveType, MergeEngine, PartialUpdateConfig};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -287,6 +288,10 @@ impl TableSchema {
             highest_field_id.max(Self::current_highest_field_id(&new_schema.fields));
 
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
+        PartialUpdateConfig::new(&new_schema.options)
+            .validate_create_mode(!new_schema.primary_keys.is_empty())?;
+        AggregationConfig::new(&new_schema.options)
+            .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
         Schema::validate_versioned_partial_update(
             &new_schema.fields,
             &new_schema.primary_keys,
@@ -537,6 +542,7 @@ impl Schema {
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
+        AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
         Self::validate_versioned_partial_update(&fields, &primary_keys, &options)?;
 
@@ -1395,6 +1401,107 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregation_schema_validation_accepts_basic_options() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("tags", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            .option("fields.value.aggregate-function", "sum")
+            .option("fields.tags.aggregate-function", "listagg")
+            .option("fields.tags.list-agg-delimiter", ";")
+            .option("fields.default-aggregate-function", "last_non_null_value")
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.fields().len(), 3);
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unsupported_options() {
+        for (key, value) in [
+            ("ignore-delete", "true"),
+            ("aggregation.remove-record-on-delete", "true"),
+            ("fields.value.ignore-retract", "true"),
+            ("fields.value.distinct", "true"),
+            ("fields.value.sequence-group", "g1"),
+            ("fields.value.nested-key", "id"),
+            ("fields.value.count-limit", "10"),
+        ] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option(key, value)
+                .build()
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains(key)),
+                "aggregation create-time validation should reject '{key}', got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unknown_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("amount", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            // typo: `amout` instead of `amount`
+            .option("fields.amout.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("amout") && message.contains("amount")),
+            "expected unknown-field rejection at CREATE TABLE, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_unknown_function() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("amount", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            .option("fields.amount.aggregate-function", "sume")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sume")),
+            "expected unknown-function rejection at CREATE TABLE, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_schema_validation_rejects_incompatible_function_type() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("tag", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .primary_key(["id"])
+            .option("merge-engine", "aggregation")
+            // sum on a VarChar column
+            .option("fields.tag.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sum") && message.contains("tag")),
+            "expected incompatible-type rejection at CREATE TABLE, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_first_row_schema_validation_accepts_supported_changelog_producers() {
         for producer in ["none", "lookup"] {
             Schema::builder()
@@ -1513,6 +1620,93 @@ mod tests {
                 .get("changelog-producer")
                 .map(String::as_str),
             Some("lookup")
+        );
+    }
+
+    #[test]
+    fn test_aggregation_apply_changes_rejects_unknown_field() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.valuee.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("is not declared")
+                    && message.contains("valuee")),
+            "aggregation alter should reject typo'd column, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_partial_update_apply_changes_rejects_unsupported_option() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "partial-update")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "ignore-delete".to_string(),
+                "true".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("merge-engine=partial-update")
+                    && message.contains("ignore-delete")),
+            "partial-update alter should reject unsupported option, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_apply_changes_accepts_valid_option() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .build()
+                .unwrap(),
+        );
+
+        let new_schema = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.value.aggregate-function".to_string(),
+                "max".to_string(),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            new_schema
+                .options()
+                .get("fields.value.aggregate-function")
+                .map(String::as_str),
+            Some("max")
         );
     }
 
