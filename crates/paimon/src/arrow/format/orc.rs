@@ -252,6 +252,16 @@ fn build_orc_leaf_predicate(
         }
         PredicateOperator::IsNull | PredicateOperator::NotEq | PredicateOperator::NotIn => None,
         PredicateOperator::IsNotNull => None,
+        // String / range operators are not pushed into ORC; they fall through
+        // to the outer (inexact) filter. These variants exist in internal's
+        // `PredicateOperator` (F7 leaf extension) but not in upstream's, so the
+        // match must cover them explicitly.
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => None,
     }
 }
 

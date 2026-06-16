@@ -23,3 +23,5 @@
 **/dist/
 docs/site/
 .qoder
+**/__pycache__/
+*.pyc
