@@ -845,7 +845,7 @@ async fn run_one_pass(
     };
 
     let mut handles = Vec::with_capacity(parallelism);
-    for chunk in chunks {
+    for chunk in chunks.into_iter() {
         let table = table.clone();
         let projection = projection.clone();
         let predicate = predicate.clone();
