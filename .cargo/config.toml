@@ -16,6 +16,12 @@
 [target.x86_64-pc-windows-gnu]
 linker = "rust-lld"
 
+# Keep frame pointers in all builds so external profilers (perf, bcc/eBPF,
+# async-profiler attached to the host JVM, etc.) can walk Rust stacks.
+# Without this, release builds omit %rbp and stack traces are truncated.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
 # Use the system `git` CLI for fetching git dependencies so the internal
 # hdfs-native fork (git.corp.kuaishou.com, patched in the root Cargo.toml)
 # can reuse the local git credentials / ssh config.

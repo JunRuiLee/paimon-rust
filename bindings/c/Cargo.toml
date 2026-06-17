@@ -33,3 +33,8 @@ paimon = { path = "../../crates/paimon" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures = "0.3"
 arrow-array = { workspace = true }
+
+[build-dependencies]
+# Auto-generates include/paimon.h from the Rust extern "C" surface on every
+# build. Pinned at 0.27 (last version supporting Rust 1.86).
+cbindgen = "0.27"
