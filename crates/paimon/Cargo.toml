@@ -45,6 +45,21 @@ fulltext = ["tantivy", "tempfile"]
 mosaic = ["dep:paimon-mosaic-core"]
 vortex = ["dep:vortex"]
 
+# Use jemalloc as the global allocator. Linux-only — on other platforms the
+# feature is accepted but compiles to a no-op so `--features jemalloc` works
+# uniformly in CI matrices.
+#
+# Enabling this only adds the optional deps; binaries (e.g. paimon examples)
+# must still install the allocator themselves via:
+#   #[cfg(feature = "jemalloc")]
+#   #[global_allocator]
+#   static GLOBAL: paimon::alloc::Jemalloc = paimon::alloc::Jemalloc;
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Build jemalloc with --enable-prof so MALLOC_CONF=prof:true emits .heap files
+# for jeprof / pprof. First build is slow (~30s+ to compile jemalloc with
+# profiling). Implies `jemalloc`.
+jemalloc-profiling = ["jemalloc", "tikv-jemallocator/profiling"]
+
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-oss = ["opendal/services-oss"]
@@ -115,6 +130,14 @@ libloading = "0.9"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
 unicode-segmentation = "=1.13.2"
+
+# Optional jemalloc bits — see the `jemalloc` / `jemalloc-profiling` features
+# above. Only pulled in on Linux: the bundled jemalloc build script does not
+# support all targets and we do not want `--features jemalloc` to break Windows
+# CI. On other platforms `paimon::alloc` falls back to a no-op shim.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }

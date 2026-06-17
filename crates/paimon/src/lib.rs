@@ -19,6 +19,7 @@ mod error;
 pub use error::Error;
 pub use error::Result;
 
+pub mod alloc;
 pub mod common;
 pub use common::{CatalogOptions, Options};
 

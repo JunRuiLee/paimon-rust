@@ -68,6 +68,15 @@ use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{Datum, Predicate, PredicateBuilder};
 use paimon::{Catalog, CatalogFactory, DataSplit};
 
+// Optional jemalloc allocator. Enable via:
+//   cargo run -p paimon --release --features jemalloc --example read_local_demo -- ...
+// Together with PAIMON_MEM_STATS_INTERVAL_SECS=N a background task prints
+// allocator stats every N seconds. Linux-only; the cfg is a no-op elsewhere
+// (the `jemalloc` deps in Cargo.toml are gated on target_os = "linux").
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: paimon::alloc::Jemalloc = paimon::alloc::Jemalloc;
+
 /// Worker-thread count for the tokio runtime AND the per-pass split fan-out.
 ///
 /// Underlying `KeyValueFileReader::read` / `DataFileReader::read` are
@@ -1117,8 +1126,11 @@ async fn main() {
         }
     };
 
+    paimon::alloc::print_stats("startup");
+    let _stats_task = spawn_periodic_mem_stats();
+
     let mut summaries: Vec<TableSummary> = Vec::with_capacity(args.table_paths.len());
-    for path in &args.table_paths {
+    for (idx, path) in args.table_paths.iter().enumerate() {
         match process_one_table(&args, path).await {
             Ok(s) => summaries.push(s),
             Err(e) => {
@@ -1126,7 +1138,34 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        paimon::alloc::print_stats(&format!("after_table[{idx}]"));
     }
 
     print_cross_table_summary(&summaries);
+    paimon::alloc::print_stats("end");
+}
+
+/// If `PAIMON_MEM_STATS_INTERVAL_SECS` is set to a positive integer, spawn a
+/// detached task that prints allocator stats every N seconds. Returns a guard
+/// whose Drop aborts the task when main returns. No-op on parse failures or
+/// when the env var is unset / zero.
+fn spawn_periodic_mem_stats() -> Option<tokio::task::JoinHandle<()>> {
+    let secs: u64 = std::env::var("PAIMON_MEM_STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if secs == 0 {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+        // Skip the immediate first tick — startup stats are already printed.
+        tick.tick().await;
+        let mut i: u64 = 0;
+        loop {
+            tick.tick().await;
+            paimon::alloc::print_stats(&format!("periodic[{i}]"));
+            i += 1;
+        }
+    }))
 }
