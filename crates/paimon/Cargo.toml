@@ -54,11 +54,23 @@ vortex = ["dep:vortex"]
 #   #[cfg(feature = "jemalloc")]
 #   #[global_allocator]
 #   static GLOBAL: paimon::alloc::Jemalloc = paimon::alloc::Jemalloc;
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+#
+# `stats` is required: without it, `tikv_jemalloc_ctl::stats` is gated out
+# and `paimon::alloc::print_stats` cannot read allocator counters.
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-ctl",
+    "tikv-jemallocator/stats",
+    "tikv-jemalloc-ctl/stats",
+]
 # Build jemalloc with --enable-prof so MALLOC_CONF=prof:true emits .heap files
 # for jeprof / pprof. First build is slow (~30s+ to compile jemalloc with
 # profiling). Implies `jemalloc`.
-jemalloc-profiling = ["jemalloc", "tikv-jemallocator/profiling"]
+jemalloc-profiling = [
+    "jemalloc",
+    "tikv-jemallocator/profiling",
+    "tikv-jemalloc-ctl/profiling",
+]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
