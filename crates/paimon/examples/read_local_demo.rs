@@ -77,15 +77,15 @@ use paimon::{Catalog, CatalogFactory, DataSplit};
 #[global_allocator]
 static GLOBAL: paimon::alloc::Jemalloc = paimon::alloc::Jemalloc;
 
-/// Worker-thread count for the tokio runtime AND the per-pass split fan-out.
+/// Default worker-thread count for the tokio runtime AND the per-pass split
+/// fan-out. Overridable via `--parallelism N` (which sets both consistently).
 ///
 /// Underlying `KeyValueFileReader::read` / `DataFileReader::read` are
 /// `try_stream! { for split in splits { ... } }` — strictly sequential per
 /// stream. To parallelize across splits we partition `Plan.splits()` into N
 /// chunks, build N independent `TableRead`s, and `tokio::spawn` each chunk.
-/// `worker_threads = 16` on the runtime caps the actual concurrent decode
-/// at 16 (matches PARALLELISM so we don't oversubscribe).
-const PARALLELISM: usize = 16;
+/// Tokio's `worker_threads` is set to the same N so we don't oversubscribe.
+const DEFAULT_PARALLELISM: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -148,6 +148,12 @@ struct Args {
     /// `None` respects whatever the table has persisted (lib default 64,
     /// matching the previously hardcoded value).
     manifest_parallelism: Option<usize>,
+    /// Per-pass split fan-out AND tokio runtime worker_threads. Defaults to
+    /// `DEFAULT_PARALLELISM`. Lower values cap concurrent parquet decoders
+    /// and the in-flight column-chunk buffer they hold — directly trades
+    /// throughput for peak RSS on row-groups-with-wide-columns workloads
+    /// (e.g. embedding tables).
+    parallelism: usize,
 }
 
 /// Stat for one read pass. `residual_dropped` is the number of rows that
@@ -205,6 +211,10 @@ fn print_usage(argv0: &str) {
     eprintln!("    applied via `Table::copy_with_options`. Caps the in-flight manifest");
     eprintln!("    fetch concurrency during scan planning (clamped to [1, 1024] by");
     eprintln!("    paimon-core). Default unset → uses lib default 64.");
+    eprintln!("  --parallelism N: per-pass split fan-out AND tokio worker_threads.");
+    eprintln!("    Default {DEFAULT_PARALLELISM}. Lower values bound peak RSS at the cost");
+    eprintln!("    of throughput — each concurrent split holds an in-flight parquet");
+    eprintln!("    column-chunk buffer (can be GiB-scale on embedding columns).");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -219,6 +229,7 @@ fn parse_args() -> Result<Args, String> {
     let mut target_size: Option<String> = None;
     let mut read_mode: Option<String> = None;
     let mut manifest_parallelism: Option<usize> = None;
+    let mut parallelism: usize = DEFAULT_PARALLELISM;
 
     let mut i = 1;
     while i < argv.len() {
@@ -319,6 +330,19 @@ fn parse_args() -> Result<Args, String> {
                 }
                 manifest_parallelism = Some(n);
             }
+            "--parallelism" => {
+                i += 1;
+                let v = argv
+                    .get(i)
+                    .ok_or_else(|| "--parallelism needs an integer argument".to_string())?;
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--parallelism must be a positive integer, got: {v}"))?;
+                if n == 0 {
+                    return Err("--parallelism must be > 0".to_string());
+                }
+                parallelism = n;
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -344,6 +368,7 @@ fn parse_args() -> Result<Args, String> {
         target_size,
         read_mode,
         manifest_parallelism,
+        parallelism,
     })
 }
 
@@ -858,12 +883,12 @@ async fn run_one_pass(
     }
 
     // Phase 2 — drain. Splits are partitioned round-robin across up to
-    // PARALLELISM tasks (mirrors the C++ demo's bucket strategy: balances
+    // args.parallelism tasks (mirrors the C++ demo's bucket strategy: balances
     // size-skew better than contiguous chunks). Each task builds its own
     // `TableRead` from a cloned `Table` and drains its chunk's stream
     // independently.
     let t_drain = Instant::now();
-    let parallelism = PARALLELISM.min(splits.len());
+    let parallelism = args.parallelism.min(splits.len());
 
     let mut chunks: Vec<Vec<DataSplit>> = (0..parallelism).map(|_| Vec::new()).collect();
     for (i, s) in splits.into_iter().enumerate() {
@@ -1142,8 +1167,7 @@ fn print_cross_table_summary(summaries: &[TableSummary]) {
     }
 }
 
-#[tokio::main(worker_threads = 16)]
-async fn main() {
+fn main() {
     let argv0 = std::env::args().next().unwrap_or_else(|| "demo".to_string());
 
     let args = match parse_args() {
@@ -1155,23 +1179,34 @@ async fn main() {
         }
     };
 
-    paimon::alloc::print_stats("startup");
-    let _stats_task = spawn_periodic_mem_stats();
+    // Build the tokio runtime explicitly so worker_threads tracks
+    // args.parallelism — the `#[tokio::main]` macro only accepts literals
+    // and would lock us at the compile-time default.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.parallelism)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
 
-    let mut summaries: Vec<TableSummary> = Vec::with_capacity(args.table_paths.len());
-    for (idx, path) in args.table_paths.iter().enumerate() {
-        match process_one_table(&args, path).await {
-            Ok(s) => summaries.push(s),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+    rt.block_on(async {
+        paimon::alloc::print_stats("startup");
+        let _stats_task = spawn_periodic_mem_stats();
+
+        let mut summaries: Vec<TableSummary> = Vec::with_capacity(args.table_paths.len());
+        for (idx, path) in args.table_paths.iter().enumerate() {
+            match process_one_table(&args, path).await {
+                Ok(s) => summaries.push(s),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
+            paimon::alloc::print_stats(&format!("after_table[{idx}]"));
         }
-        paimon::alloc::print_stats(&format!("after_table[{idx}]"));
-    }
 
-    print_cross_table_summary(&summaries);
-    paimon::alloc::print_stats("end");
+        print_cross_table_summary(&summaries);
+        paimon::alloc::print_stats("end");
+    });
 }
 
 /// If `PAIMON_MEM_STATS_INTERVAL_SECS` is set to a positive integer, spawn a
