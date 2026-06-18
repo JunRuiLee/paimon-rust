@@ -101,6 +101,7 @@ async fn read_all_manifest_entries(
     deletion_vectors_enabled: bool,
     dv_read_mode: crate::spec::DvReadMode,
     merge_engine: Option<crate::spec::MergeEngine>,
+    manifest_parallelism: usize,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let (mut manifest_files, delta) = futures::try_join!(
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
@@ -204,7 +205,7 @@ async fn read_all_manifest_entries(
                 Ok::<_, crate::Error>(filtered)
             }
         })
-        .buffered(64)
+        .buffered(manifest_parallelism)
         .try_collect::<Vec<_>>()
         .await?
         .into_iter()
@@ -589,6 +590,7 @@ impl<'a> TableScan<'a> {
             deletion_vectors_enabled,
             dv_read_mode,
             merge_engine_opt,
+            core_options.scan_manifest_parallelism(),
         )
         .await?;
         Ok(merge_manifest_entries(entries))

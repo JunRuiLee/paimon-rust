@@ -143,6 +143,11 @@ struct Args {
     /// (case-insensitive — parsed by `core_options.deletion_vectors_read_mode`).
     /// Only meaningful for tables with `deletion-vectors.enabled=true`.
     read_mode: Option<String>,
+    /// `scan.manifest-parallelism` for this run only. Applied via
+    /// `Table::copy_with_options` so the catalog/schema is not mutated.
+    /// `None` respects whatever the table has persisted (lib default 64,
+    /// matching the previously hardcoded value).
+    manifest_parallelism: Option<usize>,
 }
 
 /// Stat for one read pass. `residual_dropped` is the number of rows that
@@ -196,6 +201,10 @@ fn print_usage(argv0: &str) {
     eprintln!("    respects the persisted option (lib default PERFORMANCE).");
     eprintln!("    Has no effect on non-DV tables. Use to A/B both modes against the");
     eprintln!("    same table and confirm they return identical results.");
+    eprintln!("  --manifest-parallelism N: per-run `scan.manifest-parallelism=N` override");
+    eprintln!("    applied via `Table::copy_with_options`. Caps the in-flight manifest");
+    eprintln!("    fetch concurrency during scan planning (clamped to [1, 1024] by");
+    eprintln!("    paimon-core). Default unset → uses lib default 64.");
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -209,6 +218,7 @@ fn parse_args() -> Result<Args, String> {
     let mut batch_size: usize = 8192;
     let mut target_size: Option<String> = None;
     let mut read_mode: Option<String> = None;
+    let mut manifest_parallelism: Option<usize> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -294,6 +304,21 @@ fn parse_args() -> Result<Args, String> {
                 }
                 read_mode = Some(lower);
             }
+            "--manifest-parallelism" => {
+                i += 1;
+                let v = argv
+                    .get(i)
+                    .ok_or_else(|| "--manifest-parallelism needs an integer argument".to_string())?;
+                let n = v
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        format!("--manifest-parallelism must be a positive integer, got: {v}")
+                    })?;
+                if n == 0 {
+                    return Err("--manifest-parallelism must be > 0".to_string());
+                }
+                manifest_parallelism = Some(n);
+            }
             _ => positional.push(a.clone()),
         }
         i += 1;
@@ -318,6 +343,7 @@ fn parse_args() -> Result<Args, String> {
         batch_size,
         target_size,
         read_mode,
+        manifest_parallelism,
     })
 }
 
@@ -764,6 +790,9 @@ async fn run_one_pass(
         if let Some(ref rm) = args.read_mode {
             // Option key matches `core_options.rs::DELETION_VECTORS_READ_MODE_OPTION`.
             extra.insert("deletion-vectors.read-mode".to_string(), rm.clone());
+        }
+        if let Some(mp) = args.manifest_parallelism {
+            extra.insert("scan.manifest-parallelism".to_string(), mp.to_string());
         }
         if extra.is_empty() {
             table

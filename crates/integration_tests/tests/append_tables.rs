@@ -27,6 +27,7 @@ use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
 use paimon::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
 use paimon::table::Table;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -584,4 +585,79 @@ async fn test_reject_fixed_bucket_without_bucket_key() {
         matches!(&err, paimon::Error::Unsupported { message } if message.contains("bucket-key")),
         "Expected Unsupported error for missing bucket-key, got: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// scan.manifest-parallelism — option must not change scan results
+// ---------------------------------------------------------------------------
+
+/// Verifies that `scan.manifest-parallelism` only changes concurrency, not
+/// the entry set produced by planning. We commit several times to force
+/// multiple manifest files, then plan three times with parallelism = 1, 8,
+/// 64 and assert each run reads back the same rows.
+///
+/// This is the regression contract for the option: a buffered concurrency
+/// knob must never affect *what* is read, only *how fast*.
+#[tokio::test]
+async fn test_scan_manifest_parallelism_does_not_change_results() {
+    let file_io = memory_file_io();
+    let path = "memory:/append_manifest_parallelism";
+    setup_dirs(&file_io, path).await;
+    let table = make_table(&file_io, path, unpartitioned_schema());
+
+    // Five separate commits → five manifest files. The planner has to
+    // fetch all of them; this exercises the buffered stream path.
+    let wb = table.new_write_builder();
+    for chunk in [
+        vec![1, 2],
+        vec![3, 4, 5],
+        vec![6],
+        vec![7, 8, 9, 10],
+        vec![11, 12],
+    ] {
+        let mut tw = wb.new_write().unwrap();
+        let values: Vec<i32> = chunk.iter().map(|v| v * 10).collect();
+        tw.write_arrow_batch(&int_batch(chunk, values)).await.unwrap();
+        wb.new_commit()
+            .commit(tw.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Reference run: default parallelism (= 64).
+    let baseline = collect_int_col(&write_commit_read_with_no_writes(&table).await, "id");
+
+    for &par in &[1usize, 8, 64] {
+        let scoped = table.copy_with_options(HashMap::from([(
+            "scan.manifest-parallelism".to_string(),
+            par.to_string(),
+        )]));
+        let result = collect_int_col(&write_commit_read_with_no_writes(&scoped).await, "id");
+        assert_eq!(
+            result, baseline,
+            "manifest-parallelism={par} should produce the same rows as default"
+        );
+    }
+
+    // The dynamic option must not have leaked into the original schema's
+    // option map (Table::copy_with_options is non-mutating).
+    assert!(
+        !table
+            .schema()
+            .options()
+            .contains_key("scan.manifest-parallelism"),
+        "copy_with_options must not mutate the source Table's schema options"
+    );
+}
+
+/// Helper: scan + read, no new writes (`write_commit_read` requires writes).
+async fn write_commit_read_with_no_writes(table: &Table) -> Vec<RecordBatch> {
+    let rb = table.new_read_builder();
+    let plan = rb.new_scan().plan().await.unwrap();
+    let read = rb.new_read().unwrap();
+    read.to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
 }

@@ -69,11 +69,21 @@ const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
+pub const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest-parallelism";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 /// Default rows per batch on the read path. Aligned with paimon-java's
 /// `CoreOptions.READ_BATCH_SIZE` default (1024).
 const DEFAULT_READ_BATCH_SIZE: usize = 1024;
+/// Default in-flight concurrency for fetching manifest files during scan
+/// planning. Mirrors the previously hardcoded `.buffered(64)` so adopting
+/// the option produces zero behaviour change.
+const DEFAULT_SCAN_MANIFEST_PARALLELISM: usize = 64;
+/// Defensive upper bound for `scan.manifest-parallelism` clamp. 1024 is far
+/// above any reasonable production value (typical 8-64) but low enough to
+/// keep `ulimit -n` and per-manifest in-flight memory in check. Out-of-range
+/// values are silently clamped to this ceiling.
+const MAX_SCAN_MANIFEST_PARALLELISM: usize = 1024;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -419,6 +429,24 @@ impl<'a> CoreOptions<'a> {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_READ_BATCH_SIZE)
+    }
+
+    /// In-flight concurrency for fetching manifest files during scan
+    /// planning (the bound passed to `futures::StreamExt::buffered`).
+    /// Default 64, mirroring the previously hardcoded value so existing
+    /// callers see no behaviour change. Unparseable, zero, or negative
+    /// values silently fall back to the default; values above
+    /// `MAX_SCAN_MANIFEST_PARALLELISM` (1024) are clamped to that ceiling
+    /// to bound fd / in-flight memory usage. No Java `CoreOptions`
+    /// counterpart yet — Rust-side first.
+    pub fn scan_manifest_parallelism(&self) -> usize {
+        let raw = self
+            .options
+            .get(SCAN_MANIFEST_PARALLELISM_OPTION)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_SCAN_MANIFEST_PARALLELISM);
+        raw.min(MAX_SCAN_MANIFEST_PARALLELISM)
     }
 
     /// Whether to load parquet page index (ColumnIndex / OffsetIndex) and use
@@ -1460,5 +1488,59 @@ mod tests {
         let core = CoreOptions::new(&opts);
         // Unparseable values fall back to the default (false).
         assert!(!core.parquet_bloom_filter_enabled());
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism_default() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.scan_manifest_parallelism(), 64);
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism_typical_values() {
+        for v in [1usize, 8, 16, 64, 128, 1024] {
+            let opts = HashMap::from([(
+                SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
+                v.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert_eq!(core.scan_manifest_parallelism(), v, "value {v} not preserved");
+        }
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism_invalid_falls_back_to_default() {
+        // Zero, negatives, and unparseable strings all fall back to the
+        // 64 default rather than producing a degenerate `buffered(0)`.
+        for invalid in ["0", "-1", "abc", "", "1.5"] {
+            let opts = HashMap::from([(
+                SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
+                invalid.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert_eq!(
+                core.scan_manifest_parallelism(),
+                64,
+                "invalid input {invalid:?} should fall back to default"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism_clamps_to_max() {
+        // Values above the 1024 ceiling are silently clamped, not rejected.
+        for over in ["2048", "100000", &usize::MAX.to_string()] {
+            let opts = HashMap::from([(
+                SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
+                over.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert_eq!(
+                core.scan_manifest_parallelism(),
+                1024,
+                "value {over} should clamp to 1024"
+            );
+        }
     }
 }

@@ -18,6 +18,7 @@
 //! Paimon table provider for DataFusion.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -54,6 +55,16 @@ use crate::runtime::await_with_runtime;
 pub struct PaimonTableProvider {
     table: Table,
     schema: ArrowSchemaRef,
+    /// Dynamic Paimon options applied to every `scan()` via
+    /// [`Table::copy_with_options`]. Layered over the table schema's option
+    /// map without persisting back to the schema file. Empty by default.
+    dynamic_options: HashMap<String, String>,
+    /// When `true`, `scan()` injects the DataFusion session's
+    /// `execution.batch_size` into Paimon's `read.batch-size` (unless the
+    /// caller already supplied that key in `dynamic_options`). Off by
+    /// default — DataFusion's 8192 differs from Paimon's 1024 default and
+    /// flipping it on without measurement could 8x per-batch memory.
+    respect_session_batch_size: bool,
 }
 
 impl PaimonTableProvider {
@@ -72,7 +83,12 @@ impl PaimonTableProvider {
         }
         let schema =
             paimon::arrow::build_target_arrow_schema(&fields).map_err(to_datafusion_error)?;
-        Ok(Self { table, schema })
+        Ok(Self {
+            table,
+            schema,
+            dynamic_options: HashMap::new(),
+            respect_session_batch_size: false,
+        })
     }
 
     pub fn try_new_with_blob_reader_registry(
@@ -86,6 +102,48 @@ impl PaimonTableProvider {
 
     pub fn table(&self) -> &Table {
         &self.table
+    }
+
+    /// Layer dynamic Paimon options over this provider's view of the table.
+    /// The options are applied at every `scan()` via
+    /// [`Table::copy_with_options`], so the underlying [`Table`] and its
+    /// persisted schema are not mutated. Calling this again replaces any
+    /// previously set dynamic options.
+    pub fn with_dynamic_options(mut self, options: HashMap<String, String>) -> Self {
+        self.dynamic_options = options;
+        self
+    }
+
+    /// Opt in to translating the DataFusion session's `execution.batch_size`
+    /// into Paimon's `read.batch-size` at scan time. Off by default; explicit
+    /// keys in `dynamic_options` always win over the session value.
+    pub fn with_respect_session_batch_size(mut self, respect: bool) -> Self {
+        self.respect_session_batch_size = respect;
+        self
+    }
+
+    /// Build the merged option map and apply it via `Table::copy_with_options`.
+    /// Returns `self.table.clone()` unchanged when nothing layered (so callers
+    /// without dynamic options pay no extra schema clone beyond the existing
+    /// `read_builder` chain).
+    fn resolve_scoped_table(&self, state: &dyn Session) -> Table {
+        // Cheap fast path: no dynamic options, no session-batch-size opt-in.
+        if self.dynamic_options.is_empty() && !self.respect_session_batch_size {
+            return self.table.clone();
+        }
+
+        let mut merged = self.dynamic_options.clone();
+        if self.respect_session_batch_size {
+            // Caller-provided dynamic options always win — only fill the slot
+            // when it's empty. Mirrors plan §5.3 layered priority.
+            merged
+                .entry("read.batch-size".to_string())
+                .or_insert_with(|| state.config_options().execution.batch_size.to_string());
+        }
+        if merged.is_empty() {
+            return self.table.clone();
+        }
+        self.table.copy_with_options(merged)
     }
 }
 
@@ -174,9 +232,15 @@ impl TableProvider for PaimonTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Resolve dynamic options ONCE per scan and bake them into a scoped
+        // Table clone via `copy_with_options`. Anything we plan or execute
+        // below (scan.plan(), reader, sort-merge) reads via this clone, so
+        // the override is uniformly visible without mutating self.table.
+        let scoped_table = self.resolve_scoped_table(state);
+
         // Plan splits eagerly so we know partition count upfront.
-        let filter_analysis = analyze_filters(filters, self.table.schema().fields());
-        let mut read_builder = self.table.new_read_builder();
+        let filter_analysis = analyze_filters(filters, scoped_table.schema().fields());
+        let mut read_builder = scoped_table.new_read_builder();
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
@@ -200,7 +264,7 @@ impl TableProvider for PaimonTableProvider {
                 .as_ref()
                 .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
         PaimonScanBuilder {
-            table: &self.table,
+            table: &scoped_table,
             schema: &self.schema,
             plan: &plan,
             projection,
