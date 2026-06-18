@@ -1,0 +1,16 @@
+# macOS exported-symbols list for the static-link build of cpp_demo/test.
+#
+# Counterpart to paimon-export.ver (which is a GNU ld version script and only
+# works with GNU ld / lld on Linux). Apple's ld64 uses a different mechanism:
+#
+#   clang ... -Wl,-exported_symbols_list,paimon-export.exp
+#
+# ld64 exports ONLY the symbols matched here and hides every other global
+# symbol (the Rust runtime, zlib internals, and anything a vendored C dep
+# drags in) from the executable's exported symbol table. This keeps the
+# binary's ABI surface limited to the paimon C API, mirroring the Linux
+# version-script behaviour.
+#
+# Note the leading underscore: C symbols get a `_` prefix in the Mach-O
+# symbol table, so `paimon_open` becomes `_paimon_open`.
+_paimon_*

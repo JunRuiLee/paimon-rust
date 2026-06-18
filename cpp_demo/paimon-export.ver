@@ -1,0 +1,31 @@
+/*
+ * Linker version script for the static-link build of cpp_demo/test.
+ *
+ * Why this exists
+ * ---------------
+ * libpaimon_c.a contains the full Rust dependency tree: tokio, opendal,
+ * reqwest, parquet, apache-avro AND a vendored OpenSSL. When linked
+ * statically into an executable, openssl-sys does NOT mark its symbols
+ * hidden, so by default `EVP_*`, `SSL_*`, `X509_*`, `BN_*` etc. (≈500
+ * symbols) end up in the executable's `.dynsym` table.
+ *
+ * That breaks any later `dlopen("libsomething.so")` whose own dependency
+ * chain calls into a *different* OpenSSL version: the dynamic loader
+ * resolves the symbol against the executable first and the call jumps
+ * into our 1.1/3.x ABI, corrupting memory or crashing.
+ *
+ * This script tells ld to expose ONLY the paimon C ABI in the dynamic
+ * symbol table; everything else (OpenSSL, zlib internals, Rust runtime
+ * helpers) becomes hidden — still callable from within the binary, but
+ * invisible to dlopen'd libraries.
+ *
+ * Usage:
+ *   g++ ... -Wl,--version-script=paimon-export.ver -o test
+ */
+{
+    global:
+        paimon_*;          /* all `pub extern "C" fn paimon_*` */
+
+    local:
+        *;                 /* hide everything else */
+};
