@@ -71,13 +71,10 @@ static std::string bytes_to_string(const paimon_bytes& b) {
 
 // If `err` is non-null: print it, free it, return true.
 // Caller should treat true as "abort the demo".
-static bool check_err(const char* what, paimon_error* err) {
-    if (err == nullptr) return false;
-    std::fprintf(stderr, "%s failed: code=%d msg=%s\n", what, err->code,
-                 bytes_to_string(err->message).c_str());
-    paimon_error_free(err);
-    return true;
-}
+//
+// Defined below, after the RAII wrappers, so it can take ownership of `err`
+// via error_ptr instead of calling paimon_error_free by hand.
+static bool check_err(const char* what, paimon_error* err);
 
 // Stringify the Arrow type "format" field per the C Data Interface spec.
 // Just enough for a friendly print — full coverage would be a switch on the
@@ -107,6 +104,7 @@ static const char* arrow_format_str(const ArrowSchema* s) {
     using type##_ptr = std::unique_ptr<paimon_##type, type##_deleter>
 
 PAIMON_OWNED(catalog, paimon_catalog_free);
+PAIMON_OWNED(error, paimon_error_free);
 PAIMON_OWNED(identifier, paimon_identifier_free);
 PAIMON_OWNED(table, paimon_table_free);
 PAIMON_OWNED(read_builder, paimon_read_builder_free);
@@ -141,6 +139,16 @@ public:
 private:
     paimon_arrow_batch batch_;
 };
+
+// Definition of check_err (declared above): take ownership of `err` in an
+// error_ptr so it is freed on every return path without a manual free.
+static bool check_err(const char* what, paimon_error* err) {
+    error_ptr owned(err);
+    if (!owned) return false;
+    std::fprintf(stderr, "%s failed: code=%d msg=%s\n", what, owned->code,
+                 bytes_to_string(owned->message).c_str());
+    return true;
+}
 
 int main() {
     std::printf("Hello from cpp_demo (paimon-c)\n");
