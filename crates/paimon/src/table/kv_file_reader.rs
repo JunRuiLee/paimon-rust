@@ -281,6 +281,12 @@ impl KeyValueFileReader {
         let sequence_fields = self.config.sequence_fields;
         let parquet_page_index_enabled = self.config.parquet_page_index_enabled;
         let parquet_bloom_filter_enabled = self.config.parquet_bloom_filter_enabled;
+        // Re-derive the sort-merge buffer soft cap from `table_options` so
+        // dynamic options injected via `Table::copy_with_options` (e.g. by
+        // the DataFusion provider's `with_dynamic_options`) take effect
+        // without threading a new field through `KeyValueReadConfig`.
+        let sort_merge_soft_cap =
+            crate::spec::CoreOptions::new(&table_options).read_sort_merge_buffer_soft_cap();
 
         // Build the merge output schema (keys + values, no system columns).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
@@ -413,6 +419,7 @@ impl KeyValueFileReader {
                     )?,
                 )
                 .with_batch_size(batch_size)
+                .with_soft_cap(sort_merge_soft_cap)
                 .with_stream_metas(stream_metas)
                 .build()?;
 

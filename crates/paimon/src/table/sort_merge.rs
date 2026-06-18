@@ -39,7 +39,8 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -701,6 +702,15 @@ pub(crate) struct SortMergeReaderBuilder {
     /// Per-stream metadata aligned by index with `streams`. Empty (default
     /// fallback applied) for engines that don't need it.
     stream_metas: Vec<StreamMeta>,
+    /// Soft cap on `batch_buffer.len()`. When the buffer reaches this
+    /// length the loop forces an early flush — bounds peak memory at the
+    /// cost of (sometimes) smaller output batches. `None` disables the
+    /// cap (default behaviour).
+    soft_cap: Option<usize>,
+    /// Optional `AtomicUsize` whose `fetch_max` is bumped after every
+    /// `batch_buffer.push`. Tests use it to assert peak buffer length stays
+    /// bounded; production callers leave it `None`.
+    peak_observer: Option<Arc<AtomicUsize>>,
 }
 
 impl SortMergeReaderBuilder {
@@ -728,11 +738,31 @@ impl SortMergeReaderBuilder {
             merge_function,
             batch_size: 1024,
             stream_metas: Vec::new(),
+            soft_cap: None,
+            peak_observer: None,
         }
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the sort-merge `batch_buffer` soft cap. `None` (default)
+    /// disables the cap. When set, the loop forces an early flush as
+    /// soon as the buffer reaches `cap` entries — useful for bounding
+    /// memory on pathological wide-K splits where the regular
+    /// `read.batch-size` flush would not fire often enough.
+    pub(crate) fn with_soft_cap(mut self, cap: Option<usize>) -> Self {
+        self.soft_cap = cap;
+        self
+    }
+
+    /// Attach an observer that records the peak `batch_buffer` length over
+    /// the merge run. Test-only: production callers leave it unset.
+    #[cfg(test)]
+    pub(crate) fn with_peak_observer(mut self, observer: Arc<AtomicUsize>) -> Self {
+        self.peak_observer = Some(observer);
         self
     }
 
@@ -783,6 +813,8 @@ impl SortMergeReaderBuilder {
             self.output_schema,
             self.merge_function,
             self.batch_size,
+            self.soft_cap,
+            self.peak_observer,
         )
     }
 }
@@ -835,6 +867,8 @@ fn sort_merge_stream(
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
+    soft_cap: Option<usize>,
+    peak_observer: Option<Arc<AtomicUsize>>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -893,6 +927,33 @@ fn sort_merge_stream(
         // Output indices: (batch_buffer_idx, row_idx) for interleave.
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
 
+        // Materialized accumulator state (P0-2 fix). Producers
+        // (`PartialUpdate`, `Aggregate`) emit single-row RecordBatches via
+        // `MergeResult::MaterializedRow`; pushing one `BufferedBatch::Materialized`
+        // per row would let `batch_buffer` grow with every same-PK group
+        // until flush, accumulating ~`batch_size` 1-row RecordBatch headers.
+        // Instead we keep a single rolling `Materialized` slot in
+        // `batch_buffer` (placeholder until flush) and append the incoming
+        // 1-row batches into `pending_materialized`. At flush time we
+        // `concat_batches` once and overwrite the slot, so the
+        // `interleave`-based output gathers the correct rows by
+        // `(slot_idx, row_within_mat)` indices recorded as we went.
+        let mut pending_materialized: Vec<RecordBatch> = Vec::new();
+        let mut materialized_slot: Option<usize> = None;
+
+        // Helper macro for observing peak buffer length after every push.
+        // Using a macro keeps the conditional cheap and inline at every
+        // push site without threading the observer through more functions.
+        macro_rules! observe_peak {
+            ($buf:expr) => {
+                if let Some(obs) = peak_observer.as_ref() {
+                    obs.fetch_max($buf.len(), AtomicOrdering::Relaxed);
+                }
+            };
+        }
+        // Bump for the initial source registrations done above.
+        observe_peak!(batch_buffer);
+
         loop {
             let winner_idx = tree.winner();
             // Check if all streams are exhausted.
@@ -949,6 +1010,7 @@ fn sort_merge_stream(
                                 let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(batch.clone()));
+                                observe_peak!(batch_buffer);
                                 stream_batch_idx[current_winner] = Some(buf_idx);
                                 cursors[current_winner] = Some(SortMergeCursor { batch, rows, offset: 0 });
                                 break;
@@ -986,15 +1048,53 @@ fn sort_merge_stream(
                             source: None,
                         })?;
                     }
-                    let batch_idx = batch_buffer.len();
-                    batch_buffer.push(BufferedBatch::Materialized(batch));
-                    output_indices.push((batch_idx, 0));
+                    // Single rolling slot. The placeholder is empty (0 rows
+                    // / output_schema); it gets overwritten with the
+                    // concat'd accumulator at flush time, before
+                    // `build_output_interleave` reads it.
+                    let slot = if let Some(slot) = materialized_slot {
+                        slot
+                    } else {
+                        let slot = batch_buffer.len();
+                        batch_buffer.push(BufferedBatch::Materialized(
+                            RecordBatch::new_empty(output_schema.clone()),
+                        ));
+                        observe_peak!(batch_buffer);
+                        materialized_slot = Some(slot);
+                        slot
+                    };
+                    let row_within_mat = pending_materialized.len();
+                    pending_materialized.push(batch);
+                    output_indices.push((slot, row_within_mat));
                 }
                 MergeResult::Omit => {}
             }
 
-            // Yield a batch when we've accumulated enough rows.
-            if output_indices.len() >= batch_size {
+            // Yield a batch when we've accumulated enough rows OR when the
+            // soft cap on `batch_buffer.len()` triggers. The cap-driven
+            // flush reuses the same path so accumulator state is finalized
+            // identically.
+            let cap_hit = matches!(soft_cap, Some(cap) if batch_buffer.len() >= cap);
+            if output_indices.len() >= batch_size || cap_hit {
+                // Finalize accumulator into the rolling slot before
+                // `build_output_interleave` reads it. The slot was pushed
+                // as an empty placeholder; overwrite with the concat of
+                // every 1-row batch that arrived this window.
+                if let Some(slot) = materialized_slot {
+                    if !pending_materialized.is_empty() {
+                        let merged = arrow_select::concat::concat_batches(
+                            &output_schema,
+                            pending_materialized.iter(),
+                        )
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!(
+                                "Failed to concat materialized rows: {e}"
+                            ),
+                            source: Some(Box::new(e)),
+                        })?;
+                        batch_buffer[slot] = BufferedBatch::Materialized(merged);
+                    }
+                }
                 let batch = build_output_interleave(
                     &output_schema,
                     &batch_buffer,
@@ -1002,6 +1102,11 @@ fn sort_merge_stream(
                     &output_indices,
                 )?;
                 output_indices.clear();
+                // Reset accumulator state — the slot is now unreferenced
+                // by `output_indices` and will be dropped by
+                // `compact_batch_buffer` below.
+                pending_materialized.clear();
+                materialized_slot = None;
                 // Compact batch buffer after the pending output rows have been
                 // materialized. Source batches still referenced by cursors stay
                 // alive; materialized batches can be dropped here because they
@@ -1017,6 +1122,23 @@ fn sort_merge_stream(
 
         // Yield remaining rows.
         if !output_indices.is_empty() {
+            // Finalize accumulator for the trailing window — same as the
+            // mid-loop flush, but no compaction needed afterwards.
+            if let Some(slot) = materialized_slot {
+                if !pending_materialized.is_empty() {
+                    let merged = arrow_select::concat::concat_batches(
+                        &output_schema,
+                        pending_materialized.iter(),
+                    )
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!(
+                            "Failed to concat materialized rows: {e}"
+                        ),
+                        source: Some(Box::new(e)),
+                    })?;
+                    batch_buffer[slot] = BufferedBatch::Materialized(merged);
+                }
+            }
             let batch = build_output_interleave(
                 &output_schema,
                 &batch_buffer,
@@ -2428,6 +2550,151 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, Error::Unsupported { message } if message.contains("ignore-retract"))
+        );
+    }
+
+    /// Regression test for the Materialized accumulator (P0-2 fix). With
+    /// the old "push one BufferedBatch::Materialized per merged row"
+    /// approach, `batch_buffer` would grow with every same-PK group —
+    /// roughly N entries for N output rows before a flush. The fix keeps
+    /// a single rolling Materialized slot per flush window plus a
+    /// side-channel pending vec.
+    ///
+    /// Setup: 50 same-PK pairs across two streams (PKs 0..50, each
+    /// appearing once per stream), `batch_size=200` so no flush fires
+    /// during the run. Without the fix, peak `batch_buffer.len()` after
+    /// the first source-advance would reach ~52 (2 source slots + 50
+    /// materialized 1-row entries). With the fix, peak ≤ 5 (2 source
+    /// slots + 1 materialized slot + slack).
+    #[tokio::test]
+    async fn test_materialized_accumulator_single_buffer_slot() {
+        // Schema: (pk INT, _SEQUENCE_NUMBER INT64, _VALUE_KIND INT8, value STRING).
+        let schema = make_schema();
+
+        // Build batches with PKs 0..50 in each stream.
+        let pks: Vec<i32> = (0..50).collect();
+        let seq_a: Vec<i64> = (0..50).map(|i| i as i64).collect();
+        let seq_b: Vec<i64> = (50..100).map(|i| i as i64).collect();
+        let values: Vec<Option<&str>> = pks.iter().map(|_| Some("v")).collect();
+
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            pks.clone(),
+            seq_a,
+            values.clone(),
+        )]);
+        let s1 = stream_from_batches(vec![make_batch(&schema, pks.clone(), seq_b, values)]);
+
+        let observer = Arc::new(AtomicUsize::new(0));
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(MaterializingMergeFunction),
+        )
+        .with_batch_size(200) // > 50, so no mid-run flush
+        .with_peak_observer(observer.clone())
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        // 50 unique PKs, each materialized once.
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 50);
+
+        let peak = observer.load(AtomicOrdering::Relaxed);
+        assert!(
+            peak <= 5,
+            "peak batch_buffer.len() must be small with accumulator (got {peak}); \
+             without the fix it grows ~linear in merged rows"
+        );
+    }
+
+    /// `with_soft_cap` forces an early flush as soon as `batch_buffer.len()`
+    /// reaches the cap, even when `output_indices.len() < batch_size`. The
+    /// effect: the same total row count is delivered across more (smaller)
+    /// output batches.
+    ///
+    /// Setup: two streams with 30 disjoint PKs each (no merge collapse),
+    /// `batch_size=10000` so the row-count flush never fires. With
+    /// `soft_cap=4`, the buffer can hold at most 4 entries before a flush;
+    /// since the test pushes one source slot per advanced batch and a few
+    /// from the initial registration, output is split into multiple chunks.
+    #[tokio::test]
+    async fn test_soft_cap_forces_flush() {
+        let schema = make_schema();
+
+        // 30 unique PKs per stream, written one batch at a time so each
+        // advance grows `batch_buffer` and exposes the cap.
+        let mut s0_batches = Vec::new();
+        let mut s1_batches = Vec::new();
+        for i in 0..30 {
+            // Stream 0: even-indexed PKs (i.e. 0, 2, 4, ...)
+            s0_batches.push(make_batch(
+                &schema,
+                vec![i * 2],
+                vec![i as i64],
+                vec![Some("a")],
+            ));
+            // Stream 1: odd-indexed PKs (1, 3, 5, ...)
+            s1_batches.push(make_batch(
+                &schema,
+                vec![i * 2 + 1],
+                vec![i as i64 + 1000],
+                vec![Some("b")],
+            ));
+        }
+
+        let observer = Arc::new(AtomicUsize::new(0));
+        let result = SortMergeReaderBuilder::new(
+            vec![
+                stream_from_batches(s0_batches),
+                stream_from_batches(s1_batches),
+            ],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_batch_size(10000) // huge — only the soft cap should drive flushes
+        .with_soft_cap(Some(4))
+        .with_peak_observer(observer.clone())
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        // All 60 unique rows are present.
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 60);
+
+        // Multiple output batches — the cap forced flushes the row-count
+        // flush would not have triggered.
+        assert!(
+            result.len() > 1,
+            "soft cap=4 with batch_size=10000 must produce multiple output batches, \
+             got {} batch(es)",
+            result.len()
+        );
+
+        // Peak buffer length stays bounded by the cap (with a small slack
+        // for the push-then-flush ordering).
+        let peak = observer.load(AtomicOrdering::Relaxed);
+        assert!(
+            peak <= 6,
+            "soft cap=4 must keep peak buffer ≤ ~6 (got {peak})"
         );
     }
 }

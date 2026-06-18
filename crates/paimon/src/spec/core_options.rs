@@ -70,6 +70,8 @@ const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 pub const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest-parallelism";
+pub const READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION: &str =
+    "read.sort-merge-buffer-soft-cap";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 /// Default rows per batch on the read path. Aligned with paimon-java's
@@ -447,6 +449,20 @@ impl<'a> CoreOptions<'a> {
             .filter(|&v| v > 0)
             .unwrap_or(DEFAULT_SCAN_MANIFEST_PARALLELISM);
         raw.min(MAX_SCAN_MANIFEST_PARALLELISM)
+    }
+
+    /// Soft cap on the sort-merge `batch_buffer` length. When the buffer
+    /// reaches this size the read loop forces an early flush, bounding
+    /// peak memory at the cost of more (smaller) output batches. Returns
+    /// `None` when unset / `0` / unparseable — i.e. cap disabled, today's
+    /// default behaviour. Most tables don't need this; it exists for
+    /// pathological wide-K splits where the merge accumulates many source
+    /// batches before a regular `read.batch-size` flush fires.
+    pub fn read_sort_merge_buffer_soft_cap(&self) -> Option<usize> {
+        self.options
+            .get(READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION)
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
     }
 
     /// Whether to load parquet page index (ColumnIndex / OffsetIndex) and use
@@ -1540,6 +1556,41 @@ mod tests {
                 core.scan_manifest_parallelism(),
                 1024,
                 "value {over} should clamp to 1024"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_sort_merge_buffer_soft_cap_default() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert!(core.read_sort_merge_buffer_soft_cap().is_none());
+    }
+
+    #[test]
+    fn test_read_sort_merge_buffer_soft_cap_typical_values() {
+        for v in [1usize, 16, 1024, 16384, 1_000_000] {
+            let opts = HashMap::from([(
+                READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION.to_string(),
+                v.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert_eq!(core.read_sort_merge_buffer_soft_cap(), Some(v));
+        }
+    }
+
+    #[test]
+    fn test_read_sort_merge_buffer_soft_cap_invalid_returns_none() {
+        // 0 / negative / unparseable / empty all map to None (cap disabled).
+        for invalid in ["0", "-1", "abc", "", "1.5"] {
+            let opts = HashMap::from([(
+                READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION.to_string(),
+                invalid.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert!(
+                core.read_sort_merge_buffer_soft_cap().is_none(),
+                "{invalid:?} should disable the cap"
             );
         }
     }
