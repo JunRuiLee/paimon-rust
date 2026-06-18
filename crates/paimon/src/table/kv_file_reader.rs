@@ -303,18 +303,17 @@ impl KeyValueFileReader {
                 // Deduplicate / PartialUpdate / VersionedPartialUpdate alike.
 
                 // Build a per-split DV factory only when at least one data
-                // file in the split has a DeletionFile attached. Mirrors
-                // DataFileReader behavior; avoids loading deletion vectors
-                // for splits that don't need them.
+                // file in the split has a DeletionFile attached. The factory
+                // records `(file_name -> DeletionFile)` synchronously; actual
+                // DV blob IO + decode happens lazily inside the per-file
+                // loop below, so peak memory is one decoded DV at a time
+                // rather than the sum of every DV in the split.
                 let dv_factory = if split_has_dv {
-                    Some(
-                        DeletionVectorFactory::new(
-                            &file_io,
-                            split.data_files(),
-                            split.data_deletion_files(),
-                        )
-                        .await?,
-                    )
+                    Some(DeletionVectorFactory::new(
+                        &file_io,
+                        split.data_files(),
+                        split.data_deletion_files(),
+                    ))
                 } else {
                     None
                 };
@@ -368,12 +367,16 @@ impl KeyValueFileReader {
                         parquet_bloom_filter_enabled,
                     );
 
-                    // Look up the DV for this data file (if any). Cloning the
-                    // Arc is cheap; the inner bitmap is shared.
-                    let dv = dv_factory
-                        .as_ref()
-                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name))
-                        .cloned();
+                    // Look up the DV for this data file (if any). The lazy
+                    // factory reads + decodes here; the returned Arc is
+                    // moved into the per-file stream and dropped when the
+                    // stream ends, capping per-split DV memory at one file.
+                    let dv = match dv_factory.as_ref() {
+                        Some(factory) => {
+                            factory.get_deletion_vector(&file_meta.file_name).await?
+                        }
+                        None => None,
+                    };
 
                     let stream = reader.read_single_file_stream(
                         split,

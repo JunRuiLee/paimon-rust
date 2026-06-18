@@ -129,28 +129,32 @@ impl DataFileReader {
         let reader = self;
         Ok(try_stream! {
             for split in splits {
-                // Create DV factory for this split only.
+                // Build a per-split DV factory when any data file has a
+                // DeletionFile attached. Construction is sync; the actual
+                // DV blob IO + decode happens lazily inside the per-file
+                // loop below so peak memory is one DV at a time.
                 let dv_factory = if split
                     .data_deletion_files()
                     .is_some_and(|files| files.iter().any(Option::is_some))
                 {
-                    Some(
-                        DeletionVectorFactory::new(
-                            &reader.file_io,
-                            split.data_files(),
-                            split.data_deletion_files(),
-                        )
-                        .await?,
-                    )
+                    Some(DeletionVectorFactory::new(
+                        &reader.file_io,
+                        split.data_files(),
+                        split.data_deletion_files(),
+                    ))
                 } else {
                     None
                 };
 
                 for file_meta in split.data_files().to_vec() {
-                    let dv = dv_factory
-                        .as_ref()
-                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name))
-                        .cloned();
+                    // Lazy DV resolve — Arc moves into the file stream and
+                    // drops when the stream ends.
+                    let dv = match dv_factory.as_ref() {
+                        Some(factory) => {
+                            factory.get_deletion_vector(&file_meta.file_name).await?
+                        }
+                        None => None,
+                    };
 
                     // Load data file's schema if it differs from the table schema.
                     let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != reader.table_schema_id {
