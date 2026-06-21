@@ -927,20 +927,6 @@ fn sort_merge_stream(
         // Output indices: (batch_buffer_idx, row_idx) for interleave.
         let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
 
-        // Cap-hit decoupling: when `soft_cap` forces a flush before we've
-        // collected `batch_size` rows, the produced RecordBatch goes here
-        // instead of being yielded directly. We keep accumulating cap-hit
-        // partials until the total row count crosses `batch_size`, then
-        // concat + yield once. This restores Doris-friendly batch sizes
-        // (~`batch_size` rows per yielded RecordBatch) while still bounding
-        // peak `batch_buffer` length to `soft_cap`.
-        //
-        // The interleaved partials are self-contained: `interleave` copies
-        // referenced columns out, so `compact_batch_buffer` immediately after
-        // a cap-hit flush can still drop unreferenced source batches.
-        let mut pending_partial: Vec<RecordBatch> = Vec::new();
-        let mut pending_partial_rows: usize = 0;
-
         // Materialized accumulator state (P0-2 fix). Producers
         // (`PartialUpdate`, `Aggregate`) emit single-row RecordBatches via
         // `MergeResult::MaterializedRow`; pushing one `BufferedBatch::Materialized`
@@ -1087,14 +1073,9 @@ fn sort_merge_stream(
             // Yield a batch when we've accumulated enough rows OR when the
             // soft cap on `batch_buffer.len()` triggers. The cap-driven
             // flush reuses the same path so accumulator state is finalized
-            // identically — but cap-only flushes (i.e. fewer than batch_size
-            // rows accumulated) are stashed in `pending_partial` and yielded
-            // only once their row count crosses `batch_size`, so downstream
-            // consumers see big batches instead of one tiny RecordBatch per
-            // cap hit.
-            let size_hit = output_indices.len() >= batch_size;
+            // identically.
             let cap_hit = matches!(soft_cap, Some(cap) if batch_buffer.len() >= cap);
-            if size_hit || cap_hit {
+            if output_indices.len() >= batch_size || cap_hit {
                 // Finalize accumulator into the rolling slot before
                 // `build_output_interleave` reads it. The slot was pushed
                 // as an empty placeholder; overwrite with the concat of
@@ -1114,13 +1095,12 @@ fn sort_merge_stream(
                         batch_buffer[slot] = BufferedBatch::Materialized(merged);
                     }
                 }
-                let partial = build_output_interleave(
+                let batch = build_output_interleave(
                     &output_schema,
                     &batch_buffer,
                     &source_output_col_indices,
                     &output_indices,
                 )?;
-                let partial_rows = partial.num_rows();
                 output_indices.clear();
                 // Reset accumulator state — the slot is now unreferenced
                 // by `output_indices` and will be dropped by
@@ -1128,53 +1108,22 @@ fn sort_merge_stream(
                 pending_materialized.clear();
                 materialized_slot = None;
                 // Compact batch buffer after the pending output rows have been
-                // materialized into `partial`. Source batches still referenced
-                // by cursors stay alive; materialized batches can be dropped
-                // here because `partial` already copied their rows out via
-                // `interleave`.
+                // materialized. Source batches still referenced by cursors stay
+                // alive; materialized batches can be dropped here because they
+                // are referenced only by the flushed output_indices above.
                 compact_batch_buffer(
                     &mut batch_buffer,
                     &mut stream_batch_idx,
                     &cursors,
                 );
-
-                // size_hit alone is the normal path: yield right away,
-                // potentially flushing any previously-accumulated cap-only
-                // partials concatenated with this one. cap-only without
-                // size_hit just appends to `pending_partial` and waits.
-                pending_partial.push(partial);
-                pending_partial_rows += partial_rows;
-
-                if size_hit || pending_partial_rows >= batch_size {
-                    let merged = if pending_partial.len() == 1 {
-                        pending_partial.pop().unwrap()
-                    } else {
-                        arrow_select::concat::concat_batches(
-                            &output_schema,
-                            pending_partial.iter(),
-                        )
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!(
-                                "Failed to concat cap-hit partial batches: {e}"
-                            ),
-                            source: Some(Box::new(e)),
-                        })?
-                    };
-                    pending_partial.clear();
-                    pending_partial_rows = 0;
-                    yield merged;
-                }
+                yield batch;
             }
         }
 
-        // Yield remaining rows. Two pieces may be live at the end:
-        //   * `output_indices` — rows merged after the last flush, never
-        //     materialized into a RecordBatch yet.
-        //   * `pending_partial` — cap-hit partials that never reached
-        //     `batch_size`.
-        // Materialize the trailing window if any, then concat anything in
-        // `pending_partial` with it for a single final yield.
-        let trailing_partial = if !output_indices.is_empty() {
+        // Yield remaining rows.
+        if !output_indices.is_empty() {
+            // Finalize accumulator for the trailing window — same as the
+            // mid-loop flush, but no compaction needed afterwards.
             if let Some(slot) = materialized_slot {
                 if !pending_materialized.is_empty() {
                     let merged = arrow_select::concat::concat_batches(
@@ -1190,35 +1139,13 @@ fn sort_merge_stream(
                     batch_buffer[slot] = BufferedBatch::Materialized(merged);
                 }
             }
-            Some(build_output_interleave(
+            let batch = build_output_interleave(
                 &output_schema,
                 &batch_buffer,
                 &source_output_col_indices,
                 &output_indices,
-            )?)
-        } else {
-            None
-        };
-
-        if let Some(tail) = trailing_partial {
-            pending_partial.push(tail);
-        }
-        if !pending_partial.is_empty() {
-            let merged = if pending_partial.len() == 1 {
-                pending_partial.pop().unwrap()
-            } else {
-                arrow_select::concat::concat_batches(
-                    &output_schema,
-                    pending_partial.iter(),
-                )
-                .map_err(|e| Error::UnexpectedError {
-                    message: format!(
-                        "Failed to concat cap-hit partial batches: {e}"
-                    ),
-                    source: Some(Box::new(e)),
-                })?
-            };
-            yield merged;
+            )?;
+            yield batch;
         }
     }
     .boxed())
@@ -2690,18 +2617,16 @@ mod tests {
         );
     }
 
-    /// `with_soft_cap` bounds peak `batch_buffer` length even when the
-    /// per-batch row-count flush would otherwise never trigger. Cap-driven
-    /// flushes are *not* yielded directly: they're stashed in
-    /// `pending_partial` and concatenated back to ~`batch_size`-sized output
-    /// batches, so downstream consumers don't see one tiny RecordBatch per
-    /// cap hit (Doris dispatch overhead). The cap's job is purely to bound
-    /// memory; output batch sizing stays controlled by `batch_size`.
+    /// `with_soft_cap` forces an early flush as soon as `batch_buffer.len()`
+    /// reaches the cap, even when `output_indices.len() < batch_size`. The
+    /// effect: the same total row count is delivered across more (smaller)
+    /// output batches.
     ///
     /// Setup: two streams with 30 disjoint PKs each (no merge collapse),
     /// `batch_size=10000` so the row-count flush never fires. With
-    /// `soft_cap=4`, the buffer must stay ≤ ~cap regardless of how many
-    /// merged rows have accumulated.
+    /// `soft_cap=4`, the buffer can hold at most 4 entries before a flush;
+    /// since the test pushes one source slot per advanced batch and a few
+    /// from the initial registration, output is split into multiple chunks.
     #[tokio::test]
     async fn test_soft_cap_forces_flush() {
         let schema = make_schema();
@@ -2755,9 +2680,17 @@ mod tests {
         let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 60);
 
+        // Multiple output batches — the cap forced flushes the row-count
+        // flush would not have triggered.
+        assert!(
+            result.len() > 1,
+            "soft cap=4 with batch_size=10000 must produce multiple output batches, \
+             got {} batch(es)",
+            result.len()
+        );
+
         // Peak buffer length stays bounded by the cap (with a small slack
-        // for the push-then-flush ordering). This is the cap's actual
-        // contract — memory bound, not yield frequency.
+        // for the push-then-flush ordering).
         let peak = observer.load(AtomicOrdering::Relaxed);
         assert!(
             peak <= 6,
