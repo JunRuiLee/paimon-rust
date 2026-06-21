@@ -148,6 +148,13 @@ struct Args {
     /// `None` respects whatever the table has persisted (lib default 64,
     /// matching the previously hardcoded value).
     manifest_parallelism: Option<usize>,
+    /// `read.sort-merge-buffer-soft-cap` for this run only. Applied via
+    /// `Table::copy_with_options` so the catalog/schema is not mutated.
+    /// `None` respects whatever the table has persisted (lib default unset =
+    /// no cap). Caps the sort-merge `batch_buffer` length: when reached, the
+    /// merge loop forces an early flush, bounding peak memory at the cost of
+    /// more (smaller) output batches. Only meaningful for PK tables.
+    sort_merge_soft_cap: Option<usize>,
     /// Per-pass split fan-out AND tokio runtime worker_threads. Defaults to
     /// `DEFAULT_PARALLELISM`. Lower values cap concurrent parquet decoders
     /// and the in-flight column-chunk buffer they hold — directly trades
@@ -211,6 +218,11 @@ fn print_usage(argv0: &str) {
     eprintln!("    applied via `Table::copy_with_options`. Caps the in-flight manifest");
     eprintln!("    fetch concurrency during scan planning (clamped to [1, 1024] by");
     eprintln!("    paimon-core). Default unset → uses lib default 64.");
+    eprintln!("  --sort-merge-soft-cap N: per-run `read.sort-merge-buffer-soft-cap=N`");
+    eprintln!("    override applied via `Table::copy_with_options`. Forces the sort-merge");
+    eprintln!("    `batch_buffer` to flush once it reaches N entries (PK tables only).");
+    eprintln!("    Lower N bounds peak buffer memory, at the cost of more, smaller output");
+    eprintln!("    batches. Default unset → uses persisted value (lib default no cap).");
     eprintln!("  --parallelism N: per-pass split fan-out AND tokio worker_threads.");
     eprintln!("    Default {DEFAULT_PARALLELISM}. Lower values bound peak RSS at the cost");
     eprintln!("    of throughput — each concurrent split holds an in-flight parquet");
@@ -229,6 +241,7 @@ fn parse_args() -> Result<Args, String> {
     let mut target_size: Option<String> = None;
     let mut read_mode: Option<String> = None;
     let mut manifest_parallelism: Option<usize> = None;
+    let mut sort_merge_soft_cap: Option<usize> = None;
     let mut parallelism: usize = DEFAULT_PARALLELISM;
 
     let mut i = 1;
@@ -330,6 +343,19 @@ fn parse_args() -> Result<Args, String> {
                 }
                 manifest_parallelism = Some(n);
             }
+            "--sort-merge-soft-cap" => {
+                i += 1;
+                let v = argv.get(i).ok_or_else(|| {
+                    "--sort-merge-soft-cap needs an integer argument".to_string()
+                })?;
+                let n = v.parse::<usize>().map_err(|_| {
+                    format!("--sort-merge-soft-cap must be a positive integer, got: {v}")
+                })?;
+                if n == 0 {
+                    return Err("--sort-merge-soft-cap must be > 0".to_string());
+                }
+                sort_merge_soft_cap = Some(n);
+            }
             "--parallelism" => {
                 i += 1;
                 let v = argv
@@ -368,6 +394,7 @@ fn parse_args() -> Result<Args, String> {
         target_size,
         read_mode,
         manifest_parallelism,
+        sort_merge_soft_cap,
         parallelism,
     })
 }
@@ -818,6 +845,12 @@ async fn run_one_pass(
         }
         if let Some(mp) = args.manifest_parallelism {
             extra.insert("scan.manifest-parallelism".to_string(), mp.to_string());
+        }
+        if let Some(sc) = args.sort_merge_soft_cap {
+            extra.insert(
+                "read.sort-merge-buffer-soft-cap".to_string(),
+                sc.to_string(),
+            );
         }
         if extra.is_empty() {
             table
