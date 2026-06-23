@@ -29,7 +29,7 @@ crate-type = ["cdylib", "staticlib"]
 doc = false
 
 [dependencies]
-paimon = { path = "../../crates/paimon" }
+paimon = { path = "../../crates/paimon", features = ["storage-hdfs"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures = "0.3"
 arrow-array = { workspace = true }
