@@ -74,44 +74,72 @@ pub fn data_file_meta_from_serialized_bytes(buf: &[u8]) -> crate::Result<(DataFi
     }
     // Older paimon-cpp builds wrote v8 DataFileMeta as a 20-field row (no
     // `_MERGE_MODE` / `_COMMIT_SNAPSHOT_ID`). The current schema is 22 fields.
-    // Both wire forms are tagged `version 8`; we tell them apart by reading
-    // the file_name slot's var-offset at byte 8 and reversing
-    // `null_bits_size + arity * 8 == var_offset`. file_name on real splits is
-    // always > 7 bytes (UUID + extension), so it's a reliable anchor; if it
-    // ever isn't, we fall back to the 22-field schema.
+    // Both wire forms are tagged `version 8`; the row body length and (when
+    // available) the file_name var-offset disambiguate them.
+    //
+    // - `body_len < 168`: not a valid v8 row at all (less than 20-field fixed part).
+    // - `168 <= body_len < 184`: must be 20-field (22-field needs at least 184).
+    // - `body_len >= 184`: ambiguous — both 20- and 22-field bodies are
+    //   possible. Use the file_name slot's var-offset to disambiguate; if the
+    //   slot is inline-encoded (file_name <= 7 bytes) and the var-offset
+    //   anchor isn't available, default to 22 (latest paimon-cpp output).
     let body = &buf[4..4 + body_len];
-    let actual_arity = infer_actual_arity(body).unwrap_or(DATA_FILE_META_V8_ARITY);
-    if actual_arity != DATA_FILE_META_V8_ARITY && actual_arity != 20 {
-        return Err(crate::Error::Unsupported {
-            message: format!(
-                "DataFileMeta v8 row arity {actual_arity} not supported (expected 20 or 22)"
-            ),
-        });
-    }
+    let actual_arity = infer_actual_arity(body)?;
     let row = BinaryRow::from_bytes(actual_arity, body.to_vec());
     Ok((data_file_meta_from_row(&row)?, 4 + body_len))
 }
 
-/// Reverse-engineer the row arity from the file_name (field 0) var-offset.
-/// Returns `None` when the row is too short or the slot looks inline-encoded
-/// (caller should fall back to the canonical v8 arity of 22).
-fn infer_actual_arity(body: &[u8]) -> Option<i32> {
-    if body.len() < 16 {
-        return None;
+const FIXED_PART_20_FIELDS: usize = 8 + 20 * 8;
+const FIXED_PART_22_FIELDS: usize = 8 + 22 * 8;
+
+/// Decide whether the row body is a 20- or 22-field v8 DataFileMeta.
+///
+/// Returns 22 by default (latest paimon-cpp), 20 only when we can prove the
+/// body cannot fit a 22-field fixed-part. Errors when the body is so short it
+/// cannot fit even the 20-field fixed-part, since that would let
+/// `BinaryRow::from_bytes` paper over a malformed input until a later field
+/// access blows up.
+fn infer_actual_arity(body: &[u8]) -> crate::Result<i32> {
+    if body.len() < FIXED_PART_20_FIELDS {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "DataFileMeta v8 row body too short: {} bytes (minimum {} for 20-field schema)",
+                body.len(),
+                FIXED_PART_20_FIELDS
+            ),
+            source: None,
+        });
     }
-    let slot0 = i64::from_le_bytes(body[8..16].try_into().ok()?) as u64;
-    // Inline-encoded values have the high bit set; in that case the slot is
-    // length-encoded and tells us nothing about var-area position.
+    if body.len() < FIXED_PART_22_FIELDS {
+        // Only 20-field can fit.
+        return Ok(20);
+    }
+    // body_len >= 184: ambiguous. Anchor on file_name's var-offset when it's
+    // var-len encoded; otherwise (inline ≤ 7 bytes) default to 22.
+    let slot0 = i64::from_le_bytes(body[8..16].try_into().unwrap()) as u64;
     if slot0 & (0x80 << 56) != 0 {
-        return None;
+        // Inline-encoded file_name: cannot reverse-engineer arity from the
+        // slot. Default to 22 — this is the only path where a 20-field row
+        // with a short file_name would be misread; paimon-cpp 's modern v8
+        // never emits 20 fields, and Bleem-side fixtures (older 20-field v8)
+        // always have UUID-bearing file_names well above 7 bytes.
+        return Ok(DATA_FILE_META_V8_ARITY);
     }
     let var_offset = (slot0 >> 32) as usize;
-    // null_bits_size is 8 for v8 (header bits + 22 field null bits, 64-bit aligned).
-    if var_offset < 8 {
-        return None;
-    }
-    let arity = (var_offset - 8) / 8;
-    Some(arity as i32)
+    let arity = if var_offset == FIXED_PART_22_FIELDS {
+        DATA_FILE_META_V8_ARITY
+    } else if var_offset == FIXED_PART_20_FIELDS {
+        20
+    } else {
+        // var_offset doesn't match either canonical layout — refuse rather
+        // than silently misreading a malformed/future-version body.
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "DataFileMeta v8 row file_name var-offset {var_offset} does not match 20-field ({FIXED_PART_20_FIELDS}) or 22-field ({FIXED_PART_22_FIELDS}) schema"
+            ),
+        });
+    };
+    Ok(arity)
 }
 
 /// Build a 22-field `BinaryRow` from a `DataFileMeta` (v8 schema). Mirrors
@@ -527,5 +555,35 @@ mod tests {
     fn rejects_truncated_buffer() {
         let bytes = vec![0u8, 0, 0, 1]; // declares size = 1, no body
         assert!(data_file_meta_from_serialized_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_body_shorter_than_20_field_fixed_part() {
+        // size = 100 (< 168 = 20-field fixed part). Should be rejected before
+        // we attempt any field access.
+        let mut bytes = 100i32.to_be_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 100));
+        let err = data_file_meta_from_serialized_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    /// A row body whose file_name var-offset doesn't match either canonical
+    /// fixed-part length (168 / 184) is malformed — refuse rather than try to
+    /// invent an arity that fits.
+    #[test]
+    fn rejects_unknown_file_name_var_offset() {
+        // Build a row body of length >= 184 (so we hit the disambiguation
+        // path) where slot0's var-offset is a bogus value (200).
+        let body_len = 256usize;
+        let mut body = vec![0u8; body_len];
+        // null bitmap: zeros (no nulls).
+        // slot 0 (offset 8..16): var-offset = 200, len = 0 → encoded LE.
+        let slot0 = ((200u64) << 32) | 0u64;
+        body[8..16].copy_from_slice(&slot0.to_le_bytes());
+
+        let mut bytes = (body_len as i32).to_be_bytes().to_vec();
+        bytes.extend(body);
+        let err = data_file_meta_from_serialized_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
     }
 }

@@ -61,16 +61,24 @@ impl BeWriter {
     }
 
     /// Write UTF-8 string as `i16 BE length` + raw bytes (mirrors C++ `WriteString`).
-    /// Length must fit `i16`; debug builds assert, release builds truncate the
-    /// length cast (matching Java's `(short) length` semantics).
-    pub fn write_string(&mut self, s: &str) {
-        debug_assert!(
-            s.len() <= i16::MAX as usize,
-            "BeWriter::write_string: length {} exceeds i16::MAX",
-            s.len()
-        );
+    /// Returns `Error::DataInvalid` when the string is longer than `i16::MAX`
+    /// (32767 bytes) — the wire format cannot represent that length, and silent
+    /// truncation would produce an unparseable byte stream that the C++ reader
+    /// would either reject or, worse, mis-align subsequent fields.
+    pub fn write_string(&mut self, s: &str) -> crate::Result<()> {
+        if s.len() > i16::MAX as usize {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "BeWriter::write_string: length {} exceeds i16::MAX ({})",
+                    s.len(),
+                    i16::MAX
+                ),
+                source: None,
+            });
+        }
         self.write_i16(s.len() as i16);
         self.buf.extend_from_slice(s.as_bytes());
+        Ok(())
     }
 
     pub fn write_bytes(&mut self, b: &[u8]) {
@@ -193,7 +201,7 @@ mod tests {
         w.write_i16(-30000);
         w.write_i32(0x01020304);
         w.write_i64(-1);
-        w.write_string("hello");
+        w.write_string("hello").unwrap();
         w.write_bytes(b"\xDE\xAD\xBE\xEF");
         let buf = w.into_inner();
 
@@ -229,7 +237,7 @@ mod tests {
     #[test]
     fn write_string_uses_i16_length() {
         let mut w = BeWriter::with_capacity(0);
-        w.write_string("ab");
+        w.write_string("ab").unwrap();
         let buf = w.into_inner();
         // i16 BE length 2, then ASCII "ab".
         assert_eq!(buf, vec![0, 2, b'a', b'b']);
@@ -252,10 +260,18 @@ mod tests {
     #[test]
     fn empty_string_round_trip() {
         let mut w = BeWriter::with_capacity(0);
-        w.write_string("");
+        w.write_string("").unwrap();
         let buf = w.into_inner();
         assert_eq!(buf, vec![0, 0]);
         let mut r = BeReader::new(&buf);
         assert_eq!(r.read_string().unwrap(), "");
+    }
+
+    #[test]
+    fn write_string_rejects_too_long() {
+        let mut w = BeWriter::with_capacity(0);
+        let huge = "x".repeat(i16::MAX as usize + 1);
+        let err = w.write_string(&huge).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
     }
 }

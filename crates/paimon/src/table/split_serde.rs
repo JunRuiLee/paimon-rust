@@ -62,6 +62,21 @@ const DATA_FILE_META_V8_ARITY: i32 = 22;
 /// Serialize a `DataSplit` into the byte form that paimon-cpp's
 /// `Split::Deserialize` accepts.
 pub fn serialize_data_split(split: &DataSplit) -> crate::Result<Vec<u8>> {
+    // The C++ DataSplit wire form has no slot for `row_ranges` — that field
+    // only exists in `IndexedSplit`, which we don't support. Refuse rather
+    // than silently dropping the row-id pruning a caller (e.g. global-index /
+    // full-text / vector scan) baked into the split, which would otherwise
+    // make the C++ reader return rows the Rust planner had filtered out.
+    if split.row_ranges().is_some() {
+        return Err(crate::Error::Unsupported {
+            message: "DataSplit with row_ranges cannot be serialized: the paimon-cpp \
+                      DataSplit wire format does not carry row_ranges (only IndexedSplit does, \
+                      which paimon-rust does not yet support). Strip row_ranges or route the \
+                      split through an IndexedSplit-aware path."
+                .into(),
+        });
+    }
+
     let mut w = BeWriter::with_capacity(256);
 
     w.write_i64(DATA_SPLIT_MAGIC);
@@ -76,7 +91,7 @@ pub fn serialize_data_split(split: &DataSplit) -> crate::Result<Vec<u8>> {
     w.write_bytes(part.data());
 
     w.write_i32(split.bucket());
-    w.write_string(split.bucket_path());
+    w.write_string(split.bucket_path())?;
 
     match split.total_buckets_opt() {
         None => w.write_bool(false),
@@ -87,9 +102,9 @@ pub fn serialize_data_split(split: &DataSplit) -> crate::Result<Vec<u8>> {
     }
 
     write_data_file_list(&mut w, split.before_files())?;
-    write_deletion_file_list(&mut w, split.before_deletion_files());
+    write_deletion_file_list(&mut w, split.before_deletion_files())?;
     write_data_file_list(&mut w, split.data_files())?;
-    write_deletion_file_list(&mut w, split.data_deletion_files());
+    write_deletion_file_list(&mut w, split.data_deletion_files())?;
 
     w.write_bool(split.is_streaming());
     w.write_bool(split.raw_convertible());
@@ -205,6 +220,20 @@ fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
             source: None,
         });
     }
+    // Each entry needs at least the 4-byte BE size prefix; reject impossible
+    // counts before they trigger a huge `Vec::with_capacity` on malformed
+    // input. Real splits hold ~tens of files, so this is far above any
+    // legitimate upper bound.
+    let max_possible = r.remaining() / 4;
+    if (n as usize) > max_possible {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "DataFileMeta list size {n} exceeds {max_possible} (4 bytes/entry, {} bytes remaining)",
+                r.remaining()
+            ),
+            source: None,
+        });
+    }
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
         // We feed `data_file_meta_from_serialized_bytes` exactly the bytes it
@@ -230,7 +259,10 @@ fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
     Ok(out)
 }
 
-fn write_deletion_file_list(w: &mut BeWriter, files: Option<&[Option<DeletionFile>]>) {
+fn write_deletion_file_list(
+    w: &mut BeWriter,
+    files: Option<&[Option<DeletionFile>]>,
+) -> crate::Result<()> {
     match files {
         None => w.write_i8(0),
         // Java/C++ encode "empty" the same way as "absent": i8 0. We match that
@@ -245,7 +277,7 @@ fn write_deletion_file_list(w: &mut BeWriter, files: Option<&[Option<DeletionFil
                     None => w.write_i8(0),
                     Some(df) => {
                         w.write_i8(1);
-                        w.write_string(df.path());
+                        w.write_string(df.path())?;
                         w.write_i64(df.offset());
                         w.write_i64(df.length());
                         w.write_i64(df.cardinality().unwrap_or(-1));
@@ -254,6 +286,7 @@ fn write_deletion_file_list(w: &mut BeWriter, files: Option<&[Option<DeletionFil
             }
         }
     }
+    Ok(())
 }
 
 fn read_deletion_file_list(
@@ -273,6 +306,18 @@ fn read_deletion_file_list(
     if n < 0 {
         return Err(crate::Error::DataInvalid {
             message: format!("DeletionFile list size {n} < 0"),
+            source: None,
+        });
+    }
+    // Each entry has at least a 1-byte presence flag; reject counts larger
+    // than the bytes left in the stream so a malformed `n` cannot drive a
+    // huge `Vec::with_capacity`.
+    if (n as usize) > r.remaining() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "DeletionFile list size {n} exceeds {} bytes remaining (1 byte/entry minimum)",
+                r.remaining()
+            ),
             source: None,
         });
     }
@@ -468,6 +513,82 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 5];
         let err = deserialize_data_split(truncated).unwrap_err();
         assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn rejects_split_with_row_ranges() {
+        use crate::table::source::RowRange;
+        let split = DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(make_partition_row())
+            .with_bucket(0)
+            .with_bucket_path("data/x.db/x/bucket-0".into())
+            .with_data_files(vec![make_meta("a.orc")])
+            .with_row_ranges(vec![RowRange::new(0, 9)])
+            .build()
+            .unwrap();
+        let err = serialize_data_split(&split).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { .. }),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_bucket_path_too_long() {
+        let mut split = make_simple_split();
+        // Replace bucket_path with one that overflows i16 length.
+        let huge = "a".repeat(i16::MAX as usize + 1);
+        split = DataSplit::builder()
+            .with_snapshot(split.snapshot_id())
+            .with_partition(split.partition().clone())
+            .with_bucket(split.bucket())
+            .with_bucket_path(huge)
+            .with_total_buckets(split.total_buckets())
+            .with_data_files(split.data_files().to_vec())
+            .build()
+            .unwrap();
+        let err = serialize_data_split(&split).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "expected DataInvalid, got {err:?}"
+        );
+    }
+
+    /// A malformed list count must not drive a huge `Vec::with_capacity`. We
+    /// patch the data_files i32 count to a billion and expect a clean
+    /// DataInvalid rather than an OOM-shaped allocation before reading.
+    #[test]
+    fn rejects_oversized_data_file_list_count() {
+        let serialized = serialize_data_split(&make_simple_split()).unwrap();
+
+        // Walk the framing to locate the data_files i32 count. Skip:
+        //   8 (magic) + 4 (ver) + 8 (snap) = 20
+        //   partition: i32 total_len + total_len bytes
+        //   bucket i32, bucket_path (i16 len + bytes)
+        //   total_buckets flag (1 byte) + i32 (since make_simple_split sets it)
+        //   before_files i32 (=0)
+        //   before_dv flag i8 (=0)
+        let mut pos = 20;
+        let part_total =
+            i32::from_be_bytes(serialized[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + part_total;
+        pos += 4; // bucket
+        let bp_len =
+            i16::from_be_bytes(serialized[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + bp_len;
+        pos += 1 + 4; // total_buckets flag + value
+        pos += 4; // before_files count
+        pos += 1; // before_dv flag (0)
+                  // pos now points to the data_files i32 count.
+
+        let mut bytes = serialized.clone();
+        bytes[pos..pos + 4].copy_from_slice(&1_000_000_000i32.to_be_bytes());
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "expected DataInvalid, got {err:?}"
+        );
     }
 
     // ---------------------------------------------------------------
