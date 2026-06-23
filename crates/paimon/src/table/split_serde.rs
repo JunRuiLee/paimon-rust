@@ -47,7 +47,7 @@ use crate::spec::be_io::{BeReader, BeWriter};
 use crate::spec::{data_file_meta_from_serialized_bytes, data_file_meta_to_serialized_bytes};
 use crate::spec::BinaryRow;
 use crate::spec::DataFileMeta;
-use crate::table::source::{DataSplit, DeletionFile};
+use crate::table::source::{DataSplit, DeletionFile, Plan};
 
 /// `paimon::DataSplitImpl::MAGIC` from `paimon-cpp/.../data_split_impl.h`.
 const DATA_SPLIT_MAGIC: i64 = -2_394_839_472_490_812_314;
@@ -199,6 +199,26 @@ pub fn deserialize_data_split(buf: &[u8]) -> crate::Result<DataSplit> {
         builder = builder.with_data_deletion_files(d);
     }
     builder.build()
+}
+
+/// Convenience wrapper: deserialize a single split from bytes and wrap it in
+/// a fresh [`Plan`]. Returned plans are equivalent to what
+/// `TableScan::plan().await` would produce, so callers can hand them straight
+/// to [`crate::table::TableRead::to_arrow`] without first re-running scan
+/// planning.
+///
+/// Use case: a remote planner serialized splits over the wire (e.g. via the
+/// Bleem coordinator), and the worker just wants to read them. This skips the
+/// `paimon_plan` round-trip the on-box scan path goes through.
+///
+/// One byte buffer in → one-element plan out. Concatenating many serialized
+/// splits is not supported here because the wire form is length-implicit
+/// (each split's bytes consume the entire buffer); call this once per split
+/// and merge the resulting plans on the caller's side, or extend with a
+/// length-framed batch encoding if that pattern shows up repeatedly.
+pub fn deserialize_data_split_to_plan(buf: &[u8]) -> crate::Result<Plan> {
+    let split = deserialize_data_split(buf)?;
+    Ok(Plan::new(vec![split]))
 }
 
 // --------------------- helpers ---------------------
@@ -727,6 +747,51 @@ mod tests {
         assert!(
             matches!(err, crate::Error::Unsupported { .. }),
             "expected Unsupported, got {err:?}"
+        );
+    }
+
+    /// Round-trip a Rust-built split through the plan-shaped helper. The
+    /// returned plan must hold exactly the deserialized split, with all
+    /// fields preserved.
+    #[test]
+    fn deserialize_to_plan_round_trips_simple_split() {
+        let split = make_simple_split();
+        let bytes = serialize_data_split(&split).unwrap();
+        let plan = deserialize_data_split_to_plan(&bytes).unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        let decoded = &plan.splits()[0];
+        assert_eq!(decoded.snapshot_id(), split.snapshot_id());
+        assert_eq!(decoded.bucket(), split.bucket());
+        assert_eq!(decoded.bucket_path(), split.bucket_path());
+        assert_eq!(decoded.total_buckets_opt(), split.total_buckets_opt());
+        assert_eq!(decoded.is_streaming(), split.is_streaming());
+        assert_eq!(decoded.raw_convertible(), split.raw_convertible());
+        assert_eq!(decoded.data_files().len(), split.data_files().len());
+    }
+
+    /// The plan helper must propagate the same errors as the lower-level
+    /// `deserialize_data_split`, not silently fall back to an empty plan.
+    #[test]
+    fn deserialize_to_plan_propagates_errors() {
+        let mut bytes = vec![0u8; 12];
+        bytes[0..8].copy_from_slice(&INDEXED_SPLIT_MAGIC.to_be_bytes());
+        let err = deserialize_data_split_to_plan(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
+    }
+
+    /// Plan from a paimon-cpp v8 fixture must be readable as a single-split
+    /// plan with the expected file payload.
+    #[test]
+    fn deserialize_to_plan_decodes_cpp_fixture() {
+        let bytes = read_fixture("data_split-02_pk_dv_index_in_data_with_external");
+        let plan = deserialize_data_split_to_plan(&bytes).unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        let split = &plan.splits()[0];
+        assert_eq!(split.bucket(), 1);
+        assert_eq!(split.data_files().len(), 1);
+        assert_eq!(
+            split.data_files()[0].file_name,
+            "data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc"
         );
     }
 }

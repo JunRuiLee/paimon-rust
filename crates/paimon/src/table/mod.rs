@@ -85,7 +85,9 @@ pub use snapshot_manager::SnapshotManager;
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
-pub use split_serde::{deserialize_data_split, serialize_data_split};
+pub use split_serde::{
+    deserialize_data_split, deserialize_data_split_to_plan, serialize_data_split,
+};
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;
 pub use table_scan::TableScan;
