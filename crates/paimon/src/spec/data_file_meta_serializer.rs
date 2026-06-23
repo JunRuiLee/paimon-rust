@@ -15,13 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-//! DataFileMeta v8 ↔ BinaryRow conversion, mirroring paimon-cpp's
-//! `DataFileMetaSerializer::ToRow` / `FromRow` (v8 = 22-field schema).
+//! DataFileMeta ↔ BinaryRow conversion across the v8 and v9 split wire forms.
 //!
-//! Used by `table::split_serde` to embed `DataFileMeta` records inside
-//! serialized `Split` byte streams. The output byte form for a single meta is
-//! `BinaryRowSerializer::Serialize` style: `i32 BE size_in_bytes | raw row bytes`
-//! (NO arity prefix — the 22-field arity is implicit at this version).
+//! The two wire forms agree on fields 0..=19 but diverge after that:
+//!
+//! | wire           | arity | field 20             | field 21              |
+//! |----------------|-------|----------------------|-----------------------|
+//! | v8 (Java legacy `DataFileMetaV11LegacySerializer`) | 20 | (absent)             | (absent)              |
+//! | v8 (paimon-cpp `DataFileMetaSerializer`)            | 22 | `_MERGE_MODE` (i8)   | `_COMMIT_SNAPSHOT_ID` (i64) |
+//! | v9 (Java `DataFileMetaSerializer`)                  | 22 | `_COMMIT_SNAPSHOT_ID` (i64) | `_MERGE_MODE` (i8) |
+//!
+//! Java v9 swapped the last two fields when adding versioned-partial-update,
+//! so a wire-version-aware decoder is required. The encoder still emits the
+//! paimon-cpp v8 22-field form for Bleem's C++ reader, since that's the only
+//! consumer we ship today.
+//!
+//! Output byte form for a single meta (both v8/v9) is
+//! `BinaryRowSerializer::Serialize` style: `i32 BE size_in_bytes | raw row bytes`.
+//! The 22-field arity is implicit at this layer — only the outer `DataSplit`
+//! wire carries an explicit version int.
 
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -33,8 +45,29 @@ use super::stats::BinaryTableStats;
 const DATA_FILE_META_V8_ARITY: i32 = 22;
 const SIMPLE_STATS_ARITY: i32 = 3;
 
+/// Wire-version selector for a DataFileMeta row. Determines:
+///
+/// - Which row arities are accepted (`V8` accepts 20 or 22; `V9` requires 22)
+/// - The order of `commit_snapshot_id` and `merge_mode` at the tail of a
+///   22-field row (V8 cpp-flavor vs. Java V9)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFileMetaWireVersion {
+    /// Outer split version 8. Inner row is either 20-field (Java legacy) or
+    /// 22-field (paimon-cpp); when 22-field, `_MERGE_MODE` is at slot 20 and
+    /// `_COMMIT_SNAPSHOT_ID` at slot 21 (matches `paimon-cpp`'s
+    /// `DataFileMetaSerializer`).
+    V8,
+    /// Outer split version 9. Inner row is always 22-field with
+    /// `_COMMIT_SNAPSHOT_ID` at slot 20 and `_MERGE_MODE` at slot 21
+    /// (matches Java `DataFileMetaSerializer`).
+    V9,
+}
+
 /// Serialize `DataFileMeta` to its on-wire bytes (used inside the `Split`
 /// byte stream). Output format: `i32 BE size_in_bytes | raw row bytes`.
+///
+/// Writes the v8 paimon-cpp form (22 fields, `_MERGE_MODE` at 20,
+/// `_COMMIT_SNAPSHOT_ID` at 21). That's the only consumer we currently feed.
 pub fn data_file_meta_to_serialized_bytes(meta: &DataFileMeta) -> crate::Result<Vec<u8>> {
     let row = data_file_meta_to_row(meta)?;
     let raw = row.data();
@@ -45,10 +78,20 @@ pub fn data_file_meta_to_serialized_bytes(meta: &DataFileMeta) -> crate::Result<
     Ok(out)
 }
 
-/// Deserialize a `DataFileMeta` from its on-wire bytes (the `BinaryRowSerializer`
-/// form: `i32 BE size_in_bytes | raw row bytes`). Returns the decoded meta and
-/// the number of bytes consumed.
+/// Deserialize a `DataFileMeta` from its on-wire bytes assuming the v8 wire
+/// form. Use [`data_file_meta_from_serialized_bytes_versioned`] when the outer
+/// split version is known and may be v9.
 pub fn data_file_meta_from_serialized_bytes(buf: &[u8]) -> crate::Result<(DataFileMeta, usize)> {
+    data_file_meta_from_serialized_bytes_versioned(buf, DataFileMetaWireVersion::V8)
+}
+
+/// Wire-version-aware deserialize. Splits decoded as Java v9 must use
+/// [`DataFileMetaWireVersion::V9`] because the field 20/21 order changed in
+/// that wire revision.
+pub fn data_file_meta_from_serialized_bytes_versioned(
+    buf: &[u8],
+    version: DataFileMetaWireVersion,
+) -> crate::Result<(DataFileMeta, usize)> {
     if buf.len() < 4 {
         return Err(crate::Error::DataInvalid {
             message: format!("DataFileMeta: buffer too short ({} bytes)", buf.len()),
@@ -72,57 +115,55 @@ pub fn data_file_meta_from_serialized_bytes(buf: &[u8]) -> crate::Result<(DataFi
             source: None,
         });
     }
-    // Older paimon-cpp builds wrote v8 DataFileMeta as a 20-field row (no
-    // `_MERGE_MODE` / `_COMMIT_SNAPSHOT_ID`). The current schema is 22 fields.
-    // Both wire forms are tagged `version 8`; the row body length and (when
-    // available) the file_name var-offset disambiguate them.
-    //
-    // - `body_len < 168`: not a valid v8 row at all (less than 20-field fixed part).
-    // - `168 <= body_len < 184`: must be 20-field (22-field needs at least 184).
-    // - `body_len >= 184`: ambiguous — both 20- and 22-field bodies are
-    //   possible. Use the file_name slot's var-offset to disambiguate; if the
-    //   slot is inline-encoded (file_name <= 7 bytes) and the var-offset
-    //   anchor isn't available, default to 22 (latest paimon-cpp output).
     let body = &buf[4..4 + body_len];
-    let actual_arity = infer_actual_arity(body)?;
+    let actual_arity = infer_actual_arity(body, version)?;
     let row = BinaryRow::from_bytes(actual_arity, body.to_vec());
-    Ok((data_file_meta_from_row(&row)?, 4 + body_len))
+    Ok((data_file_meta_from_row_versioned(&row, version)?, 4 + body_len))
 }
 
 const FIXED_PART_20_FIELDS: usize = 8 + 20 * 8;
 const FIXED_PART_22_FIELDS: usize = 8 + 22 * 8;
 
-/// Decide whether the row body is a 20- or 22-field v8 DataFileMeta.
+/// Decide the row arity.
 ///
-/// Returns 22 by default (latest paimon-cpp), 20 only when we can prove the
-/// body cannot fit a 22-field fixed-part. Errors when the body is so short it
-/// cannot fit even the 20-field fixed-part, since that would let
-/// `BinaryRow::from_bytes` paper over a malformed input until a later field
-/// access blows up.
-fn infer_actual_arity(body: &[u8]) -> crate::Result<i32> {
+/// - V9 is strictly 22 fields — anything shorter is malformed.
+/// - V8 may be 20-field (Java legacy) or 22-field (paimon-cpp). We use the
+///   row body length first (sub-184 must be 20-field) and the file_name var-
+///   offset as a tiebreaker when body length alone is ambiguous.
+fn infer_actual_arity(
+    body: &[u8],
+    version: DataFileMetaWireVersion,
+) -> crate::Result<i32> {
     if body.len() < FIXED_PART_20_FIELDS {
         return Err(crate::Error::DataInvalid {
             message: format!(
-                "DataFileMeta v8 row body too short: {} bytes (minimum {} for 20-field schema)",
+                "DataFileMeta row body too short: {} bytes (minimum {} for 20-field schema)",
                 body.len(),
                 FIXED_PART_20_FIELDS
             ),
             source: None,
         });
     }
+    if matches!(version, DataFileMetaWireVersion::V9) {
+        if body.len() < FIXED_PART_22_FIELDS {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "DataFileMeta v9 row body too short: {} bytes (minimum {} for 22-field schema)",
+                    body.len(),
+                    FIXED_PART_22_FIELDS
+                ),
+                source: None,
+            });
+        }
+        return Ok(DATA_FILE_META_V8_ARITY);
+    }
     if body.len() < FIXED_PART_22_FIELDS {
-        // Only 20-field can fit.
         return Ok(20);
     }
-    // body_len >= 184: ambiguous. Anchor on file_name's var-offset when it's
-    // var-len encoded; otherwise (inline ≤ 7 bytes) default to 22.
+    // V8, body_len >= 184: ambiguous. Anchor on file_name's var-offset when
+    // it's var-len encoded; otherwise (inline ≤ 7 bytes) default to 22.
     let slot0 = i64::from_le_bytes(body[8..16].try_into().unwrap()) as u64;
     if slot0 & (0x80 << 56) != 0 {
-        // Inline-encoded file_name: cannot reverse-engineer arity from the
-        // slot. Default to 22 — this is the only path where a 20-field row
-        // with a short file_name would be misread; paimon-cpp 's modern v8
-        // never emits 20 fields, and Bleem-side fixtures (older 20-field v8)
-        // always have UUID-bearing file_names well above 7 bytes.
         return Ok(DATA_FILE_META_V8_ARITY);
     }
     let var_offset = (slot0 >> 32) as usize;
@@ -131,8 +172,6 @@ fn infer_actual_arity(body: &[u8]) -> crate::Result<i32> {
     } else if var_offset == FIXED_PART_20_FIELDS {
         20
     } else {
-        // var_offset doesn't match either canonical layout — refuse rather
-        // than silently misreading a malformed/future-version body.
         return Err(crate::Error::Unsupported {
             message: format!(
                 "DataFileMeta v8 row file_name var-offset {var_offset} does not match 20-field ({FIXED_PART_20_FIELDS}) or 22-field ({FIXED_PART_22_FIELDS}) schema"
@@ -142,8 +181,8 @@ fn infer_actual_arity(body: &[u8]) -> crate::Result<i32> {
     Ok(arity)
 }
 
-/// Build a 22-field `BinaryRow` from a `DataFileMeta` (v8 schema). Mirrors
-/// `paimon-cpp/.../data_file_meta_serializer.cpp::ToRow`.
+/// Build a 22-field `BinaryRow` from a `DataFileMeta` (v8 paimon-cpp schema).
+/// Mirrors `paimon-cpp/.../data_file_meta_serializer.cpp::ToRow`.
 pub fn data_file_meta_to_row(meta: &DataFileMeta) -> crate::Result<BinaryRow> {
     let mut b = BinaryRowBuilder::new(DATA_FILE_META_V8_ARITY);
 
@@ -159,12 +198,9 @@ pub fn data_file_meta_to_row(meta: &DataFileMeta) -> crate::Result<BinaryRow> {
     b.write_long(9, meta.schema_id);
     b.write_int(10, meta.level);
 
-    // _EXTRA_FILES — array<string, nullable> per C++ ToStringArrayData; Rust
-    // stores Vec<String> with no null encoding, so wrap each as Some.
     let extra: Vec<Option<String>> = meta.extra_files.iter().cloned().map(Some).collect();
     b.write_array(11, &BinaryArray::from_str_array_nullable(&extra));
 
-    // _CREATION_TIME — timestamp(precision=3), encoded compact (epoch millis).
     match meta.creation_time {
         Some(t) => b.write_timestamp_compact(12, t.timestamp_millis()),
         None => b.set_null_at(12),
@@ -177,7 +213,6 @@ pub fn data_file_meta_to_row(meta: &DataFileMeta) -> crate::Result<BinaryRow> {
         None => b.set_null_at(14),
     }
 
-    // _FILE_SOURCE — Rust holds Option<i32>; C++ writes as i8.
     match meta.file_source {
         Some(v) => b.write_byte(15, v as i8),
         None => b.set_null_at(15),
@@ -200,29 +235,50 @@ pub fn data_file_meta_to_row(meta: &DataFileMeta) -> crate::Result<BinaryRow> {
         None => b.set_null_at(19),
     }
 
+    // v8 paimon-cpp schema: 20 = merge_mode, 21 = commit_snapshot_id.
     match meta.merge_mode {
         Some(v) => b.write_byte(20, v),
         None => b.set_null_at(20),
     }
-
     set_optional_long(&mut b, 21, meta.commit_snapshot_id);
 
     Ok(b.build())
 }
 
-/// Decode a 22-field `BinaryRow` back to a `DataFileMeta`. Mirrors the C++
-/// `FromRow` (v8 path). Also accepts the older 20-field v8 wire form (no
-/// `_MERGE_MODE` / `_COMMIT_SNAPSHOT_ID`) which paimon-cpp produced before
-/// versioned-partial-update was added.
+/// Decode a v8 paimon-cpp-shaped row (the default this crate emits).
 pub fn data_file_meta_from_row(row: &BinaryRow) -> crate::Result<DataFileMeta> {
+    data_file_meta_from_row_versioned(row, DataFileMetaWireVersion::V8)
+}
+
+/// Wire-version-aware row decode. The first 20 fields are identical between
+/// v8 and v9; only the trailing `merge_mode` / `commit_snapshot_id` slots are
+/// swapped, and v9 requires arity 22 (no 20-field legacy form).
+pub fn data_file_meta_from_row_versioned(
+    row: &BinaryRow,
+    version: DataFileMetaWireVersion,
+) -> crate::Result<DataFileMeta> {
     let arity = row.arity();
-    if arity != DATA_FILE_META_V8_ARITY && arity != 20 {
-        return Err(crate::Error::DataInvalid {
-            message: format!(
-                "DataFileMeta v8 expects arity 20 or {DATA_FILE_META_V8_ARITY}, got {arity}"
-            ),
-            source: None,
-        });
+    match version {
+        DataFileMetaWireVersion::V8 => {
+            if arity != DATA_FILE_META_V8_ARITY && arity != 20 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "DataFileMeta v8 expects arity 20 or {DATA_FILE_META_V8_ARITY}, got {arity}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+        DataFileMetaWireVersion::V9 => {
+            if arity != DATA_FILE_META_V8_ARITY {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "DataFileMeta v9 expects arity {DATA_FILE_META_V8_ARITY}, got {arity}"
+                    ),
+                    source: None,
+                });
+            }
+        }
     }
 
     let file_name = row.get_string(0)?.to_string();
@@ -269,7 +325,6 @@ pub fn data_file_meta_from_row(row: &BinaryRow) -> crate::Result<DataFileMeta> {
         Some(row.get_binary(14)?.to_vec())
     };
 
-    // _FILE_SOURCE: read 1 byte, sign-extend to i32.
     let file_source = if row.is_null_at(15) {
         None
     } else {
@@ -300,16 +355,37 @@ pub fn data_file_meta_from_row(row: &BinaryRow) -> crate::Result<DataFileMeta> {
         Some(string_array_required_to_vec(&row.get_array(19)?)?)
     };
 
-    let merge_mode = if arity > 20 && !row.is_null_at(20) {
-        Some(row.get_byte(20)?)
-    } else {
-        None
-    };
-
-    let commit_snapshot_id = if arity > 21 && !row.is_null_at(21) {
-        Some(row.get_long(21)?)
-    } else {
-        None
+    // Slots 20/21 — order depends on wire version.
+    let (merge_mode, commit_snapshot_id) = match version {
+        DataFileMetaWireVersion::V8 => {
+            // 20 = merge_mode, 21 = commit_snapshot_id (paimon-cpp layout;
+            // the Java legacy 20-field form has neither).
+            let mm = if arity > 20 && !row.is_null_at(20) {
+                Some(row.get_byte(20)?)
+            } else {
+                None
+            };
+            let csi = if arity > 21 && !row.is_null_at(21) {
+                Some(row.get_long(21)?)
+            } else {
+                None
+            };
+            (mm, csi)
+        }
+        DataFileMetaWireVersion::V9 => {
+            // 20 = commit_snapshot_id, 21 = merge_mode (Java v9 layout).
+            let csi = if !row.is_null_at(20) {
+                Some(row.get_long(20)?)
+            } else {
+                None
+            };
+            let mm = if !row.is_null_at(21) {
+                Some(row.get_byte(21)?)
+            } else {
+                None
+            };
+            (mm, csi)
+        }
     };
 
     Ok(DataFileMeta {

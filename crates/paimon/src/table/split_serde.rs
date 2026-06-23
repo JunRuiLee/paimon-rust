@@ -44,7 +44,10 @@
 //! returns `Error::Unsupported` rather than silently dropping data.
 
 use crate::spec::be_io::{BeReader, BeWriter};
-use crate::spec::{data_file_meta_from_serialized_bytes, data_file_meta_to_serialized_bytes};
+use crate::spec::{
+    data_file_meta_from_serialized_bytes_versioned, data_file_meta_to_serialized_bytes,
+    DataFileMetaWireVersion,
+};
 use crate::spec::BinaryRow;
 use crate::spec::DataFileMeta;
 use crate::table::source::{DataSplit, DeletionFile, Plan};
@@ -53,10 +56,14 @@ use crate::table::source::{DataSplit, DeletionFile, Plan};
 const DATA_SPLIT_MAGIC: i64 = -2_394_839_472_490_812_314;
 /// `paimon::IndexedSplitImpl::MAGIC` from `paimon-cpp/.../indexed_split_impl.h`.
 const INDEXED_SPLIT_MAGIC: i64 = -938_472_394_838_495_695;
-/// `paimon::DataSplitImpl::VERSION`.
+/// Outer split versions we accept on deserialize. The encoder still emits v8
+/// — that's what paimon-cpp's `Split::Deserialize` accepts. Java engines emit
+/// v9, which is wire-compatible with v8 at the split layer but uses a
+/// different DataFileMeta row schema.
 const VERSION_8: i32 = 8;
-/// Arity of the v8 DataFileMeta `BinaryRow` schema. Used when decoding a
-/// `DataFileMeta` row body whose arity is implicit on the wire.
+const VERSION_9: i32 = 9;
+/// Arity of the v8 paimon-cpp DataFileMeta `BinaryRow` schema. Used when
+/// decoding a `DataFileMeta` row body whose arity is implicit on the wire.
 const DATA_FILE_META_V8_ARITY: i32 = 22;
 
 /// Serialize a `DataSplit` into the byte form that paimon-cpp's
@@ -129,11 +136,17 @@ pub fn deserialize_data_split(buf: &[u8]) -> crate::Result<DataSplit> {
         });
     }
     let version = r.read_i32()?;
-    if version != VERSION_8 {
-        return Err(crate::Error::Unsupported {
-            message: format!("DataSplit version {version} not supported, only v{VERSION_8}"),
-        });
-    }
+    let wire_version = match version {
+        VERSION_8 => DataFileMetaWireVersion::V8,
+        VERSION_9 => DataFileMetaWireVersion::V9,
+        other => {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "DataSplit version {other} not supported, only v{VERSION_8} or v{VERSION_9}"
+                ),
+            });
+        }
+    };
     let snapshot_id = r.read_i64()?;
 
     // partition (SerializationUtils form: i32 total_len + i32 arity + raw bytes).
@@ -158,9 +171,9 @@ pub fn deserialize_data_split(buf: &[u8]) -> crate::Result<DataSplit> {
         None
     };
 
-    let before_files = read_data_file_list(&mut r)?;
+    let before_files = read_data_file_list(&mut r, wire_version)?;
     let before_deletion_files = read_deletion_file_list(&mut r)?;
-    let data_files = read_data_file_list(&mut r)?;
+    let data_files = read_data_file_list(&mut r, wire_version)?;
     let data_deletion_files = read_deletion_file_list(&mut r)?;
 
     let is_streaming = r.read_bool()?;
@@ -232,7 +245,10 @@ fn write_data_file_list(w: &mut BeWriter, files: &[DataFileMeta]) -> crate::Resu
     Ok(())
 }
 
-fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
+fn read_data_file_list(
+    r: &mut BeReader,
+    wire_version: DataFileMetaWireVersion,
+) -> crate::Result<Vec<DataFileMeta>> {
     let n = r.read_i32()?;
     if n < 0 {
         return Err(crate::Error::DataInvalid {
@@ -256,9 +272,9 @@ fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
     }
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        // We feed `data_file_meta_from_serialized_bytes` exactly the bytes it
-        // needs to parse one entry by reading the i32 size first, then handing
-        // over `[size_be_bytes][body]`.
+        // We feed `data_file_meta_from_serialized_bytes_versioned` exactly the
+        // bytes it needs to parse one entry by reading the i32 size first,
+        // then handing over `[size_be_bytes][body]`.
         let size = r.read_i32()?;
         if size < 0 {
             return Err(crate::Error::DataInvalid {
@@ -270,7 +286,8 @@ fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
         let mut buf = Vec::with_capacity(4 + body.len());
         buf.extend_from_slice(&size.to_be_bytes());
         buf.extend_from_slice(body);
-        let (meta, consumed) = data_file_meta_from_serialized_bytes(&buf)?;
+        let (meta, consumed) =
+            data_file_meta_from_serialized_bytes_versioned(&buf, wire_version)?;
         debug_assert_eq!(consumed, buf.len());
         // Suppress unused-arity-constant warning when DEBUG_ASSERTIONS is off.
         let _ = DATA_FILE_META_V8_ARITY;
@@ -793,5 +810,220 @@ mod tests {
             split.data_files()[0].file_name,
             "data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // v9 (Java DataSplit / DataFileMetaSerializer) wire compatibility.
+    //
+    // The Java side swapped the trailing two fields when adding versioned-
+    // partial-update: v9 row has commit_snapshot_id at slot 20 and merge_mode
+    // at slot 21, the opposite of paimon-cpp's v8 layout. We don't yet have a
+    // Java-produced fixture, so we synthesize one by starting from our v8
+    // encoder and mutating the wire bytes in place — patch the version int
+    // and swap slots 20/21 in every DataFileMeta row body. If the decoder
+    // routes through `DataFileMetaWireVersion::V9`, the original field values
+    // round-trip exactly.
+    // ---------------------------------------------------------------
+
+    /// Locate every DataFileMeta row body in a serialized split and call
+    /// `mutate` on each `&mut [u8]` (the 22-field row data, no size prefix).
+    /// Walks the outer framing identically to `deserialize_data_split`.
+    fn for_each_meta_row(bytes: &mut [u8], mut mutate: impl FnMut(&mut [u8])) {
+        // magic(8) + ver(4) + snap(8) = 20
+        let mut pos = 20;
+        let part_total = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4 + part_total;
+        pos += 4; // bucket
+        let bp_len = i16::from_be_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + bp_len;
+        // total_buckets flag + optional i32
+        let tb_flag = bytes[pos];
+        pos += 1;
+        if tb_flag != 0 {
+            pos += 4;
+        }
+
+        // before_files i32 count, then n × (i32 size + body)
+        let consume_list = |bytes: &mut [u8], pos: &mut usize, mutate: &mut dyn FnMut(&mut [u8])| {
+            let n = i32::from_be_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            for _ in 0..n {
+                let size = i32::from_be_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+                *pos += 4;
+                let body = &mut bytes[*pos..*pos + size];
+                mutate(body);
+                *pos += size;
+            }
+        };
+        consume_list(bytes, &mut pos, &mut mutate);
+
+        // before_deletion_files: flag + (i32 n + entries)
+        if bytes[pos] != 0 {
+            pos += 1;
+            let n = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            for _ in 0..n {
+                let entry_flag = bytes[pos];
+                pos += 1;
+                if entry_flag != 0 {
+                    let p_len = i16::from_be_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2 + p_len + 8 + 8 + 8;
+                }
+            }
+        } else {
+            pos += 1;
+        }
+
+        consume_list(bytes, &mut pos, &mut mutate);
+        // We don't need to walk past data_files for the v9-swap fixture; the
+        // remaining bytes (data_deletion_files + flags) aren't touched.
+    }
+
+    /// Swap the 8-byte fixed slot 20 with slot 21 in a 22-field DataFileMeta
+    /// row body, and swap the corresponding null bits. After this, a row
+    /// originally written by `data_file_meta_to_row` (v8 layout) reads back
+    /// correctly under the v9 decoder.
+    fn swap_v9_layout(row_body: &mut [u8]) {
+        const NULL_BITS_SIZE: usize = 8;
+        const SLOT20: usize = NULL_BITS_SIZE + 20 * 8;
+        const SLOT21: usize = NULL_BITS_SIZE + 21 * 8;
+        // Swap 8-byte fixed slots.
+        for i in 0..8 {
+            row_body.swap(SLOT20 + i, SLOT21 + i);
+        }
+        // Swap null bits at field positions 20 and 21 (bit_index = pos + 8).
+        let bit20 = 20 + 8;
+        let bit21 = 21 + 8;
+        let byte20 = bit20 / 8;
+        let byte21 = bit21 / 8;
+        let mask20 = 1u8 << (bit20 % 8);
+        let mask21 = 1u8 << (bit21 % 8);
+        let v20 = row_body[byte20] & mask20 != 0;
+        let v21 = row_body[byte21] & mask21 != 0;
+        if v20 {
+            row_body[byte21] |= mask21;
+        } else {
+            row_body[byte21] &= !mask21;
+        }
+        if v21 {
+            row_body[byte20] |= mask20;
+        } else {
+            row_body[byte20] &= !mask20;
+        }
+    }
+
+    fn make_v9_bytes_from_meta_with_tail(commit_id: i64, merge_mode: i8) -> Vec<u8> {
+        // Build a split whose only file carries commit_snapshot_id + merge_mode.
+        let meta = DataFileMeta {
+            file_name: "data-v9-fixture.orc".into(),
+            file_size: 256,
+            row_count: 5,
+            min_key: vec![0u8; 4],
+            max_key: vec![0u8; 4],
+            key_stats: empty_stats(),
+            value_stats: empty_stats(),
+            min_sequence_number: 0,
+            max_sequence_number: 4,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: Some(Utc.timestamp_millis_opt(1_700_000_000_000).unwrap()),
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: Some(0),
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            merge_mode: Some(merge_mode),
+            commit_snapshot_id: Some(commit_id),
+        };
+        let split = DataSplit::builder()
+            .with_snapshot(7)
+            .with_partition(make_partition_row())
+            .with_bucket(0)
+            .with_bucket_path("data/x.db/x/bucket-0".into())
+            .with_total_buckets(1)
+            .with_data_files(vec![meta])
+            .build()
+            .unwrap();
+
+        let mut bytes = serialize_data_split(&split).unwrap();
+        // Patch outer version 8 → 9.
+        bytes[8..12].copy_from_slice(&9i32.to_be_bytes());
+        // Swap field-20/21 in every row body so the wire matches Java v9
+        // semantics (commit_snapshot_id at 20, merge_mode at 21).
+        for_each_meta_row(&mut bytes, swap_v9_layout);
+        bytes
+    }
+
+    #[test]
+    fn v9_round_trip_decodes_commit_snapshot_id_and_merge_mode() {
+        let bytes = make_v9_bytes_from_meta_with_tail(99, 1);
+        let split = deserialize_data_split(&bytes).expect("v9 decode");
+        assert_eq!(split.data_files().len(), 1);
+        let df = &split.data_files()[0];
+        assert_eq!(df.commit_snapshot_id, Some(99));
+        assert_eq!(df.merge_mode, Some(1));
+        assert_eq!(df.file_name, "data-v9-fixture.orc");
+    }
+
+    /// v9 with both tail fields null must round-trip the nulls (not silently
+    /// fill them with the wrong slot's content).
+    #[test]
+    fn v9_round_trip_handles_null_tail_fields() {
+        // Build a meta with nulls at both tail slots, run v8 encode, swap to
+        // v9 layout, decode under v9 → expect both fields to come back as None.
+        let meta = DataFileMeta {
+            file_name: "data-v9-nulls.orc".into(),
+            file_size: 100,
+            row_count: 1,
+            min_key: vec![0u8; 4],
+            max_key: vec![0u8; 4],
+            key_stats: empty_stats(),
+            value_stats: empty_stats(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            merge_mode: None,
+            commit_snapshot_id: None,
+        };
+        let split = DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(make_partition_row())
+            .with_bucket(0)
+            .with_bucket_path("data/x.db/x/bucket-0".into())
+            .with_data_files(vec![meta])
+            .build()
+            .unwrap();
+        let mut bytes = serialize_data_split(&split).unwrap();
+        bytes[8..12].copy_from_slice(&9i32.to_be_bytes());
+        for_each_meta_row(&mut bytes, swap_v9_layout);
+
+        let decoded = deserialize_data_split(&bytes).unwrap();
+        let df = &decoded.data_files()[0];
+        assert!(df.merge_mode.is_none());
+        assert!(df.commit_snapshot_id.is_none());
+    }
+
+    /// A v10+ split (or any future version we haven't certified) must still
+    /// be refused — silently routing it through the v9 path would risk
+    /// mis-decoding fields that change shape again.
+    #[test]
+    fn rejects_v10_wire() {
+        let mut bytes = serialize_data_split(&make_simple_split()).unwrap();
+        bytes[8..12].copy_from_slice(&10i32.to_be_bytes());
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
     }
 }
