@@ -54,6 +54,7 @@ pub(crate) mod snapshot_commit;
 mod snapshot_manager;
 mod sort_merge;
 mod source;
+pub mod split_serde;
 mod stats_filter;
 pub(crate) mod table_commit;
 mod table_read;
@@ -84,6 +85,7 @@ pub use snapshot_manager::SnapshotManager;
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
+pub use split_serde::{deserialize_data_split, serialize_data_split};
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;
 pub use table_scan::TableScan;

@@ -422,11 +422,21 @@ pub struct DataSplit {
     bucket: i32,
     bucket_path: String,
     total_buckets: i32,
+    /// Files to remove from the bucket as part of this split (used for streaming /
+    /// compaction reads). Always empty for batch reads. Mirrors Java
+    /// `DataSplit#beforeFiles`.
+    before_files: Vec<DataFileMeta>,
+    /// Deletion vectors associated with `before_files` (same length when present).
+    /// Mirrors Java `DataSplit#beforeDeletionFiles`.
+    before_deletion_files: Option<Vec<Option<DeletionFile>>>,
     data_files: Vec<DataFileMeta>,
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Whether this split is from a streaming scan. Mirrors Java
+    /// `DataSplit#isStreaming`.
+    is_streaming: bool,
     /// Whether the split can be read raw, without the sort-merge reader: its
     /// physical rows are exactly its logical (merged) rows, modulo deletion
     /// files. `false` for merge-engine splits whose files may hold multiple
@@ -452,8 +462,38 @@ impl DataSplit {
         self.total_buckets
     }
 
+    /// `total_buckets` semantics matching the Java/C++ on-wire form: `-1`
+    /// (the in-memory sentinel for "absent") maps to `None`. Used by split
+    /// serde to round-trip the optional field.
+    pub fn total_buckets_opt(&self) -> Option<i32> {
+        if self.total_buckets == -1 {
+            None
+        } else {
+            Some(self.total_buckets)
+        }
+    }
+
     pub fn data_files(&self) -> &[DataFileMeta] {
         &self.data_files
+    }
+
+    /// Files removed by this split (only populated for streaming / compaction
+    /// reads). Mirrors Java `DataSplit#beforeFiles`.
+    pub fn before_files(&self) -> &[DataFileMeta] {
+        &self.before_files
+    }
+
+    /// Deletion files for `before_files`, indexed identically. `None` = no
+    /// before-deletion-files list (the on-wire encoding wrote a 0-byte). Inner
+    /// `None` at index `i` = no deletion file for `before_files[i]`.
+    pub fn before_deletion_files(&self) -> Option<&[Option<DeletionFile>]> {
+        self.before_deletion_files.as_deref()
+    }
+
+    /// Whether this split was emitted by a streaming scan. Mirrors Java
+    /// `DataSplit#isStreaming`.
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
     }
 
     /// Deletion files for each data file (same order as `data_files`); `None` = no deletion file for that data file.
@@ -584,10 +624,13 @@ pub struct DataSplitBuilder {
     bucket: i32,
     bucket_path: Option<String>,
     total_buckets: i32,
+    before_files: Vec<DataFileMeta>,
+    before_deletion_files: Option<Vec<Option<DeletionFile>>>,
     data_files: Option<Vec<DataFileMeta>>,
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    is_streaming: bool,
     raw_convertible: bool,
 }
 
@@ -599,9 +642,12 @@ impl DataSplitBuilder {
             bucket: -1,
             bucket_path: None,
             total_buckets: -1,
+            before_files: Vec::new(),
+            before_deletion_files: None,
             data_files: None,
             data_deletion_files: None,
             row_ranges: None,
+            is_streaming: false,
             // Default to raw-convertible (exact `merged_row_count`): non-merge
             // tables (append, data-evolution) and direct test builders keep the
             // existing exact-count behaviour. Scan planning explicitly marks
@@ -632,6 +678,29 @@ impl DataSplitBuilder {
     }
     pub fn with_data_files(mut self, data_files: Vec<DataFileMeta>) -> Self {
         self.data_files = Some(data_files);
+        self
+    }
+
+    /// Sets the `before_files` list (files removed by this split, used for
+    /// streaming / compaction reads).
+    pub fn with_before_files(mut self, before_files: Vec<DataFileMeta>) -> Self {
+        self.before_files = before_files;
+        self
+    }
+
+    /// Sets deletion files for `before_files`; length must match `before_files`.
+    pub fn with_before_deletion_files(
+        mut self,
+        before_deletion_files: Vec<Option<DeletionFile>>,
+    ) -> Self {
+        self.before_deletion_files = Some(before_deletion_files);
+        self
+    }
+
+    /// Marks the split as a streaming-scan split. Mirrors Java
+    /// `DataSplit#isStreaming`.
+    pub fn with_is_streaming(mut self, is_streaming: bool) -> Self {
+        self.is_streaming = is_streaming;
         self
     }
 
@@ -700,15 +769,30 @@ impl DataSplitBuilder {
                 });
             }
         }
+        if let Some(ref before_deletion_files) = self.before_deletion_files {
+            if before_deletion_files.len() != self.before_files.len() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "DataSplit before_deletion_files length {} must match before_files length {}",
+                        before_deletion_files.len(),
+                        self.before_files.len()
+                    ),
+                    source: None,
+                });
+            }
+        }
         Ok(DataSplit {
             snapshot_id: self.snapshot_id,
             partition,
             bucket: self.bucket,
             bucket_path,
             total_buckets: self.total_buckets,
+            before_files: self.before_files,
+            before_deletion_files: self.before_deletion_files,
             data_files,
             data_deletion_files: self.data_deletion_files,
             row_ranges: self.row_ranges,
+            is_streaming: self.is_streaming,
             raw_convertible: self.raw_convertible,
         })
     }

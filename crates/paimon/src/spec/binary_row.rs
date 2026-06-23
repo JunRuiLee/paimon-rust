@@ -265,6 +265,23 @@ impl BinaryRow {
         })
     }
 
+    /// Read a sub-row stored at field `pos`. The bytes between `(offset, len)`
+    /// in this row's data form an inner row's raw bytes (no arity prefix);
+    /// caller must know `num_fields` (it is fixed by the schema, e.g. 3 for
+    /// `SimpleStats`). Mirrors C++ `BinaryRow::GetRow`.
+    pub fn get_row(&self, pos: usize, num_fields: i32) -> crate::Result<crate::spec::BinaryRow> {
+        let (start, len) = self.resolve_var_length_field(pos)?;
+        let body = self.data[start..start + len].to_vec();
+        Ok(crate::spec::BinaryRow::from_bytes(num_fields, body))
+    }
+
+    /// Read a sub-array stored at field `pos`. Mirrors C++ `BinaryRow::GetArray`.
+    pub fn get_array(&self, pos: usize) -> crate::Result<crate::spec::BinaryArray> {
+        let (start, len) = self.resolve_var_length_field(pos)?;
+        let body = self.data[start..start + len].to_vec();
+        crate::spec::BinaryArray::from_bytes(body)
+    }
+
     pub(crate) fn get_decimal_unscaled(&self, pos: usize, precision: u32) -> crate::Result<i128> {
         if precision <= 18 {
             Ok(self.get_long(pos)? as i128)
@@ -527,6 +544,19 @@ impl BinaryRowBuilder {
         self.data[offset..offset + 8].fill(0);
         self.data[offset..offset + value.len()].copy_from_slice(value);
         self.data[offset + 7] = 0x80 | (value.len() as u8);
+    }
+
+    /// Write an inner BinaryRow at `pos`. Appends the inner row's raw data
+    /// bytes (no arity prefix) to this row's variable area, 8-byte aligned,
+    /// and stores `(offset << 32) | len` as a LE i64 in the fixed slot.
+    /// Mirrors C++ `AbstractBinaryWriter::WriteRow`.
+    pub fn write_row(&mut self, pos: usize, inner: &crate::spec::BinaryRow) {
+        self.write_binary(pos, inner.data());
+    }
+
+    /// Write an inner BinaryArray at `pos`. Same encoding as `write_row`.
+    pub fn write_array(&mut self, pos: usize, inner: &crate::spec::BinaryArray) {
+        self.write_binary(pos, inner.data());
     }
 
     /// Write a compact Decimal (precision <= 18) as its unscaled i64 value.
@@ -1530,6 +1560,47 @@ mod tests {
         let (millis, nano) = row.get_timestamp_raw(0, 6).unwrap();
         assert_eq!(millis, epoch_millis);
         assert_eq!(nano, nano_of_milli);
+    }
+
+    #[test]
+    fn test_write_and_get_row_nested() {
+        // Inner: 2 fields (long, string).
+        let mut inner_builder = BinaryRowBuilder::new(2);
+        inner_builder.write_long(0, 42);
+        inner_builder.write_string(1, "embedded_string");
+        let inner = inner_builder.build();
+
+        // Outer: 3 fields (int, sub-row, long).
+        let mut outer_builder = BinaryRowBuilder::new(3);
+        outer_builder.write_int(0, 7);
+        outer_builder.write_row(1, &inner);
+        outer_builder.write_long(2, 99);
+        let outer = outer_builder.build();
+
+        assert_eq!(outer.get_int(0).unwrap(), 7);
+        assert_eq!(outer.get_long(2).unwrap(), 99);
+
+        let read_inner = outer.get_row(1, 2).unwrap();
+        assert_eq!(read_inner.arity(), 2);
+        assert_eq!(read_inner.get_long(0).unwrap(), 42);
+        assert_eq!(read_inner.get_string(1).unwrap(), "embedded_string");
+    }
+
+    #[test]
+    fn test_write_and_get_array_nested() {
+        let inner = crate::spec::BinaryArray::from_long_array_nullable(&[Some(1), None, Some(3)]);
+
+        let mut outer_builder = BinaryRowBuilder::new(2);
+        outer_builder.write_array(0, &inner);
+        outer_builder.write_int(1, 11);
+        let outer = outer_builder.build();
+
+        let read_arr = outer.get_array(0).unwrap();
+        assert_eq!(read_arr.size(), 3);
+        assert_eq!(read_arr.get_long(0).unwrap(), 1);
+        assert!(read_arr.is_null_at(1));
+        assert_eq!(read_arr.get_long(2).unwrap(), 3);
+        assert_eq!(outer.get_int(1).unwrap(), 11);
     }
 
     #[test]

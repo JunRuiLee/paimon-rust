@@ -19,8 +19,16 @@
 //!
 //! All paimon specs types are defined here.
 
+mod binary_array;
+pub use binary_array::*;
+
+pub(crate) mod be_io;
+
 mod binary_row;
 pub use binary_row::*;
+
+mod data_file_meta_serializer;
+pub use data_file_meta_serializer::*;
 
 mod blob_descriptor;
 pub use blob_descriptor::BlobDescriptor;

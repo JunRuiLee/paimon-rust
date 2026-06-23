@@ -1,0 +1,611 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+//! Compatible serialization for `DataSplit` matching paimon-cpp's
+//! `paimon::Split::Serialize` / `Split::Deserialize`. Used by Bleem to feed
+//! splits into the C++ reader (`bleem/be/src/format/table/paimon_cpp_reader.cpp`).
+//!
+//! ## Wire format (v8, big-endian outer stream)
+//! ```text
+//! i64  magic = -2_394_839_472_490_812_314 (DataSplit)
+//! i32  version = 8
+//! i64  snapshot_id
+//! i32  partition_total_len = 4 + sizeInBytes(partition)
+//! i32  partition_arity
+//! raw  partition_bytes[sizeInBytes]
+//! i32  bucket
+//! i16  bucket_path_len, raw utf8 bytes
+//! i8   total_buckets_present (0 or 1)
+//! [i32 total_buckets if present]
+//! i32  before_files_n; for each: i32 size, raw row bytes (DataFileMetaSerializer form)
+//! deletion_file_list                              (before_deletion_files)
+//! i32  data_files_n; for each: i32 size, raw row bytes
+//! deletion_file_list                              (data_deletion_files)
+//! i8   is_streaming
+//! i8   raw_convertible
+//! ```
+//!
+//! Only DataSplit + DataFileMeta v8 are supported. Encountering an
+//! `IndexedSplit` magic, a non-v8 version, or a trailing FallbackDataSplit byte
+//! returns `Error::Unsupported` rather than silently dropping data.
+
+use crate::spec::be_io::{BeReader, BeWriter};
+use crate::spec::{data_file_meta_from_serialized_bytes, data_file_meta_to_serialized_bytes};
+use crate::spec::BinaryRow;
+use crate::spec::DataFileMeta;
+use crate::table::source::{DataSplit, DeletionFile};
+
+/// `paimon::DataSplitImpl::MAGIC` from `paimon-cpp/.../data_split_impl.h`.
+const DATA_SPLIT_MAGIC: i64 = -2_394_839_472_490_812_314;
+/// `paimon::IndexedSplitImpl::MAGIC` from `paimon-cpp/.../indexed_split_impl.h`.
+const INDEXED_SPLIT_MAGIC: i64 = -938_472_394_838_495_695;
+/// `paimon::DataSplitImpl::VERSION`.
+const VERSION_8: i32 = 8;
+/// Arity of the v8 DataFileMeta `BinaryRow` schema. Used when decoding a
+/// `DataFileMeta` row body whose arity is implicit on the wire.
+const DATA_FILE_META_V8_ARITY: i32 = 22;
+
+/// Serialize a `DataSplit` into the byte form that paimon-cpp's
+/// `Split::Deserialize` accepts.
+pub fn serialize_data_split(split: &DataSplit) -> crate::Result<Vec<u8>> {
+    let mut w = BeWriter::with_capacity(256);
+
+    w.write_i64(DATA_SPLIT_MAGIC);
+    w.write_i32(VERSION_8);
+    w.write_i64(split.snapshot_id());
+
+    // partition: SerializationUtils::SerializeBinaryRow form.
+    let part = split.partition();
+    let raw_len = part.data().len() as i32;
+    w.write_i32(4 + raw_len); // total_len = arity_int(4) + raw_size
+    w.write_i32(part.arity());
+    w.write_bytes(part.data());
+
+    w.write_i32(split.bucket());
+    w.write_string(split.bucket_path());
+
+    match split.total_buckets_opt() {
+        None => w.write_bool(false),
+        Some(v) => {
+            w.write_bool(true);
+            w.write_i32(v);
+        }
+    }
+
+    write_data_file_list(&mut w, split.before_files())?;
+    write_deletion_file_list(&mut w, split.before_deletion_files());
+    write_data_file_list(&mut w, split.data_files())?;
+    write_deletion_file_list(&mut w, split.data_deletion_files());
+
+    w.write_bool(split.is_streaming());
+    w.write_bool(split.raw_convertible());
+
+    Ok(w.into_inner())
+}
+
+/// Deserialize a `DataSplit` from bytes produced by paimon-cpp's
+/// `Split::Serialize` (or by [`serialize_data_split`]).
+pub fn deserialize_data_split(buf: &[u8]) -> crate::Result<DataSplit> {
+    let mut r = BeReader::new(buf);
+    let magic = r.read_i64()?;
+    if magic == INDEXED_SPLIT_MAGIC {
+        return Err(crate::Error::Unsupported {
+            message: "IndexedSplit not supported by paimon-rust split serde".into(),
+        });
+    }
+    if magic != DATA_SPLIT_MAGIC {
+        return Err(crate::Error::DataInvalid {
+            message: format!("invalid split magic: {magic:#018x}"),
+            source: None,
+        });
+    }
+    let version = r.read_i32()?;
+    if version != VERSION_8 {
+        return Err(crate::Error::Unsupported {
+            message: format!("DataSplit version {version} not supported, only v{VERSION_8}"),
+        });
+    }
+    let snapshot_id = r.read_i64()?;
+
+    // partition (SerializationUtils form: i32 total_len + i32 arity + raw bytes).
+    let total_len = r.read_i32()?;
+    if total_len < 4 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("partition total_len {total_len} < 4"),
+            source: None,
+        });
+    }
+    let arity = r.read_i32()?;
+    let body_len = (total_len - 4) as usize;
+    let body = r.read_bytes(body_len)?.to_vec();
+    let partition = BinaryRow::from_bytes(arity, body);
+
+    let bucket = r.read_i32()?;
+    let bucket_path = r.read_string()?;
+
+    let total_buckets_opt = if r.read_bool()? {
+        Some(r.read_i32()?)
+    } else {
+        None
+    };
+
+    let before_files = read_data_file_list(&mut r)?;
+    let before_deletion_files = read_deletion_file_list(&mut r)?;
+    let data_files = read_data_file_list(&mut r)?;
+    let data_deletion_files = read_deletion_file_list(&mut r)?;
+
+    let is_streaming = r.read_bool()?;
+    let raw_convertible = r.read_bool()?;
+
+    if r.remaining() == 1 {
+        return Err(crate::Error::Unsupported {
+            message: "FallbackDataSplit not supported by paimon-rust split serde".into(),
+        });
+    }
+    if r.remaining() != 0 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "trailing {} bytes after DataSplit at pos {}",
+                r.remaining(),
+                r.pos()
+            ),
+            source: None,
+        });
+    }
+
+    let mut builder = DataSplit::builder()
+        .with_snapshot(snapshot_id)
+        .with_partition(partition)
+        .with_bucket(bucket)
+        .with_bucket_path(bucket_path)
+        .with_total_buckets(total_buckets_opt.unwrap_or(-1))
+        .with_data_files(data_files)
+        .with_before_files(before_files)
+        .with_is_streaming(is_streaming)
+        .with_raw_convertible(raw_convertible);
+    if let Some(b) = before_deletion_files {
+        builder = builder.with_before_deletion_files(b);
+    }
+    if let Some(d) = data_deletion_files {
+        builder = builder.with_data_deletion_files(d);
+    }
+    builder.build()
+}
+
+// --------------------- helpers ---------------------
+
+fn write_data_file_list(w: &mut BeWriter, files: &[DataFileMeta]) -> crate::Result<()> {
+    w.write_i32(files.len() as i32);
+    for f in files {
+        let bytes = data_file_meta_to_serialized_bytes(f)?;
+        w.write_bytes(&bytes);
+    }
+    Ok(())
+}
+
+fn read_data_file_list(r: &mut BeReader) -> crate::Result<Vec<DataFileMeta>> {
+    let n = r.read_i32()?;
+    if n < 0 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("DataFileMeta list size {n} < 0"),
+            source: None,
+        });
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        // We feed `data_file_meta_from_serialized_bytes` exactly the bytes it
+        // needs to parse one entry by reading the i32 size first, then handing
+        // over `[size_be_bytes][body]`.
+        let size = r.read_i32()?;
+        if size < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!("DataFileMeta size {size} < 0"),
+                source: None,
+            });
+        }
+        let body = r.read_bytes(size as usize)?;
+        let mut buf = Vec::with_capacity(4 + body.len());
+        buf.extend_from_slice(&size.to_be_bytes());
+        buf.extend_from_slice(body);
+        let (meta, consumed) = data_file_meta_from_serialized_bytes(&buf)?;
+        debug_assert_eq!(consumed, buf.len());
+        // Suppress unused-arity-constant warning when DEBUG_ASSERTIONS is off.
+        let _ = DATA_FILE_META_V8_ARITY;
+        out.push(meta);
+    }
+    Ok(out)
+}
+
+fn write_deletion_file_list(w: &mut BeWriter, files: Option<&[Option<DeletionFile>]>) {
+    match files {
+        None => w.write_i8(0),
+        // Java/C++ encode "empty" the same way as "absent": i8 0. We match that
+        // (so Some(empty) round-trips as None on read; the public API contract
+        // already collapses these states).
+        Some(list) if list.is_empty() => w.write_i8(0),
+        Some(list) => {
+            w.write_i8(1);
+            w.write_i32(list.len() as i32);
+            for entry in list {
+                match entry {
+                    None => w.write_i8(0),
+                    Some(df) => {
+                        w.write_i8(1);
+                        w.write_string(df.path());
+                        w.write_i64(df.offset());
+                        w.write_i64(df.length());
+                        w.write_i64(df.cardinality().unwrap_or(-1));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn read_deletion_file_list(
+    r: &mut BeReader,
+) -> crate::Result<Option<Vec<Option<DeletionFile>>>> {
+    let has = r.read_i8()?;
+    if has == 0 {
+        return Ok(None);
+    }
+    if has != 1 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("DeletionFile list flag must be 0 or 1, got {has}"),
+            source: None,
+        });
+    }
+    let n = r.read_i32()?;
+    if n < 0 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("DeletionFile list size {n} < 0"),
+            source: None,
+        });
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let entry_flag = r.read_i8()?;
+        if entry_flag == 0 {
+            out.push(None);
+        } else if entry_flag == 1 {
+            let path = r.read_string()?;
+            let offset = r.read_i64()?;
+            let length = r.read_i64()?;
+            let card = r.read_i64()?;
+            let cardinality = if card == -1 { None } else { Some(card) };
+            out.push(Some(DeletionFile::new(path, offset, length, cardinality)));
+        } else {
+            return Err(crate::Error::DataInvalid {
+                message: format!("DeletionFile entry flag must be 0 or 1, got {entry_flag}"),
+                source: None,
+            });
+        }
+    }
+    Ok(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::BinaryRowBuilder;
+    use chrono::TimeZone;
+    use chrono::Utc;
+
+    fn empty_stats() -> BinaryTableStats {
+        BinaryTableStats::empty()
+    }
+
+    fn make_partition_row() -> BinaryRow {
+        let mut b = BinaryRowBuilder::new(1);
+        b.write_int(0, 10);
+        b.build()
+    }
+
+    fn make_meta(file_name: &str) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.into(),
+            file_size: 1024,
+            row_count: 7,
+            min_key: vec![0u8; 4],
+            max_key: vec![0u8; 4],
+            key_stats: empty_stats(),
+            value_stats: empty_stats(),
+            min_sequence_number: 0,
+            max_sequence_number: 6,
+            schema_id: 0,
+            level: 1,
+            extra_files: Vec::new(),
+            creation_time: Some(Utc.timestamp_millis_opt(1_700_000_000_000).unwrap()),
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: Some(0),
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            merge_mode: None,
+            commit_snapshot_id: None,
+        }
+    }
+
+    fn make_simple_split() -> DataSplit {
+        DataSplit::builder()
+            .with_snapshot(7)
+            .with_partition(make_partition_row())
+            .with_bucket(3)
+            .with_bucket_path("data/some.db/some/f1=10/bucket-3".into())
+            .with_total_buckets(4)
+            .with_data_files(vec![make_meta("data-0001.parquet")])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn rust_self_round_trip_simple() {
+        let split = make_simple_split();
+        let bytes = serialize_data_split(&split).unwrap();
+        let decoded = deserialize_data_split(&bytes).unwrap();
+
+        assert_eq!(decoded.snapshot_id(), 7);
+        assert_eq!(decoded.bucket(), 3);
+        assert_eq!(decoded.bucket_path(), split.bucket_path());
+        assert_eq!(decoded.total_buckets_opt(), Some(4));
+        assert_eq!(decoded.is_streaming(), false);
+        assert_eq!(decoded.raw_convertible(), true);
+        assert_eq!(decoded.data_files().len(), 1);
+        assert_eq!(decoded.data_files()[0].file_name, "data-0001.parquet");
+        assert!(decoded.data_deletion_files().is_none());
+        assert!(decoded.before_files().is_empty());
+
+        // Idempotent re-serialize.
+        let bytes2 = serialize_data_split(&decoded).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn rust_round_trip_with_deletion_files() {
+        let dv = DeletionFile::new(
+            "FILE:/tmp/external/index-1".into(),
+            1,
+            22,
+            Some(1),
+        );
+        let split = DataSplit::builder()
+            .with_snapshot(4)
+            .with_partition(make_partition_row())
+            .with_bucket(1)
+            .with_bucket_path("data/x.db/x/f1=10/bucket-1".into())
+            .with_total_buckets(2)
+            .with_data_files(vec![make_meta("data-foo.orc")])
+            .with_data_deletion_files(vec![Some(dv.clone())])
+            .with_raw_convertible(true)
+            .build()
+            .unwrap();
+        let bytes = serialize_data_split(&split).unwrap();
+        let decoded = deserialize_data_split(&bytes).unwrap();
+        let dvs = decoded.data_deletion_files().unwrap();
+        assert_eq!(dvs.len(), 1);
+        let got = dvs[0].as_ref().unwrap();
+        assert_eq!(got.path(), dv.path());
+        assert_eq!(got.offset(), 1);
+        assert_eq!(got.length(), 22);
+        assert_eq!(got.cardinality(), Some(1));
+
+        let bytes2 = serialize_data_split(&decoded).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    fn rust_round_trip_total_buckets_absent() {
+        let split = DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(make_partition_row())
+            .with_bucket(0)
+            .with_bucket_path("data/x.db/x/bucket-0".into())
+            // total_buckets defaults to -1 => absent on the wire.
+            .with_data_files(vec![make_meta("a.orc")])
+            .build()
+            .unwrap();
+        let bytes = serialize_data_split(&split).unwrap();
+        let decoded = deserialize_data_split(&bytes).unwrap();
+        assert_eq!(decoded.total_buckets_opt(), None);
+    }
+
+    #[test]
+    fn rejects_indexed_split_magic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&INDEXED_SPLIT_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 4]); // pretend version
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
+    }
+
+    #[test]
+    fn rejects_unknown_magic() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i64.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn rejects_wrong_version() {
+        let mut bytes = serialize_data_split(&make_simple_split()).unwrap();
+        // Patch version (bytes 8..12) to 7.
+        bytes[8..12].copy_from_slice(&7i32.to_be_bytes());
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
+    }
+
+    #[test]
+    fn rejects_fallback_trailing_byte() {
+        let mut bytes = serialize_data_split(&make_simple_split()).unwrap();
+        bytes.push(1u8);
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported { .. }));
+    }
+
+    #[test]
+    fn rejects_truncated_input() {
+        let bytes = serialize_data_split(&make_simple_split()).unwrap();
+        let truncated = &bytes[..bytes.len() - 5];
+        let err = deserialize_data_split(truncated).unwrap_err();
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    // ---------------------------------------------------------------
+    // Cross-language compatibility against paimon-cpp golden fixtures.
+    // ---------------------------------------------------------------
+
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/data_splits")
+                .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("failed to read fixture {}: {e}", path.display())
+        })
+    }
+
+    /// Fixture: `pk_dv_index_in_data_with_external/data_split-02`
+    /// Reference: paimon-cpp `data_split_test.cpp::TestDeserializeVersion8WithWriteColsAndExternalPath`.
+    #[test]
+    fn cpp_fixture_with_external_path_decodes() {
+        let bytes = read_fixture("data_split-02_pk_dv_index_in_data_with_external");
+        let split = deserialize_data_split(&bytes).expect("decode fixture");
+        assert_eq!(split.snapshot_id(), 4);
+        assert_eq!(split.bucket(), 1);
+        assert_eq!(
+            split.bucket_path(),
+            "data/orc/pk_dv_index_in_data_with_external.db/pk_dv_index_in_data_with_external/f1=10/bucket-1"
+        );
+        assert_eq!(split.total_buckets_opt(), Some(2));
+        assert!(!split.is_streaming());
+        assert!(split.raw_convertible());
+        assert!(split.before_files().is_empty());
+
+        assert_eq!(split.data_files().len(), 1);
+        let df = &split.data_files()[0];
+        assert_eq!(df.file_name, "data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc");
+        assert_eq!(df.file_size, 961);
+        assert_eq!(df.row_count, 5);
+        assert_eq!(df.min_sequence_number, 0);
+        assert_eq!(df.max_sequence_number, 4);
+        assert_eq!(df.schema_id, 0);
+        assert_eq!(df.level, 5);
+        assert_eq!(
+            df.creation_time.unwrap().timestamp_millis(),
+            1_757_354_415_711
+        );
+        assert_eq!(df.delete_row_count, Some(0));
+        assert_eq!(df.file_source, Some(0)); // FileSource::Append() = 0
+        assert_eq!(
+            df.external_path.as_deref(),
+            Some(
+                "FILE:/tmp/external/f1=10/bucket-1/data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc"
+            )
+        );
+
+        let dvs = split.data_deletion_files().expect("has deletion list");
+        assert_eq!(dvs.len(), 1);
+        let dv = dvs[0].as_ref().expect("first deletion file present");
+        assert_eq!(
+            dv.path(),
+            "FILE:/tmp/external/f1=10/bucket-1/index-419e7c6b-9cad-49e8-9cd2-6187471df954-1"
+        );
+        assert_eq!(dv.offset(), 1);
+        assert_eq!(dv.length(), 22);
+        assert_eq!(dv.cardinality(), Some(1));
+    }
+
+    /// Byte-stable Rust round-trip: encode → decode → encode must be deterministic.
+    /// Critical for caching and idempotent transforms; weaker than byte-equality
+    /// against a paimon-cpp fixture but does not depend on the paimon-cpp
+    /// version that produced the fixture.
+    #[test]
+    fn rust_serialize_is_deterministic() {
+        let split = make_simple_split();
+        let bytes = serialize_data_split(&split).unwrap();
+        let decoded = deserialize_data_split(&bytes).unwrap();
+        let bytes2 = serialize_data_split(&decoded).unwrap();
+        assert_eq!(bytes, bytes2);
+    }
+
+    /// Fixture: `pk_dv_index_not_in_data_no_external/data_split-02`
+    /// Reference: paimon-cpp `data_split_test.cpp::TestDeserializeVersion8WithWriteCols`.
+    /// Exercises `external_path = None` and a non-external deletion file path.
+    /// Note: this fixture was produced by an earlier paimon-cpp build whose
+    /// DataFileMeta v8 schema had 20 fields (no `_MERGE_MODE` /
+    /// `_COMMIT_SNAPSHOT_ID`). Current paimon-cpp serializes 22 fields, so we
+    /// can no longer assert byte-equality against this golden fixture; we still
+    /// verify that the deserializer correctly recovers all populated fields.
+    #[test]
+    fn cpp_fixture_no_external_decodes() {
+        let bytes = read_fixture("data_split-02_pk_dv_index_not_in_data_no_external");
+        let split = deserialize_data_split(&bytes).expect("decode fixture");
+        assert_eq!(split.snapshot_id(), 4);
+        assert_eq!(split.bucket(), 1);
+        assert_eq!(
+            split.bucket_path(),
+            "data/orc/pk_dv_index_not_in_data_no_external.db/pk_dv_index_not_in_data_no_external/f1=10/bucket-1"
+        );
+        assert_eq!(split.total_buckets_opt(), Some(2));
+        assert_eq!(split.data_files().len(), 1);
+
+        let df = &split.data_files()[0];
+        assert_eq!(df.file_name, "data-aa87291d-2a90-4846-b106-1bb4c76d74db-0.orc");
+        assert_eq!(df.file_size, 961);
+        assert_eq!(df.row_count, 5);
+        assert!(df.external_path.is_none(), "fixture has no external_path");
+        assert_eq!(df.creation_time.unwrap().timestamp_millis(), 1_757_349_273_246);
+
+        let dvs = split.data_deletion_files().expect("has deletion list");
+        let dv = dvs[0].as_ref().unwrap();
+        assert_eq!(
+            dv.path(),
+            "data/orc/pk_dv_index_not_in_data_no_external.db/pk_dv_index_not_in_data_no_external/index/index-aa60193d-d7cd-434f-bc1a-c1adb210e1f7-1"
+        );
+        assert_eq!(dv.cardinality(), Some(1));
+    }
+
+    /// Older-version fixtures must be rejected with `Error::Unsupported`. Bleem
+    /// callers can then surface a clear "regenerate v8 split" message instead
+    /// of silently mis-decoding fields.
+    #[test]
+    fn cpp_fixture_v3_append_rejected() {
+        let bytes = read_fixture("data_split-01_append_10");
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { .. }),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    /// Older-version fixtures must be rejected with `Error::Unsupported`.
+    #[test]
+    fn cpp_fixture_v6_pk_total_buckets_rejected() {
+        let bytes = read_fixture("data_split-01_pk_table_with_total_buckets");
+        let err = deserialize_data_split(&bytes).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { .. }),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+}
