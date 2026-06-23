@@ -375,9 +375,31 @@ paimon_error *paimon_read_builder_with_filter(paimon_read_builder *rb,
  * Free a paimon_plan.
  *
  * # Safety
- * Only call with a plan returned from `paimon_table_scan_plan`.
+ * Only call with a plan returned from `paimon_table_scan_plan` or
+ * `paimon_plan_from_split_bytes`.
  */
  void paimon_plan_free(paimon_plan *plan) ;
+
+/**
+ * Build a one-split `paimon_plan` from a serialized `DataSplit` byte buffer
+ * (the wire form produced by `paimon::table::serialize_data_split` and
+ * accepted by `paimon-cpp`'s `Split::Deserialize`).
+ *
+ * Use this on workers that received split bytes from a remote planner —
+ * e.g. Bleem's coordinator already ran scan planning and just hands each
+ * worker the bytes for the splits it should read. Once you have the plan,
+ * pass it straight to `paimon_table_read_to_arrow` like any plan obtained
+ * from `paimon_table_scan_plan`.
+ *
+ * One byte buffer becomes a one-split plan. Concatenating multiple splits
+ * into one buffer is not supported — call this once per split and merge on
+ * the caller side, or extend the wire form upstream.
+ *
+ * # Safety
+ * `data` must point to `len` bytes of valid serialized split, or be null
+ * when `len == 0` (which returns `InvalidInput`).
+ */
+ paimon_result_plan paimon_plan_from_split_bytes(const uint8_t *data, uintptr_t len) ;
 
 /**
  * Return the number of data splits in a plan.
