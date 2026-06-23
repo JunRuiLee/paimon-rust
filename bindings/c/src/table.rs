@@ -20,14 +20,17 @@ use std::ffi::c_void;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, StructArray};
 use futures::StreamExt;
+use paimon::catalog::Identifier;
+use paimon::io::FileIO;
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
-use paimon::table::{ArrowRecordBatchStream, Table};
+use paimon::table::{ArrowRecordBatchStream, SchemaManager, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
-    paimon_result_new_read, paimon_result_next_batch, paimon_result_plan, paimon_result_predicate,
-    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_table_scan,
+    paimon_result_get_table, paimon_result_new_read, paimon_result_next_batch, paimon_result_plan,
+    paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
+    paimon_result_table_scan,
 };
 use crate::runtime;
 use crate::types::*;
@@ -60,10 +63,177 @@ unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read 
 /// Free a paimon_table.
 ///
 /// # Safety
-/// Only call with a table returned from `paimon_catalog_get_table`.
+/// Only call with a table returned from `paimon_catalog_get_table` or
+/// `paimon_table_open_path`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
     free_table_wrapper(table, |t| t.inner);
+}
+
+/// Open a Paimon table directly from its on-disk root path, skipping the
+/// usual `paimon_catalog_create` + `paimon_catalog_get_table` round-trip.
+///
+/// `table_path` is expected to be the table's filesystem root, e.g.
+/// `/warehouse/mydb.db/users` for a local fs, `oss://bucket/warehouse/mydb.db/users`
+/// for OSS, etc. The path's last two `/`-separated segments are interpreted
+/// as `<db>.db/<table>`; everything before that is treated as the warehouse
+/// root and used to construct the underlying `FileIO` (and as the home of
+/// any object-storage credentials in `options`).
+///
+/// `options` is an optional array of key/value pairs that gets fed to the
+/// FileIO storage layer (S3 / OSS / etc.). Pass `NULL` and `0` for a local
+/// filesystem table that needs no extra configuration.
+///
+/// # Safety
+/// `table_path` must be a valid null-terminated UTF-8 C string. `options`
+/// must point to `options_len` valid `paimon_option`s, or be null when
+/// `options_len == 0`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_open_path(
+    table_path: *const std::ffi::c_char,
+    options: *const paimon_option,
+    options_len: usize,
+) -> paimon_result_get_table {
+    let path = match validate_cstr(table_path, "table_path") {
+        Ok(s) => s,
+        Err(e) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: e,
+            }
+        }
+    };
+
+    // The C++ side hands us only the table root; reconstruct the (warehouse,
+    // db, table) triple Java/Paimon expects. Splitting in Rust mirrors what
+    // examples/read_local_demo.rs does for the same use case.
+    let (warehouse, db, table_name) = match split_table_path(&path) {
+        Ok(x) => x,
+        Err(msg) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::new(PaimonErrorCode::InvalidInput, msg),
+            }
+        }
+    };
+
+    // Build the FileIO; on local fs nothing extra is needed, but for S3/OSS
+    // the caller provides credentials via `options`. Pass them directly to
+    // the storage layer — they're the same keys `paimon_catalog_create` uses.
+    let file_io_builder = match FileIO::from_path(&warehouse) {
+        Ok(b) => b,
+        Err(e) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            }
+        }
+    };
+
+    let file_io_builder = if !options.is_null() && options_len > 0 {
+        let slice = std::slice::from_raw_parts(options, options_len);
+        let mut props: Vec<(String, String)> = Vec::with_capacity(slice.len());
+        for opt in slice {
+            let key = match validate_cstr(opt.key, "option key") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_get_table {
+                        table: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            let value = match validate_cstr(opt.value, "option value") {
+                Ok(s) => s,
+                Err(e) => {
+                    return paimon_result_get_table {
+                        table: std::ptr::null_mut(),
+                        error: e,
+                    }
+                }
+            };
+            props.push((key, value));
+        }
+        file_io_builder.with_props(props)
+    } else {
+        file_io_builder
+    };
+
+    let file_io = match file_io_builder.build() {
+        Ok(io) => io,
+        Err(e) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            }
+        }
+    };
+
+    // Resolve the latest schema for the table by listing `<table_path>/schema/`.
+    // Mirrors `FileSystemCatalog::load_latest_table_schema` so a path-loaded
+    // table is byte-for-byte identical to one obtained from the catalog API.
+    let schema_manager = SchemaManager::new(file_io.clone(), path.clone());
+    let schema_arc = match runtime().block_on(schema_manager.latest()) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::new(
+                    PaimonErrorCode::NotFound,
+                    format!("no schema found under {path}"),
+                ),
+            }
+        }
+        Err(e) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            }
+        }
+    };
+
+    let identifier = Identifier::new(db, table_name);
+    let table = Table::new(file_io, identifier, path, (*schema_arc).clone(), None);
+    let wrapper = Box::new(paimon_table {
+        inner: Box::into_raw(Box::new(table)) as *mut c_void,
+    });
+    paimon_result_get_table {
+        table: Box::into_raw(wrapper),
+        error: std::ptr::null_mut(),
+    }
+}
+
+/// Split a `<warehouse>/<db>.db/<table>` path into its three parts.
+///
+/// Done at the byte level via `rsplit_once('/')`, so URI prefixes like
+/// `oss://bucket/...` survive intact (`std::path::Path` would mangle the `://`).
+/// Mirrors `crates/paimon/examples/read_local_demo.rs::split_table_path`; we
+/// duplicate it here rather than depend on `examples/` since example modules
+/// aren't compiled into the library target.
+fn split_table_path(path: &str) -> Result<(String, String, String), String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(format!("invalid table_path: {path}"));
+    }
+    let (rest, table) = trimmed
+        .rsplit_once('/')
+        .ok_or_else(|| format!("table_path has no parent (db dir): {path}"))?;
+    if table.is_empty() {
+        return Err(format!("empty table name in: {path}"));
+    }
+    let (warehouse, db_dir) = rest
+        .rsplit_once('/')
+        .ok_or_else(|| format!("table_path's db dir has no parent (warehouse): {path}"))?;
+    let db = db_dir
+        .strip_suffix(".db")
+        .ok_or_else(|| format!("expected db directory ending in '.db', got: {db_dir}"))?;
+    if db.is_empty() {
+        return Err(format!("empty db name parsed from: {path}"));
+    }
+    if warehouse.is_empty() {
+        return Err(format!("empty warehouse parsed from: {path}"));
+    }
+    Ok((warehouse.to_string(), db.to_string(), table.to_string()))
 }
 
 /// Create a new ReadBuilder from a Table.
@@ -1027,6 +1197,136 @@ pub unsafe extern "C" fn paimon_predicate_free(p: *mut paimon_predicate) {
         let wrapper = Box::from_raw(p);
         if !wrapper.inner.is_null() {
             drop(Box::from_raw(wrapper.inner as *mut Predicate));
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(windows))] // Local-fs paths under tempfile are POSIX-only.
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn split_table_path_local_absolute() {
+        let (w, d, t) = split_table_path("/tmp/warehouse/mydb.db/users").unwrap();
+        assert_eq!(w, "/tmp/warehouse");
+        assert_eq!(d, "mydb");
+        assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn split_table_path_uri() {
+        let (w, d, t) = split_table_path("oss://bucket/warehouse/mydb.db/users").unwrap();
+        assert_eq!(w, "oss://bucket/warehouse");
+        assert_eq!(d, "mydb");
+        assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn split_table_path_trailing_slash() {
+        let (_, _, t) = split_table_path("/tmp/warehouse/db.db/users/").unwrap();
+        assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn split_table_path_missing_db_suffix() {
+        assert!(split_table_path("/tmp/warehouse/mydb/users").is_err());
+    }
+
+    #[test]
+    fn split_table_path_too_short() {
+        assert!(split_table_path("users").is_err());
+    }
+
+    /// Build an isolated tempdir warehouse, create a real Paimon table via
+    /// the FileSystemCatalog, then ensure `paimon_table_open_path` can open
+    /// the same on-disk layout without a catalog handle. This is the closest
+    /// thing the C binding has to an end-to-end test for the new entry point.
+    #[test]
+    fn open_path_reads_table_created_by_filesystem_catalog() {
+        use paimon::catalog::Identifier as Id;
+        use paimon::spec::{DataType, IntType, Schema};
+        use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let warehouse = temp.path().to_str().unwrap().to_string();
+
+        // Set up a `db1.db/users` table with a single int column. The exact
+        // schema doesn't matter — we only assert path-based loading sees it.
+        let mut opts = Options::new();
+        opts.set(CatalogOptions::WAREHOUSE, &warehouse);
+        let catalog = FileSystemCatalog::new(opts).unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            catalog
+                .create_database("db1", false, std::collections::HashMap::new())
+                .await
+                .unwrap();
+            catalog
+                .create_table(&Id::new("db1", "users"), schema, false)
+                .await
+                .unwrap();
+        });
+        // Drop the catalog before invoking the C-API path; the entry point
+        // must work without a live catalog handle.
+        drop(catalog);
+
+        let table_path = format!("{warehouse}/db1.db/users");
+        let c_path = CString::new(table_path).unwrap();
+
+        unsafe {
+            let result = paimon_table_open_path(c_path.as_ptr(), std::ptr::null(), 0);
+            assert!(result.error.is_null(), "open_path must succeed");
+            assert!(!result.table.is_null());
+
+            // Round-trip a no-op derived API call to confirm the returned
+            // handle is usable like one from `paimon_catalog_get_table`.
+            let rb_result = paimon_table_new_read_builder(result.table);
+            assert!(rb_result.error.is_null());
+            paimon_read_builder_free(rb_result.read_builder);
+            paimon_table_free(result.table);
+        }
+    }
+
+    #[test]
+    fn open_path_returns_not_found_for_missing_table() {
+        let bogus = CString::new("/nonexistent-warehouse-9f3a/missing.db/x").unwrap();
+        unsafe {
+            let result = paimon_table_open_path(bogus.as_ptr(), std::ptr::null(), 0);
+            assert!(result.table.is_null());
+            assert!(!result.error.is_null());
+            // Either NotFound (no schema dir) or IoError (no warehouse dir);
+            // both are acceptable here — the contract is "non-null error".
+            crate::error::paimon_error_free(result.error);
+        }
+    }
+
+    #[test]
+    fn open_path_rejects_invalid_path() {
+        let bad = CString::new("not-a-table-path").unwrap();
+        unsafe {
+            let result = paimon_table_open_path(bad.as_ptr(), std::ptr::null(), 0);
+            assert!(result.table.is_null());
+            assert!(!result.error.is_null());
+            assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+            crate::error::paimon_error_free(result.error);
+        }
+    }
+
+    #[test]
+    fn open_path_rejects_null_path() {
+        unsafe {
+            let result = paimon_table_open_path(std::ptr::null(), std::ptr::null(), 0);
+            assert!(result.table.is_null());
+            assert!(!result.error.is_null());
+            crate::error::paimon_error_free(result.error);
         }
     }
 }

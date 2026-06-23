@@ -260,9 +260,36 @@ paimon_result_get_table paimon_catalog_get_table(const paimon_catalog *catalog,
  * Free a paimon_table.
  *
  * # Safety
- * Only call with a table returned from `paimon_catalog_get_table`.
+ * Only call with a table returned from `paimon_catalog_get_table` or
+ * `paimon_table_open_path`.
  */
  void paimon_table_free(paimon_table *table) ;
+
+/**
+ * Open a Paimon table directly from its on-disk root path, skipping the
+ * usual `paimon_catalog_create` + `paimon_catalog_get_table` round-trip.
+ *
+ * `table_path` is expected to be the table's filesystem root, e.g.
+ * `/warehouse/mydb.db/users` for a local fs, `oss://bucket/warehouse/mydb.db/users`
+ * for OSS, etc. The path's last two `/`-separated segments are interpreted
+ * as `<db>.db/<table>`; everything before that is treated as the warehouse
+ * root and used to construct the underlying `FileIO` (and as the home of
+ * any object-storage credentials in `options`).
+ *
+ * `options` is an optional array of key/value pairs that gets fed to the
+ * FileIO storage layer (S3 / OSS / etc.). Pass `NULL` and `0` for a local
+ * filesystem table that needs no extra configuration.
+ *
+ * # Safety
+ * `table_path` must be a valid null-terminated UTF-8 C string. `options`
+ * must point to `options_len` valid `paimon_option`s, or be null when
+ * `options_len == 0`.
+ */
+
+paimon_result_get_table paimon_table_open_path(const char *table_path,
+                                               const paimon_option *options,
+                                               uintptr_t options_len)
+;
 
 /**
  * Create a new ReadBuilder from a Table.

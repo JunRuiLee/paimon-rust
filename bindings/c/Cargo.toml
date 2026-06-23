@@ -38,3 +38,6 @@ arrow-array = { workspace = true }
 # Auto-generates include/paimon.h from the Rust extern "C" surface on every
 # build. Pinned at 0.27 (last version supporting Rust 1.86).
 cbindgen = "0.27"
+
+[dev-dependencies]
+tempfile = "3"
