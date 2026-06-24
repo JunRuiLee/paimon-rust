@@ -1253,6 +1253,29 @@ pub unsafe extern "C" fn paimon_predicate_free(p: *mut paimon_predicate) {
     }
 }
 
+/// Render a predicate as a human-readable, SQL-like string (for debugging /
+/// printing), e.g. `(id > 5 AND name = 'foo')`.
+///
+/// Returns a `paimon_bytes` holding UTF-8 text (NOT null-terminated). The
+/// caller must free it with `paimon_bytes_free`. Returns an empty buffer if
+/// `p` (or its inner pointer) is null.
+///
+/// The predicate is only borrowed, not consumed: it remains valid for use in
+/// scan planning after this call.
+///
+/// # Safety
+/// `p` must be a valid pointer returned from a paimon predicate function, or null.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_predicate_to_string(
+    p: *const paimon_predicate,
+) -> paimon_bytes {
+    if p.is_null() || (*p).inner.is_null() {
+        return paimon_bytes::new(Vec::new());
+    }
+    let pred = &*((*p).inner as *const Predicate);
+    paimon_bytes::new(pred.to_string().into_bytes())
+}
+
 #[cfg(test)]
 #[cfg(not(windows))] // Local-fs paths under tempfile are POSIX-only.
 mod tests {

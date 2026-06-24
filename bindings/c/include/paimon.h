@@ -618,6 +618,22 @@ paimon_result_predicate paimon_predicate_is_not_in(const paimon_table *table,
  void paimon_predicate_free(paimon_predicate *p) ;
 
 /**
+ * Render a predicate as a human-readable, SQL-like string (for debugging /
+ * printing), e.g. `(id > 5 AND name = 'foo')`.
+ *
+ * Returns a `paimon_bytes` holding UTF-8 text (NOT null-terminated). The
+ * caller must free it with `paimon_bytes_free`. Returns an empty buffer if
+ * `p` (or its inner pointer) is null.
+ *
+ * The predicate is only borrowed, not consumed: it remains valid for use in
+ * scan planning after this call.
+ *
+ * # Safety
+ * `p` must be a valid pointer returned from a paimon predicate function, or null.
+ */
+ paimon_bytes paimon_predicate_to_string(const paimon_predicate *p) ;
+
+/**
  * Free a paimon_bytes buffer.
  *
  * # Safety
