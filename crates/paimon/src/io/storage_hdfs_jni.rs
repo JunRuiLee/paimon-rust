@@ -108,10 +108,19 @@ const HDFS_USER: &str = "hdfs.user";
 /// All keys are optional. `name_node` will be derived from the path at
 /// operator build time when missing. The set of recognised keys mirrors
 /// the native backend so callers don't have to branch on backend choice.
+///
+/// If `hdfs.name-node` is passed in `hdfs://` / `viewfs://` form (typically
+/// because the caller is reusing a native HDFS configuration verbatim),
+/// the scheme is rewritten to `alluxio://`. Otherwise libhdfs would dial
+/// the original NameNode and silently bypass the Alluxio Hadoop FS SPI —
+/// the path would have been rewritten to `alluxio://` while name_node
+/// stayed `hdfs://`, and reads would never reach the cache.
 pub(crate) fn hdfs_jni_config_parse(props: HashMap<String, String>) -> Result<HdfsConfig> {
     let mut cfg = HdfsConfig::default();
 
-    cfg.name_node = props.get(HDFS_NAME_NODE).cloned();
+    if let Some(raw) = props.get(HDFS_NAME_NODE) {
+        cfg.name_node = Some(hdfs_to_alluxio_path(raw)?);
+    }
     cfg.user = props.get(HDFS_USER).cloned();
     cfg.kerberos_ticket_cache_path = props.get(HDFS_KERBEROS_TICKET_CACHE_PATH).cloned();
 
@@ -252,6 +261,47 @@ mod tests {
         assert!(cfg.user.is_none());
         assert!(cfg.kerberos_ticket_cache_path.is_none());
         assert!(!cfg.enable_append);
+    }
+
+    /// Critical: when callers reuse their native HDFS config wholesale
+    /// (the common case — they don't even know they switched backends),
+    /// the name_node arrives in `hdfs://` form. If we forwarded it
+    /// verbatim, libhdfs would dial the original NameNode and skip
+    /// Alluxio entirely — silent cache bypass with no error.
+    #[test]
+    fn test_hdfs_jni_config_parse_rewrites_hdfs_name_node_to_alluxio() {
+        let props = make_props(&[("hdfs.name-node", "hdfs://nn:8020")]);
+        let cfg = hdfs_jni_config_parse(props).unwrap();
+        assert_eq!(cfg.name_node.as_deref(), Some("alluxio://nn:8020"));
+    }
+
+    /// Same protection for `viewfs://` — bleem-style configs leak the
+    /// mount-table authority through unchanged.
+    #[test]
+    fn test_hdfs_jni_config_parse_rewrites_viewfs_name_node_to_alluxio() {
+        let props = make_props(&[("hdfs.name-node", "viewfs://cluster")]);
+        let cfg = hdfs_jni_config_parse(props).unwrap();
+        assert_eq!(cfg.name_node.as_deref(), Some("alluxio://cluster"));
+    }
+
+    /// Already-rewritten name_node passes through unchanged. Idempotent
+    /// for callers that have already done their own rewriting upstream.
+    #[test]
+    fn test_hdfs_jni_config_parse_keeps_existing_alluxio_name_node() {
+        let props = make_props(&[("hdfs.name-node", "alluxio://master:19998")]);
+        let cfg = hdfs_jni_config_parse(props).unwrap();
+        assert_eq!(cfg.name_node.as_deref(), Some("alluxio://master:19998"));
+    }
+
+    /// Bogus name_node scheme should surface as a config error rather
+    /// than reach libhdfs as a silent misroute. Caller learns at build
+    /// time which key is wrong, not after the first read fails.
+    #[test]
+    fn test_hdfs_jni_config_parse_rejects_unrelated_name_node_scheme() {
+        let props = make_props(&[("hdfs.name-node", "s3://bucket")]);
+        let err = hdfs_jni_config_parse(props).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("alluxio://"), "got {msg}");
     }
 
     #[test]
