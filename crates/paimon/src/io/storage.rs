@@ -508,7 +508,6 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::io::FileIOBuilder;
 
     /// alluxio:// scheme without `use_alluxio=true` is rejected upfront —
