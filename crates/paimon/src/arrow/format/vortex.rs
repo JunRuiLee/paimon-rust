@@ -745,7 +745,11 @@ fn literal_scalar_for_arrow_filter(
             }
             _ => return Ok(None),
         },
-        DataType::Array(_) | DataType::Map(_) | DataType::Multiset(_) | DataType::Row(_) => {
+        DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Multiset(_)
+        | DataType::Row(_)
+        | DataType::Vector(_) => {
             return Ok(None);
         }
     };

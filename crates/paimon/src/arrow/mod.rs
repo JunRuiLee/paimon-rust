@@ -117,6 +117,11 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
                 .collect::<crate::Result<Vec<_>>>()?;
             ArrowDataType::Struct(fields.into())
         }
+        PaimonDataType::Vector(_) => {
+            return Err(crate::Error::Unsupported {
+                message: "VectorType is not yet supported in arrow conversion".to_string(),
+            })
+        }
     })
 }
 

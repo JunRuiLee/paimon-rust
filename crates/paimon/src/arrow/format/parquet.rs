@@ -759,7 +759,8 @@ fn literal_scalar_for_parquet_filter(
         | DataType::Array(_)
         | DataType::Map(_)
         | DataType::Multiset(_)
-        | DataType::Row(_) => return Ok(None),
+        | DataType::Row(_)
+        | DataType::Vector(_) => return Ok(None),
     };
 
     Ok(Some(Scalar::new(array)))
