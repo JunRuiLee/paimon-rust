@@ -25,6 +25,9 @@ mod row;
 #[cfg(feature = "vortex")]
 mod vortex;
 
+#[cfg(test)]
+pub(crate) use parquet::ParquetFormatWriter;
+
 use crate::io::{FileRead, OutputFile};
 use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};

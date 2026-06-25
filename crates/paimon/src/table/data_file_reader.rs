@@ -1066,3 +1066,168 @@ mod tests {
         assert_eq!(collect_ids(&batches), vec![11]);
     }
 }
+
+/// Parquet-only end-to-end tests for the inline VECTOR (`FixedSizeList`) read path.
+///
+/// This module is deliberately NOT gated behind the `mosaic` feature: the vector
+/// read capability is core parquet support, so these tests must run under a plain
+/// `cargo test -p paimon`.
+#[cfg(test)]
+mod vector_parquet_tests {
+    use super::*;
+    use crate::arrow::format::FormatFileWriter;
+    use crate::arrow::format::ParquetFormatWriter;
+    use crate::io::FileIOBuilder;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{DataFileMeta, DataType, FloatType, VectorType};
+    use crate::table::source::DataSplitBuilder;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+    use futures::TryStreamExt;
+
+    fn data_file(file_name: &str, file_size: i64, row_count: i64, schema_id: i64) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
+    /// TRUE end-to-end: write a parquet data file containing a `FixedSizeList<Float32, 2>`
+    /// column, then read it back through `DataFileReader` using a Paimon `read_type` whose
+    /// field is `DataType::Vector`. This exercises `build_target_arrow_schema`, the parquet
+    /// format dispatch (by `.parquet` extension), and the read path's pass-through/cast
+    /// logic — not just a raw Arrow/parquet round-trip.
+    #[tokio::test]
+    async fn test_datafilereader_inline_vector_column_e2e() {
+        // Paimon read schema: a single nullable VECTOR<FLOAT> column of length 2.
+        let vector_type = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+        let read_fields = vec![DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(vector_type),
+        )];
+
+        // Build the physical Arrow data via the Paimon -> Arrow conversion under test,
+        // so the parquet file matches what the read path expects to materialize.
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+
+        // Build a FixedSizeList<Float32, 2> column:
+        //   row 0 = [1.0, 2.0]   (non-null)
+        //   row 1 = null         (null vector row)
+        //   row 2 = [3.0, 4.0]   (non-null)
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.append(true);
+        builder.values().append_value(0.0);
+        builder.values().append_value(0.0);
+        builder.append(false); // null vector row
+        builder.values().append_value(3.0);
+        builder.values().append_value(4.0);
+        builder.append(true);
+        let vec_array = builder.finish();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(vec_array)]).unwrap();
+
+        // Write the data file as parquet into the split's bucket path.
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/vector_inline_e2e";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.parquet";
+        let file_path = format!("{bucket_path}/{file_name}");
+        let output = file_io.new_output(&file_path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, arrow_schema.clone(), "zstd", 1)
+                .await
+                .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap();
+
+        // Build a split whose data file's schema_id matches the table schema_id, so the
+        // read path uses `read_type` directly (no SchemaManager lookup needed).
+        let table_schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(
+                file_name,
+                file_size as i64,
+                3,
+                table_schema_id,
+            )])
+            .build()
+            .unwrap();
+
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            table_schema_id,
+            read_fields.clone(),
+            read_fields.clone(),
+            Vec::new(),
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+        let result = &batches[0];
+        assert_eq!(result.num_columns(), 1);
+        assert_eq!(result.schema().field(0).name(), "embedding");
+
+        // The materialized column must be a FixedSizeListArray with the right length,
+        // child Float32 values, and null bitmap (one non-null and one null row).
+        let fsl = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("column should materialize as FixedSizeListArray");
+        assert_eq!(fsl.value_length(), 2);
+        assert!(fsl.is_valid(0));
+        assert!(fsl.is_null(1)); // null vector row preserved through the read path
+        assert!(fsl.is_valid(2));
+
+        let row0 = fsl.value(0);
+        let floats0 = row0
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("child should be Float32Array");
+        assert_eq!(floats0.values(), &[1.0, 2.0]);
+
+        let row2 = fsl.value(2);
+        let floats2 = row2
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("child should be Float32Array");
+        assert_eq!(floats2.values(), &[3.0, 4.0]);
+    }
+}

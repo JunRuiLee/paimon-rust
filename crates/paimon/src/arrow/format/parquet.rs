@@ -1410,4 +1410,65 @@ mod tests {
         let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 5);
     }
+
+    #[tokio::test]
+    async fn test_parquet_inline_fixed_size_list_roundtrip() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        // Build a FixedSizeList<Float32, 2> column: row 0 = [1.0, 2.0], row 1 = null.
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.append(true);
+        builder.values().append_value(0.0);
+        builder.values().append_value(0.0);
+        builder.append(false); // null vector row
+        let vec_array = builder.finish();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "embedding",
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                2,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vec_array)]).unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_inline_vector.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1)
+                .await
+                .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let batches: Vec<RecordBatch> = reader.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        let col = batches[0].column(0);
+        let fsl = col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("column should be FixedSizeListArray");
+        assert_eq!(fsl.value_length(), 2);
+        assert!(fsl.is_valid(0));
+        assert!(fsl.is_null(1)); // null vector row preserved
+
+        let row0 = fsl.value(0);
+        let floats = row0
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("child should be Float32Array");
+        assert_eq!(floats.values(), &[1.0, 2.0]);
+    }
 }
