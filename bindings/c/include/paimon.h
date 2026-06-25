@@ -224,12 +224,21 @@ paimon_result_catalog_new paimon_catalog_create(const paimon_option *options,
 /**
  * Get a table from the catalog.
  *
+ * `use_alluxio` is the session-level switch for routing this table's data
+ * reads through Alluxio. Combined with the table's own `alluxio.cache-enabled`
+ * option (declared in the table's schema), it gates whether `Table::with_alluxio`
+ * rebuilds the data FileIO against libhdfs. Pass `false` to keep the existing
+ * native-HDFS behaviour; pass `true` when the caller knows this catalog is
+ * covered by an Alluxio cache and wants reads to go through it. Catalog
+ * metadata (schema/, snapshot, manifest) is never affected by this flag.
+ *
  * # Safety
  * `catalog` and `identifier` must be valid pointers from previous paimon C calls, or null (returns error).
  */
 
 paimon_result_get_table paimon_catalog_get_table(const paimon_catalog *catalog,
-                                                 const paimon_identifier *identifier)
+                                                 const paimon_identifier *identifier,
+                                                 bool use_alluxio)
 ;
 
 /**
@@ -280,6 +289,11 @@ paimon_result_get_table paimon_catalog_get_table(const paimon_catalog *catalog,
  * FileIO storage layer (S3 / OSS / etc.). Pass `NULL` and `0` for a local
  * filesystem table that needs no extra configuration.
  *
+ * `use_alluxio` is the session-level switch for routing this table's data
+ * reads through Alluxio (see `paimon_catalog_get_table` for the contract).
+ * Pass `false` to keep the existing native-HDFS behaviour. Catalog metadata
+ * (schema/, snapshot, manifest) is unaffected.
+ *
  * # Safety
  * `table_path` must be a valid null-terminated UTF-8 C string. `options`
  * must point to `options_len` valid `paimon_option`s, or be null when
@@ -288,7 +302,8 @@ paimon_result_get_table paimon_catalog_get_table(const paimon_catalog *catalog,
 
 paimon_result_get_table paimon_table_open_path(const char *table_path,
                                                const paimon_option *options,
-                                               uintptr_t options_len)
+                                               uintptr_t options_len,
+                                               bool use_alluxio)
 ;
 
 /**

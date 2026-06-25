@@ -97,12 +97,21 @@ pub unsafe extern "C" fn paimon_catalog_free(catalog: *mut paimon_catalog) {
 
 /// Get a table from the catalog.
 ///
+/// `use_alluxio` is the session-level switch for routing this table's data
+/// reads through Alluxio. Combined with the table's own `alluxio.cache-enabled`
+/// option (declared in the table's schema), it gates whether `Table::with_alluxio`
+/// rebuilds the data FileIO against libhdfs. Pass `false` to keep the existing
+/// native-HDFS behaviour; pass `true` when the caller knows this catalog is
+/// covered by an Alluxio cache and wants reads to go through it. Catalog
+/// metadata (schema/, snapshot, manifest) is never affected by this flag.
+///
 /// # Safety
 /// `catalog` and `identifier` must be valid pointers from previous paimon C calls, or null (returns error).
 #[no_mangle]
 pub unsafe extern "C" fn paimon_catalog_get_table(
     catalog: *const paimon_catalog,
     identifier: *const crate::types::paimon_identifier,
+    use_alluxio: bool,
 ) -> paimon_result_get_table {
     if let Err(e) = check_non_null(catalog, "catalog") {
         return paimon_result_get_table {
@@ -121,15 +130,21 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
     let identifier_ref = &*((*identifier).inner as *const Identifier);
 
     match runtime().block_on(catalog_ref.get_table(identifier_ref)) {
-        Ok(table) => {
-            let wrapper = Box::new(paimon_table {
-                inner: Box::into_raw(Box::new(table)) as *mut c_void,
-            });
-            paimon_result_get_table {
-                table: Box::into_raw(wrapper),
-                error: std::ptr::null_mut(),
+        Ok(table) => match table.with_alluxio(use_alluxio) {
+            Ok(table) => {
+                let wrapper = Box::new(paimon_table {
+                    inner: Box::into_raw(Box::new(table)) as *mut c_void,
+                });
+                paimon_result_get_table {
+                    table: Box::into_raw(wrapper),
+                    error: std::ptr::null_mut(),
+                }
             }
-        }
+            Err(e) => paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            },
+        },
         Err(e) => paimon_result_get_table {
             table: std::ptr::null_mut(),
             error: paimon_error::from_paimon(e),

@@ -180,7 +180,9 @@ int main() {
     identifier_ptr ident(id_res.identifier);
 
     std::printf("Getting table 'test.testrust0'...\n");
-    paimon_result_get_table tbl_res = paimon_catalog_get_table(catalog.get(), ident.get());
+    // use_alluxio=false: the demo reads through native HDFS / local fs; flip to
+    // true to route data IO through Alluxio when the table opts in.
+    paimon_result_get_table tbl_res = paimon_catalog_get_table(catalog.get(), ident.get(), false);
     if (check_err("paimon_catalog_get_table", tbl_res.error)) return 1;
     table_ptr table(tbl_res.table);
 

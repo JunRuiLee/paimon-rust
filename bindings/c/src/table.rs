@@ -86,6 +86,11 @@ pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
 /// FileIO storage layer (S3 / OSS / etc.). Pass `NULL` and `0` for a local
 /// filesystem table that needs no extra configuration.
 ///
+/// `use_alluxio` is the session-level switch for routing this table's data
+/// reads through Alluxio (see `paimon_catalog_get_table` for the contract).
+/// Pass `false` to keep the existing native-HDFS behaviour. Catalog metadata
+/// (schema/, snapshot, manifest) is unaffected.
+///
 /// # Safety
 /// `table_path` must be a valid null-terminated UTF-8 C string. `options`
 /// must point to `options_len` valid `paimon_option`s, or be null when
@@ -95,6 +100,7 @@ pub unsafe extern "C" fn paimon_table_open_path(
     table_path: *const std::ffi::c_char,
     options: *const paimon_option,
     options_len: usize,
+    use_alluxio: bool,
 ) -> paimon_result_get_table {
     let path = match validate_cstr(table_path, "table_path") {
         Ok(s) => s,
@@ -196,6 +202,15 @@ pub unsafe extern "C" fn paimon_table_open_path(
 
     let identifier = Identifier::new(db, table_name);
     let table = Table::new(file_io, identifier, path, (*schema_arc).clone(), None);
+    let table = match table.with_alluxio(use_alluxio) {
+        Ok(t) => t,
+        Err(e) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            }
+        }
+    };
     let wrapper = Box::new(paimon_table {
         inner: Box::into_raw(Box::new(table)) as *mut c_void,
     });
@@ -1357,7 +1372,7 @@ mod tests {
         let c_path = CString::new(table_path).unwrap();
 
         unsafe {
-            let result = paimon_table_open_path(c_path.as_ptr(), std::ptr::null(), 0);
+            let result = paimon_table_open_path(c_path.as_ptr(), std::ptr::null(), 0, false);
             assert!(result.error.is_null(), "open_path must succeed");
             assert!(!result.table.is_null());
 
@@ -1374,7 +1389,7 @@ mod tests {
     fn open_path_returns_not_found_for_missing_table() {
         let bogus = CString::new("/nonexistent-warehouse-9f3a/missing.db/x").unwrap();
         unsafe {
-            let result = paimon_table_open_path(bogus.as_ptr(), std::ptr::null(), 0);
+            let result = paimon_table_open_path(bogus.as_ptr(), std::ptr::null(), 0, false);
             assert!(result.table.is_null());
             assert!(!result.error.is_null());
             // Either NotFound (no schema dir) or IoError (no warehouse dir);
@@ -1383,11 +1398,66 @@ mod tests {
         }
     }
 
+    /// `use_alluxio=true` on a table that hasn't opted into Alluxio caching
+    /// must be a silent no-op — the second gate (`alluxio.cache-enabled` on
+    /// the table) is what actually flips the data FileIO. This guards
+    /// against an over-eager session flag silently rerouting reads for
+    /// tables the deployer never said are cached.
+    #[test]
+    fn open_path_with_use_alluxio_but_table_not_opted_in_is_noop() {
+        use paimon::catalog::Identifier as Id;
+        use paimon::spec::{DataType, IntType, Schema};
+        use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let warehouse = temp.path().to_str().unwrap().to_string();
+        let mut opts = Options::new();
+        opts.set(CatalogOptions::WAREHOUSE, &warehouse);
+        let catalog = FileSystemCatalog::new(opts).unwrap();
+        // Table without alluxio.cache-enabled — the table half of the gate
+        // is off, so the rebuild must NOT happen even with
+        // use_alluxio=true. If the table half were missing, the rebuild
+        // would explode here: FileIO::with_alluxio rejects a non-HDFS
+        // scheme (file://) and ConfigInvalid would bubble up.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            catalog
+                .create_database("db1", false, std::collections::HashMap::new())
+                .await
+                .unwrap();
+            catalog
+                .create_table(&Id::new("db1", "users"), schema, false)
+                .await
+                .unwrap();
+        });
+        drop(catalog);
+
+        let table_path = format!("{warehouse}/db1.db/users");
+        let c_path = CString::new(table_path).unwrap();
+
+        unsafe {
+            let result =
+                paimon_table_open_path(c_path.as_ptr(), std::ptr::null(), 0, true);
+            assert!(
+                result.error.is_null(),
+                "use_alluxio=true on a non-opted-in table must be a silent no-op"
+            );
+            assert!(!result.table.is_null());
+            paimon_table_free(result.table);
+        }
+    }
+
     #[test]
     fn open_path_rejects_invalid_path() {
         let bad = CString::new("not-a-table-path").unwrap();
         unsafe {
-            let result = paimon_table_open_path(bad.as_ptr(), std::ptr::null(), 0);
+            let result = paimon_table_open_path(bad.as_ptr(), std::ptr::null(), 0, false);
             assert!(result.table.is_null());
             assert!(!result.error.is_null());
             assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
@@ -1398,7 +1468,7 @@ mod tests {
     #[test]
     fn open_path_rejects_null_path() {
         unsafe {
-            let result = paimon_table_open_path(std::ptr::null(), std::ptr::null(), 0);
+            let result = paimon_table_open_path(std::ptr::null(), std::ptr::null(), 0, false);
             assert!(result.table.is_null());
             assert!(!result.error.is_null());
             crate::error::paimon_error_free(result.error);
