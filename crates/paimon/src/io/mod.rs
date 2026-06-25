@@ -70,7 +70,15 @@ mod storage_gcs;
 #[cfg(feature = "storage-gcs")]
 use storage_gcs::*;
 
+#[cfg(any(feature = "storage-hdfs", feature = "storage-hdfs-jni"))]
+mod storage_hdfs_common;
+
 #[cfg(feature = "storage-hdfs")]
 mod storage_hdfs;
 #[cfg(feature = "storage-hdfs")]
 use storage_hdfs::*;
+
+#[cfg(feature = "storage-hdfs-jni")]
+mod storage_hdfs_jni;
+#[cfg(feature = "storage-hdfs-jni")]
+use storage_hdfs_jni::*;

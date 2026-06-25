@@ -23,7 +23,8 @@ use std::collections::HashMap;
     feature = "storage-oss",
     feature = "storage-obs",
     feature = "storage-s3",
-    feature = "storage-hdfs"
+    feature = "storage-hdfs",
+    feature = "storage-hdfs-jni"
 ))]
 use std::sync::Mutex;
 #[cfg(any(
@@ -42,6 +43,8 @@ use super::AzdlsStorageConfig;
 use opendal::services::CosConfig;
 #[cfg(feature = "storage-gcs")]
 use opendal::services::GcsConfig;
+#[cfg(feature = "storage-hdfs-jni")]
+use opendal::services::HdfsConfig;
 #[cfg(feature = "storage-hdfs")]
 use opendal::services::HdfsNativeConfig;
 #[cfg(feature = "storage-obs")]
@@ -102,16 +105,51 @@ pub enum Storage {
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-hdfs")]
-    Hdfs {
+    HdfsNative {
         config: Box<HdfsNativeConfig>,
+        op: Mutex<Option<Operator>>,
+    },
+    #[cfg(feature = "storage-hdfs-jni")]
+    HdfsJni {
+        config: Box<HdfsConfig>,
         op: Mutex<Option<Operator>>,
     },
 }
 
 impl Storage {
     pub(crate) fn build(file_io_builder: FileIOBuilder) -> crate::Result<Self> {
-        let (scheme_str, props) = file_io_builder.into_parts();
+        let (scheme_str, props, use_alluxio) = file_io_builder.into_parts();
+        let is_hdfs_family =
+            matches!(scheme_str.as_str(), "hdfs" | "viewfs" | "alluxio");
+
+        // Two refusals enforced regardless of feature flags, so the error
+        // surface stays predictable even on binaries that disabled storage
+        // backends. (1) alluxio:// without use_alluxio doesn't make sense:
+        // the native HDFS RPC client cannot reach an alluxio master.
+        if !use_alluxio && scheme_str == "alluxio" {
+            return Err(error::Error::ConfigInvalid {
+                message:
+                    "alluxio:// scheme requires FileIOBuilder::with_alluxio(true)"
+                        .to_string(),
+            });
+        }
+        // (2) use_alluxio=true with a non-HDFS-family scheme is nonsense —
+        // alluxio caching only spans HDFS / ViewFS clusters.
+        if use_alluxio && !is_hdfs_family {
+            return Err(error::Error::ConfigInvalid {
+                message: format!(
+                    "alluxio mode only supports hdfs/viewfs/alluxio scheme, got: {scheme_str}"
+                ),
+            });
+        }
+
         let scheme = Self::parse_scheme(&scheme_str)?;
+
+        // HDFS-family route: pick native or JNI based on use_alluxio.
+        // Falls through to the per-scheme match below for everything else.
+        if is_hdfs_family {
+            return Self::build_hdfs_family(use_alluxio, props);
+        }
 
         match scheme {
             #[cfg(feature = "storage-memory")]
@@ -170,17 +208,55 @@ impl Storage {
                     operators: Mutex::new(HashMap::new()),
                 })
             }
-            #[cfg(feature = "storage-hdfs")]
-            Scheme::HdfsNative => {
-                let config = super::hdfs_config_parse(props)?;
-                Ok(Self::Hdfs {
-                    config: Box::new(config),
-                    op: Mutex::new(None),
-                })
-            }
             _ => Err(error::Error::IoUnsupported {
                 message: "Unsupported storage feature".to_string(),
             }),
+        }
+    }
+
+    /// Build the HDFS-family branch of [`Storage::build`]. Splits on
+    /// `use_alluxio` after both top-level guards in `build()` have already
+    /// rejected the impossible combinations (alluxio scheme without the
+    /// flag, alluxio flag with a non-HDFS-family scheme).
+    fn build_hdfs_family(
+        use_alluxio: bool,
+        props: HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        if use_alluxio {
+            #[cfg(feature = "storage-hdfs-jni")]
+            {
+                let config = super::hdfs_jni_config_parse(props)?;
+                return Ok(Self::HdfsJni {
+                    config: Box::new(config),
+                    op: Mutex::new(None),
+                });
+            }
+            #[cfg(not(feature = "storage-hdfs-jni"))]
+            {
+                let _ = props;
+                return Err(error::Error::ConfigInvalid {
+                    message:
+                        "use_alluxio=true requires the paimon crate to be built with the storage-hdfs-jni feature"
+                            .to_string(),
+                });
+            }
+        }
+        #[cfg(feature = "storage-hdfs")]
+        {
+            let config = super::hdfs_config_parse(props)?;
+            Ok(Self::HdfsNative {
+                config: Box::new(config),
+                op: Mutex::new(None),
+            })
+        }
+        #[cfg(not(feature = "storage-hdfs"))]
+        {
+            let _ = props;
+            Err(error::Error::ConfigInvalid {
+                message:
+                    "hdfs:// / viewfs:// require the paimon crate to be built with the storage-hdfs feature"
+                        .to_string(),
+            })
         }
     }
 
@@ -241,7 +317,7 @@ impl Storage {
                 Ok((op, relative_path))
             }
             #[cfg(feature = "storage-hdfs")]
-            Storage::Hdfs { config, op } => {
+            Storage::HdfsNative { config, op } => {
                 let relative_path = super::hdfs_relative_path(path)?;
                 let mut guard = op.lock().map_err(|_| error::Error::UnexpectedError {
                     message: "Failed to lock HDFS operator".to_string(),
@@ -255,6 +331,29 @@ impl Storage {
                     *guard = Some(super::hdfs_config_build(config, path)?);
                 }
                 Ok((guard.as_ref().unwrap().clone(), relative_path))
+            }
+            #[cfg(feature = "storage-hdfs-jni")]
+            Storage::HdfsJni { config, op } => {
+                // Bleem-style scheme rewrite: hdfs://nn/p and viewfs://cluster/p
+                // become alluxio://nn/p and alluxio://cluster/p before reaching
+                // libhdfs. The Alluxio Hadoop FS SPI (alluxio.hadoop.FileSystem,
+                // registered via classpath / HADOOP_CONF_DIR) takes over from
+                // there. Idempotent for paths already in alluxio:// form.
+                let rewritten = super::hdfs_to_alluxio_path(path)?;
+                // The relative path must be derived from the rewritten path
+                // so the substring offset returned to the caller is
+                // self-consistent — but the caller only ever passes the
+                // rewritten path's original on-wire form, so we also need to
+                // resolve the original input back to its relative tail.
+                let original_relative = super::hdfs_jni_relative_path(path)?;
+                let mut guard = op.lock().map_err(|_| error::Error::UnexpectedError {
+                    message: "Failed to lock HDFS JNI operator".to_string(),
+                    source: None,
+                })?;
+                if guard.is_none() {
+                    *guard = Some(super::hdfs_jni_config_build(config, &rewritten)?);
+                }
+                Ok((guard.as_ref().unwrap().clone(), original_relative))
             }
         }
     }
@@ -396,8 +495,128 @@ impl Storage {
             // `viewfs` is routed through the same hdfs-native backend: the
             // native client resolves the viewfs mount table (from Hadoop xml
             // discovered via HADOOP_CONF_DIR / HADOOP_HOME) to real clusters.
+            // `alluxio` flows through opendal's libhdfs/JNI backend
+            // (services-hdfs); it never enters this function for the native
+            // path because the build() guard rejects it without
+            // use_alluxio=true.
             "hdfs" | "viewfs" => Ok(Scheme::HdfsNative),
+            "alluxio" => Ok(Scheme::Hdfs),
             s => Ok(s.parse::<Scheme>()?),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+
+    /// alluxio:// scheme without `use_alluxio=true` is rejected upfront —
+    /// hdfs-native cannot talk to an alluxio master.
+    #[test]
+    fn build_rejects_alluxio_scheme_without_use_alluxio() {
+        let err = FileIOBuilder::new("alluxio")
+            .build()
+            .expect_err("alluxio scheme without use_alluxio should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alluxio") && msg.contains("with_alluxio"),
+            "got {msg}"
+        );
+    }
+
+    /// `use_alluxio=true` with a non-HDFS-family scheme is nonsense —
+    /// alluxio caching only spans HDFS / ViewFS clusters. Should be
+    /// rejected before any backend is constructed.
+    #[test]
+    fn build_rejects_use_alluxio_with_non_hdfs_scheme() {
+        let err = FileIOBuilder::new("s3")
+            .with_alluxio(true)
+            .build()
+            .expect_err("alluxio mode with s3:// should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alluxio mode") && msg.contains("s3"),
+            "got {msg}"
+        );
+    }
+
+    /// `use_alluxio=true` with no JNI feature compiled in is a configuration
+    /// mistake. The error must call out the missing feature so the deployer
+    /// knows the binary needs a rebuild — silently falling back to native
+    /// would defeat the whole point.
+    #[cfg(all(feature = "storage-hdfs", not(feature = "storage-hdfs-jni")))]
+    #[test]
+    fn build_rejects_use_alluxio_when_jni_feature_disabled() {
+        let err = FileIOBuilder::new("hdfs")
+            .with_alluxio(true)
+            .build()
+            .expect_err("use_alluxio=true without JNI feature should be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("storage-hdfs-jni"), "got {msg}");
+    }
+
+    /// hdfs:// without `use_alluxio` routes to the native backend on
+    /// builds that have it; this is the path everyone has today.
+    #[cfg(feature = "storage-hdfs")]
+    #[test]
+    fn build_routes_hdfs_to_native_backend() {
+        let file_io = FileIOBuilder::new("hdfs")
+            .with_prop("hdfs.name-node", "hdfs://nn:8020")
+            .build()
+            .unwrap();
+        assert!(!file_io.use_alluxio());
+    }
+
+    /// hdfs:// with `use_alluxio=true` routes to the JNI backend on builds
+    /// that have it. We can confirm via `FileIO::use_alluxio` without
+    /// touching the (lazy) opendal operator — the JNI side won't try to
+    /// initialise libhdfs until the first IO call.
+    #[cfg(feature = "storage-hdfs-jni")]
+    #[test]
+    fn build_routes_alluxio_to_jni_backend() {
+        let file_io = FileIOBuilder::new("hdfs")
+            .with_alluxio(true)
+            .with_prop("hdfs.name-node", "alluxio://master:19998")
+            .build()
+            .unwrap();
+        assert!(file_io.use_alluxio());
+    }
+
+    /// `FileIO::with_alluxio` flips the flag without losing the props
+    /// passed at builder time. Round-trips back to false so the test also
+    /// covers the no-op fast path (returning self.clone() when the flag
+    /// already matches).
+    #[cfg(all(feature = "storage-hdfs", feature = "storage-hdfs-jni"))]
+    #[test]
+    fn with_alluxio_round_trip_preserves_props() {
+        let file_io = FileIOBuilder::new("hdfs")
+            .with_props([
+                ("hdfs.name-node", "hdfs://nn:8020"),
+                ("hdfs.enable-append", "true"),
+                ("unrelated.key", "ignored-but-kept"),
+            ])
+            .build()
+            .unwrap();
+        assert!(!file_io.use_alluxio());
+
+        let alluxio = file_io.with_alluxio(true).unwrap();
+        assert!(alluxio.use_alluxio());
+
+        let back = alluxio.with_alluxio(false).unwrap();
+        assert!(!back.use_alluxio());
+    }
+
+    /// `with_alluxio` is a cheap no-op when the requested value already
+    /// matches the current flag — covers the early-return branch.
+    #[cfg(feature = "storage-hdfs")]
+    #[test]
+    fn with_alluxio_noop_when_flag_already_matches() {
+        let file_io = FileIOBuilder::new("hdfs")
+            .with_prop("hdfs.name-node", "hdfs://nn:8020")
+            .build()
+            .unwrap();
+        let same = file_io.with_alluxio(false).unwrap();
+        assert!(!same.use_alluxio());
     }
 }

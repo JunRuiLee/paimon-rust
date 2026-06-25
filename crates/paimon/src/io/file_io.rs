@@ -34,6 +34,16 @@ use super::Storage;
 #[derive(Clone, Debug)]
 pub struct FileIO {
     storage: Arc<Storage>,
+    /// Original scheme passed to the builder. Kept on the FileIO so
+    /// [`FileIO::with_alluxio`] can rebuild the underlying Storage without
+    /// reaching back into the (typed) Storage variants.
+    scheme: String,
+    /// Original property bag passed to the builder, shared via Arc so flipping
+    /// the alluxio flag doesn't clone a potentially-large credentials map.
+    props: Arc<HashMap<String, String>>,
+    /// Whether this FileIO is currently routing HDFS-family paths through the
+    /// libhdfs JNI backend (and rewriting them to `alluxio://`).
+    use_alluxio: bool,
 }
 
 impl FileIO {
@@ -72,6 +82,36 @@ impl FileIO {
                 })?
         };
         Ok(FileIOBuilder::new(url.scheme()))
+    }
+
+    /// Whether this FileIO is currently routing HDFS-family paths through
+    /// the libhdfs/JNI backend (and rewriting them to `alluxio://`).
+    ///
+    /// Mostly useful for testing — the actual storage backend is hidden
+    /// inside an opaque `Storage`, so this is the supported way for a
+    /// caller to confirm an alluxio switch happened.
+    pub fn use_alluxio(&self) -> bool {
+        self.use_alluxio
+    }
+
+    /// Clone this FileIO with the alluxio flag flipped. The original
+    /// scheme/props captured at build time are reused, so callers don't
+    /// need to keep the builder around. Returns `Ok(self.clone())` when
+    /// the flag already matches the requested value.
+    ///
+    /// This drives [`Table::with_alluxio`]: catalog metadata stays on the
+    /// FileIO it was built with, and only the table's data FileIO is
+    /// rebuilt when the caller opts in.
+    pub fn with_alluxio(&self, enabled: bool) -> crate::Result<Self> {
+        if enabled == self.use_alluxio {
+            return Ok(self.clone());
+        }
+        FileIOBuilder {
+            scheme_str: Some(self.scheme.clone()),
+            props: (*self.props).clone(),
+            use_alluxio: enabled,
+        }
+        .build()
     }
 
     /// Create a new input file to read data.
@@ -349,6 +389,10 @@ fn looks_like_windows_drive_path(path: &str) -> bool {
 pub struct FileIOBuilder {
     scheme_str: Option<String>,
     props: HashMap<String, String>,
+    /// Caller's request for the libhdfs/JNI backend. Defaults to false so
+    /// existing callers stay on the native HDFS path. Routed through
+    /// [`Storage::build`] to pick the backend variant.
+    use_alluxio: bool,
 }
 
 impl FileIOBuilder {
@@ -356,11 +400,16 @@ impl FileIOBuilder {
         Self {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
+            use_alluxio: false,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
-        (self.scheme_str.unwrap_or_default(), self.props)
+    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>, bool) {
+        (
+            self.scheme_str.unwrap_or_default(),
+            self.props,
+            self.use_alluxio,
+        )
     }
 
     pub fn with_prop(mut self, key: impl ToString, value: impl ToString) -> Self {
@@ -377,10 +426,27 @@ impl FileIOBuilder {
         self
     }
 
+    /// Opt this FileIO into the libhdfs/JNI backend for HDFS-family paths.
+    /// Defaults to false. When true and the scheme isn't in
+    /// `{hdfs, viewfs, alluxio}`, [`build`] returns `ConfigInvalid` —
+    /// alluxio caching only makes sense for the HDFS family.
+    pub fn with_alluxio(mut self, enabled: bool) -> Self {
+        self.use_alluxio = enabled;
+        self
+    }
+
     pub fn build(self) -> crate::Result<FileIO> {
+        // Stash builder state before move into Storage::build — FileIO
+        // needs it to be able to rebuild with a flipped alluxio flag later.
+        let scheme = self.scheme_str.clone().unwrap_or_default();
+        let props = Arc::new(self.props.clone());
+        let use_alluxio = self.use_alluxio;
         let storage = Storage::build(self)?;
         Ok(FileIO {
             storage: Arc::new(storage),
+            scheme,
+            props,
+            use_alluxio,
         })
     }
 }

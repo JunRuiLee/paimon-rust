@@ -24,32 +24,15 @@ use url::Url;
 use crate::error::Error;
 use crate::Result;
 
-/// Supported HDFS-family scheme prefixes, both routed through hdfs-native.
-const HDFS_SCHEME_PREFIXES: [&str; 2] = ["hdfs://", "viewfs://"];
+use super::storage_hdfs_common::hdfs_family_relative_path;
 
-/// Strip a supported HDFS-family scheme prefix (`hdfs://` or `viewfs://`),
-/// returning the `authority/path` remainder. Returns `None` for any other scheme.
-fn strip_hdfs_scheme(path: &str) -> Option<&str> {
-    HDFS_SCHEME_PREFIXES
-        .iter()
-        .find_map(|prefix| path.strip_prefix(prefix))
-}
+/// Supported HDFS-family scheme prefixes for the native (hdfs-native) backend.
+const HDFS_NATIVE_SCHEME_PREFIXES: [&str; 2] = ["hdfs://", "viewfs://"];
 
-/// Parse an HDFS or ViewFS path to get the relative path from the cluster root.
-///
-/// Examples:
-/// - "hdfs://namenode:8020/warehouse/db/table" -> "warehouse/db/table"
-/// - "viewfs://cluster/warehouse/db/table"     -> "warehouse/db/table"
+/// Native-backend convenience: only accepts `hdfs://` / `viewfs://`. The JNI
+/// backend (`storage_hdfs_jni`) has its own helper that adds `alluxio://`.
 pub(crate) fn hdfs_relative_path(path: &str) -> Result<&str> {
-    let after_scheme = strip_hdfs_scheme(path).ok_or_else(|| Error::ConfigInvalid {
-        message: format!("Invalid HDFS path: {path}, should start with hdfs:// or viewfs://"),
-    })?;
-    match after_scheme.find('/') {
-        Some(pos) => Ok(&after_scheme[pos + 1..]),
-        None => Err(Error::ConfigInvalid {
-            message: format!("Invalid HDFS path: {path}, missing path component"),
-        }),
-    }
+    hdfs_family_relative_path(path, &HDFS_NATIVE_SCHEME_PREFIXES)
 }
 
 /// Built-in Hadoop configuration baked into the binary, so that ViewFS works
