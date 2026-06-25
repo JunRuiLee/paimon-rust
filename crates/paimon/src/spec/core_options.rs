@@ -95,6 +95,15 @@ const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
+/// Whether this table's data files are covered by an Alluxio cache cluster.
+/// Read-side gate only: when the caller also passes `session_use_alluxio=true`
+/// (e.g. via `Table::with_alluxio`), the table's data FileIO is rebuilt with
+/// the libhdfs JNI backend and `hdfs://` / `viewfs://` paths are rewritten to
+/// `alluxio://` to route through alluxio-client's Hadoop FileSystem SPI. Both
+/// gates must be true for any Alluxio I/O to happen — see
+/// `docs/alluxio-via-libhdfs-impl-plan.md`. Catalog metadata (schema,
+/// snapshot, manifest) is never affected by this option.
+const ALLUXIO_CACHE_ENABLED_OPTION: &str = "alluxio.cache-enabled";
 
 /// Merge engine for primary-key tables.
 ///
@@ -694,6 +703,21 @@ impl<'a> CoreOptions<'a> {
     pub fn row_tracking_enabled(&self) -> bool {
         self.options
             .get(ROW_TRACKING_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether this table opts into Alluxio caching on the read path.
+    ///
+    /// Pure declaration on the table side; the actual switch is gated by the
+    /// caller's `session_use_alluxio` flag (see `Table::with_alluxio`). Both
+    /// must be true for `Table.file_io` to be rebuilt against the libhdfs JNI
+    /// backend with `hdfs://` / `viewfs://` paths rewritten to `alluxio://`.
+    /// Mirrors bleem's `PaimonScanNode` enableAlluxio behaviour, but scoped
+    /// per-table instead of catalog-wide.
+    pub fn alluxio_cache_enabled(&self) -> bool {
+        self.options
+            .get(ALLUXIO_CACHE_ENABLED_OPTION)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
@@ -1592,6 +1616,42 @@ mod tests {
                 core.read_sort_merge_buffer_soft_cap().is_none(),
                 "{invalid:?} should disable the cap"
             );
+        }
+    }
+
+    #[test]
+    fn test_alluxio_cache_enabled_defaults_false() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert!(!core.alluxio_cache_enabled());
+    }
+
+    #[test]
+    fn test_alluxio_cache_enabled_accepts_case_insensitive_true() {
+        // Java options are stringly-typed and case-insensitive; mirror the
+        // existing bool getters (row_tracking_enabled / deletion_vectors_enabled).
+        for v in ["true", "TRUE", "True", "tRuE"] {
+            let opts = HashMap::from([(
+                ALLUXIO_CACHE_ENABLED_OPTION.to_string(),
+                v.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert!(core.alluxio_cache_enabled(), "{v:?} should enable");
+        }
+    }
+
+    #[test]
+    fn test_alluxio_cache_enabled_anything_else_is_false() {
+        // Anything that is not the literal "true" (any case) stays disabled,
+        // including the explicit "false", garbage, or empty string. Matches
+        // how `row_tracking_enabled` handles the same input shapes.
+        for v in ["false", "FALSE", "0", "1", "yes", "", "  true  "] {
+            let opts = HashMap::from([(
+                ALLUXIO_CACHE_ENABLED_OPTION.to_string(),
+                v.to_string(),
+            )]);
+            let core = CoreOptions::new(&opts);
+            assert!(!core.alluxio_cache_enabled(), "{v:?} should stay disabled");
         }
     }
 }
