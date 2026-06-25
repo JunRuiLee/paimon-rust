@@ -99,7 +99,7 @@ pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::{DataField, Snapshot, TableSchema};
+use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -274,6 +274,34 @@ impl Table {
     pub(crate) fn travel_snapshot(&self) -> Option<&Snapshot> {
         self.travel_snapshot.as_ref()
     }
+
+    /// Apply the session-level alluxio switch to this table's data FileIO.
+    ///
+    /// Two gates have to be true for the rebuild to actually happen:
+    /// 1. `session_use_alluxio` — the caller's runtime choice (e.g. driven
+    ///    by a C-binding parameter on `paimon_catalog_get_table` /
+    ///    `paimon_table_open_path`).
+    /// 2. `alluxio.cache-enabled` on the table's options — declaration that
+    ///    this table's data files are actually covered by an alluxio cache.
+    ///
+    /// When both are true, `self.file_io` is rebuilt via
+    /// [`FileIO::with_alluxio`] so subsequent `hdfs://` / `viewfs://` IO is
+    /// routed through libhdfs to alluxio. `self.schema_manager` is
+    /// deliberately left alone: catalog metadata (schema, snapshot,
+    /// manifest) always reads through the native HDFS backend.
+    ///
+    /// Returns `Ok(self)` unchanged when either gate is false, so callers
+    /// can pipe every `get_table` / `open_path` result through this method
+    /// without branching.
+    pub fn with_alluxio(mut self, session_use_alluxio: bool) -> Result<Self> {
+        let effective =
+            session_use_alluxio && CoreOptions::new(self.schema.options()).alluxio_cache_enabled();
+        if !effective {
+            return Ok(self);
+        }
+        self.file_io = self.file_io.with_alluxio(true)?;
+        Ok(self)
+    }
 }
 
 /// A stream of arrow [`RecordBatch`]es.
@@ -281,4 +309,102 @@ pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 
 pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
     fields.iter().find(|f| f.name() == name).map(|f| f.id())
+}
+
+#[cfg(all(test, feature = "storage-hdfs"))]
+mod alluxio_tests {
+    //! Coverage for the two-level (session ∧ table-option) gating in
+    //! [`Table::with_alluxio`]. The non-flip cases run on any build that
+    //! supplies `storage-hdfs`; the actual flip path requires
+    //! `storage-hdfs-jni` so [`FileIO::with_alluxio(true)`] can resolve.
+
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema};
+
+    /// Build a `Table` whose data FileIO is on the native HDFS backend.
+    /// `with_table_flag=true` sets `alluxio.cache-enabled=true` on the
+    /// table options; otherwise the option is absent (default false).
+    fn make_table(with_table_flag: bool) -> Table {
+        let mut builder = Schema::builder().column("id", DataType::Int(IntType::new()));
+        if with_table_flag {
+            builder = builder.option("alluxio.cache-enabled", "true");
+        }
+        let schema = builder.build().unwrap();
+        let file_io = FileIOBuilder::new("hdfs")
+            .with_prop("hdfs.name-node", "hdfs://nn:8020")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io,
+            Identifier::new("db", "t"),
+            "hdfs://nn:8020/warehouse/db.db/t".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    /// Session off + table off → no rebuild.
+    #[test]
+    fn with_alluxio_session_off_table_off_is_noop() {
+        let table = make_table(false).with_alluxio(false).unwrap();
+        assert!(!table.file_io().use_alluxio());
+    }
+
+    /// Session on but the table never opted in → no rebuild. Catches the
+    /// regression where a global session flag accidentally rewrote every
+    /// table.
+    #[test]
+    fn with_alluxio_session_on_table_off_is_noop() {
+        let table = make_table(false).with_alluxio(true).unwrap();
+        assert!(!table.file_io().use_alluxio());
+    }
+
+    /// Table declares cache-enabled but the session didn't opt in — caller
+    /// wants a fresh read or doesn't trust the cache. No rebuild.
+    #[test]
+    fn with_alluxio_session_off_table_on_is_noop() {
+        let table = make_table(true).with_alluxio(false).unwrap();
+        assert!(!table.file_io().use_alluxio());
+    }
+
+    /// Both gates on → data FileIO rebuilt; the SchemaManager FileIO
+    /// stays native, so catalog metadata (schema-* files) still goes
+    /// through hdfs-native even after the switch. Requires the JNI
+    /// feature because the rebuild itself needs services-hdfs to be in
+    /// the binary.
+    #[cfg(feature = "storage-hdfs-jni")]
+    #[test]
+    fn with_alluxio_session_on_table_on_flips_data_io_only() {
+        let table = make_table(true).with_alluxio(true).unwrap();
+        assert!(
+            table.file_io().use_alluxio(),
+            "data FileIO should be on the alluxio/JNI backend"
+        );
+        assert!(
+            !table.schema_manager().file_io().use_alluxio(),
+            "schema manager must keep reading metadata through the native backend"
+        );
+    }
+
+    /// `copy_with_options` must preserve the alluxio state on the data
+    /// FileIO and the native state on the schema manager. The clone
+    /// shares the same Arc-wrapped storage; this just locks down that we
+    /// don't accidentally reset either field in the copy.
+    #[cfg(feature = "storage-hdfs-jni")]
+    #[test]
+    fn copy_with_options_preserves_alluxio_state() {
+        let table = make_table(true).with_alluxio(true).unwrap();
+        assert!(table.file_io().use_alluxio());
+
+        let copy = table.copy_with_options(HashMap::new());
+        assert!(
+            copy.file_io().use_alluxio(),
+            "copy should keep the alluxio data FileIO"
+        );
+        assert!(
+            !copy.schema_manager().file_io().use_alluxio(),
+            "copy's schema manager must still be native"
+        );
+    }
 }

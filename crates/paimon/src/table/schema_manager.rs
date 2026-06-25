@@ -57,6 +57,14 @@ impl SchemaManager {
         }
     }
 
+    /// The FileIO this SchemaManager reads schema files through. Exposed so
+    /// callers (mainly [`Table::with_alluxio`]) can verify the catalog FileIO
+    /// for metadata stays on the native HDFS backend, even when the table's
+    /// data FileIO has been rebuilt against libhdfs / Alluxio.
+    pub fn file_io(&self) -> &FileIO {
+        &self.file_io
+    }
+
     /// Path to the schema directory (e.g. `{table_path}/schema`).
     fn schema_directory(&self) -> String {
         format!("{}/{}", self.table_path.trim_end_matches('/'), SCHEMA_DIR)
