@@ -2623,11 +2623,13 @@ mod tests {
     }
 
     #[test]
-    fn test_datatype_vector_arrow_unsupported() {
+    fn test_datatype_vector_arrow_conversion() {
+        // PR 2 lifted the PR 1 boundary: Vector now converts to an Arrow
+        // FixedSizeList (see arrow/mod.rs for the full conversion test matrix).
         let dt = DataType::Vector(
             VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
         );
-        let err = crate::arrow::paimon_type_to_arrow(&dt);
-        assert!(matches!(err, Err(crate::Error::Unsupported { .. })));
+        let arrow = crate::arrow::paimon_type_to_arrow(&dt).unwrap();
+        assert!(matches!(arrow, arrow_schema::DataType::FixedSizeList(_, 4)));
     }
 }
