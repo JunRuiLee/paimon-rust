@@ -81,6 +81,13 @@ storage-azdls = ["opendal/services-azdls"]
 storage-obs = ["opendal/services-obs"]
 storage-gcs = ["opendal/services-gcs"]
 storage-hdfs = ["opendal/services-hdfs-native"]
+# JNI-based HDFS backend via libhdfs, used to reach Hadoop FileSystem SPI
+# implementations like Alluxio's `alluxio.hadoop.FileSystem`. Compile-time
+# requires JAVA_HOME (libjvm) and libhdfs headers; runtime requires a JVM,
+# alluxio-client.jar (or other FS SPI jars) on CLASSPATH, and a hadoop conf
+# (HADOOP_CONF_DIR) that registers fs.alluxio.impl. Intentionally NOT in
+# `storage-all` to keep generic builds free of JDK/libhdfs dependencies.
+storage-hdfs-jni = ["opendal/services-hdfs"]
 
 [dependencies]
 url = "2.5.2"

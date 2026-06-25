@@ -28,8 +28,17 @@ version.workspace = true
 crate-type = ["cdylib", "staticlib"]
 doc = false
 
+[features]
+# storage-hdfs (services-hdfs-native, pure Rust) is on by default for paimon-c
+# since bleem builds always read from HDFS. storage-hdfs-jni is opt-in: it
+# pulls in libhdfs + JNI, used together with alluxio-client.jar to reach
+# Alluxio via the Hadoop FileSystem SPI. See `docs/alluxio-via-libhdfs-impl-plan.md`.
+default = ["storage-hdfs"]
+storage-hdfs = ["paimon/storage-hdfs"]
+storage-hdfs-jni = ["paimon/storage-hdfs-jni"]
+
 [dependencies]
-paimon = { path = "../../crates/paimon", features = ["storage-hdfs"] }
+paimon = { path = "../../crates/paimon", default-features = false, features = ["storage-memory", "storage-fs", "storage-oss"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures = "0.3"
 arrow-array = { workspace = true }
