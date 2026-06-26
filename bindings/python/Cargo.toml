@@ -35,3 +35,8 @@ paimon-datafusion = { path = "../../crates/integrations/datafusion", features = 
 pyo3 = { version = "0.28", features = ["abi3-py310"] }
 serde_json = "1.0"
 tokio = { workspace = true }
+
+[dev-dependencies]
+# Enables `Python::attach` to auto-initialize an interpreter for Rust unit tests.
+# Only applied to the test build; the maturin/extension-module build does not pull dev-dependencies.
+pyo3 = { version = "0.28", features = ["abi3-py310", "auto-initialize"] }
