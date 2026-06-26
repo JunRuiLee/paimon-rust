@@ -50,3 +50,53 @@ def test_write_commit_read_roundtrip():
             ctx.sql("SELECT id, name FROM paimon.wdb.t")
         ).sort_by("id").to_pydict()
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
+
+
+def test_write_multiple_batches():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        wb = table.new_write_builder()
+        write = wb.new_write()
+        write.write_arrow(pa.record_batch([[1], ["a"]], names=["id", "name"]))
+        write.write_arrow(pa.record_batch([[2], ["b"]], names=["id", "name"]))
+        messages = write.prepare_commit()
+        wb.new_commit().commit(messages)
+        result = pa.Table.from_batches(
+            ctx.sql("SELECT id, name FROM paimon.wdb.t")
+        ).sort_by("id").to_pydict()
+        assert result == {"id": [1, 2], "name": ["a", "b"]}
+
+
+def test_prepare_commit_returns_messages():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        write = table.new_write_builder().new_write()
+        write.write_arrow(pa.record_batch([[1], ["a"]], names=["id", "name"]))
+        messages = write.prepare_commit()
+        assert len(messages) >= 1
+        assert all(type(m).__name__ == "CommitMessage" for m in messages)
+
+
+def test_commit_empty_messages_noop():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        wb = table.new_write_builder()
+        messages = wb.new_write().prepare_commit()   # no write
+        assert messages == []
+        wb.new_commit().commit(messages)             # no-op success
+        batches = ctx.sql("SELECT COUNT(*) AS cnt FROM paimon.wdb.t")
+        assert batches[0].column(0).to_pylist() == [0]
+
+
+def test_commit_non_message_raises_typeerror():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        with pytest.raises(TypeError):
+            table.new_write_builder().new_commit().commit([object()])
+        # A non-iterable argument also raises TypeError (not a raw PyO3 error).
+        with pytest.raises(TypeError):
+            table.new_write_builder().new_commit().commit(42)
