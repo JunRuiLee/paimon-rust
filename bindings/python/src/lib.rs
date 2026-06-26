@@ -24,6 +24,7 @@ mod read;
 mod schema;
 mod table;
 mod udf;
+mod write;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

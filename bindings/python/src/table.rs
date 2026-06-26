@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
+use crate::write::PyWriteBuilder;
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -51,5 +52,10 @@ impl PyTable {
     /// Create a [`PyReadBuilder`] for DataFrame-style scan planning.
     fn new_read_builder(&self) -> PyReadBuilder {
         PyReadBuilder::new(Arc::clone(&self.inner))
+    }
+
+    /// Create a [`PyWriteBuilder`] for the batch write loop.
+    fn new_write_builder(&self) -> PyWriteBuilder {
+        PyWriteBuilder::new(Arc::clone(&self.inner))
     }
 }

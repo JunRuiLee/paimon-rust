@@ -277,6 +277,10 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::schema::PyDataField>()?;
     this.add_class::<PyPythonScalarUDFObject>()?;
     this.add_class::<PySQLContext>()?;
+    this.add_class::<crate::write::PyWriteBuilder>()?;
+    this.add_class::<crate::write::PyTableWrite>()?;
+    this.add_class::<crate::write::PyTableCommit>()?;
+    this.add_class::<crate::write::PyCommitMessage>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
     m.add_submodule(&this)?;
     py.import("sys")?
