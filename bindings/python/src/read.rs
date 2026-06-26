@@ -27,6 +27,26 @@ use pyo3::types::{PyBytes, PyDict};
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
 
+/// Apply projection/limit/filter from a config snapshot onto a core ReadBuilder.
+/// Shared by PyTableScan::plan and PyTableRead::read so scan and read stay consistent.
+fn apply_read_config(
+    builder: &mut paimon::table::ReadBuilder<'_>,
+    projection: &Option<Vec<String>>,
+    limit: Option<usize>,
+    filter: &Option<Predicate>,
+) {
+    if let Some(projection) = projection {
+        let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
+        builder.with_projection(&cols);
+    }
+    if let Some(limit) = limit {
+        builder.with_limit(limit);
+    }
+    if let Some(filter) = filter {
+        builder.with_filter(filter.clone());
+    }
+}
+
 #[pyclass(name = "ReadBuilder", module = "pypaimon_rust.datafusion")]
 pub struct PyReadBuilder {
     table: Arc<Table>,
@@ -96,16 +116,7 @@ impl PyTableScan {
         let splits = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
-                if let Some(projection) = &self.projection {
-                    let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
-                    builder.with_projection(&cols);
-                }
-                if let Some(limit) = self.limit {
-                    builder.with_limit(limit);
-                }
-                if let Some(filter) = &self.filter {
-                    builder.with_filter(filter.clone());
-                }
+                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter);
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())
             })
