@@ -17,14 +17,52 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::error::to_py_err;
+
+/// Validate an incoming batch schema against the table's target Arrow schema,
+/// replicating pypaimon's `_validate_pyarrow_schema` semantics (minus the
+/// projection-write branch PR1 lacks): field count, order, and names must match;
+/// types must match field-by-field, tolerating binary-family interchange
+/// (Binary / LargeBinary / FixedSizeBinary). The nullable flag is intentionally
+/// NOT compared, since `build_target_arrow_schema` derives nullability from the
+/// Paimon field while pyarrow-constructed batches infer nullable=true. No cast.
+fn validate_batch_schema(input: &ArrowSchema, target: &ArrowSchema) -> PyResult<()> {
+    let mismatch = || {
+        PyValueError::new_err(format!(
+            "Input schema is not consistent with the table schema. \
+             input: {input:?}, table: {target:?}"
+        ))
+    };
+    if input.fields().len() != target.fields().len() {
+        return Err(mismatch());
+    }
+    for (i, t) in input.fields().iter().zip(target.fields().iter()) {
+        if i.name() != t.name() {
+            return Err(mismatch());
+        }
+        if i.data_type() != t.data_type()
+            && !(is_binary_family(i.data_type()) && is_binary_family(t.data_type()))
+        {
+            return Err(mismatch());
+        }
+    }
+    Ok(())
+}
+
+fn is_binary_family(t: &ArrowDataType) -> bool {
+    matches!(
+        t,
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_)
+    )
+}
 
 /// Builder for the batch write loop, created via [`crate::table::PyTable::new_write_builder`].
 ///
@@ -55,8 +93,11 @@ impl PyWriteBuilder {
             .new_write_builder()
             .with_commit_user(self.commit_user.clone())
             .map_err(to_py_err)?;
+        let target_schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
+            .map_err(to_py_err)?;
         Ok(PyTableWrite {
             inner: builder.new_write().map_err(to_py_err)?,
+            target_schema,
         })
     }
 
@@ -80,6 +121,8 @@ impl PyWriteBuilder {
 #[pyclass(name = "TableWrite", module = "pypaimon_rust.datafusion", unsendable)]
 pub struct PyTableWrite {
     inner: TableWrite,
+    /// The table's target Arrow schema, used to validate incoming batches.
+    target_schema: Arc<ArrowSchema>,
 }
 
 #[pymethods]
@@ -87,6 +130,7 @@ impl PyTableWrite {
     /// Write a single PyArrow RecordBatch into the table's writers.
     fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        validate_batch_schema(&batch.schema(), &self.target_schema)?;
         let rt = runtime();
         py.detach(|| rt.block_on(async { self.inner.write_arrow_batch(&batch).await }))
             .map_err(to_py_err)

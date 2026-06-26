@@ -22,6 +22,16 @@ import pytest
 
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
+# The table created by _make_empty_table is (id INT, name STRING). Paimon INT maps
+# to Arrow int32, so batches must use int32 for id — pyarrow infers Python ints as
+# int64, which write_arrow now (correctly, matching pypaimon) rejects as a type
+# mismatch. Build batches against this explicit schema to match the table.
+_TABLE_SCHEMA = pa.schema([("id", pa.int32()), ("name", pa.string())])
+
+
+def _batch(ids, names):
+    return pa.record_batch([ids, names], schema=_TABLE_SCHEMA)
+
 
 def _make_empty_table(warehouse):
     ctx = SQLContext()
@@ -39,7 +49,7 @@ def test_write_commit_read_roundtrip():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        batch = pa.record_batch([[1, 2, 3], ["a", "b", "c"]], names=["id", "name"])
+        batch = _batch([1, 2, 3], ["a", "b", "c"])
         wb = table.new_write_builder()
         write = wb.new_write()
         write.write_arrow(batch)
@@ -58,8 +68,8 @@ def test_write_multiple_batches():
         table = _get_table(warehouse)
         wb = table.new_write_builder()
         write = wb.new_write()
-        write.write_arrow(pa.record_batch([[1], ["a"]], names=["id", "name"]))
-        write.write_arrow(pa.record_batch([[2], ["b"]], names=["id", "name"]))
+        write.write_arrow(_batch([1], ["a"]))
+        write.write_arrow(_batch([2], ["b"]))
         messages = write.prepare_commit()
         wb.new_commit().commit(messages)
         result = pa.Table.from_batches(
@@ -73,7 +83,7 @@ def test_prepare_commit_returns_messages():
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
         write = table.new_write_builder().new_write()
-        write.write_arrow(pa.record_batch([[1], ["a"]], names=["id", "name"]))
+        write.write_arrow(_batch([1], ["a"]))
         messages = write.prepare_commit()
         assert len(messages) >= 1
         assert all(type(m).__name__ == "CommitMessage" for m in messages)
@@ -89,6 +99,16 @@ def test_commit_empty_messages_noop():
         wb.new_commit().commit(messages)             # no-op success
         batches = ctx.sql("SELECT COUNT(*) AS cnt FROM paimon.wdb.t")
         assert batches[0].column(0).to_pylist() == [0]
+
+
+def test_write_arrow_type_mismatch_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)          # table (id INT, name STRING)
+        table = _get_table(warehouse)
+        write = table.new_write_builder().new_write()
+        bad = pa.record_batch([["x", "y"], ["a", "b"]], names=["id", "name"])  # id as STRING
+        with pytest.raises(ValueError):
+            write.write_arrow(bad)
 
 
 def test_commit_non_message_raises_typeerror():
