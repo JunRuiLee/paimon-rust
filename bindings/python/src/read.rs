@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use paimon::table::{DataSplit, Table};
 use paimon_datafusion::runtime::runtime;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::error::to_py_err;
 
@@ -115,10 +117,44 @@ pub struct PySplit {
     pub(crate) inner: DataSplit,
 }
 
+impl PySplit {
+    fn to_bytes(&self) -> PyResult<Vec<u8>> {
+        serde_json::to_vec(&self.inner)
+            .map_err(|e| PyValueError::new_err(format!("failed to serialize split: {e}")))
+    }
+
+    fn from_bytes(bytes: &[u8]) -> PyResult<DataSplit> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| PyValueError::new_err(format!("failed to deserialize split: {e}")))
+    }
+}
+
 #[pymethods]
 impl PySplit {
     /// Physical row count: sum of data-file row counts (not a logical result count).
     fn row_count(&self) -> i64 {
         self.inner.row_count()
+    }
+
+    /// Reduce to `Split(bytes)` for pickle/copy. The bytes are an opaque,
+    /// implementation-detail encoding; only same/compatible-version round-trip
+    /// is guaranteed.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<(Py<PyAny>, (Py<PyBytes>,))> {
+        let bytes = slf.borrow().to_bytes()?;
+        let cls = slf.get_type().unbind().into_any();
+        Ok((cls, (PyBytes::new(py, &bytes).unbind(),)))
+    }
+
+    /// Reconstruct a split from opaque bytes produced by pickling. Direct
+    /// construction without those bytes is unsupported; obtain splits from
+    /// `ReadBuilder.new_scan().plan()`.
+    #[new]
+    fn new(state: &Bound<'_, PyBytes>) -> PyResult<Self> {
+        Ok(Self {
+            inner: Self::from_bytes(state.as_bytes())?,
+        })
     }
 }

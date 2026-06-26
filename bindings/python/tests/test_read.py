@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import pickle
 import tempfile
 
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
@@ -74,3 +75,13 @@ def test_plan_without_filter_succeeds():
         table = _make_table_with_data(warehouse)
         plan = table.new_read_builder().new_scan().plan()
         assert len(plan.splits()) >= 1
+
+
+def test_split_pickle_roundtrip():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        splits = table.new_read_builder().new_scan().plan().splits()
+        assert len(splits) >= 1
+        split = splits[0]
+        restored = pickle.loads(pickle.dumps(split))
+        assert restored.row_count() == split.row_count()
