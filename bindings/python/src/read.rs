@@ -17,10 +17,12 @@
 
 use std::sync::Arc;
 
+use arrow::pyarrow::ToPyArrow;
+use futures::TryStreamExt;
 use paimon::spec::Predicate;
 use paimon::table::{DataSplit, Table};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -45,6 +47,25 @@ fn apply_read_config(
     if let Some(filter) = filter {
         builder.with_filter(filter.clone());
     }
+}
+
+/// Extract a sequence of Python `Split` objects into core `DataSplit`s. Accepts
+/// any iterable (list/tuple/generator). Runs under the GIL since it touches
+/// Python objects. A non-iterable argument or a non-`Split` element raises
+/// `TypeError`.
+fn extract_splits(splits: &Bound<'_, PyAny>) -> PyResult<Vec<DataSplit>> {
+    let iter = splits
+        .try_iter()
+        .map_err(|_| PyTypeError::new_err("read() expects a sequence of Split objects"))?;
+    let mut out = Vec::new();
+    for item in iter {
+        let item = item?;
+        let split: PyRef<PySplit> = item
+            .extract()
+            .map_err(|_| PyTypeError::new_err("read() expects a sequence of Split objects"))?;
+        out.push(split.inner.clone());
+    }
+    Ok(out)
 }
 
 #[pyclass(name = "ReadBuilder", module = "pypaimon_rust.datafusion")]
@@ -99,6 +120,15 @@ impl PyReadBuilder {
             filter: self.filter.clone(),
         }
     }
+
+    fn new_read(&self) -> PyTableRead {
+        PyTableRead {
+            table: Arc::clone(&self.table),
+            projection: self.projection.clone(),
+            limit: self.limit,
+            filter: self.filter.clone(),
+        }
+    }
 }
 
 #[pyclass(name = "TableScan", module = "pypaimon_rust.datafusion")]
@@ -122,6 +152,39 @@ impl PyTableScan {
             })
         })?;
         Ok(PyPlan { splits })
+    }
+}
+
+#[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]
+pub struct PyTableRead {
+    table: Arc<Table>,
+    projection: Option<Vec<String>>,
+    limit: Option<usize>,
+    filter: Option<Predicate>,
+}
+
+#[pymethods]
+impl PyTableRead {
+    /// Read the given splits into a list of PyArrow RecordBatches.
+    fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
+        let splits = extract_splits(splits)?;
+        if splits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rt = runtime();
+        let batches = py.detach(|| {
+            rt.block_on(async {
+                let mut builder = self.table.new_read_builder();
+                apply_read_config(&mut builder, &self.projection, self.limit, &self.filter);
+                let read = builder.new_read().map_err(to_py_err)?;
+                let stream = read.to_arrow(&splits).map_err(to_py_err)?;
+                stream.try_collect::<Vec<_>>().await.map_err(to_py_err)
+            })
+        })?;
+        batches
+            .iter()
+            .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
+            .collect()
     }
 }
 

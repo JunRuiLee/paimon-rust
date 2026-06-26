@@ -272,6 +272,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::read::PyReadBuilder>()?;
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
+    this.add_class::<crate::read::PyTableRead>()?;
     this.add_class::<crate::read::PySplit>()?;
     this.add_class::<crate::schema::PyTableSchema>()?;
     this.add_class::<crate::schema::PyDataField>()?;

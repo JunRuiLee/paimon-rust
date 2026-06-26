@@ -18,6 +18,7 @@
 import pickle
 import tempfile
 
+import pyarrow as pa
 import pytest
 
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
@@ -280,3 +281,71 @@ def test_filter_overwrite():
             .with_filter({"method": "equal", "field": "dt", "literals": ["p2"]})
             .new_scan().plan().splits())
         assert overwritten == only_p2
+
+
+def test_read_returns_expected_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        splits = b.new_scan().plan().splits()
+        batches = b.new_read().read(splits)
+        t = pa.Table.from_batches(batches)
+        assert t.num_rows == 3
+        assert t.sort_by("id").to_pydict() == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
+
+
+def test_read_empty_splits():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        assert table.new_read_builder().new_read().read([]) == []
+
+
+def test_read_non_split_raises_typeerror():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        with pytest.raises(TypeError):
+            table.new_read_builder().new_read().read([object()])
+
+
+def test_read_pickled_split():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        splits = b.new_scan().plan().splits()
+        pickled = [pickle.loads(pickle.dumps(s)) for s in splits]
+        batches = b.new_read().read(pickled)
+        t = pa.Table.from_batches(batches)
+        assert t.num_rows == 3
+        assert sorted(t.column("id").to_pylist()) == [1, 2, 3]
+
+
+def test_read_projection_applied():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder().with_projection(["id"])
+        splits = b.new_scan().plan().splits()
+        batches = b.new_read().read(splits)
+        t = pa.Table.from_batches(batches)
+        assert t.schema.names == ["id"]
+        assert sorted(t.column("id").to_pylist()) == [1, 2, 3]
+
+
+def test_read_is_config_snapshot():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder().with_projection(["id"])
+        splits = b.new_scan().plan().splits()
+        read = b.new_read()
+        b.with_projection(["name"])  # mutate builder AFTER new_read()
+        t = pa.Table.from_batches(read.read(splits))
+        assert t.schema.names == ["id"]
+
+
+def test_read_with_filter_smoke():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "greaterOrEqual", "field": "id", "literals": [1]})
+        splits = b.new_scan().plan().splits()
+        batches = b.new_read().read(splits)
+        assert isinstance(batches, list)
