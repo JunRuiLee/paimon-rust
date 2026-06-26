@@ -413,7 +413,7 @@ impl PartitionBucket {
 /// Input split for reading: partition + bucket + list of data files and optional deletion files.
 ///
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataSplit {
     snapshot_id: i64,
     partition: BinaryRow,
@@ -776,6 +776,25 @@ mod tests {
             .with_raw_convertible(raw_convertible)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn data_split_serde_json_round_trip() {
+        let split = DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![])
+            .build()
+            .unwrap();
+
+        let bytes = serde_json::to_vec(&split).expect("serialize");
+        let restored: DataSplit = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.snapshot_id(), split.snapshot_id());
+        assert_eq!(restored.bucket(), split.bucket());
+        assert_eq!(restored.bucket_path(), split.bucket_path());
     }
 
     /// Raw convertible split without deletion files: physical sum is exact.
