@@ -17,19 +17,22 @@
 
 use std::sync::Arc;
 
+use paimon::spec::Predicate;
 use paimon::table::{DataSplit, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use crate::error::to_py_err;
+use crate::predicate::dict_to_predicate;
 
 #[pyclass(name = "ReadBuilder", module = "pypaimon_rust.datafusion")]
 pub struct PyReadBuilder {
     table: Arc<Table>,
     projection: Option<Vec<String>>,
     limit: Option<usize>,
+    filter: Option<Predicate>,
 }
 
 impl PyReadBuilder {
@@ -38,6 +41,7 @@ impl PyReadBuilder {
             table,
             projection: None,
             limit: None,
+            filter: None,
         }
     }
 }
@@ -54,11 +58,25 @@ impl PyReadBuilder {
         slf
     }
 
+    /// Convert a lightweight dict predicate into a Rust [`Predicate`] and store
+    /// it for pushdown. Conversion happens immediately, so conversion errors
+    /// (unknown field, type mismatch, unsupported operator/type) surface at call
+    /// time. Repeated calls overwrite the previously stored filter.
+    fn with_filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        predicate: &Bound<'_, PyDict>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let filter = dict_to_predicate(predicate, slf.table.schema().fields())?;
+        slf.filter = Some(filter);
+        Ok(slf)
+    }
+
     fn new_scan(&self) -> PyTableScan {
         PyTableScan {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             limit: self.limit,
+            filter: self.filter.clone(),
         }
     }
 }
@@ -68,6 +86,7 @@ pub struct PyTableScan {
     table: Arc<Table>,
     projection: Option<Vec<String>>,
     limit: Option<usize>,
+    filter: Option<Predicate>,
 }
 
 #[pymethods]
@@ -83,6 +102,9 @@ impl PyTableScan {
                 }
                 if let Some(limit) = self.limit {
                     builder.with_limit(limit);
+                }
+                if let Some(filter) = &self.filter {
+                    builder.with_filter(filter.clone());
                 }
                 let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
                 Ok::<_, PyErr>(plan.splits().to_vec())

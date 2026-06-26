@@ -125,9 +125,6 @@ const METHOD_NOT_SUPPORTED: &[&str] = &["like", "startsWith", "endsWith", "conta
 ///   literals, empty/missing `children`, non-dict children, or non-list
 ///   `literals`/`children`.
 /// - `NotImplementedError` for unsupported operators or unsupported literal types.
-// NOTE: `#[allow(dead_code)]` is temporary — Task 3 wires this into read.rs and
-// removes it.
-#[allow(dead_code)]
 pub(crate) fn dict_to_predicate(
     node: &Bound<'_, PyDict>,
     fields: &[DataField],
@@ -173,7 +170,6 @@ pub(crate) fn dict_to_predicate(
 
 /// Convert a single leaf dict (already known not to be `and`/`or`) into a
 /// [`Predicate`], resolving the field type from the schema.
-#[allow(dead_code)]
 fn leaf_to_predicate(
     method: &str,
     node: &Bound<'_, PyDict>,
@@ -256,7 +252,6 @@ fn leaf_to_predicate(
 }
 
 /// Extract exactly one literal for comparison/equality operators.
-#[allow(dead_code)]
 fn one(mut ds: Vec<Datum>) -> PyResult<Datum> {
     if ds.len() != 1 {
         return Err(PyValueError::new_err(format!(
@@ -289,7 +284,6 @@ fn ensure_no_literals(method: &str, obj: Option<Bound<'_, PyAny>>) -> PyResult<(
 
 /// Re-wrap an unsupported-literal-type `NotImplementedError` from [`py_to_datum`]
 /// with field-name context; pass other errors through unchanged.
-#[allow(dead_code)]
 fn with_field_context(err: PyErr, field: &str, data_type: &DataType) -> PyErr {
     Python::attach(|py| {
         if err.is_instance_of::<PyNotImplementedError>(py) {

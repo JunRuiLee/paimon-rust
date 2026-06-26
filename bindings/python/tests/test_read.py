@@ -18,6 +18,8 @@
 import pickle
 import tempfile
 
+import pytest
+
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
@@ -85,3 +87,196 @@ def test_split_pickle_roundtrip():
         split = splits[0]
         restored = pickle.loads(pickle.dumps(split))
         assert restored.row_count() == split.row_count()
+
+
+def _make_partitioned_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.pdb")
+    ctx.sql("CREATE TABLE paimon.pdb.pt (dt STRING, id INT) PARTITIONED BY (dt)")
+    ctx.sql("INSERT INTO paimon.pdb.pt VALUES ('p1', 1), ('p1', 2), ('p2', 3), ('p3', 4)")
+    catalog = PaimonCatalog({"warehouse": warehouse})
+    return catalog.get_table("pdb.pt")
+
+
+def test_filter_equal_converts_and_plans():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        plan = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "id", "literals": [1]}).new_scan().plan()
+        assert plan is not None
+
+
+def test_filter_prunes_partition_splits():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        unfiltered = len(table.new_read_builder().new_scan().plan().splits())
+        filtered = len(table.new_read_builder().with_filter(
+            {"method": "equal", "field": "dt", "literals": ["p1"]}).new_scan().plan().splits())
+        assert filtered < unfiltered
+
+
+def test_filter_and_or_compound():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        pred = {"method": "and", "children": [
+            {"method": "greaterOrEqual", "field": "id", "literals": [1]},
+            {"method": "lessThan", "field": "id", "literals": [99]},
+        ]}
+        assert table.new_read_builder().with_filter(pred).new_scan().plan() is not None
+
+
+def test_filter_in_notin():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        assert b.with_filter({"method": "in", "field": "id", "literals": [1, 2]}).new_scan().plan() is not None
+        # Fresh builder for notIn (with_filter overwrites; avoid relying on overwrite here).
+        b2 = table.new_read_builder()
+        assert b2.with_filter({"method": "notIn", "field": "id", "literals": [1, 2]}).new_scan().plan() is not None
+
+
+def test_filter_isnull_isnotnull():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        assert b.with_filter({"method": "isNotNull", "field": "name", "literals": []}).new_scan().plan() is not None
+        b2 = table.new_read_builder()
+        assert b2.with_filter({"method": "isNull", "field": "name", "literals": []}).new_scan().plan() is not None
+
+
+def test_filter_null_check_with_literals_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "isNull", "field": "name", "literals": [1]})
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "isNotNull", "field": "name", "literals": [1]})
+        # Valid empty/missing cases still succeed.
+        assert b.with_filter(
+            {"method": "isNull", "field": "name", "literals": []}).new_scan().plan() is not None
+        assert b.with_filter(
+            {"method": "isNull", "field": "name"}).new_scan().plan() is not None
+
+
+def test_filter_bool_literal_converts():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.bdb")
+        ctx.sql("CREATE TABLE paimon.bdb.bt (id INT, flag BOOLEAN)")
+        ctx.sql("INSERT INTO paimon.bdb.bt VALUES (1, true), (2, false)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("bdb.bt")
+        plan = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "flag", "literals": [True]}).new_scan().plan()
+        assert plan is not None
+
+
+@pytest.mark.parametrize("method", ["like", "startsWith", "not"])
+def test_filter_unsupported_operator_raises(method):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        with pytest.raises(NotImplementedError):
+            table.new_read_builder().with_filter(
+                {"method": method, "field": "name", "literals": ["x"]})
+
+
+def test_filter_unsupported_operator_precedes_shape_errors():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        # 'not' with no field -> NotImplementedError, not ValueError about missing field
+        with pytest.raises(NotImplementedError):
+            b.with_filter({"method": "not", "children": []})
+        # 'like' with unknown field -> NotImplementedError, not ValueError about unknown field
+        with pytest.raises(NotImplementedError):
+            b.with_filter({"method": "like", "field": "nope", "literals": ["x"]})
+
+
+def test_filter_unsupported_type_raises():
+    # Build a table with a timestamp column, filter on it -> NotImplementedError
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.tdb")
+        ctx.sql("CREATE TABLE paimon.tdb.tt (id INT, created_at TIMESTAMP)")
+        ctx.sql("INSERT INTO paimon.tdb.tt VALUES (1, TIMESTAMP '2024-01-01 00:00:00')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.tt")
+        with pytest.raises(NotImplementedError):
+            table.new_read_builder().with_filter(
+                {"method": "equal", "field": "created_at", "literals": [0]})
+
+
+def test_filter_unknown_field_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_filter(
+                {"method": "equal", "field": "nope", "literals": [1]})
+
+
+def test_filter_type_mismatch_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "equal", "field": "id", "literals": [True]})
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "equal", "field": "id", "literals": ["x"]})
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "equal", "field": "id", "literals": [None]})
+
+
+def test_filter_out_of_range_raises():
+    # needs a TinyInt column
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.ndb")
+        ctx.sql("CREATE TABLE paimon.ndb.nt (id INT, small TINYINT)")
+        ctx.sql("INSERT INTO paimon.ndb.nt VALUES (1, 5)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("ndb.nt")
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_filter(
+                {"method": "equal", "field": "small", "literals": [9999]})
+
+
+def test_filter_wrong_literal_count_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "equal", "field": "id", "literals": [1, 2]})
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "in", "field": "id", "literals": []})
+
+
+def test_filter_compound_with_unsupported_child_fails():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        pred = {"method": "and", "children": [
+            {"method": "equal", "field": "id", "literals": [1]},
+            {"method": "like", "field": "name", "literals": ["a%"]},
+        ]}
+        with pytest.raises(NotImplementedError):
+            table.new_read_builder().with_filter(pred)
+
+
+def test_filter_empty_children_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_filter({"method": "and", "children": []})
+
+
+def test_filter_overwrite():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_partitioned_table(warehouse)
+        only_p2 = len(table.new_read_builder().with_filter(
+            {"method": "equal", "field": "dt", "literals": ["p2"]}).new_scan().plan().splits())
+        overwritten = len(table.new_read_builder()
+            .with_filter({"method": "equal", "field": "dt", "literals": ["p1"]})
+            .with_filter({"method": "equal", "field": "dt", "literals": ["p2"]})
+            .new_scan().plan().splits())
+        assert overwritten == only_p2
