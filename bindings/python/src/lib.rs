@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 mod blob;
 mod context;
 mod error;
+mod read;
 mod schema;
 mod table;
 mod udf;

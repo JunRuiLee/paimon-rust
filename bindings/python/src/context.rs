@@ -269,6 +269,10 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     let this = PyModule::new(py, "datafusion")?;
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
+    this.add_class::<crate::read::PyReadBuilder>()?;
+    this.add_class::<crate::read::PyTableScan>()?;
+    this.add_class::<crate::read::PyPlan>()?;
+    this.add_class::<crate::read::PySplit>()?;
     this.add_class::<crate::schema::PyTableSchema>()?;
     this.add_class::<crate::schema::PyDataField>()?;
     this.add_class::<PyPythonScalarUDFObject>()?;

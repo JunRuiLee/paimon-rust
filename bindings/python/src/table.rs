@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
+use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
@@ -45,5 +46,10 @@ impl PyTable {
 
     fn schema(&self) -> PyTableSchema {
         PyTableSchema::new(self.inner.schema().clone())
+    }
+
+    /// Create a [`PyReadBuilder`] for DataFrame-style scan planning.
+    fn new_read_builder(&self) -> PyReadBuilder {
+        PyReadBuilder::new(Arc::clone(&self.inner))
     }
 }
