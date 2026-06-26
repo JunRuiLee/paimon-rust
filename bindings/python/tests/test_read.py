@@ -15,7 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import os
 import tempfile
 
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
@@ -39,3 +38,39 @@ def test_read_builder_chain_exists():
         # plan() returns a Plan; deeper assertions are in later tasks.
         plan = scan.plan()
         assert plan is not None
+
+
+def test_new_read_builder_plan():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        plan = table.new_read_builder().new_scan().plan()
+        assert len(plan.splits()) >= 1
+
+
+def test_with_projection():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        plan = table.new_read_builder().with_projection(["id"]).new_scan().plan()
+        assert plan is not None
+
+
+def test_with_limit():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        # limit is a planning hint; assert only that planning succeeds.
+        plan = table.new_read_builder().with_limit(1).new_scan().plan()
+        assert plan is not None
+
+
+def test_plan_len():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        plan = table.new_read_builder().new_scan().plan()
+        assert len(plan) == len(plan.splits())
+
+
+def test_plan_without_filter_succeeds():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        plan = table.new_read_builder().new_scan().plan()
+        assert len(plan.splits()) >= 1
