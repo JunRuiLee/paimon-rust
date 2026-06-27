@@ -27,7 +27,7 @@ use crate::table::{
     CommitMessage, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
 use crate::{Error, Result};
-use arrow_array::{Array, Float32Array, Int64Array, ListArray, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use std::collections::HashMap;
@@ -652,14 +652,11 @@ fn extract_vectors_from_batches(
         let column = batch.column(vector_index);
         enum VectorLayout<'a> {
             List(&'a ListArray),
-            Fixed(&'a arrow_array::FixedSizeListArray),
+            Fixed(&'a FixedSizeListArray),
         }
         let layout = if let Some(a) = column.as_any().downcast_ref::<ListArray>() {
             VectorLayout::List(a)
-        } else if let Some(a) = column
-            .as_any()
-            .downcast_ref::<arrow_array::FixedSizeListArray>()
-        {
+        } else if let Some(a) = column.as_any().downcast_ref::<FixedSizeListArray>() {
             VectorLayout::Fixed(a)
         } else {
             return Err(Error::DataInvalid {
@@ -892,9 +889,7 @@ mod tests {
         ArrayType, DoubleType, FloatType, IntType, ManifestEntry, Schema, TableSchema, VectorType,
     };
     use crate::table::TableWrite;
-    use arrow_array::builder::{
-        FixedSizeListBuilder, Float32Builder, Int64Builder, ListBuilder,
-    };
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, Int64Builder, ListBuilder};
     use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};
@@ -1126,7 +1121,9 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+            ),
         );
         assert!(validate_vector_field(&field).is_ok());
     }
@@ -1136,7 +1133,9 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 4, DataType::Double(DoubleType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 4, DataType::Double(DoubleType::new())).unwrap(),
+            ),
         );
         let err = validate_vector_field(&field).expect_err("VECTOR<DOUBLE> must be rejected");
         assert!(matches!(err, Error::DataInvalid { .. }));
@@ -1147,10 +1146,15 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap(),
+            ),
         );
         let opts = effective_lumina_options(&field, HashMap::new()).unwrap();
-        assert_eq!(opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str), Some("256"));
+        assert_eq!(
+            opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str),
+            Some("256")
+        );
     }
 
     #[test]
@@ -1158,11 +1162,16 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap(),
+            ),
         );
         let resolved = HashMap::from([(LUMINA_DIMENSION_OPTION.to_string(), "256".to_string())]);
         let opts = effective_lumina_options(&field, resolved).unwrap();
-        assert_eq!(opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str), Some("256"));
+        assert_eq!(
+            opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str),
+            Some("256")
+        );
     }
 
     #[test]
@@ -1170,11 +1179,13 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap(),
+            ),
         );
         let resolved = HashMap::from([(LUMINA_DIMENSION_OPTION.to_string(), "128".to_string())]);
-        let err = effective_lumina_options(&field, resolved)
-            .expect_err("dimension mismatch must error");
+        let err =
+            effective_lumina_options(&field, resolved).expect_err("dimension mismatch must error");
         assert!(matches!(err, Error::ConfigInvalid { .. }));
     }
 
@@ -1196,15 +1207,22 @@ mod tests {
         let field = DataField::new(
             0,
             "embedding".to_string(),
-            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+            DataType::Vector(
+                VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap(),
+            ),
         );
         // No lumina.index.dimension set by the user.
         let resolved = effective_lumina_options(&field, HashMap::new()).unwrap();
         let opts = LuminaVectorIndexOptions::new(&resolved).unwrap();
 
-        assert_eq!(opts.dimension, 256, "local dimension must be N, not default 128");
         assert_eq!(
-            opts.to_lumina_options().get(KEY_DIMENSION).map(String::as_str),
+            opts.dimension, 256,
+            "local dimension must be N, not default 128"
+        );
+        assert_eq!(
+            opts.to_lumina_options()
+                .get(KEY_DIMENSION)
+                .map(String::as_str),
             Some("256"),
             "native index.dimension must be N, not default 128"
         );
@@ -1454,7 +1472,9 @@ mod tests {
         let batch = fixed_size_vector_batch(vec![None], vec![Some(0)], 2);
         let err = extract_vectors_from_batches(&[batch], "embedding", 2, 0, 1)
             .expect_err("null vector should fail");
-        assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("null vector")));
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("null vector"))
+        );
     }
 
     #[test]
@@ -1463,7 +1483,46 @@ mod tests {
         let batch = fixed_size_vector_batch(vec![Some(vec![1.0, 2.0, 3.0])], vec![Some(0)], 3);
         let err = extract_vectors_from_batches(&[batch], "embedding", 2, 0, 1)
             .expect_err("dimension mismatch should fail");
-        assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("dimension mismatch")));
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("dimension mismatch"))
+        );
+    }
+
+    #[test]
+    fn test_extract_vectors_fixed_size_list_rejects_null_element() {
+        // A non-null vector row whose second child element is null. Mirrors the
+        // List path's test_extract_vectors_rejects_null_element so both layouts
+        // reject null elements identically.
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut builder =
+            FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
+        builder.values().append_value(1.0);
+        builder.values().append_null();
+        builder.append(true);
+        let row_ids = Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(builder.finish()) as ArrayRef, row_ids],
+        )
+        .unwrap();
+
+        let err = extract_vectors_from_batches(&[batch], "embedding", 2, 0, 1)
+            .expect_err("null element should fail");
+
+        assert!(
+            matches!(err, Error::DataInvalid { message, .. } if message.contains("null vector element"))
+        );
     }
 
     #[test]
