@@ -94,6 +94,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
 
         let resolved_options =
             resolve_lumina_options(self.table.schema().options(), &self.options)?;
+        let resolved_options = effective_lumina_options(index_field, resolved_options)?;
         let lumina_options = LuminaVectorIndexOptions::new(&resolved_options)?;
         let dimension = lumina_options.dimension;
         let index_meta = LuminaIndexMeta::new(lumina_options.to_lumina_options()).serialize()?;
@@ -308,6 +309,41 @@ fn validate_vector_field(field: &DataField) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// For a `VECTOR<FLOAT, N>` column, ensure the effective Lumina options carry
+/// `lumina.index.dimension = N`, so the native options and serialized index
+/// metadata match the column type. Absent → inject N; present-and-equal → keep;
+/// present-and-different → ConfigInvalid. Non-vector columns (e.g. ARRAY<FLOAT>)
+/// are returned unchanged so the existing option/default behavior is preserved.
+fn effective_lumina_options(
+    field: &DataField,
+    mut resolved: HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let DataType::Vector(vector) = field.data_type() else {
+        return Ok(resolved);
+    };
+    let n = vector.length().to_string();
+    match resolved.get(crate::lumina::LUMINA_DIMENSION_OPTION) {
+        None => {
+            resolved.insert(crate::lumina::LUMINA_DIMENSION_OPTION.to_string(), n);
+        }
+        Some(existing) if *existing == n => {}
+        Some(existing) => {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "Vector column '{}' has dimension {} from its type, but '{}' is set to '{}'. \
+                     Remove the option or set it to {}.",
+                    field.name(),
+                    n,
+                    crate::lumina::LUMINA_DIMENSION_OPTION,
+                    existing,
+                    n
+                ),
+            });
+        }
+    }
+    Ok(resolved)
 }
 
 fn resolve_lumina_options(
@@ -850,6 +886,7 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIO;
     use crate::io::FileIOBuilder;
+    use crate::lumina::LUMINA_DIMENSION_OPTION;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
         ArrayType, DoubleType, FloatType, IntType, ManifestEntry, Schema, TableSchema, VectorType,
@@ -1103,6 +1140,54 @@ mod tests {
         );
         let err = validate_vector_field(&field).expect_err("VECTOR<DOUBLE> must be rejected");
         assert!(matches!(err, Error::DataInvalid { .. }));
+    }
+
+    #[test]
+    fn test_effective_options_vector_absent_inserts_length() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+        );
+        let opts = effective_lumina_options(&field, HashMap::new()).unwrap();
+        assert_eq!(opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str), Some("256"));
+    }
+
+    #[test]
+    fn test_effective_options_vector_matching_option_ok() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+        );
+        let resolved = HashMap::from([(LUMINA_DIMENSION_OPTION.to_string(), "256".to_string())]);
+        let opts = effective_lumina_options(&field, resolved).unwrap();
+        assert_eq!(opts.get(LUMINA_DIMENSION_OPTION).map(String::as_str), Some("256"));
+    }
+
+    #[test]
+    fn test_effective_options_vector_mismatch_errors() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+        );
+        let resolved = HashMap::from([(LUMINA_DIMENSION_OPTION.to_string(), "128".to_string())]);
+        let err = effective_lumina_options(&field, resolved)
+            .expect_err("dimension mismatch must error");
+        assert!(matches!(err, Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn test_effective_options_array_unchanged() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        );
+        // No dimension option set: array path must NOT inject one.
+        let opts = effective_lumina_options(&field, HashMap::new()).unwrap();
+        assert!(opts.get(LUMINA_DIMENSION_OPTION).is_none());
     }
 
     #[tokio::test]
