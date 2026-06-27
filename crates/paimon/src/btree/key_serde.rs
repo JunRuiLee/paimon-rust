@@ -109,12 +109,6 @@ pub fn make_key_comparator(data_type: &DataType) -> KeyComparator {
             let bv = i64::from_le_bytes(b[..8].try_into().unwrap());
             av.cmp(&bv)
         }),
-        // VECTOR is not a valid key type. Fail loudly rather than letting it fall
-        // into the lexicographic byte comparator below, which would silently sort
-        // vectors incorrectly.
-        DataType::Vector(_) => {
-            panic!("VECTOR columns are not supported as BTree keys")
-        }
         // String, VarChar, Char, Bytes — lexicographic
         _ => Box::new(|a: &[u8], b: &[u8]| a.cmp(b)),
     }
