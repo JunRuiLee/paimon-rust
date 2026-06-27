@@ -289,13 +289,18 @@ fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField>
 }
 
 fn validate_vector_field(field: &DataField) -> Result<()> {
-    if !matches!(
+    let is_array_float = matches!(
         field.data_type(),
         DataType::Array(array) if matches!(array.element_type(), DataType::Float(_))
-    ) {
+    );
+    let is_vector_float = matches!(
+        field.data_type(),
+        DataType::Vector(vector) if matches!(vector.element_type(), DataType::Float(_))
+    );
+    if !is_array_float && !is_vector_float {
         return Err(Error::DataInvalid {
             message: format!(
-                "Lumina index requires ARRAY<FLOAT> column, got {:?} for column '{}'",
+                "Lumina index requires ARRAY<FLOAT> or VECTOR<FLOAT> column, got {:?} for column '{}'",
                 field.data_type(),
                 field.name()
             ),
@@ -820,7 +825,9 @@ mod tests {
     use crate::io::FileIO;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{ArrayType, FloatType, IntType, ManifestEntry, Schema, TableSchema};
+    use crate::spec::{
+        ArrayType, DoubleType, FloatType, IntType, ManifestEntry, Schema, TableSchema, VectorType,
+    };
     use crate::table::TableWrite;
     use arrow_array::builder::{Float32Builder, Int64Builder, ListBuilder};
     use arrow_array::{ArrayRef, Int32Array};
@@ -1037,6 +1044,37 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("row-count-per-shard"))
         );
+    }
+
+    #[test]
+    fn test_validate_vector_field_accepts_array_float() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        );
+        assert!(validate_vector_field(&field).is_ok());
+    }
+
+    #[test]
+    fn test_validate_vector_field_accepts_vector_float() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap()),
+        );
+        assert!(validate_vector_field(&field).is_ok());
+    }
+
+    #[test]
+    fn test_validate_vector_field_rejects_vector_double() {
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 4, DataType::Double(DoubleType::new())).unwrap()),
+        );
+        let err = validate_vector_field(&field).expect_err("VECTOR<DOUBLE> must be rejected");
+        assert!(matches!(err, Error::DataInvalid { .. }));
     }
 
     #[tokio::test]
