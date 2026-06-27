@@ -1187,7 +1187,27 @@ mod tests {
         );
         // No dimension option set: array path must NOT inject one.
         let opts = effective_lumina_options(&field, HashMap::new()).unwrap();
-        assert!(opts.get(LUMINA_DIMENSION_OPTION).is_none());
+        assert!(!opts.contains_key(LUMINA_DIMENSION_OPTION));
+    }
+
+    #[test]
+    fn test_vector_without_option_propagates_dimension_to_native_options() {
+        use crate::lumina::{LuminaVectorIndexOptions, KEY_DIMENSION};
+        let field = DataField::new(
+            0,
+            "embedding".to_string(),
+            DataType::Vector(VectorType::try_new(true, 256, DataType::Float(FloatType::new())).unwrap()),
+        );
+        // No lumina.index.dimension set by the user.
+        let resolved = effective_lumina_options(&field, HashMap::new()).unwrap();
+        let opts = LuminaVectorIndexOptions::new(&resolved).unwrap();
+
+        assert_eq!(opts.dimension, 256, "local dimension must be N, not default 128");
+        assert_eq!(
+            opts.to_lumina_options().get(KEY_DIMENSION).map(String::as_str),
+            Some("256"),
+            "native index.dimension must be N, not default 128"
+        );
     }
 
     #[tokio::test]
