@@ -111,6 +111,23 @@ def test_write_arrow_type_mismatch_raises():
             write.write_arrow(bad)
 
 
+def test_write_arrow_binary_family_mismatch_raises():
+    # A BINARY column requires Arrow `binary`; a near-equivalent `large_binary`
+    # must be rejected at validation (it would otherwise fail deeper, since the
+    # write path downcasts binary fields to arrow_array::BinaryArray only).
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.wdb")
+        ctx.sql("CREATE TABLE paimon.wdb.bt (id INT, data BINARY)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("wdb.bt")
+        write = table.new_write_builder().new_write()
+        schema = pa.schema([("id", pa.int32()), ("data", pa.large_binary())])
+        bad = pa.record_batch([[1], [b"x"]], schema=schema)
+        with pytest.raises(ValueError):
+            write.write_arrow(bad)
+
+
 def test_commit_non_message_raises_typeerror():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_empty_table(warehouse)

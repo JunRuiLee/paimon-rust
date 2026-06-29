@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
@@ -27,13 +27,18 @@ use pyo3::prelude::*;
 
 use crate::error::to_py_err;
 
-/// Validate an incoming batch schema against the table's target Arrow schema,
-/// replicating pypaimon's `_validate_pyarrow_schema` semantics (minus the
-/// projection-write branch PR1 lacks): field count, order, and names must match;
-/// types must match field-by-field, tolerating binary-family interchange
-/// (Binary / LargeBinary / FixedSizeBinary). The nullable flag is intentionally
-/// NOT compared, since `build_target_arrow_schema` derives nullability from the
-/// Paimon field while pyarrow-constructed batches infer nullable=true. No cast.
+/// Validate an incoming batch schema against the table's target Arrow schema:
+/// field count, order, and names must match, and types must match exactly. The
+/// nullable flag is intentionally NOT compared, since `build_target_arrow_schema`
+/// derives nullability from the Paimon field while pyarrow-constructed batches
+/// infer nullable=true. No cast — callers supply correctly-typed batches.
+///
+/// Type matching is strict (no binary-family interchange): the lower write path
+/// downcasts to the exact Arrow array for each Paimon type (e.g. a `Binary` /
+/// `VarBinary` field requires `arrow_array::BinaryArray`, not `LargeBinary` /
+/// `FixedSizeBinary`). Accepting a near-equivalent type here would pass
+/// validation but then fail deeper with a type-mismatch (or write files whose
+/// Arrow schema differs from the table), so it is rejected up front.
 fn validate_batch_schema(input: &ArrowSchema, target: &ArrowSchema) -> PyResult<()> {
     let mismatch = || {
         PyValueError::new_err(format!(
@@ -48,20 +53,11 @@ fn validate_batch_schema(input: &ArrowSchema, target: &ArrowSchema) -> PyResult<
         if i.name() != t.name() {
             return Err(mismatch());
         }
-        if i.data_type() != t.data_type()
-            && !(is_binary_family(i.data_type()) && is_binary_family(t.data_type()))
-        {
+        if i.data_type() != t.data_type() {
             return Err(mismatch());
         }
     }
     Ok(())
-}
-
-fn is_binary_family(t: &ArrowDataType) -> bool {
-    matches!(
-        t,
-        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_)
-    )
 }
 
 /// Builder for the batch write loop, created via [`crate::table::PyTable::new_write_builder`].
