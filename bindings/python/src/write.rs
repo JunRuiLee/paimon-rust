@@ -95,6 +95,7 @@ impl PyWriteBuilder {
             inner: builder.new_write().map_err(to_py_err)?,
             target_schema,
             table_location: self.table.location().to_string(),
+            commit_user: self.commit_user.clone(),
         })
     }
 
@@ -108,6 +109,7 @@ impl PyWriteBuilder {
         Ok(PyTableCommit {
             inner: builder.new_commit(),
             table_location: self.table.location().to_string(),
+            commit_user: self.commit_user.clone(),
         })
     }
 }
@@ -124,6 +126,11 @@ pub struct PyTableWrite {
     /// The owning table's location, stamped onto produced commit messages so a
     /// committer can reject messages prepared for a different table.
     table_location: String,
+    /// The originating builder's `commit_user`, stamped onto produced messages so
+    /// a committer can reject messages prepared by a different `WriteBuilder`
+    /// (writers and committers from the same builder must share one commit_user;
+    /// it drives snapshot duplicate detection and postpone-bucket file naming).
+    commit_user: String,
 }
 
 #[pymethods]
@@ -148,6 +155,7 @@ impl PyTableWrite {
             .map(|inner| PyCommitMessage {
                 inner,
                 table_location: self.table_location.clone(),
+                commit_user: self.commit_user.clone(),
             })
             .collect())
     }
@@ -161,6 +169,10 @@ pub struct PyTableCommit {
     /// prepared for a different table (which would otherwise persist a snapshot
     /// referencing data files written under another table).
     table_location: String,
+    /// The committer's `commit_user`, used to reject messages prepared by a
+    /// different `WriteBuilder` — even for the same table — since the writer and
+    /// committer must share one commit_user.
+    commit_user: String,
 }
 
 #[pymethods]
@@ -183,6 +195,14 @@ impl PyTableCommit {
                     msg.table_location, self.table_location
                 )));
             }
+            if msg.commit_user != self.commit_user {
+                return Err(PyValueError::new_err(
+                    "commit message was prepared by a different WriteBuilder \
+                     (writer and committer must come from the same \
+                     table.new_write_builder() so they share one commit_user)"
+                        .to_string(),
+                ));
+            }
             inner_messages.push(msg.inner.clone());
         }
         let rt = runtime();
@@ -194,10 +214,12 @@ impl PyTableCommit {
 /// An opaque commit message produced by `prepare_commit`, consumed by `commit`.
 /// PR1 supports same-process transfer only (no pickle/serialization).
 ///
-/// Carries the originating table's location so a committer can reject messages
-/// prepared for a different table.
+/// Carries the originating table's location and builder `commit_user` so a
+/// committer can reject messages prepared for a different table or by a
+/// different `WriteBuilder`.
 #[pyclass(name = "CommitMessage", module = "pypaimon_rust.datafusion")]
 pub struct PyCommitMessage {
     pub(crate) inner: CommitMessage,
     pub(crate) table_location: String,
+    pub(crate) commit_user: String,
 }

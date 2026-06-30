@@ -163,3 +163,17 @@ def test_commit_cross_table_messages_raises():
         with pytest.raises(ValueError):
             t2.new_write_builder().new_commit().commit(messages)
 
+
+def test_commit_different_builder_same_table_raises():
+    # Even for the same table, a committer from a different WriteBuilder must
+    # reject the messages: each builder mints its own commit_user, and writers
+    # and committers must share one (snapshot duplicate detection / postpone
+    # bucket file naming depend on it).
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_empty_table(warehouse)
+        table = _get_table(warehouse)
+        write = table.new_write_builder().new_write()
+        write.write_arrow(_batch([1], ["a"]))
+        messages = write.prepare_commit()
+        with pytest.raises(ValueError):
+            table.new_write_builder().new_commit().commit(messages)
