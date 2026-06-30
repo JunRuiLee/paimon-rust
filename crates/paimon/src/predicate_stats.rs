@@ -67,6 +67,17 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
             // substring matches, so fail open.
             return true;
         }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            return between_may_match(
+                index,
+                stats_data_type,
+                predicate_data_type,
+                op,
+                literals,
+                stats,
+                all_null,
+            );
+        }
         PredicateOperator::Eq
         | PredicateOperator::NotEq
         | PredicateOperator::Lt
@@ -172,7 +183,9 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::In
         | PredicateOperator::NotIn
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => true,
+        | PredicateOperator::Contains
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => true,
     }
 }
 
@@ -219,6 +232,60 @@ pub(crate) fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> 
     }
 
     matches!(op, PredicateOperator::IsNull)
+}
+
+/// Stats-prune `field BETWEEN low AND high` (and its negation) by treating it
+/// as the conjunction `field >= low AND field <= high`:
+/// * `Between` may match iff the file's `[min, max]` overlaps `[low, high]`.
+/// * `NotBetween` may match iff some row could fall outside `[low, high]`,
+///   i.e. unless the file's `[min, max]` is entirely inside `[low, high]`.
+///
+/// All-null files are pruned for both ops (NULL comparisons resolve to NULL,
+/// which the evaluator treats as false).
+fn between_may_match<T: StatsAccessor>(
+    index: usize,
+    stats_data_type: &DataType,
+    predicate_data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+    stats: &T,
+    all_null: Option<bool>,
+) -> bool {
+    if all_null == Some(true) {
+        return false;
+    }
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        return true;
+    };
+    let min_value = match stats
+        .min_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return true,
+    };
+    let max_value = match stats
+        .max_value(index, stats_data_type)
+        .and_then(|datum| coerce_stats_datum_for_predicate(datum, predicate_data_type))
+    {
+        Some(value) => value,
+        None => return true,
+    };
+
+    let max_ge_low = !matches!(max_value.partial_cmp(low), Some(Ordering::Less));
+    let min_le_high = !matches!(min_value.partial_cmp(high), Some(Ordering::Greater));
+    let overlaps = max_ge_low && min_le_high;
+
+    match op {
+        PredicateOperator::Between => overlaps,
+        PredicateOperator::NotBetween => {
+            // Prune only when [min, max] is entirely inside [low, high].
+            let min_ge_low = !matches!(min_value.partial_cmp(low), Some(Ordering::Less));
+            let max_le_high = !matches!(max_value.partial_cmp(high), Some(Ordering::Greater));
+            !(min_ge_low && max_le_high)
+        }
+        _ => unreachable!("between_may_match is only called for Between/NotBetween"),
+    }
 }
 
 fn predicate_may_match_with_schema<T: StatsAccessor>(
@@ -449,4 +516,123 @@ mod tests {
         ));
     }
 
+    fn int_stats(min: i32, max: i32) -> MockStats {
+        MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::Int(min)),
+            max: Some(Datum::Int(max)),
+        }
+    }
+
+    fn run_int(op: PredicateOperator, lits: &[Datum], stats: &MockStats) -> bool {
+        let dt = DataType::Int(IntType::new());
+        data_leaf_may_match(0, &dt, &dt, op, lits, stats)
+    }
+
+    /// Stage 3 invariant: a `Between` leaf and the equivalent `GtEq+LtEq`
+    /// conjunction must produce identical stats-prune verdicts. If they
+    /// diverge, the DataFusion translator switch (And-of-comparisons →
+    /// Between leaf) silently changes pruning behavior in production.
+    #[test]
+    fn between_matches_gteq_lteq_conjunction() {
+        let cases: &[(i32, i32, i32, i32, bool)] = &[
+            // (min, max, low, high, expected_may_match)
+            (0, 100, 50, 60, true),     // overlap inside
+            (0, 100, 200, 300, false),  // entirely above
+            (0, 100, -50, -1, false),   // entirely below
+            (0, 100, 100, 100, true),   // boundary high
+            (0, 100, 0, 0, true),       // boundary low
+            (50, 100, 0, 49, false),    // low < min < high < max impossible — fully below
+            (50, 100, 0, 200, true),    // file fully inside [low, high]
+        ];
+        for &(min, max, low, high, expected) in cases {
+            let stats = int_stats(min, max);
+            let between = run_int(
+                PredicateOperator::Between,
+                &[Datum::Int(low), Datum::Int(high)],
+                &stats,
+            );
+            let gteq = run_int(PredicateOperator::GtEq, &[Datum::Int(low)], &stats);
+            let lteq = run_int(PredicateOperator::LtEq, &[Datum::Int(high)], &stats);
+            assert_eq!(
+                between,
+                gteq && lteq,
+                "Between vs GtEq+LtEq divergence at ({min},{max}) ∩ [{low},{high}]"
+            );
+            assert_eq!(between, expected, "Between unexpected at {min},{max} ∩ [{low},{high}]");
+        }
+    }
+
+    #[test]
+    fn not_between_prunes_only_when_file_fully_inside_range() {
+        // file [10, 20] ⊆ [0, 100] → all rows are within [0, 100], so NOT
+        // BETWEEN can prune.
+        let stats = int_stats(10, 20);
+        assert!(!run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+        // file [0, 100] ⊃ [10, 20] → some rows lie outside, can't prune.
+        let stats = int_stats(0, 100);
+        assert!(run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(10), Datum::Int(20)],
+            &stats,
+        ));
+        // file disjoint with [50, 60] → all rows are outside, can't prune.
+        let stats = int_stats(0, 10);
+        assert!(run_int(
+            PredicateOperator::NotBetween,
+            &[Datum::Int(50), Datum::Int(60)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn between_with_all_null_file_is_pruned() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(10),
+            min: None,
+            max: None,
+        };
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Between,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::NotBetween,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn between_falls_open_when_stats_missing() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: None,
+            max: None,
+        };
+        assert!(data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Between,
+            &[Datum::Int(0), Datum::Int(100)],
+            &stats,
+        ));
+    }
 }

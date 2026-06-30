@@ -227,6 +227,8 @@ pub enum PredicateOperator {
     EndsWith,
     Contains,
     Like,
+    Between,
+    NotBetween,
 }
 
 impl fmt::Display for PredicateOperator {
@@ -246,6 +248,8 @@ impl fmt::Display for PredicateOperator {
             Self::EndsWith => write!(f, "ENDS_WITH"),
             Self::Contains => write!(f, "CONTAINS"),
             Self::Like => write!(f, "LIKE"),
+            Self::Between => write!(f, "BETWEEN"),
+            Self::NotBetween => write!(f, "NOT BETWEEN"),
         }
     }
 }
@@ -724,6 +728,33 @@ impl PredicateBuilder {
         }
     }
 
+    // -- range operators --
+
+    /// `field BETWEEN low AND high`. SQL semantics: inclusive on both ends.
+    /// `low > high` short-circuits to [`Predicate::AlwaysFalse`] (no value can
+    /// be between an empty range).
+    pub fn between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
+        if Self::low_strictly_above_high(&low, &high) {
+            return Ok(Predicate::AlwaysFalse);
+        }
+        self.leaf(field, PredicateOperator::Between, vec![low, high])
+    }
+
+    /// `field NOT BETWEEN low AND high`. SQL three-valued logic: NULL value
+    /// → NULL → treated as false, matching the existing `NotEq` evaluator.
+    /// `low > high` short-circuits to `IsNotNull(field)` (every non-null value
+    /// is "not between" an empty range).
+    pub fn not_between(&self, field: &str, low: Datum, high: Datum) -> Result<Predicate> {
+        if Self::low_strictly_above_high(&low, &high) {
+            return self.is_not_null(field);
+        }
+        self.leaf(field, PredicateOperator::NotBetween, vec![low, high])
+    }
+
+    fn low_strictly_above_high(low: &Datum, high: &Datum) -> bool {
+        matches!(datum_cmp(low, high), Some(Ordering::Greater))
+    }
+
     /// Shared body for the three string operators: empty-string short-circuit
     /// and literal-type guard ([`leaf`] still cross-checks against the column
     /// type, so non-string columns are rejected there).
@@ -803,6 +834,7 @@ impl PredicateBuilder {
                     message: format!("{op} expects at least 1 literal, got 0"),
                 });
             }
+            PredicateOperator::Between | PredicateOperator::NotBetween => (2, literals.len()),
             _ => (1, literals.len()),
         };
         if actual != expected {
@@ -1046,6 +1078,8 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                         "LIKE must have Datum::String value and literal (validated by builder)"
                     ),
                 },
+                PredicateOperator::Between => eval_between(val, literals),
+                PredicateOperator::NotBetween => !eval_between(val, literals),
                 // IsNull/IsNotNull are handled in the outer match above.
                 PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
             }
@@ -1179,6 +1213,30 @@ fn like_match_chars(value: &[char], mut vi: usize, pattern: &[char], mut pi: usi
         }
     }
     vi == value.len()
+}
+
+// ---------------------------------------------------------------------------
+// BETWEEN evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate `value BETWEEN low AND high` (inclusive). `NotBetween` is the
+/// boolean complement at the call site, which is correct for non-null
+/// `value` — null handling already short-circuits in the outer `eval_leaf`.
+/// Returns `false` when either comparison is incomparable (defensive: the
+/// builder validates types up front, so this is unreachable in practice).
+fn eval_between(value: &Datum, literals: &[Datum]) -> bool {
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        unreachable!("BETWEEN must have 2 literals (validated by builder)");
+    };
+    let above_low = matches!(
+        datum_cmp(value, low),
+        Some(Ordering::Greater | Ordering::Equal)
+    );
+    let below_high = matches!(
+        datum_cmp(value, high),
+        Some(Ordering::Less | Ordering::Equal)
+    );
+    above_low && below_high
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,4 +2438,88 @@ mod tests {
         assert!(!super::like_match("a", ""));
     }
 
+    // ======================== BETWEEN / NOT BETWEEN ========================
+
+    #[test]
+    fn test_builder_between_keeps_inclusive_range() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb.between("id", Datum::Int(1), Datum::Int(10)).unwrap();
+        match &pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, PredicateOperator::Between);
+                assert_eq!(literals, &[Datum::Int(1), Datum::Int(10)]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_between_low_above_high_short_circuits_to_always_false() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb.between("id", Datum::Int(10), Datum::Int(1)).unwrap();
+        assert!(matches!(pred, Predicate::AlwaysFalse));
+    }
+
+    #[test]
+    fn test_builder_not_between_low_above_high_short_circuits_to_is_not_null() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .not_between("id", Datum::Int(10), Datum::Int(1))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::IsNotNull),
+            other => panic!("expected IsNotNull leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_between_rejects_type_mismatch() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `id` is Int — String literal violates leaf() type cross-check.
+        assert!(pb
+            .between("id", Datum::String("a".to_string()), Datum::Int(10))
+            .is_err());
+    }
+
+    #[test]
+    fn test_eval_between_inclusive() {
+        let lits = [Datum::Int(5), Datum::Int(10)];
+        for v in [5, 7, 10] {
+            assert!(eval_leaf(
+                PredicateOperator::Between,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        for v in [4, 11] {
+            assert!(!eval_leaf(
+                PredicateOperator::Between,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        // NULL value → false.
+        assert!(!eval_leaf(PredicateOperator::Between, None, &lits));
+    }
+
+    #[test]
+    fn test_eval_not_between_complement_with_null_false() {
+        let lits = [Datum::Int(5), Datum::Int(10)];
+        for v in [4, 11] {
+            assert!(eval_leaf(
+                PredicateOperator::NotBetween,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        for v in [5, 7, 10] {
+            assert!(!eval_leaf(
+                PredicateOperator::NotBetween,
+                Some(&Datum::Int(v)),
+                &lits,
+            ));
+        }
+        // NULL value → false (matches existing NotEq null-semantics).
+        assert!(!eval_leaf(PredicateOperator::NotBetween, None, &lits));
+    }
 }

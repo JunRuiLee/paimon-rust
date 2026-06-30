@@ -253,21 +253,18 @@ impl<'a> FilterTranslator<'a> {
             field.data_type(),
         )?;
 
-        let predicate = Predicate::and(vec![
-            self.predicate_builder
-                .greater_or_equal(field.name(), low)
-                .ok()?,
-            self.predicate_builder
-                .less_or_equal(field.name(), high)
-                .ok()?,
-        ]);
-
+        // Native Between / NotBetween leaf: lets the planner / b-tree
+        // recognize the range as a single op (see `btree::query::extract_between`).
+        // NotBetween is safe to push because its evaluator, stats prune and
+        // Parquet row filter all treat a NULL operand as non-matching (SQL
+        // three-valued logic), and a data-column range stays Inexact so
+        // DataFusion keeps the residual filter.
         if between.negated {
-            // Same concern as Expr::Not: negation wraps in Predicate::Not
-            // which has incorrect NULL semantics for Exact pushdown.
-            None
+            self.predicate_builder
+                .not_between(field.name(), low, high)
+                .ok()
         } else {
-            Some(predicate)
+            self.predicate_builder.between(field.name(), low, high).ok()
         }
     }
 
@@ -639,22 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_negated_between_is_not_supported() {
-        let fields = test_fields();
-        let filter = Expr::Between(Between::new(
-            Box::new(Expr::Column(Column::from_name("hr"))),
-            true, // negated
-            Box::new(lit(1)),
-            Box::new(lit(20)),
-        ));
-
-        assert!(
-            build_pushed_predicate(&[filter], &fields).is_none(),
-            "Negated BETWEEN should not translate due to NULL semantics"
-        );
-    }
-
-    #[test]
     fn test_translate_boolean_literal_is_not_supported() {
         let fields = test_fields();
 
@@ -829,4 +810,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_translate_between_produces_native_between_leaf() {
+        let fields = test_fields();
+        let filter = Expr::Between(Between::new(
+            Box::new(Expr::Column(Column::from_name("hr"))),
+            false,
+            Box::new(lit(1)),
+            Box::new(lit(20)),
+        ));
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("BETWEEN should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Between);
+                assert_eq!(literals, vec![Datum::Int(1), Datum::Int(20)]);
+            }
+            other => panic!(
+                "expected native Between leaf, got {other:?} (Stage 3 must not produce \
+                 the legacy GtEq+LtEq And shape)"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_translate_not_between_produces_native_not_between_leaf() {
+        let fields = test_fields();
+        let filter = Expr::Between(Between::new(
+            Box::new(Expr::Column(Column::from_name("hr"))),
+            true,
+            Box::new(lit(1)),
+            Box::new(lit(20)),
+        ));
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("NOT BETWEEN should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::NotBetween);
+                assert_eq!(literals, vec![Datum::Int(1), Datum::Int(20)]);
+            }
+            other => panic!("expected native NotBetween leaf, got {other:?}"),
+        }
+    }
 }

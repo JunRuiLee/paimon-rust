@@ -551,7 +551,9 @@ fn evaluate_arrow_leaf_predicate(
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
-        | PredicateOperator::Like => Ok(None),
+        | PredicateOperator::Like
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(None),
     }
 }
 
@@ -623,7 +625,9 @@ fn evaluate_column_predicate(
         | PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
-        | PredicateOperator::Like => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::Like
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
 }
 

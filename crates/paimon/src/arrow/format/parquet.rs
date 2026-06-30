@@ -295,6 +295,8 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::EndsWith
             | PredicateOperator::Contains
             | PredicateOperator::Like
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
     )
 }
 
@@ -338,6 +340,17 @@ fn parquet_row_filter_literals_supported(
                 return Ok(false);
             };
             Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
+        }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            if literals.len() != 2 {
+                return Ok(false);
+            }
+            for literal in literals {
+                if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
 }
@@ -394,7 +407,46 @@ fn evaluate_exact_leaf_predicate(
             let result = evaluate_column_predicate(array, &scalar, op)?;
             Ok(sanitize_filter_mask(result))
         }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            evaluate_between_predicate(array, data_type, op, literals)
+        }
     }
+}
+
+/// `Between` / `NotBetween` translate to `gt_eq(col, low) & lt_eq(col, high)`
+/// (and its negation). `arrow_ord::cmp` produces nullable masks: any null
+/// row makes the comparison null, so a fully-built `Between` mask preserves
+/// nulls. `NotBetween` then negates valid rows and leaves nulls null —
+/// matching SQL three-valued logic; `sanitize_filter_mask` collapses nulls
+/// into `false` to match the predicate evaluator's "NULL → false" rule.
+fn evaluate_between_predicate(
+    array: &ArrayRef,
+    data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> Result<BooleanArray, ArrowError> {
+    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(low_scalar) = literal_scalar_for_parquet_filter(low, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let Some(high_scalar) = literal_scalar_for_parquet_filter(high, data_type)
+        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
+    else {
+        return Ok(BooleanArray::from(vec![true; array.len()]));
+    };
+    let lo_mask = arrow_gt_eq(array, &low_scalar)?;
+    let hi_mask = arrow_lt_eq(array, &high_scalar)?;
+    let between = arrow_arith::boolean::and_kleene(&lo_mask, &hi_mask)?;
+    let result = match op {
+        PredicateOperator::Between => between,
+        PredicateOperator::NotBetween => arrow_arith::boolean::not(&between)?,
+        _ => unreachable!(),
+    };
+    Ok(sanitize_filter_mask(result))
 }
 
 fn evaluate_set_membership_predicate(
@@ -467,7 +519,9 @@ fn evaluate_column_predicate(
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::NotIn
+        | PredicateOperator::Between
+        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
 }
 
@@ -1353,6 +1407,47 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("100%"), Some("1000"), None]));
         let mask = run_string_op(super::PredicateOperator::Like, arr, r"100\%");
         let expected = arrow_array::BooleanArray::from(vec![true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // BETWEEN / NOT BETWEEN row-filter tests
+    // -----------------------------------------------------------------------
+
+    fn run_between(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        low: i32,
+        high: i32,
+    ) -> arrow_array::BooleanArray {
+        let dt = DataType::Int(IntType::new());
+        super::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::Int(low), Datum::Int(high)],
+        )
+        .expect("BETWEEN should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_between_int_array() {
+        let arr: arrow_array::ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let mask = run_between(super::PredicateOperator::Between, arr, 5, 10);
+        let expected =
+            arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_not_between_treats_null_as_false() {
+        let arr: arrow_array::ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let mask = run_between(super::PredicateOperator::NotBetween, arr, 5, 10);
+        // NULL → false (residual filter convention; matches sanitize_filter_mask).
+        let expected =
+            arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
         assert_eq!(mask, expected);
     }
 
