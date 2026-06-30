@@ -33,8 +33,23 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Whether a file name denotes a dedicated vector-store file (`*.vector.<format>`).
+/// Mirrors upstream `VectorType.isVectorStoreFile`: the name contains `.vector.`.
+fn is_vector_store_file_name(file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().contains(".vector.")
+}
+
 /// Whether the files in a split can be read independently (no column-wise merge needed).
 fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
+    // A split containing a dedicated vector file must go through the column-merge
+    // path so vector columns are routed to their VectorFile source. Check this
+    // BEFORE the single-file early-return.
+    if files
+        .iter()
+        .any(|f| is_vector_store_file_name(&f.file_name))
+    {
+        return false;
+    }
     if files.len() <= 1 {
         return true;
     }
@@ -500,6 +515,9 @@ fn open_source_stream(
     match source {
         FieldSource::DataFile {
             file, data_fields, ..
+        }
+        | FieldSource::VectorFile {
+            file, data_fields, ..
         } => file_reader.read_single_file_stream(
             split,
             file.as_ref().clone(),
@@ -552,11 +570,13 @@ impl PreparedMergeGroup {
 
         let data_files: Vec<&DataFileMeta> = files
             .iter()
-            .filter(|file| !is_blob_file_name(&file.file_name))
+            .filter(|file| {
+                !is_blob_file_name(&file.file_name) && !is_vector_store_file_name(&file.file_name)
+            })
             .collect();
         if data_files.is_empty() {
             return Err(Error::DataInvalid {
-                message: "Field merge split containing .blob files requires at least one non-blob data file".to_string(),
+                message: "Field merge split with .blob/.vector. files requires at least one normal data file".to_string(),
                 source: None,
             });
         }
@@ -655,7 +675,8 @@ fn build_source_plan(
     blob_descriptor_fields: &HashSet<String>,
 ) -> crate::Result<SourcePlan> {
     let mut sources = Vec::new();
-    let mut normal_source_indices: HashMap<usize, usize> = HashMap::new();
+    let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
+    let mut vector_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
     let mut blob_source_indices: HashMap<i32, usize> = HashMap::new();
     let mut expected_blob_row_count: Option<i64> = None;
 
@@ -688,6 +709,26 @@ fn build_source_plan(
                 .blob_bunch_mut()
                 .unwrap()
                 .add(file.clone())?;
+        } else if is_vector_store_file_name(&file.file_name) {
+            // A vector file is a column provider only; unlike a normal data file it does
+            // NOT update `expected_blob_row_count` (it must not anchor a following blob's
+            // row count).
+            let source_idx = sources.len();
+            sources.push(FieldSource::VectorFile {
+                file: Box::new(file.clone()),
+                data_fields: info.data_fields.clone(),
+                read_fields: Vec::new(),
+            });
+            for &field_id in &info.field_ids {
+                if vector_providers.insert(field_id, source_idx).is_some() {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Vector field id {field_id} is provided by more than one .vector. file"
+                        ),
+                        source: None,
+                    });
+                }
+            }
         } else {
             expected_blob_row_count = Some(file.row_count);
             let source_idx = sources.len();
@@ -696,7 +737,10 @@ fn build_source_plan(
                 data_fields: info.data_fields.clone(),
                 read_fields: Vec::new(),
             });
-            normal_source_indices.insert(file_idx, source_idx);
+            for &field_id in &info.field_ids {
+                // first normal file that carries the id wins (preserve existing semantics)
+                normal_providers.entry(field_id).or_insert(source_idx);
+            }
         }
     }
 
@@ -706,13 +750,16 @@ fn build_source_plan(
             && !blob_descriptor_fields.contains(field.name())
         {
             blob_source_indices.get(&field.id()).copied()
+        } else if matches!(field.data_type(), DataType::Vector(_)) {
+            // Prefer the dedicated .vector. file; fall back to a normal data file
+            // (PR 2 inline-vector compatibility path).
+            vector_providers
+                .get(&field.id())
+                .copied()
+                .or_else(|| normal_providers.get(&field.id()).copied())
         } else {
-            select_normal_provider(
-                &prepared_group.files,
-                file_infos,
-                &normal_source_indices,
-                field.id(),
-            )
+            // Non-vector fields never read from a .vector. file.
+            normal_providers.get(&field.id()).copied()
         };
 
         if let Some(source_idx) = source_idx {
@@ -747,25 +794,6 @@ fn build_source_plan(
     })
 }
 
-fn select_normal_provider(
-    files: &[DataFileMeta],
-    file_infos: &[ResolvedFileInfo],
-    normal_source_indices: &HashMap<usize, usize>,
-    field_id: i32,
-) -> Option<usize> {
-    files.iter().enumerate().find_map(|(file_idx, file)| {
-        if is_blob_file_name(&file.file_name) {
-            return None;
-        }
-
-        file_infos[file_idx]
-            .field_ids
-            .contains(&field_id)
-            .then(|| normal_source_indices.get(&file_idx).copied())
-            .flatten()
-    })
-}
-
 fn resolve_blob_field_id(file: &DataFileMeta, info: &ResolvedFileInfo) -> crate::Result<i32> {
     if info.field_ids.len() != 1 {
         return Err(Error::DataInvalid {
@@ -788,6 +816,11 @@ enum FieldSource {
         data_fields: Option<Vec<DataField>>,
         read_fields: Vec<DataField>,
     },
+    VectorFile {
+        file: Box<DataFileMeta>,
+        data_fields: Option<Vec<DataField>>,
+        read_fields: Vec<DataField>,
+    },
     BlobBunch {
         bunch: BlobBunch,
         data_fields: Option<Vec<DataField>>,
@@ -799,6 +832,7 @@ impl FieldSource {
     fn read_fields(&self) -> &[DataField] {
         match self {
             FieldSource::DataFile { read_fields, .. }
+            | FieldSource::VectorFile { read_fields, .. }
             | FieldSource::BlobBunch { read_fields, .. } => read_fields,
         }
     }
@@ -806,6 +840,7 @@ impl FieldSource {
     fn add_read_field(&mut self, field: DataField) -> usize {
         let read_fields = match self {
             FieldSource::DataFile { read_fields, .. }
+            | FieldSource::VectorFile { read_fields, .. }
             | FieldSource::BlobBunch { read_fields, .. } => read_fields,
         };
         if let Some(offset) = read_fields
@@ -822,7 +857,7 @@ impl FieldSource {
     fn blob_bunch_mut(&mut self) -> Option<&mut BlobBunch> {
         match self {
             FieldSource::BlobBunch { bunch, .. } => Some(bunch),
-            FieldSource::DataFile { .. } => None,
+            FieldSource::DataFile { .. } | FieldSource::VectorFile { .. } => None,
         }
     }
 }
@@ -937,44 +972,53 @@ impl BlobBunch {
 }
 
 fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFileMeta>> {
-    let mut data_files = Vec::new();
+    let mut normal_files = Vec::new();
+    let mut vector_files = Vec::new();
     let mut blob_files = Vec::new();
 
     for file in files {
         if is_blob_file_name(&file.file_name) {
             blob_files.push(file);
+        } else if is_vector_store_file_name(&file.file_name) {
+            vector_files.push(file);
         } else {
-            data_files.push(file);
+            normal_files.push(file);
         }
     }
 
-    data_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
-    if let Some(first) = data_files.first() {
-        let first_row_id = first.first_row_id.ok_or_else(|| Error::DataInvalid {
-            message: "All data files in a field merge split should have first_row_id".to_string(),
+    normal_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
+    vector_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
+
+    // Normal + vector files all share the anchor's row range. Validate together,
+    // using the first normal file as the reference when present, else the first
+    // vector file (a vector-only group has no anchor and is rejected later in
+    // PreparedMergeGroup::new).
+    let mut range_ref: Option<(i64, i64)> = None;
+    for file in normal_files.iter().chain(vector_files.iter()) {
+        let first_row_id = file.first_row_id.ok_or_else(|| Error::DataInvalid {
+            message: "All data/vector files in a field merge split should have first_row_id"
+                .to_string(),
             source: None,
         })?;
-        let first_row_count = first.row_count;
-        for file in data_files.iter().skip(1) {
-            if file.first_row_id != Some(first_row_id) || file.row_count != first_row_count {
-                return Err(Error::DataInvalid {
-                    message:
-                        "All data files in a field merge split should have the same row id range."
-                            .to_string(),
-                    source: None,
-                });
+        match range_ref {
+            None => range_ref = Some((first_row_id, file.row_count)),
+            Some((ref_first, ref_count)) => {
+                if first_row_id != ref_first || file.row_count != ref_count {
+                    return Err(Error::DataInvalid {
+                        message: "All data and vector files in a field merge split should have the same row id range.".to_string(),
+                        source: None,
+                    });
+                }
             }
         }
     }
 
     blob_files.sort_by(|left, right| {
-        let left_first_row_id = left.first_row_id.unwrap_or(i64::MIN);
-        let right_first_row_id = right.first_row_id.unwrap_or(i64::MIN);
-        left_first_row_id
-            .cmp(&right_first_row_id)
+        let l = left.first_row_id.unwrap_or(i64::MIN);
+        let r = right.first_row_id.unwrap_or(i64::MIN);
+        l.cmp(&r)
             .then_with(|| right.max_sequence_number.cmp(&left.max_sequence_number))
     });
-
     if blob_files.iter().any(|file| file.first_row_id.is_none()) {
         return Err(Error::DataInvalid {
             message: "All blob files in a field merge split should have first_row_id".to_string(),
@@ -982,8 +1026,10 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
         });
     }
 
-    data_files.extend(blob_files);
-    Ok(data_files)
+    let mut out = normal_files;
+    out.extend(vector_files);
+    out.extend(blob_files);
+    Ok(out)
 }
 
 fn count_selected_rows(
@@ -1006,9 +1052,11 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, BlobType, IntType, Schema, TableSchema};
+    use crate::spec::{BinaryRow, BlobType, FloatType, IntType, Schema, TableSchema, VectorType};
     use crate::table::{DataSplitBuilder, Table, TableRead};
-    use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch};
+    use arrow_array::{
+        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
+    };
     use futures::TryStreamExt;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1028,6 +1076,45 @@ mod tests {
 
     use blob_test_utils::write_blob_file;
     use test_utils::{local_file_path, write_int_parquet_file};
+
+    #[test]
+    fn test_build_source_plan_rejects_duplicate_vector_field_id() {
+        // Two .vector. files both advertising the same vector field id (1) must be
+        // rejected rather than one silently overwriting the other.
+        let files = vec![
+            data_file("v1.vector.parquet", 0, 10, 2, Some(vec!["emb"])),
+            data_file("v2.vector.parquet", 0, 10, 1, Some(vec!["emb"])),
+        ];
+        let prepared_group = PreparedMergeGroup {
+            files: files.clone(),
+            logical_row_count: 10,
+            first_row_id: 0,
+        };
+        let file_infos = vec![
+            ResolvedFileInfo {
+                field_ids: vec![1],
+                data_fields: None,
+            },
+            ResolvedFileInfo {
+                field_ids: vec![1],
+                data_fields: None,
+            },
+        ];
+        let read_type = vec![DataField::new(
+            1,
+            "emb".to_string(),
+            DataType::Vector(
+                VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap(),
+            ),
+        )];
+        let err = build_source_plan(
+            &prepared_group,
+            &file_infos,
+            &read_type,
+            &std::collections::HashSet::new(),
+        );
+        assert!(matches!(err, Err(Error::DataInvalid { .. })));
+    }
 
     #[test]
     fn test_normalize_merge_group_orders_blob_files_after_data_files() {
@@ -1057,6 +1144,33 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_merge_group_orders_vector_files_between_data_and_blob() {
+        // Discriminating fixture: the vector file has a HIGHER max_sequence_number than
+        // the normal file and is listed first. Old two-group code sorted it among the
+        // "data files" by Reverse(seq), yielding [v1, d1, ...]; the three-way split must
+        // force normal -> vector -> blob regardless of sequence, yielding [d1, v1, b1].
+        let files = vec![
+            data_file("v1.vector.parquet", 0, 10, 5, Some(vec!["emb"])),
+            data_file("b1.blob", 0, 1, 1, Some(vec!["payload"])),
+            data_file("d1.parquet", 0, 10, 1, Some(vec!["id"])),
+        ];
+        let normalized = normalize_merge_group(files).unwrap();
+        let names: Vec<&str> = normalized.iter().map(|f| f.file_name.as_str()).collect();
+        // normal first, then vector, then blob
+        assert_eq!(names, vec!["d1.parquet", "v1.vector.parquet", "b1.blob"]);
+    }
+
+    #[test]
+    fn test_normalize_merge_group_rejects_vector_row_range_mismatch() {
+        let files = vec![
+            data_file("d1.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("v1.vector.parquet", 0, 8, 1, Some(vec!["emb"])), // row_count mismatch
+        ];
+        let err = normalize_merge_group(files);
+        assert!(matches!(err, Err(Error::DataInvalid { .. })));
+    }
+
+    #[test]
     fn test_blob_bunch_ignores_same_first_row_id_with_lower_sequence() {
         let mut bunch = BlobBunch::new(1000);
         bunch
@@ -1075,6 +1189,31 @@ mod tests {
         assert_eq!(bunch.row_count(), 100);
         assert_eq!(bunch.files.len(), 1);
         assert_eq!(bunch.files[0].file_name, "blob-high.blob");
+    }
+
+    #[test]
+    fn test_is_vector_store_file_name() {
+        assert!(is_vector_store_file_name("data-1.vector.parquet"));
+        assert!(is_vector_store_file_name("data-1.vector.vortex"));
+        assert!(is_vector_store_file_name("PART.VECTOR.PARQUET")); // case-insensitive
+        assert!(!is_vector_store_file_name("data-1.parquet"));
+        assert!(!is_vector_store_file_name("data-1.blob"));
+        assert!(!is_vector_store_file_name("x.vectorstuff")); // not the ".vector." segment
+    }
+
+    #[test]
+    fn test_is_raw_convertible_false_for_single_vector_file() {
+        // A lone vector file must NOT be raw-convertible (would bypass merge routing).
+        let files = vec![data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"]))];
+        assert!(!is_raw_convertible(&files));
+    }
+
+    #[test]
+    fn test_prepared_merge_group_rejects_vector_only_split() {
+        // No normal anchor file -> DataInvalid.
+        let files = vec![data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"]))];
+        let err = PreparedMergeGroup::new(&files);
+        assert!(matches!(err, Err(Error::DataInvalid { .. })));
     }
 
     #[test]
@@ -1228,7 +1367,9 @@ mod tests {
                     vec!["blob5.blob", "blob9.blob", "blob7.blob", "blob8.blob"]
                 );
             }
-            FieldSource::DataFile { .. } => panic!("expected blob bunch source"),
+            FieldSource::DataFile { .. } | FieldSource::VectorFile { .. } => {
+                panic!("expected blob bunch source")
+            }
         }
     }
 
@@ -1308,7 +1449,9 @@ mod tests {
                     vec!["blob5.blob", "blob9.blob", "blob7.blob", "blob8.blob"]
                 );
             }
-            FieldSource::DataFile { .. } => panic!("expected blob bunch source"),
+            FieldSource::DataFile { .. } | FieldSource::VectorFile { .. } => {
+                panic!("expected blob bunch source")
+            }
         }
 
         match &source_plan.sources[2] {
@@ -1323,7 +1466,9 @@ mod tests {
                     vec!["blob15.blob", "blob19.blob", "blob17.blob", "blob18.blob"]
                 );
             }
-            FieldSource::DataFile { .. } => panic!("expected blob bunch source"),
+            FieldSource::DataFile { .. } | FieldSource::VectorFile { .. } => {
+                panic!("expected blob bunch source")
+            }
         }
     }
 
@@ -1521,6 +1666,718 @@ mod tests {
         assert_eq!(
             collect_binary_values(&batches, "payload2"),
             vec![Some(b"b2".to_vec()), Some(b"b3".to_vec())]
+        );
+    }
+
+    fn write_fixed_size_list_parquet(
+        path: &std::path::Path,
+        col: &str,
+        dim: i32,
+        rows: &[Option<Vec<f32>>],
+    ) {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::fs::File;
+
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim).with_field(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+        );
+        for row in rows {
+            match row {
+                Some(vals) => {
+                    assert_eq!(vals.len() as i32, dim);
+                    for v in vals {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                None => {
+                    for _ in 0..dim {
+                        builder.values().append_value(0.0);
+                    }
+                    builder.append(false);
+                }
+            }
+        }
+        let array = builder.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            col,
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                dim,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Build a `VECTOR<FLOAT, dim>` column type whose element is nullable, matching the
+    /// arrow `FixedSizeList(element: Float32 nullable)` produced by the writer helper.
+    fn vector_float_type(dim: u32) -> DataType {
+        DataType::Vector(VectorType::try_new(true, dim, DataType::Float(FloatType::new())).unwrap())
+    }
+
+    /// Locate the embedding column, downcast to `FixedSizeListArray`, and assert the
+    /// per-row validity bitmap and child `Float32` values across all batches.
+    fn assert_fixed_size_list(
+        batches: &[RecordBatch],
+        column_name: &str,
+        expected_dim: i32,
+        expected: &[Option<Vec<f32>>],
+    ) {
+        let mut row = 0usize;
+        for batch in batches {
+            let idx = batch.schema().index_of(column_name).unwrap();
+            let list = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert_eq!(list.value_length(), expected_dim);
+            for i in 0..list.len() {
+                let want = &expected[row];
+                match want {
+                    Some(vals) => {
+                        assert!(list.is_valid(i), "row {row} expected non-null");
+                        let child = list.value(i);
+                        let floats = child.as_any().downcast_ref::<Float32Array>().unwrap();
+                        let got: Vec<f32> = (0..floats.len()).map(|j| floats.value(j)).collect();
+                        assert_eq!(&got, vals, "row {row} value mismatch");
+                    }
+                    None => {
+                        assert!(list.is_null(i), "row {row} expected null");
+                    }
+                }
+                row += 1;
+            }
+        }
+        assert_eq!(row, expected.len(), "row count mismatch");
+    }
+
+    /// (1) Provider priority: the normal data file ALSO advertises the embedding write_col,
+    /// but the dedicated `.vector.parquet` file must win.
+    #[tokio::test]
+    async fn test_read_dedicated_vector_parquet_file_with_provider_priority() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Normal data file carries id AND a (wrong) inline embedding to prove priority.
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
+
+        // Dedicated vector file: row1=[1,2], row2=null, row3=[3,4].
+        let vector_path = bucket_dir.join("data.vector.parquet");
+        write_fixed_size_list_parquet(
+            &vector_path,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_priority_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                // Normal file advertises BOTH id and embedding write_cols.
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    3,
+                    1,
+                    normal_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id", "embedding"]),
+                ),
+                data_file_meta_with_path(
+                    "data.vector.parquet",
+                    0,
+                    3,
+                    1,
+                    vector_path.metadata().unwrap().len() as i64,
+                    Some(vec!["embedding"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3]);
+        // Value MUST come from the .vector. file (vector-provider priority).
+        assert_fixed_size_list(
+            &batches,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+    }
+
+    /// (2) Same shape but the dedicated vector file is `.vector.vortex`.
+    #[cfg(feature = "vortex")]
+    #[tokio::test]
+    async fn test_read_dedicated_vector_vortex_file() {
+        use crate::arrow::format::create_format_writer;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
+
+        // Write data.vector.vortex via the format writer (dispatches on the .vortex suffix).
+        let vector_path = bucket_dir.join("data.vector.vortex");
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        {
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+            );
+            for row in [Some([1.0_f32, 2.0]), None, Some([3.0, 4.0])] {
+                match row {
+                    Some(vals) => {
+                        for v in vals {
+                            builder.values().append_value(v);
+                        }
+                        builder.append(true);
+                    }
+                    None => {
+                        builder.values().append_value(0.0);
+                        builder.values().append_value(0.0);
+                        builder.append(false);
+                    }
+                }
+            }
+            let array = builder.finish();
+            let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                    2,
+                ),
+                true,
+            )]));
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+            let output = file_io.new_output(&local_file_path(&vector_path)).unwrap();
+            let mut writer = create_format_writer(&output, arrow_schema, "zstd", 1, None)
+                .await
+                .unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_vortex_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    3,
+                    1,
+                    normal_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "data.vector.vortex",
+                    0,
+                    3,
+                    1,
+                    vector_path.metadata().unwrap().len() as i64,
+                    Some(vec!["embedding"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3]);
+        assert_fixed_size_list(
+            &batches,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+    }
+
+    /// (3) Multiple vector columns living in ONE `.vector.parquet` file; both must
+    /// route to the same VectorFile source and materialize.
+    #[tokio::test]
+    async fn test_read_dedicated_vector_file_multiple_columns() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::fs::File;
+
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
+
+        // One vector file with two FixedSizeList columns: emb1 (dim 2), emb2 (dim 3).
+        let vector_path = bucket_dir.join("data.vector.parquet");
+        {
+            let elem = || Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+            let mut b1 = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(elem());
+            let mut b2 = FixedSizeListBuilder::new(Float32Builder::new(), 3).with_field(elem());
+            // emb1: [1,2], null, [5,6]
+            for row in [Some(vec![1.0_f32, 2.0]), None, Some(vec![5.0, 6.0])] {
+                match row {
+                    Some(v) => {
+                        for x in v {
+                            b1.values().append_value(x);
+                        }
+                        b1.append(true);
+                    }
+                    None => {
+                        b1.values().append_value(0.0);
+                        b1.values().append_value(0.0);
+                        b1.append(false);
+                    }
+                }
+            }
+            // emb2: [7,8,9], [1,1,1], null
+            for row in [
+                Some(vec![7.0_f32, 8.0, 9.0]),
+                Some(vec![1.0, 1.0, 1.0]),
+                None,
+            ] {
+                match row {
+                    Some(v) => {
+                        for x in v {
+                            b2.values().append_value(x);
+                        }
+                        b2.append(true);
+                    }
+                    None => {
+                        for _ in 0..3 {
+                            b2.values().append_value(0.0);
+                        }
+                        b2.append(false);
+                    }
+                }
+            }
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("emb1", ArrowDataType::FixedSizeList(elem(), 2), true),
+                ArrowField::new("emb2", ArrowDataType::FixedSizeList(elem(), 3), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(b1.finish()), Arc::new(b2.finish())],
+            )
+            .unwrap();
+            let file = File::create(&vector_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("emb1", vector_float_type(2))
+                .column("emb2", vector_float_type(3))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_multi_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    3,
+                    1,
+                    normal_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "data.vector.parquet",
+                    0,
+                    3,
+                    1,
+                    vector_path.metadata().unwrap().len() as i64,
+                    Some(vec!["emb1", "emb2"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3]);
+        assert_fixed_size_list(
+            &batches,
+            "emb1",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![5.0, 6.0])],
+        );
+        assert_fixed_size_list(
+            &batches,
+            "emb2",
+            3,
+            &[Some(vec![7.0, 8.0, 9.0]), Some(vec![1.0, 1.0, 1.0]), None],
+        );
+    }
+
+    /// (4) Inline fallback: embedding lives in the normal parquet, NO `.vector.` file
+    /// present. Routing must fall back to the normal provider (PR 2 compatibility).
+    #[tokio::test]
+    async fn test_inline_vector_fallback_still_reads() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Single normal parquet holding id + an inline FixedSizeList embedding.
+        let normal_path = bucket_dir.join("data.parquet");
+        {
+            use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+            use arrow_schema::{
+                DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+            };
+            use parquet::arrow::ArrowWriter;
+            use std::fs::File;
+
+            let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+                ArrowField::new("element", ArrowDataType::Float32, true),
+            ));
+            for row in [Some([1.0_f32, 2.0]), None, Some([3.0, 4.0])] {
+                match row {
+                    Some(vals) => {
+                        for v in vals {
+                            emb.values().append_value(v);
+                        }
+                        emb.append(true);
+                    }
+                    None => {
+                        emb.values().append_value(0.0);
+                        emb.values().append_value(0.0);
+                        emb.append(false);
+                    }
+                }
+            }
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new(
+                    "embedding",
+                    ArrowDataType::FixedSizeList(
+                        Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                        2,
+                    ),
+                    true,
+                ),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(emb.finish()),
+                ],
+            )
+            .unwrap();
+            let file = File::create(&normal_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_inline_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                0,
+                3,
+                1,
+                normal_path.metadata().unwrap().len() as i64,
+                Some(vec!["id", "embedding"]),
+            )])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3]);
+        assert_fixed_size_list(
+            &batches,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+    }
+
+    /// (5) A `.vector.` file is present, but a non-vector field (`id`) must still be
+    /// read from the normal file, never mis-selected from the vector file.
+    #[tokio::test]
+    async fn test_non_vector_field_ignores_vector_file() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![10, 20, 30])], None);
+
+        let vector_path = bucket_dir.join("data.vector.parquet");
+        write_fixed_size_list_parquet(
+            &vector_path,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_nonvec_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    3,
+                    1,
+                    normal_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "data.vector.parquet",
+                    0,
+                    3,
+                    1,
+                    vector_path.metadata().unwrap().len() as i64,
+                    Some(vec!["embedding"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        // Project only the non-vector `id` field.
+        let id_field = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| f.name() == "id")
+            .unwrap()
+            .clone();
+        let read = TableRead::new(&table, vec![id_field], Vec::new());
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![10, 20, 30]);
+    }
+
+    /// (6) Row-range mismatch: normal file row_count=3 but `.vector.parquet` row_count=2
+    /// must surface as DataInvalid.
+    #[tokio::test]
+    async fn test_read_vector_file_row_range_mismatch_errors() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let normal_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&normal_path, vec![("id", vec![1, 2, 3])], None);
+
+        let vector_path = bucket_dir.join("data.vector.parquet");
+        write_fixed_size_list_parquet(
+            &vector_path,
+            "embedding",
+            2,
+            &[Some(vec![1.0, 2.0]), Some(vec![3.0, 4.0])],
+        );
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("embedding", vector_float_type(2))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "vec_mismatch_t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "data.parquet",
+                    0,
+                    3,
+                    1,
+                    normal_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "data.vector.parquet",
+                    0,
+                    2, // row_count mismatch vs the normal file's 3
+                    1,
+                    vector_path.metadata().unwrap().len() as i64,
+                    Some(vec!["embedding"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let result = read.to_arrow(&[split]);
+        let collected = match result {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await,
+            Err(e) => Err(e),
+        };
+        assert!(
+            matches!(collected, Err(Error::DataInvalid { .. })),
+            "expected DataInvalid, got {collected:?}"
         );
     }
 
