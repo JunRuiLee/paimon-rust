@@ -252,6 +252,11 @@ fn build_orc_leaf_predicate(
         }
         PredicateOperator::IsNull | PredicateOperator::NotEq | PredicateOperator::NotIn => None,
         PredicateOperator::IsNotNull => None,
+        // String ops are not pushed into ORC; returning None falls open to the
+        // outer stats-prune + arrow row-filter path.
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains => None,
     }
 }
 

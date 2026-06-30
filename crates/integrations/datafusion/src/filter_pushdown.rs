@@ -16,7 +16,7 @@
 // under the License.
 
 use datafusion::common::{Column, ScalarValue};
-use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::expr::{InList, ScalarFunction};
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
@@ -146,6 +146,7 @@ impl<'a> FilterTranslator<'a> {
             }
             Expr::InList(in_list) => self.translate_in_list(in_list),
             Expr::Between(between) => self.translate_between(between),
+            Expr::ScalarFunction(func) => self.translate_scalar_function(func),
             _ => None,
         }
     }
@@ -264,6 +265,26 @@ impl<'a> FilterTranslator<'a> {
             None
         } else {
             Some(predicate)
+        }
+    }
+
+    fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<Predicate> {
+        // DataFusion built-in UDFs surfaced from direct `starts_with(col, 'x')
+        // / ends_with / contains` calls. Only `(col, literal)` shapes are
+        // handled; anything else (transform on either side, non-string args)
+        // falls open to None.
+        if func.args.len() != 2 {
+            return None;
+        }
+        let field = self.resolve_field(&func.args[0])?;
+        let scalar = extract_scalar_literal(&func.args[1])?;
+        let datum = scalar_to_datum(scalar, field.data_type())?;
+
+        match func.name() {
+            "starts_with" => self.predicate_builder.starts_with(field.name(), datum).ok(),
+            "ends_with" => self.predicate_builder.ends_with(field.name(), datum).ok(),
+            "contains" => self.predicate_builder.contains(field.name(), datum).ok(),
+            _ => None,
         }
     }
 
@@ -625,4 +646,71 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_translate_starts_with_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::starts_with(
+            Expr::Column(Column::from_name("dt")),
+            lit("2024"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("starts_with should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
+                assert_eq!(literals, vec![Datum::String("2024".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_ends_with_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::ends_with(
+            Expr::Column(Column::from_name("dt")),
+            lit("01-01"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("ends_with should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::EndsWith);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_contains_udf() {
+        let fields = test_fields();
+        let filter = datafusion::functions::string::expr_fn::contains(
+            Expr::Column(Column::from_name("dt")),
+            lit("01"),
+        );
+        let predicate =
+            build_pushed_predicate(&[filter], &fields).expect("contains should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Contains);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_starts_with_on_non_string_column_falls_open() {
+        let fields = test_fields();
+        // `id` is Int — datum coercion fails and translation returns None.
+        let filter = datafusion::functions::string::expr_fn::starts_with(
+            Expr::Column(Column::from_name("id")),
+            lit("foo"),
+        );
+        assert!(
+            build_pushed_predicate(&[filter], &fields).is_none(),
+            "starts_with on non-string column must not translate"
+        );
+    }
+
 }

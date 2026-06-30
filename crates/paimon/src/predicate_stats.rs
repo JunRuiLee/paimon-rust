@@ -62,12 +62,18 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::In | PredicateOperator::NotIn => {
             return true;
         }
+        PredicateOperator::EndsWith | PredicateOperator::Contains => {
+            // String min/max ordering carries no information about suffix /
+            // substring matches, so fail open.
+            return true;
+        }
         PredicateOperator::Eq
         | PredicateOperator::NotEq
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {}
+        | PredicateOperator::GtEq
+        | PredicateOperator::StartsWith => {}
     }
 
     if all_null == Some(true) {
@@ -112,11 +118,54 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
             Some(Ordering::Less | Ordering::Equal)
         ),
         PredicateOperator::GtEq => !matches!(max_value.partial_cmp(literal), Some(Ordering::Less)),
+        PredicateOperator::StartsWith => {
+            // pat lives in [min, max] iff max >= pat AND min < pat_next, where
+            // pat_next is pat with its last codepoint incremented. If we can't
+            // compute pat_next (last char is char::MAX, increments into the
+            // UTF-16 surrogate range, etc.), fail open.
+            let (pat, min_str, max_str) = match (literal, &min_value, &max_value) {
+                (Datum::String(p), Datum::String(lo), Datum::String(hi)) => {
+                    (p.as_str(), lo.as_str(), hi.as_str())
+                }
+                _ => return true,
+            };
+            // If the file's max is below the pattern (lexicographically), no
+            // string in the file can start with `pat`.
+            if max_str < pat {
+                return false;
+            }
+            // Compute pat_next; if we can, use the [pat, pat_next) range to
+            // also rule out files whose min is already past every pat-prefixed
+            // string. Otherwise just trust the upper bound check.
+            match next_string_for_prefix(pat) {
+                Some(pat_next) => min_str.as_bytes() < pat_next.as_slice(),
+                None => true,
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
-        | PredicateOperator::NotIn => true,
+        | PredicateOperator::NotIn
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains => true,
     }
+}
+
+/// Compute the smallest string strictly greater than every string with `prefix`
+/// as a prefix, by incrementing the last codepoint. Returns `None` if the last
+/// codepoint cannot be incremented within valid Unicode (e.g. `char::MAX`).
+fn next_string_for_prefix(prefix: &str) -> Option<Vec<u8>> {
+    let last_char = prefix.chars().next_back()?;
+    let mut next_code = last_char as u32 + 1;
+    // Skip over the UTF-16 surrogate range, which is not valid scalar Unicode.
+    if (0xD800..=0xDFFF).contains(&next_code) {
+        next_code = 0xE000;
+    }
+    let next_char = char::from_u32(next_code)?;
+    let mut bytes = prefix.as_bytes()[..prefix.len() - last_char.len_utf8()].to_vec();
+    let mut buf = [0u8; 4];
+    bytes.extend_from_slice(next_char.encode_utf8(&mut buf).as_bytes());
+    Some(bytes)
 }
 
 pub(crate) fn missing_field_may_match(op: PredicateOperator, row_count: i64) -> bool {
@@ -192,4 +241,134 @@ fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType
         (Datum::Float(value), DataType::Double(_)) => Some(Datum::Double(value as f64)),
         _ => None,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{IntType, VarCharType};
+
+    struct MockStats {
+        row_count: i64,
+        null_count: Option<i64>,
+        min: Option<Datum>,
+        max: Option<Datum>,
+    }
+
+    impl StatsAccessor for MockStats {
+        fn row_count(&self) -> i64 {
+            self.row_count
+        }
+        fn null_count(&self, _index: usize) -> Option<i64> {
+            self.null_count
+        }
+        fn min_value(&self, _index: usize, _data_type: &DataType) -> Option<Datum> {
+            self.min.clone()
+        }
+        fn max_value(&self, _index: usize, _data_type: &DataType) -> Option<Datum> {
+            self.max.clone()
+        }
+    }
+
+    fn varchar() -> DataType {
+        DataType::VarChar(VarCharType::default())
+    }
+
+    fn string_stats(min: &str, max: &str) -> MockStats {
+        MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::String(min.to_string())),
+            max: Some(Datum::String(max.to_string())),
+        }
+    }
+
+    fn run(op: PredicateOperator, lit: &str, stats: &MockStats) -> bool {
+        let dt = varchar();
+        data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            op,
+            &[Datum::String(lit.to_string())],
+            stats,
+        )
+    }
+
+    #[test]
+    fn starts_with_prunes_when_max_below_pattern() {
+        let stats = string_stats("aaa", "fooa");
+        assert!(!run(PredicateOperator::StartsWith, "foob", &stats));
+    }
+
+    #[test]
+    fn starts_with_prunes_when_min_past_pattern_range() {
+        // [foo, fop) is the pat range. min "fop" is already past it.
+        let stats = string_stats("fop", "zzz");
+        assert!(!run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_keeps_when_pattern_inside_range() {
+        let stats = string_stats("aaa", "zzz");
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_keeps_when_min_equals_pattern() {
+        let stats = string_stats("foo", "foozzz");
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn starts_with_falls_open_when_stats_missing() {
+        let stats = MockStats {
+            row_count: 5,
+            null_count: Some(0),
+            min: None,
+            max: None,
+        };
+        assert!(run(PredicateOperator::StartsWith, "foo", &stats));
+    }
+
+    #[test]
+    fn ends_with_and_contains_fall_open() {
+        let stats = string_stats("aaa", "zzz");
+        assert!(run(PredicateOperator::EndsWith, "foo", &stats));
+        assert!(run(PredicateOperator::Contains, "foo", &stats));
+    }
+
+    #[test]
+    fn missing_field_returns_false_for_string_ops() {
+        // Only IsNull is allowed when the field is missing.
+        for op in [
+            PredicateOperator::StartsWith,
+            PredicateOperator::EndsWith,
+            PredicateOperator::Contains,
+        ] {
+            assert!(!missing_field_may_match(op, 5));
+        }
+    }
+
+    // Sanity check: integer ops keep their existing semantics after the new
+    // string variants are interleaved into the dispatcher.
+    #[test]
+    fn integer_eq_still_prunes_outside_range() {
+        let dt = DataType::Int(IntType::new());
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::Int(0)),
+            max: Some(Datum::Int(100)),
+        };
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Eq,
+            &[Datum::Int(500)],
+            &stats,
+        ));
+    }
+
 }

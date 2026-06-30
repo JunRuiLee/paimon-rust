@@ -223,6 +223,9 @@ pub enum PredicateOperator {
     GtEq,
     In,
     NotIn,
+    StartsWith,
+    EndsWith,
+    Contains,
 }
 
 impl fmt::Display for PredicateOperator {
@@ -238,6 +241,9 @@ impl fmt::Display for PredicateOperator {
             Self::GtEq => write!(f, ">="),
             Self::In => write!(f, "IN"),
             Self::NotIn => write!(f, "NOT IN"),
+            Self::StartsWith => write!(f, "STARTS_WITH"),
+            Self::EndsWith => write!(f, "ENDS_WITH"),
+            Self::Contains => write!(f, "CONTAINS"),
         }
     }
 }
@@ -650,6 +656,51 @@ impl PredicateBuilder {
         self.leaf(field, PredicateOperator::NotIn, literals)
     }
 
+    // -- string operators --
+
+    /// `field LIKE 'pat%'` shape. Empty pattern → `IsNotNull(field)` (every
+    /// non-null string starts with the empty string). Non-string `pattern`
+    /// → [`Error::ConfigInvalid`].
+    pub fn starts_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::StartsWith, pattern)
+    }
+
+    /// `field LIKE '%pat'` shape. Empty pattern → `IsNotNull(field)`.
+    pub fn ends_with(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::EndsWith, pattern)
+    }
+
+    /// `field LIKE '%pat%'` shape. Empty pattern → `IsNotNull(field)`.
+    pub fn contains(&self, field: &str, pattern: Datum) -> Result<Predicate> {
+        self.string_leaf(field, PredicateOperator::Contains, pattern)
+    }
+
+    /// Shared body for the three string operators: empty-string short-circuit
+    /// and literal-type guard ([`leaf`] still cross-checks against the column
+    /// type, so non-string columns are rejected there).
+    fn string_leaf(
+        &self,
+        field: &str,
+        op: PredicateOperator,
+        pattern: Datum,
+    ) -> Result<Predicate> {
+        match &pattern {
+            // Every non-null string starts with / ends with / contains the
+            // empty string, and a NULL value matches none of them — i.e. the
+            // empty pattern is exactly `IsNotNull`. Folding to `AlwaysTrue`
+            // would wrongly retain NULL rows (and drop the field reference,
+            // keeping the predicate out of the data-pruning path).
+            Datum::String(s) if s.is_empty() => return self.is_not_null(field),
+            Datum::String(_) => {}
+            other => {
+                return Err(Error::ConfigInvalid {
+                    message: format!("{op} requires a string pattern, got {other}"),
+                });
+            }
+        }
+        self.leaf(field, op, vec![pattern])
+    }
+
     // -- internal --
 
     /// Resolve field name to index + type, validate literals, and build a leaf predicate.
@@ -914,6 +965,30 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                 ),
                 PredicateOperator::In => literals.iter().any(|lit| datum_eq(val, lit)),
                 PredicateOperator::NotIn => !literals.iter().any(|lit| datum_eq(val, lit)),
+                PredicateOperator::StartsWith => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.starts_with(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "STARTS_WITH must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::EndsWith => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.ends_with(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "ENDS_WITH must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
+                PredicateOperator::Contains => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(needle))) => {
+                        haystack.contains(needle.as_str())
+                    }
+                    _ => unreachable!(
+                        "CONTAINS must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
                 // IsNull/IsNotNull are handled in the outer match above.
                 PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
             }
@@ -1893,4 +1968,119 @@ mod tests {
             .project_field_index_inclusive(&mapping)
             .is_none());
     }
+
+    // ======================== string operators ========================
+
+    #[test]
+    fn test_builder_starts_with() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .starts_with("name", Datum::String("foo".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, PredicateOperator::StartsWith);
+                assert_eq!(literals, &[Datum::String("foo".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_ends_with() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .ends_with("name", Datum::String("bar".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::EndsWith),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_contains() {
+        let pb = PredicateBuilder::new(&test_fields());
+        let pred = pb
+            .contains("name", Datum::String("baz".to_string()))
+            .unwrap();
+        match &pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::Contains),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_string_ops_empty_pattern_is_not_null() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // An empty pattern matches every non-null string and no NULL, so it is
+        // exactly `IsNotNull` (not `AlwaysTrue`, which would retain NULL rows).
+        for build in [
+            pb.starts_with("name", Datum::String(String::new())),
+            pb.ends_with("name", Datum::String(String::new())),
+            pb.contains("name", Datum::String(String::new())),
+        ] {
+            assert!(matches!(
+                build.unwrap(),
+                Predicate::Leaf {
+                    op: PredicateOperator::IsNotNull,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_builder_string_ops_reject_non_string_pattern() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb.starts_with("name", Datum::Int(1)).is_err());
+        assert!(pb.ends_with("name", Datum::Int(1)).is_err());
+        assert!(pb.contains("name", Datum::Int(1)).is_err());
+    }
+
+    #[test]
+    fn test_builder_string_ops_reject_non_string_column() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `id` is Int, so a String literal fails the cross-check inside leaf().
+        assert!(pb.starts_with("id", Datum::String("x".to_string())).is_err());
+    }
+
+    #[test]
+    fn test_eval_string_operators() {
+        let lit = Datum::String("oo".to_string());
+        let val = Datum::String("foobar".to_string());
+
+        assert!(eval_leaf(
+            PredicateOperator::Contains,
+            Some(&val),
+            std::slice::from_ref(&lit),
+        ));
+        assert!(!eval_leaf(
+            PredicateOperator::StartsWith,
+            Some(&val),
+            std::slice::from_ref(&lit),
+        ));
+        assert!(eval_leaf(
+            PredicateOperator::StartsWith,
+            Some(&val),
+            &[Datum::String("foo".to_string())],
+        ));
+        assert!(eval_leaf(
+            PredicateOperator::EndsWith,
+            Some(&val),
+            &[Datum::String("bar".to_string())],
+        ));
+        assert!(!eval_leaf(
+            PredicateOperator::EndsWith,
+            Some(&val),
+            &[Datum::String("baz".to_string())],
+        ));
+        // NULL value → false (SQL three-valued logic).
+        assert!(!eval_leaf(
+            PredicateOperator::StartsWith,
+            None,
+            &[Datum::String("foo".to_string())],
+        ));
+    }
+
 }

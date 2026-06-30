@@ -22,14 +22,19 @@ use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Datum as ArrowDatum, Date32Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
+    StringArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
     neq as arrow_neq,
 };
 use arrow_schema::ArrowError;
+use arrow_string::like::{
+    contains as arrow_contains, ends_with as arrow_ends_with,
+    starts_with as arrow_starts_with,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -286,6 +291,9 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::GtEq
             | PredicateOperator::In
             | PredicateOperator::NotIn
+            | PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
     )
 }
 
@@ -314,6 +322,20 @@ fn parquet_row_filter_literals_supported(
                 }
             }
             Ok(true)
+        }
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains => {
+            // Substring kernels only run against string-typed columns; reject
+            // non-string file types early so the filter falls back to stats
+            // pruning + residual evaluation.
+            if !matches!(file_data_type, DataType::Char(_) | DataType::VarChar(_)) {
+                return Ok(false);
+            }
+            let Some(literal) = literals.first() else {
+                return Ok(false);
+            };
+            Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
         }
     }
 }
@@ -354,7 +376,10 @@ fn evaluate_exact_leaf_predicate(
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
-        | PredicateOperator::GtEq => {
+        | PredicateOperator::GtEq
+        | PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains => {
             let Some(literal) = literals.first() else {
                 return Ok(BooleanArray::from(vec![true; array.len()]));
             };
@@ -423,11 +448,60 @@ fn evaluate_column_predicate(
         PredicateOperator::LtEq => arrow_lt_eq(column, scalar),
         PredicateOperator::Gt => arrow_gt(column, scalar),
         PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains => {
+            let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
+            match op {
+                PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
+                PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
+                PredicateOperator::Contains => arrow_contains(column, &pattern),
+                _ => unreachable!(),
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
         | PredicateOperator::NotIn => Ok(BooleanArray::new_null(column.len())),
     }
+}
+
+/// `arrow_string::like::*` kernels reject mismatched string types — Utf8 column
+/// against Utf8 pattern is fine, but a LargeUtf8 / Utf8View column needs a
+/// pattern of the same flavour. The shared scalar built upstream is always
+/// `StringArray` (Utf8); promote it to match the column when needed.
+fn pattern_scalar_for_string_kernel(
+    scalar: &Scalar<ArrayRef>,
+    column_type: &arrow_schema::DataType,
+) -> Result<Scalar<ArrayRef>, ArrowError> {
+    use arrow_array::{LargeStringArray, StringArray, StringViewArray};
+    use arrow_schema::DataType as ArrowDataType;
+
+    let arr = scalar.get().0;
+    let value = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .and_then(|s| (s.len() == 1 && s.is_valid(0)).then(|| s.value(0).to_string()));
+    let Some(value) = value else {
+        return Ok(scalar.clone());
+    };
+    Ok(match column_type {
+        ArrowDataType::Utf8 => Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef),
+        ArrowDataType::LargeUtf8 => {
+            Scalar::new(Arc::new(LargeStringArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Utf8View => {
+            Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef)
+        }
+        ArrowDataType::Dictionary(_, value_type) if value_type.as_ref() == &ArrowDataType::Utf8 => {
+            Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef)
+        }
+        other => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "string predicate against non-string column type {other:?}"
+            )))
+        }
+    })
 }
 
 fn sanitize_filter_mask(mask: BooleanArray) -> BooleanArray {
@@ -1187,6 +1261,68 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // String predicate tests (StartsWith / EndsWith / Contains)
+    // -----------------------------------------------------------------------
+
+    fn run_string_op(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        pattern: &str,
+    ) -> arrow_array::BooleanArray {
+        use crate::spec::VarCharType;
+        let dt = DataType::VarChar(VarCharType::default());
+        super::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::String(pattern.to_string())],
+        )
+        .expect("string op should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_starts_with_string_array() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foo"),
+            Some("foobar"),
+            Some("baz"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::StartsWith, arr, "foo");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_ends_with_large_string_array() {
+        use arrow_array::LargeStringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            Some("ello"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::EndsWith, arr, "ello");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_contains_string_view_array() {
+        use arrow_array::StringViewArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("apple pie"),
+            Some("banana"),
+            Some("crab apple"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::Contains, arr, "apple");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
     }
 
     // -----------------------------------------------------------------------
