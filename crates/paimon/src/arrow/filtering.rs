@@ -146,6 +146,7 @@ fn predicate_supported_for_reader_pruning(predicate: &Predicate) -> bool {
                     | PredicateOperator::StartsWith
                     | PredicateOperator::EndsWith
                     | PredicateOperator::Contains
+                    | PredicateOperator::Like
             )
         }
         Predicate::AlwaysTrue | Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => false,

@@ -226,6 +226,7 @@ pub enum PredicateOperator {
     StartsWith,
     EndsWith,
     Contains,
+    Like,
 }
 
 impl fmt::Display for PredicateOperator {
@@ -244,6 +245,7 @@ impl fmt::Display for PredicateOperator {
             Self::StartsWith => write!(f, "STARTS_WITH"),
             Self::EndsWith => write!(f, "ENDS_WITH"),
             Self::Contains => write!(f, "CONTAINS"),
+            Self::Like => write!(f, "LIKE"),
         }
     }
 }
@@ -675,6 +677,53 @@ impl PredicateBuilder {
         self.string_leaf(field, PredicateOperator::Contains, pattern)
     }
 
+    /// `field LIKE '<pattern>'` with optional `escape` character (default `\`).
+    /// Mirrors Java `LikeOptimization`: rewrites `prefix%` / `%suffix` /
+    /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
+    /// [`PredicateOperator::EndsWith`] / [`PredicateOperator::Contains`] /
+    /// [`PredicateOperator::Eq`]; falls back to a [`PredicateOperator::Like`]
+    /// leaf for anything more complex (`_`, multi-segment `%`, escaped
+    /// wildcards). The `Like` evaluator follows arrow_string `like` kernel
+    /// semantics for the residual cases.
+    ///
+    /// `escape == None` defaults to `\`. Any other ESCAPE character is
+    /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
+    /// that into a fall-open). Empty pattern → [`PredicateOperator::Eq`] of the
+    /// empty string (SQL semantics: only the empty string matches).
+    pub fn like(
+        &self,
+        field: &str,
+        pattern: Datum,
+        escape: Option<char>,
+    ) -> Result<Predicate> {
+        let pattern_str = match &pattern {
+            Datum::String(s) => s.clone(),
+            other => {
+                return Err(Error::ConfigInvalid {
+                    message: format!("LIKE requires a string pattern, got {other}"),
+                });
+            }
+        };
+        let escape_char = escape.unwrap_or('\\');
+        if escape_char != '\\' {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "LIKE escape character {escape_char:?} is not supported (only '\\\\')"
+                ),
+            });
+        }
+
+        match optimize_like_pattern(&pattern_str) {
+            LikeShape::EmptyOrLiteral(s) => self.equal(field, Datum::String(s)),
+            LikeShape::StartsWith(prefix) => {
+                self.starts_with(field, Datum::String(prefix))
+            }
+            LikeShape::EndsWith(suffix) => self.ends_with(field, Datum::String(suffix)),
+            LikeShape::Contains(mid) => self.contains(field, Datum::String(mid)),
+            LikeShape::Residual => self.leaf(field, PredicateOperator::Like, vec![pattern]),
+        }
+    }
+
     /// Shared body for the three string operators: empty-string short-circuit
     /// and literal-type guard ([`leaf`] still cross-checks against the column
     /// type, so non-string columns are rejected there).
@@ -989,11 +1038,147 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                         "CONTAINS must have Datum::String value and literal (validated by builder)"
                     ),
                 },
+                PredicateOperator::Like => match (val, literals.first()) {
+                    (Datum::String(haystack), Some(Datum::String(pattern))) => {
+                        like_match(haystack, pattern)
+                    }
+                    _ => unreachable!(
+                        "LIKE must have Datum::String value and literal (validated by builder)"
+                    ),
+                },
                 // IsNull/IsNotNull are handled in the outer match above.
                 PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LIKE pattern optimization & evaluation
+// ---------------------------------------------------------------------------
+
+/// Result of LIKE pattern shape analysis. The `String` payloads are the
+/// literal substrings extracted from the pattern (with escape sequences
+/// already decoded).
+enum LikeShape {
+    /// Empty pattern, or a pattern that contains no wildcards / escapes —
+    /// equivalent to `Eq <literal>` (where the literal is the unescaped
+    /// pattern, possibly empty).
+    EmptyOrLiteral(String),
+    /// `prefix%` (exactly one trailing `%`, no other wildcards or escapes).
+    StartsWith(String),
+    /// `%suffix`.
+    EndsWith(String),
+    /// `%mid%` (exactly one leading and one trailing `%`).
+    Contains(String),
+    /// Anything else: `_`, multi-segment `%`, or any escape sequence — must
+    /// fall through to a `Like` leaf evaluator.
+    Residual,
+}
+
+/// Classify a SQL LIKE pattern. The escape character is hardcoded to `\` —
+/// callers wanting any other escape should bypass optimization and surface a
+/// `Like` leaf directly. Any presence of `\` in the pattern forces
+/// [`LikeShape::Residual`] (the simple shape rules don't account for escaped
+/// wildcards).
+fn optimize_like_pattern(pattern: &str) -> LikeShape {
+    if pattern.contains('\\') || pattern.contains('_') {
+        return LikeShape::Residual;
+    }
+    let bytes = pattern.as_bytes();
+    let percent_count = bytes.iter().filter(|b| **b == b'%').count();
+    match percent_count {
+        0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
+        1 => {
+            if pattern.ends_with('%') {
+                LikeShape::StartsWith(pattern[..pattern.len() - 1].to_string())
+            } else if pattern.starts_with('%') {
+                LikeShape::EndsWith(pattern[1..].to_string())
+            } else {
+                LikeShape::Residual
+            }
+        }
+        2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+            // `%%` reduces to `Contains('')`, which itself short-circuits to
+            // `IsNotNull` at the StartsWith/EndsWith/Contains builder boundary
+            // — so no special-casing here.
+            LikeShape::Contains(pattern[1..pattern.len() - 1].to_string())
+        }
+        _ => LikeShape::Residual,
+    }
+}
+
+/// Evaluate a SQL LIKE pattern against a value. Implements the backtracking
+/// matcher used by `arrow_string::like::like`:
+/// * `%` matches any (possibly empty) substring,
+/// * `_` matches exactly one character,
+/// * `\X` matches the literal `X` for any character `X` (the backslash is
+///   consumed); a trailing `\` matches a literal backslash.
+fn like_match(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    like_match_chars(&value, 0, &pattern, 0)
+}
+
+fn like_match_chars(value: &[char], mut vi: usize, pattern: &[char], mut pi: usize) -> bool {
+    while pi < pattern.len() {
+        match pattern[pi] {
+            '%' => {
+                // Collapse runs of `%` and try every possible suffix.
+                while pi < pattern.len() && pattern[pi] == '%' {
+                    pi += 1;
+                }
+                if pi == pattern.len() {
+                    return true;
+                }
+                while vi <= value.len() {
+                    if like_match_chars(value, vi, pattern, pi) {
+                        return true;
+                    }
+                    if vi == value.len() {
+                        return false;
+                    }
+                    vi += 1;
+                }
+                return false;
+            }
+            '_' => {
+                if vi == value.len() {
+                    return false;
+                }
+                vi += 1;
+                pi += 1;
+            }
+            '\\' => {
+                // Mirror arrow's `like` kernel: a backslash consumes the next
+                // character and matches it literally, whatever it is (`%`, `_`,
+                // `\`, or any other char such as `a`). A trailing backslash
+                // matches a literal backslash.
+                let expected = match pattern.get(pi + 1) {
+                    Some(&next) => {
+                        pi += 2;
+                        next
+                    }
+                    None => {
+                        pi += 1;
+                        '\\'
+                    }
+                };
+                if vi == value.len() || value[vi] != expected {
+                    return false;
+                }
+                vi += 1;
+            }
+            other => {
+                if vi == value.len() || value[vi] != other {
+                    return false;
+                }
+                vi += 1;
+                pi += 1;
+            }
+        }
+    }
+    vi == value.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,6 +2266,118 @@ mod tests {
             None,
             &[Datum::String("foo".to_string())],
         ));
+    }
+
+    // ======================== LIKE operator ========================
+
+    fn assert_leaf(pred: &Predicate, expected_op: PredicateOperator, expected_lit: &str) {
+        match pred {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(*op, expected_op, "op mismatch");
+                assert_eq!(literals, &[Datum::String(expected_lit.to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_like_optimization_rewrites() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // No wildcards → Eq.
+        assert_leaf(
+            &pb.like("name", Datum::String("foo".to_string()), None).unwrap(),
+            PredicateOperator::Eq,
+            "foo",
+        );
+        // Empty pattern → Eq("") (only empty string matches).
+        assert_leaf(
+            &pb.like("name", Datum::String(String::new()), None).unwrap(),
+            PredicateOperator::Eq,
+            "",
+        );
+        // prefix% → StartsWith.
+        assert_leaf(
+            &pb.like("name", Datum::String("foo%".to_string()), None).unwrap(),
+            PredicateOperator::StartsWith,
+            "foo",
+        );
+        // %suffix → EndsWith.
+        assert_leaf(
+            &pb.like("name", Datum::String("%bar".to_string()), None).unwrap(),
+            PredicateOperator::EndsWith,
+            "bar",
+        );
+        // %mid% → Contains.
+        assert_leaf(
+            &pb.like("name", Datum::String("%baz%".to_string()), None).unwrap(),
+            PredicateOperator::Contains,
+            "baz",
+        );
+    }
+
+    #[test]
+    fn test_like_residual_for_non_optimizable_patterns() {
+        let pb = PredicateBuilder::new(&test_fields());
+        // `_` keeps Like leaf.
+        assert_leaf(
+            &pb.like("name", Datum::String("f_o".to_string()), None).unwrap(),
+            PredicateOperator::Like,
+            "f_o",
+        );
+        // Multi-segment % keeps Like leaf.
+        assert_leaf(
+            &pb.like("name", Datum::String("a%b%c".to_string()), None).unwrap(),
+            PredicateOperator::Like,
+            "a%b%c",
+        );
+        // Escaped wildcards keep Like leaf (optimization is conservative).
+        assert_leaf(
+            &pb.like("name", Datum::String(r"foo\%".to_string()), None)
+                .unwrap(),
+            PredicateOperator::Like,
+            r"foo\%",
+        );
+    }
+
+    #[test]
+    fn test_like_rejects_custom_escape_char() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb
+            .like("name", Datum::String("a$%".to_string()), Some('$'))
+            .is_err());
+    }
+
+    #[test]
+    fn test_like_rejects_non_string_pattern() {
+        let pb = PredicateBuilder::new(&test_fields());
+        assert!(pb.like("name", Datum::Int(1), None).is_err());
+    }
+
+    #[test]
+    fn test_like_match_evaluator() {
+        // Patterns that fall back to Like leaf must evaluate correctly.
+        assert!(super::like_match("foobar", "f_o%"));
+        assert!(super::like_match("foobar", "%bar"));
+        assert!(super::like_match("foobar", "f%r"));
+        assert!(!super::like_match("foobar", "f_x%"));
+        // `_` requires exactly one character.
+        assert!(super::like_match("ab", "a_"));
+        assert!(!super::like_match("a", "a_"));
+        assert!(!super::like_match("abc", "a_"));
+        // Escape handling.
+        assert!(super::like_match("100%", "100\\%"));
+        assert!(!super::like_match("1000", "100\\%"));
+        assert!(super::like_match("a_b", "a\\_b"));
+        assert!(!super::like_match("axb", "a\\_b"));
+        // Escaped non-wildcard: `\X` matches literal `X`, not `\X` (arrow
+        // semantics, verified against arrow_string's like_escape test).
+        assert!(super::like_match("a", "\\a"));
+        assert!(!super::like_match("\\a", "\\a"));
+        // Trailing backslash matches a literal backslash.
+        assert!(super::like_match("\\", "\\"));
+        // Empty pattern only matches empty value.
+        assert!(super::like_match("", ""));
+        assert!(!super::like_match("a", ""));
     }
 
 }

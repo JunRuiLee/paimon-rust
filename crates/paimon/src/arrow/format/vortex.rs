@@ -545,12 +545,13 @@ fn evaluate_arrow_leaf_predicate(
                 })?;
             Ok(Some(sanitize_filter_mask(mask)))
         }
-        // Vortex's scalar comparators don't cover substring predicates, so fall
-        // open: returning None defers them to the outer stats-prune + arrow
+        // Vortex's scalar comparators don't cover substring/range predicates, so
+        // fall open: returning None defers them to the outer stats-prune + arrow
         // row-filter path, which evaluates them with full NULL (Kleene) semantics.
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => Ok(None),
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => Ok(None),
     }
 }
 
@@ -616,12 +617,13 @@ fn evaluate_column_predicate(
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
         | PredicateOperator::NotIn
-        // String ops never reach the scalar comparator: the leaf dispatcher
-        // falls open (returns None) for them, so the value here is unused.
-        // Listed only to keep the match exhaustive.
+        // String/range ops never reach the scalar comparator: the leaf
+        // dispatcher falls open (returns None) for them, so the value here is
+        // unused. Listed only to keep the match exhaustive.
         | PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => Ok(BooleanArray::new_null(column.len())),
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => Ok(BooleanArray::new_null(column.len())),
     }
 }
 

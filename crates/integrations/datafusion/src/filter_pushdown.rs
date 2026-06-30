@@ -17,7 +17,9 @@
 
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::{InList, ScalarFunction};
-use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Expr, Like, Operator, TableProviderFilterPushDown,
+};
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
 
 #[derive(Debug)]
@@ -147,6 +149,7 @@ impl<'a> FilterTranslator<'a> {
             Expr::InList(in_list) => self.translate_in_list(in_list),
             Expr::Between(between) => self.translate_between(between),
             Expr::ScalarFunction(func) => self.translate_scalar_function(func),
+            Expr::Like(like) => self.translate_like(like),
             _ => None,
         }
     }
@@ -269,10 +272,10 @@ impl<'a> FilterTranslator<'a> {
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<Predicate> {
-        // DataFusion built-in UDFs surfaced from direct `starts_with(col, 'x')
-        // / ends_with / contains` calls. Only `(col, literal)` shapes are
-        // handled; anything else (transform on either side, non-string args)
-        // falls open to None.
+        // DataFusion built-in UDFs surfaced from `LIKE 'x%' / '%x' / '%x%'`
+        // rewrites and direct `starts_with(col, 'x') / ends_with / contains`
+        // calls. Only `(col, literal)` shapes are handled; anything else
+        // (transform on either side, non-string args) falls open to None.
         if func.args.len() != 2 {
             return None;
         }
@@ -286,6 +289,23 @@ impl<'a> FilterTranslator<'a> {
             "contains" => self.predicate_builder.contains(field.name(), datum).ok(),
             _ => None,
         }
+    }
+
+    fn translate_like(&self, like: &Like) -> Option<Predicate> {
+        // Negated and case-insensitive (ILIKE) variants stay unsupported for
+        // now: NOT-LIKE has the same NULL-semantics concern as `Expr::Not`;
+        // ILIKE has no equivalent in paimon's predicate model.
+        if like.negated || like.case_insensitive {
+            return None;
+        }
+        let field = self.resolve_field(like.expr.as_ref())?;
+        let scalar = extract_scalar_literal(like.pattern.as_ref())?;
+        let datum = scalar_to_datum(scalar, field.data_type())?;
+        // PredicateBuilder::like rejects escape characters other than `\`,
+        // so unsupported escapes naturally fall open via `.ok() -> None`.
+        self.predicate_builder
+            .like(field.name(), datum, like.escape_char)
+            .ok()
     }
 
     fn resolve_field(&self, expr: &Expr) -> Option<&'a DataField> {
@@ -710,6 +730,102 @@ mod tests {
         assert!(
             build_pushed_predicate(&[filter], &fields).is_none(),
             "starts_with on non-string column must not translate"
+        );
+    }
+
+    fn like_filter(pattern: &str, negated: bool, case_insensitive: bool) -> Expr {
+        Expr::Like(Like::new(
+            negated,
+            Box::new(Expr::Column(Column::from_name("dt"))),
+            Box::new(lit(pattern)),
+            None,
+            case_insensitive,
+        ))
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_starts_with() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("2024%", false, false)], &fields)
+            .expect("LIKE prefix% should translate");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::StartsWith);
+                assert_eq!(literals, vec![Datum::String("2024".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_ends_with() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("%01-01", false, false)], &fields)
+            .expect("LIKE %suffix should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::EndsWith);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_rewrites_to_contains() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("%01%", false, false)], &fields)
+            .expect("LIKE %mid% should translate");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Contains);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_no_wildcards_rewrites_to_eq() {
+        let fields = test_fields();
+        let predicate =
+            build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
+                .expect("LIKE without wildcards should translate to Eq");
+        match predicate {
+            Predicate::Leaf { op, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Eq);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_like_residual_keeps_like_leaf() {
+        let fields = test_fields();
+        let predicate = build_pushed_predicate(&[like_filter("a%b%c", false, false)], &fields)
+            .expect("complex LIKE should translate as a Like leaf");
+        match predicate {
+            Predicate::Leaf { op, literals, .. } => {
+                assert_eq!(op, paimon::spec::PredicateOperator::Like);
+                assert_eq!(literals, vec![Datum::String("a%b%c".to_string())]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_translate_negated_like_falls_open() {
+        let fields = test_fields();
+        assert!(
+            build_pushed_predicate(&[like_filter("a%", true, false)], &fields).is_none(),
+            "NOT LIKE must not translate (NULL semantics)"
+        );
+    }
+
+    #[test]
+    fn test_translate_ilike_falls_open() {
+        let fields = test_fields();
+        assert!(
+            build_pushed_predicate(&[like_filter("a%", false, true)], &fields).is_none(),
+            "ILIKE must not translate (case-insensitive not modeled)"
         );
     }
 

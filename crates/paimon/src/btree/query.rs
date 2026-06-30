@@ -98,7 +98,8 @@ where
             }
             PredicateOperator::StartsWith
             | PredicateOperator::EndsWith
-            | PredicateOperator::Contains => Err(io::Error::new(
+            | PredicateOperator::Contains
+            | PredicateOperator::Like => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("BTree index does not support op: {op}"),
             )),

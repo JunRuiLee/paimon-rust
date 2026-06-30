@@ -73,7 +73,8 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
         | PredicateOperator::GtEq
-        | PredicateOperator::StartsWith => {}
+        | PredicateOperator::StartsWith
+        | PredicateOperator::Like => {}
     }
 
     if all_null == Some(true) {
@@ -142,6 +143,30 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
                 None => true,
             }
         }
+        PredicateOperator::Like => {
+            // Try to extract a literal prefix from the LIKE pattern (the
+            // characters before the first unescaped wildcard). If we get one,
+            // prune as if it were StartsWith; otherwise fail open.
+            let (pattern, min_str, max_str) = match (literal, &min_value, &max_value) {
+                (Datum::String(p), Datum::String(lo), Datum::String(hi)) => {
+                    (p.as_str(), lo.as_str(), hi.as_str())
+                }
+                _ => return true,
+            };
+            let Some(pat) = like_pattern_literal_prefix(pattern) else {
+                return true;
+            };
+            if pat.is_empty() {
+                return true;
+            }
+            if max_str < pat.as_str() {
+                return false;
+            }
+            match next_string_for_prefix(&pat) {
+                Some(pat_next) => min_str.as_bytes() < pat_next.as_slice(),
+                None => true,
+            }
+        }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
         | PredicateOperator::In
@@ -149,6 +174,26 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains => true,
     }
+}
+
+/// Return the literal prefix of a SQL LIKE pattern up to the first unescaped
+/// `%` or `_`. A backslash escapes the next character (which is appended
+/// literally, mirroring arrow's `like` kernel); a trailing backslash is a
+/// literal backslash.
+fn like_pattern_literal_prefix(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' | '_' => return Some(out),
+            '\\' => match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 /// Compute the smallest string strictly greater than every string with `prefix`
@@ -339,12 +384,45 @@ mod tests {
     }
 
     #[test]
+    fn like_with_literal_prefix_prunes_like_starts_with() {
+        // pattern "foo%" → prefix "foo"; max "fooa" already past pattern end?
+        // No: max = "fooa" >= "foo" and min "aaa" < "fop". So this case keeps.
+        let stats = string_stats("aaa", "fooa");
+        assert!(run(PredicateOperator::Like, "foo%", &stats));
+        // pattern "foo%": [foo, fop). file [zaa, zzz] — max < pat → prune.
+        let stats = string_stats("zaa", "zzz");
+        assert!(!run(PredicateOperator::Like, "foo%", &stats));
+        // file [fop, zzz] — min already past prefix range → prune.
+        let stats = string_stats("fop", "zzz");
+        assert!(!run(PredicateOperator::Like, "foo%", &stats));
+    }
+
+    #[test]
+    fn like_without_literal_prefix_falls_open() {
+        let stats = string_stats("aaa", "ccc");
+        // Leading wildcard → no prefix → fail open.
+        assert!(run(PredicateOperator::Like, "%foo%", &stats));
+        // Leading underscore → no prefix → fail open.
+        assert!(run(PredicateOperator::Like, "_oo", &stats));
+    }
+
+    #[test]
+    fn like_with_escaped_wildcard_in_prefix_is_decoded() {
+        // "100\%foo" → literal prefix "100%foo".
+        let stats = string_stats("100", "100%fzz");
+        assert!(run(PredicateOperator::Like, r"100\%foo", &stats));
+        let stats = string_stats("zzz0", "zzz9");
+        assert!(!run(PredicateOperator::Like, r"100\%foo", &stats));
+    }
+
+    #[test]
     fn missing_field_returns_false_for_string_ops() {
         // Only IsNull is allowed when the field is missing.
         for op in [
             PredicateOperator::StartsWith,
             PredicateOperator::EndsWith,
             PredicateOperator::Contains,
+            PredicateOperator::Like,
         ] {
             assert!(!missing_field_may_match(op, 5));
         }

@@ -32,7 +32,7 @@ use arrow_ord::cmp::{
 };
 use arrow_schema::ArrowError;
 use arrow_string::like::{
-    contains as arrow_contains, ends_with as arrow_ends_with,
+    contains as arrow_contains, ends_with as arrow_ends_with, like as arrow_like,
     starts_with as arrow_starts_with,
 };
 use async_trait::async_trait;
@@ -294,6 +294,7 @@ fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
             | PredicateOperator::StartsWith
             | PredicateOperator::EndsWith
             | PredicateOperator::Contains
+            | PredicateOperator::Like
     )
 }
 
@@ -325,7 +326,8 @@ fn parquet_row_filter_literals_supported(
         }
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => {
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
             // Substring kernels only run against string-typed columns; reject
             // non-string file types early so the filter falls back to stats
             // pruning + residual evaluation.
@@ -379,7 +381,8 @@ fn evaluate_exact_leaf_predicate(
         | PredicateOperator::GtEq
         | PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => {
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
             let Some(literal) = literals.first() else {
                 return Ok(BooleanArray::from(vec![true; array.len()]));
             };
@@ -450,12 +453,14 @@ fn evaluate_column_predicate(
         PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => {
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
             let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
             match op {
                 PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
                 PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
                 PredicateOperator::Contains => arrow_contains(column, &pattern),
+                PredicateOperator::Like => arrow_like(column, &pattern),
                 _ => unreachable!(),
             }
         }
@@ -1322,6 +1327,32 @@ mod tests {
         ]));
         let mask = run_string_op(super::PredicateOperator::Contains, arr, "apple");
         let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_pattern_with_underscore_and_percent() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foobar"),
+            Some("foox"),
+            Some("zoobar"),
+            None,
+        ]));
+        // f_o% matches "foobar" (f-o-o then anything) and "foox" (f-o-o then x)
+        // but not "zoobar".
+        let mask = run_string_op(super::PredicateOperator::Like, arr, "f_o%");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_escaped_percent_treated_literally() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef =
+            Arc::new(StringArray::from(vec![Some("100%"), Some("1000"), None]));
+        let mask = run_string_op(super::PredicateOperator::Like, arr, r"100\%");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false]);
         assert_eq!(mask, expected);
     }
 

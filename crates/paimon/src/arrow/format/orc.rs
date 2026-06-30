@@ -256,7 +256,8 @@ fn build_orc_leaf_predicate(
         // outer stats-prune + arrow row-filter path.
         PredicateOperator::StartsWith
         | PredicateOperator::EndsWith
-        | PredicateOperator::Contains => None,
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => None,
     }
 }
 
