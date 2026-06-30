@@ -1,0 +1,1 @@
+JAVA_HOME=/home/clickhouse/software/java17  HDFS_LIB_DIR=/home/clickhouse/dengfangyuan/bleem4/bleem/thirdparty/installed/lib/hadoop_hdfs/native HDFS_STATIC=1 cargo build -p paimon-c --features storage-hdfs-jni --release
