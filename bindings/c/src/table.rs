@@ -128,8 +128,16 @@ pub unsafe extern "C" fn paimon_table_open_path(
     // Build the FileIO; on local fs nothing extra is needed, but for S3/OSS
     // the caller provides credentials via `options`. Pass them directly to
     // the storage layer — they're the same keys `paimon_catalog_create` uses.
+    //
+    // Unlike the catalog path (which keeps metadata on native HDFS and only
+    // flips the *data* FileIO via `Table::with_alluxio`), the open-path caller
+    // hands us a table root that is itself already an `alluxio://` URI when it
+    // wants Alluxio. We therefore propagate `use_alluxio` to the FileIO that
+    // backs the schema/snapshot/manifest reads too, so an `alluxio://` warehouse
+    // doesn't trip `Storage::build`'s "alluxio:// scheme requires with_alluxio"
+    // guard. The result: metadata and data both route through Alluxio.
     let file_io_builder = match FileIO::from_path(&warehouse) {
-        Ok(b) => b,
+        Ok(b) => b.with_alluxio(use_alluxio),
         Err(e) => {
             return paimon_result_get_table {
                 table: std::ptr::null_mut(),
