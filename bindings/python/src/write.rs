@@ -94,6 +94,7 @@ impl PyWriteBuilder {
         Ok(PyTableWrite {
             inner: builder.new_write().map_err(to_py_err)?,
             target_schema,
+            table_location: self.table.location().to_string(),
         })
     }
 
@@ -106,6 +107,7 @@ impl PyWriteBuilder {
             .map_err(to_py_err)?;
         Ok(PyTableCommit {
             inner: builder.new_commit(),
+            table_location: self.table.location().to_string(),
         })
     }
 }
@@ -119,6 +121,9 @@ pub struct PyTableWrite {
     inner: TableWrite,
     /// The table's target Arrow schema, used to validate incoming batches.
     target_schema: Arc<ArrowSchema>,
+    /// The owning table's location, stamped onto produced commit messages so a
+    /// committer can reject messages prepared for a different table.
+    table_location: String,
 }
 
 #[pymethods]
@@ -140,7 +145,10 @@ impl PyTableWrite {
             .map_err(to_py_err)?;
         Ok(messages
             .into_iter()
-            .map(|inner| PyCommitMessage { inner })
+            .map(|inner| PyCommitMessage {
+                inner,
+                table_location: self.table_location.clone(),
+            })
             .collect())
     }
 }
@@ -149,6 +157,10 @@ impl PyTableWrite {
 #[pyclass(name = "TableCommit", module = "pypaimon_rust.datafusion")]
 pub struct PyTableCommit {
     inner: TableCommit,
+    /// The owning table's location, used to reject commit messages that were
+    /// prepared for a different table (which would otherwise persist a snapshot
+    /// referencing data files written under another table).
+    table_location: String,
 }
 
 #[pymethods]
@@ -164,6 +176,13 @@ impl PyTableCommit {
             let msg: PyRef<PyCommitMessage> = item.extract().map_err(|_| {
                 PyTypeError::new_err("commit() expects a sequence of CommitMessage objects")
             })?;
+            if msg.table_location != self.table_location {
+                return Err(PyValueError::new_err(format!(
+                    "commit message was prepared for a different table \
+                     (message table '{}', committer table '{}')",
+                    msg.table_location, self.table_location
+                )));
+            }
             inner_messages.push(msg.inner.clone());
         }
         let rt = runtime();
@@ -174,7 +193,11 @@ impl PyTableCommit {
 
 /// An opaque commit message produced by `prepare_commit`, consumed by `commit`.
 /// PR1 supports same-process transfer only (no pickle/serialization).
+///
+/// Carries the originating table's location so a committer can reject messages
+/// prepared for a different table.
 #[pyclass(name = "CommitMessage", module = "pypaimon_rust.datafusion")]
 pub struct PyCommitMessage {
     pub(crate) inner: CommitMessage,
+    pub(crate) table_location: String,
 }

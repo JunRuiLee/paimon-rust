@@ -137,3 +137,29 @@ def test_commit_non_message_raises_typeerror():
         # A non-iterable argument also raises TypeError (not a raw PyO3 error).
         with pytest.raises(TypeError):
             table.new_write_builder().new_commit().commit(42)
+
+
+def test_commit_cross_table_messages_raises():
+    # Messages prepared for one table must not be committed by another table's
+    # committer (would persist a snapshot referencing data files written
+    # elsewhere). The wrapper stamps each message with its source table location
+    # and the committer rejects mismatches.
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.wdb")
+        ctx.sql("CREATE TABLE paimon.wdb.t1 (id INT, name STRING)")
+        ctx.sql("CREATE TABLE paimon.wdb.t2 (id INT, name STRING)")
+        catalog = PaimonCatalog({"warehouse": warehouse})
+        t1 = catalog.get_table("wdb.t1")
+        t2 = catalog.get_table("wdb.t2")
+        batch = pa.record_batch(
+            [pa.array([1], pa.int32()), pa.array(["a"], pa.string())],
+            names=["id", "name"],
+        )
+        w1 = t1.new_write_builder().new_write()
+        w1.write_arrow(batch)
+        messages = w1.prepare_commit()
+        with pytest.raises(ValueError):
+            t2.new_write_builder().new_commit().commit(messages)
+
