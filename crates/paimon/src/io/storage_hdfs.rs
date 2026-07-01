@@ -52,6 +52,26 @@ const BUILTIN_HDFS_SITE: &str = include_str!("../../resources/hadoop-conf/hdfs-s
 /// (`1` / `true` / `yes` / `on`) to instead defer to the external config.
 const EXTERNAL_HADOOP_CONF_FLAG: &str = "PAIMON_USE_EXTERNAL_HADOOP_CONF";
 
+/// Override for the base directory the built-in Hadoop conf is materialized
+/// under.
+///
+/// By default the conf is written to `std::env::temp_dir()` (e.g. `/tmp`). Set
+/// this to an absolute directory to place the `paimon-builtin-hadoop-conf`
+/// subdir elsewhere — useful when `/tmp` is noexec / tiny / shared, or when the
+/// deployer wants the materialized conf on a known, inspectable path.
+const BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV: &str = "PAIMON_BUILTIN_HADOOP_CONF_DIR_PREFIX";
+
+/// Base directory under which the built-in Hadoop conf subdir is created.
+///
+/// Uses [`BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV`] when set (and non-empty),
+/// otherwise falls back to the system temp dir.
+fn builtin_hadoop_conf_dir_prefix() -> std::path::PathBuf {
+    match std::env::var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV) {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => std::env::temp_dir(),
+    }
+}
+
 /// Whether the deployer opted into using an external Hadoop config.
 fn external_hadoop_conf_enabled() -> bool {
     std::env::var(EXTERNAL_HADOOP_CONF_FLAG)
@@ -82,7 +102,7 @@ fn ensure_builtin_hadoop_conf() -> Result<()> {
         return Ok(());
     }
 
-    let dir = std::env::temp_dir().join("paimon-builtin-hadoop-conf");
+    let dir = builtin_hadoop_conf_dir_prefix().join("paimon-builtin-hadoop-conf");
     let write = |name: &str, content: &str| -> Result<()> {
         std::fs::write(dir.join(name), content).map_err(|e| Error::ConfigInvalid {
             message: format!("Failed to write built-in hadoop conf {name} to {dir:?}: {e}"),
@@ -346,5 +366,43 @@ mod tests {
     fn test_hdfs_relative_path_wrong_scheme() {
         let result = hdfs_relative_path("s3://bucket/key");
         assert!(result.is_err());
+    }
+
+    /// The env var override for the built-in hadoop conf base dir. All three
+    /// cases live in one test because the env var is process-global — running
+    /// them as separate `#[test]`s would let cargo's parallel runner interleave
+    /// the set/remove and make assertions flaky.
+    #[test]
+    fn test_builtin_hadoop_conf_dir_prefix_override() {
+        // Save and restore whatever the surrounding environment had, so this
+        // test leaves no residue for others.
+        let saved = std::env::var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV).ok();
+
+        // Unset -> falls back to the system temp dir.
+        std::env::remove_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV);
+        assert_eq!(builtin_hadoop_conf_dir_prefix(), std::env::temp_dir());
+
+        // Set to an absolute dir -> used verbatim.
+        std::env::set_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV, "/data/paimon");
+        assert_eq!(
+            builtin_hadoop_conf_dir_prefix(),
+            std::path::PathBuf::from("/data/paimon")
+        );
+
+        // Surrounding whitespace is trimmed.
+        std::env::set_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV, "  /data/paimon  ");
+        assert_eq!(
+            builtin_hadoop_conf_dir_prefix(),
+            std::path::PathBuf::from("/data/paimon")
+        );
+
+        // Empty / whitespace-only -> treated as unset, falls back to temp dir.
+        std::env::set_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV, "   ");
+        assert_eq!(builtin_hadoop_conf_dir_prefix(), std::env::temp_dir());
+
+        match saved {
+            Some(v) => std::env::set_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV, v),
+            None => std::env::remove_var(BUILTIN_HADOOP_CONF_DIR_PREFIX_ENV),
+        }
     }
 }
