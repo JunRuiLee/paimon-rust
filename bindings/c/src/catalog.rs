@@ -23,7 +23,6 @@ use paimon::{Catalog, CatalogFactory, Options};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr};
 use crate::result::{paimon_result_catalog_new, paimon_result_get_table};
-use crate::runtime;
 use crate::types::{paimon_catalog, paimon_option, paimon_table};
 
 /// Create a catalog using CatalogFactory with the given options.
@@ -64,7 +63,7 @@ pub unsafe extern "C" fn paimon_catalog_create(
     }
 
     // Create catalog using CatalogFactory
-    match runtime().block_on(CatalogFactory::create(opts)) {
+    match crate::block_on(CatalogFactory::create(opts)) {
         Ok(catalog) => {
             let wrapper = Box::new(paimon_catalog {
                 inner: Box::into_raw(Box::new(catalog)) as *mut c_void,
@@ -129,7 +128,7 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
     let catalog_ref = &*((*catalog).inner as *const Arc<dyn Catalog>);
     let identifier_ref = &*((*identifier).inner as *const Identifier);
 
-    match runtime().block_on(catalog_ref.get_table(identifier_ref)) {
+    match crate::block_on(catalog_ref.get_table(identifier_ref)) {
         Ok(table) => match table.with_alluxio(use_alluxio) {
             Ok(table) => {
                 let wrapper = Box::new(paimon_table {

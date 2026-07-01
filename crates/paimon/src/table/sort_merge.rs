@@ -57,6 +57,14 @@ pub(crate) enum BufferedBatch {
 }
 
 impl BufferedBatch {
+    /// Arrow memory footprint of the wrapped batch, used for explicit
+    /// per-query memory accounting of the merge buffer.
+    pub(crate) fn memory_size(&self) -> usize {
+        match self {
+            BufferedBatch::Source(b) | BufferedBatch::Materialized(b) => b.get_array_memory_size(),
+        }
+    }
+
     pub(crate) fn column_for_output<'a>(
         &'a self,
         output_col_idx: usize,
@@ -954,6 +962,12 @@ fn sort_merge_stream(
         // Bump for the initial source registrations done above.
         observe_peak!(batch_buffer);
 
+        // Explicit per-query memory accounting of the merge buffer (the MOR
+        // memory hot spot). Recomputed after every buffer mutation; Drop
+        // releases the remainder on completion / early drop / error.
+        let mut mem_acct = MergeMemAccount::new();
+        mem_acct.sync(&batch_buffer, &cursors);
+
         loop {
             let winner_idx = tree.winner();
             // Check if all streams are exhausted.
@@ -1011,6 +1025,7 @@ fn sort_merge_stream(
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(batch.clone()));
                                 observe_peak!(batch_buffer);
+                                mem_acct.sync(&batch_buffer, &cursors);
                                 stream_batch_idx[current_winner] = Some(buf_idx);
                                 cursors[current_winner] = Some(SortMergeCursor { batch, rows, offset: 0 });
                                 break;
@@ -1116,6 +1131,9 @@ fn sort_merge_stream(
                     &mut stream_batch_idx,
                     &cursors,
                 );
+                // Buffer shrank (dead batches dropped) and/or a materialized
+                // batch was written above; reconcile the accounted bytes.
+                mem_acct.sync(&batch_buffer, &cursors);
                 yield batch;
             }
         }
@@ -1176,6 +1194,59 @@ fn build_output_interleave(
         message: format!("Failed to build interleaved RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
+}
+
+/// Explicit per-query memory accounting for the merge's resident memory.
+///
+/// The sort-merge simultaneously holds, per split (N = files in the split):
+///   - the accumulating `batch_buffer` of input/materialized `RecordBatch`es
+///     (arrow array bytes), and
+///   - one arrow-row key encoding (`Rows`) per live cursor.
+/// Together these are the bulk of merge-on-read memory. The cdylib no longer
+/// uses a global allocator (IO frees happen on untagged blocking-pool threads
+/// and drift), so we account them explicitly here: this runs on the tagged
+/// scanner thread that drives the merge, so `mem_tag::account` charges the right
+/// query. When no tag is installed (tests, non-FFI callers) `account` is a
+/// no-op.
+///
+/// Note we do NOT separately count `cursor.batch`: for a Source batch it is the
+/// same Arc already counted in `batch_buffer`, so counting it again would double
+/// count. Only the cursor's `rows` (an independent key buffer) is added.
+///
+/// We recompute the total after every mutation and charge only the delta;
+/// `Drop` returns whatever is still charged, covering normal completion, early
+/// stream drop, and errors.
+struct MergeMemAccount {
+    charged: i64,
+}
+
+impl MergeMemAccount {
+    fn new() -> Self {
+        MergeMemAccount { charged: 0 }
+    }
+
+    fn sync(&mut self, buffer: &[BufferedBatch], cursors: &[Option<SortMergeCursor>]) {
+        let buffer_bytes: i64 = buffer.iter().map(|b| b.memory_size() as i64).sum();
+        let rows_bytes: i64 = cursors
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|c| c.rows.size() as i64)
+            .sum();
+        let total = buffer_bytes + rows_bytes;
+        let delta = total - self.charged;
+        if delta != 0 {
+            crate::mem_tag::account(delta);
+            self.charged = total;
+        }
+    }
+}
+
+impl Drop for MergeMemAccount {
+    fn drop(&mut self) {
+        if self.charged != 0 {
+            crate::mem_tag::account(-self.charged);
+        }
+    }
 }
 
 /// Compact the batch buffer by removing batches no longer referenced by any

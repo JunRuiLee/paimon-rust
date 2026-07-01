@@ -75,6 +75,14 @@ typedef struct {
   paimon_error *error;
 } paimon_result_identifier_new;
 
+/**
+ * Opaque per-query memory counter. `inner` is a `Box<AtomicI64>` holding the
+ * net allocated bytes (alloc − dealloc) attributed to this counter.
+ */
+typedef struct {
+  void *inner;
+} paimon_mem_counter;
+
 typedef struct {
   void *inner;
 } paimon_read_builder;
@@ -264,6 +272,52 @@ paimon_result_get_table paimon_catalog_get_table(const paimon_catalog *catalog,
  * Only call with an identifier returned from `paimon_identifier_new`.
  */
  void paimon_identifier_free(paimon_identifier *id) ;
+
+/**
+ * Create a memory counter. Returns an owning pointer the caller must release
+ * with `paimon_mem_counter_destroy`.
+ */
+ paimon_mem_counter *paimon_mem_counter_create(void) ;
+
+/**
+ * Destroy a counter created by `paimon_mem_counter_create`. No-op on null.
+ *
+ * # Safety
+ * `counter` must be null or a pointer from `paimon_mem_counter_create`, and
+ * must not be currently installed as any thread's accounting target.
+ */
+ void paimon_mem_counter_destroy(paimon_mem_counter *counter) ;
+
+/**
+ * Install `counter` as the calling thread's accounting target for the
+ * allocations that follow, returning the previous target as an opaque token.
+ * Pass that token to `paimon_mem_counter_restore` to undo the installation.
+ * A null `counter` installs "no target" (allocations are not attributed).
+ *
+ * # Safety
+ * `counter` must be null or a pointer from `paimon_mem_counter_create`, and
+ * must stay alive until the matching `paimon_mem_counter_restore`.
+ */
+ void *paimon_mem_counter_enter(const paimon_mem_counter *counter) ;
+
+/**
+ * Restore the accounting target to the token returned by a prior
+ * `paimon_mem_counter_enter`.
+ *
+ * # Safety
+ * `old` must be a token returned by `paimon_mem_counter_enter` on this thread,
+ * restored in LIFO order.
+ */
+ void paimon_mem_counter_restore(void *old) ;
+
+/**
+ * Net bytes (alloc − dealloc) currently attributed to `counter`. Returns 0 on
+ * null.
+ *
+ * # Safety
+ * `counter` must be null or a pointer from `paimon_mem_counter_create`.
+ */
+ int64_t paimon_mem_counter_net_bytes(const paimon_mem_counter *counter) ;
 
 /**
  * Free a paimon_table.

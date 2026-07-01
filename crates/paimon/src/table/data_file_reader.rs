@@ -172,7 +172,17 @@ impl DataFileReader {
                         None,
                     )?;
                     while let Some(batch) = stream.next().await {
-                        yield batch?;
+                        let batch = batch?;
+                        // Explicit per-query accounting of the in-flight batch
+                        // (the cdylib has no global allocator). append-only holds
+                        // one batch at a time; charge it for the yield window and
+                        // release when the next batch arrives or the stream ends.
+                        // Runs on the tagged scanner thread; no-op without a tag.
+                        // NOTE: only this append-only entry accounts here — MOR
+                        // drives read_single_file_stream directly and accounts in
+                        // sort_merge instead, so batches are never double-counted.
+                        let _batch_mem = crate::mem_tag::ScopedBytes::new(batch.get_array_memory_size() as i64);
+                        yield batch;
                     }
                 }
             }

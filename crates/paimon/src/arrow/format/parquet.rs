@@ -192,6 +192,28 @@ impl FormatFileReader for ParquetFormatReader {
             .collect();
 
         let mask = ProjectionMask::roots(&parquet_schema, root_indices);
+        // Estimate the parquet decoder's peak resident memory for this file so
+        // it can be charged to the query. The async reader decodes one row group
+        // at a time, holding its decompressed column chunks (for the projected
+        // leaves only) in crate-internal buffers we cannot see via
+        // get_array_memory_size. We approximate that peak as the largest
+        // per-row-group sum of *projected* leaf uncompressed sizes. In MOR the N
+        // concurrent file streams each carry one such guard, so N of these add
+        // up — matching the N-way concurrent decompression residency.
+        let peak_decode_bytes: i64 = batch_stream_builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                rg.columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(leaf_idx, _)| mask.leaf_included(*leaf_idx))
+                    .map(|(_, col)| col.uncompressed_size())
+                    .sum::<i64>()
+            })
+            .max()
+            .unwrap_or(0);
         batch_stream_builder = batch_stream_builder.with_projection(mask);
 
         let empty_predicates = Vec::new();
@@ -255,7 +277,17 @@ impl FormatFileReader for ParquetFormatReader {
         }
 
         let batch_stream = batch_stream_builder.build()?;
-        Ok(batch_stream.map(|r| r.map_err(Error::from)).boxed())
+        // Charge the decoder's estimated peak residency for as long as the
+        // stream lives; the guard is moved into the stream so it releases on
+        // drop (normal completion, early drop, or error). Runs on the tagged
+        // scanner thread that polls the stream.
+        let decode_guard = crate::mem_tag::ScopedBytes::new(peak_decode_bytes);
+        let batch_stream = batch_stream.map(move |r| {
+            // keep `decode_guard` captured for the stream's whole lifetime
+            let _ = &decode_guard;
+            r.map_err(Error::from)
+        });
+        Ok(batch_stream.boxed())
     }
 }
 

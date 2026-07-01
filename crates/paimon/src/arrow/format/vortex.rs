@@ -97,13 +97,27 @@ impl FormatFileReader for VortexFormatReader {
             predicates,
             row_selection,
         };
-        let batches =
-            tokio::task::spawn_blocking(move || read_vortex_batches_blocking(bytes, plan))
-                .await
-                .map_err(|e| Error::DataInvalid {
-                    message: format!("Vortex read task failed: {e}"),
-                    source: None,
-                })??;
+        // Capture the memory-accounting tag on the calling (scanner) thread,
+        // where it is valid, and re-install it at the top of the blocking
+        // task. The Vortex read crosses two thread hops — spawn_blocking onto
+        // a tokio blocking thread, then run_vortex_on_thread onto a dedicated
+        // OS thread — and neither inherits our thread-local. Re-installing it
+        // here lets run_vortex_on_thread read it back via mem_tag::current()
+        // and propagate it to the decode thread. The pointer stays valid for
+        // the whole call: block_on keeps this thread parked (and the owning
+        // reader alive) until the blocking task and its join complete.
+        let mem_tag = crate::mem_tag::current() as usize;
+        let batches = tokio::task::spawn_blocking(move || {
+            let _mem_guard = crate::mem_tag::CounterGuard::enter(
+                mem_tag as *const std::sync::atomic::AtomicI64,
+            );
+            read_vortex_batches_blocking(bytes, plan)
+        })
+        .await
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Vortex read task failed: {e}"),
+            source: None,
+        })??;
 
         Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok))))
     }
@@ -1023,9 +1037,21 @@ fn run_vortex_on_thread<T>(
 where
     T: Send + 'static,
 {
+    // Propagate the memory-accounting tag to the worker thread. The decode
+    // (and write) work happens on a fresh OS thread that does not inherit our
+    // thread-local, so without this its allocations would not be charged to
+    // the reader that owns this call. We pass the pointer as a usize because
+    // raw pointers are not Send; this is sound because we `join()` below, so
+    // the parent stays blocked — and the reader (which owns the pointed-to
+    // counter) stays alive — for the entire lifetime of the worker thread.
+    let tag = crate::mem_tag::current() as usize;
     let join = std::thread::Builder::new()
         .name(name.to_string())
-        .spawn(f)
+        .spawn(move || {
+            let _mem_guard =
+                crate::mem_tag::CounterGuard::enter(tag as *const std::sync::atomic::AtomicI64);
+            f()
+        })
         .map_err(|e| Error::DataInvalid {
             message: format!("Failed to spawn Vortex worker thread: {e}"),
             source: None,

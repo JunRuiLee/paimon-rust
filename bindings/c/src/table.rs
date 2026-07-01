@@ -23,9 +23,7 @@ use futures::StreamExt;
 use paimon::catalog::Identifier;
 use paimon::io::FileIO;
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
-use paimon::table::{
-    deserialize_data_split_to_plan, ArrowRecordBatchStream, SchemaManager, Table,
-};
+use paimon::table::{deserialize_data_split_to_plan, ArrowRecordBatchStream, SchemaManager, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
@@ -34,7 +32,6 @@ use crate::result::{
     paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
     paimon_result_table_scan,
 };
-use crate::runtime;
 use crate::types::*;
 
 // Helper to free a wrapper struct that contains a Table clone.
@@ -189,7 +186,7 @@ pub unsafe extern "C" fn paimon_table_open_path(
     // Mirrors `FileSystemCatalog::load_latest_table_schema` so a path-loaded
     // table is byte-for-byte identical to one obtained from the catalog API.
     let schema_manager = SchemaManager::new(file_io.clone(), path.clone());
-    let schema_arc = match runtime().block_on(schema_manager.latest()) {
+    let schema_arc = match crate::block_on(schema_manager.latest()) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return paimon_result_get_table {
@@ -488,7 +485,7 @@ pub unsafe extern "C" fn paimon_table_scan_plan(
     }
     let table_scan = rb.new_scan();
 
-    match runtime().block_on(table_scan.plan()) {
+    match crate::block_on(table_scan.plan()) {
         Ok(plan) => {
             let wrapper = Box::new(paimon_plan {
                 inner: Box::into_raw(Box::new(plan)) as *mut c_void,
@@ -690,8 +687,14 @@ pub unsafe extern "C" fn paimon_record_batch_reader_next(
     }
 
     let stream = &mut *((*reader).inner as *mut ArrowRecordBatchStream);
+    // Memory accounting is driven by the C++ caller: it installs the query's
+    // counter as this thread's tag (via paimon_mem_counter_enter) for the whole
+    // span of get_next_block, so the batch buffers allocated here are balanced
+    // by their later free in the C++ batch destructor. Decoding for
+    // parquet/ORC/avro runs synchronously on this thread; the Vortex decode
+    // thread re-installs the tag itself by reading it back (run_vortex_on_thread).
 
-    match runtime().block_on(stream.next()) {
+    match crate::block_on(stream.next()) {
         Some(Ok(batch)) => {
             let schema = batch.schema();
             let struct_array = StructArray::from(batch);
