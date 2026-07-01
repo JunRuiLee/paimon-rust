@@ -300,6 +300,16 @@ def test_read_empty_splits():
         assert table.new_read_builder().new_read().read([]) == []
 
 
+def test_read_empty_splits_still_validates_projection():
+    # An invalid projection must fail regardless of split count; the empty-splits
+    # fast path should not bypass config validation.
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        read = table.new_read_builder().with_projection(["does_not_exist"]).new_read()
+        with pytest.raises(Exception):
+            read.read([])
+
+
 def test_read_non_split_raises_typeerror():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)

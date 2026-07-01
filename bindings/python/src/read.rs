@@ -168,15 +168,18 @@ impl PyTableRead {
     /// Read the given splits into a list of PyArrow RecordBatches.
     fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
         let splits = extract_splits(splits)?;
-        if splits.is_empty() {
-            return Ok(Vec::new());
-        }
         let rt = runtime();
         let batches = py.detach(|| {
             rt.block_on(async {
                 let mut builder = self.table.new_read_builder();
                 apply_read_config(&mut builder, &self.projection, self.limit, &self.filter);
+                // Validate config (e.g. projection) before the empty-splits fast
+                // path so an invalid projection fails consistently regardless of
+                // how many splits are passed.
                 let read = builder.new_read().map_err(to_py_err)?;
+                if splits.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let stream = read.to_arrow(&splits).map_err(to_py_err)?;
                 stream.try_collect::<Vec<_>>().await.map_err(to_py_err)
             })
