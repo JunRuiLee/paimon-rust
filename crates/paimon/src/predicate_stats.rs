@@ -397,14 +397,7 @@ mod tests {
 
     fn run(op: PredicateOperator, lit: &str, stats: &MockStats) -> bool {
         let dt = varchar();
-        data_leaf_may_match(
-            0,
-            &dt,
-            &dt,
-            op,
-            &[Datum::String(lit.to_string())],
-            stats,
-        )
+        data_leaf_may_match(0, &dt, &dt, op, &[Datum::String(lit.to_string())], stats)
     }
 
     #[test]
@@ -538,13 +531,13 @@ mod tests {
     fn between_matches_gteq_lteq_conjunction() {
         let cases: &[(i32, i32, i32, i32, bool)] = &[
             // (min, max, low, high, expected_may_match)
-            (0, 100, 50, 60, true),     // overlap inside
-            (0, 100, 200, 300, false),  // entirely above
-            (0, 100, -50, -1, false),   // entirely below
-            (0, 100, 100, 100, true),   // boundary high
-            (0, 100, 0, 0, true),       // boundary low
-            (50, 100, 0, 49, false),    // low < min < high < max impossible — fully below
-            (50, 100, 0, 200, true),    // file fully inside [low, high]
+            (0, 100, 50, 60, true),    // overlap inside
+            (0, 100, 200, 300, false), // entirely above
+            (0, 100, -50, -1, false),  // entirely below
+            (0, 100, 100, 100, true),  // boundary high
+            (0, 100, 0, 0, true),      // boundary low
+            (50, 100, 0, 49, false),   // low < min < high < max impossible — fully below
+            (50, 100, 0, 200, true),   // file fully inside [low, high]
         ];
         for &(min, max, low, high, expected) in cases {
             let stats = int_stats(min, max);
@@ -560,7 +553,10 @@ mod tests {
                 gteq && lteq,
                 "Between vs GtEq+LtEq divergence at ({min},{max}) ∩ [{low},{high}]"
             );
-            assert_eq!(between, expected, "Between unexpected at {min},{max} ∩ [{low},{high}]");
+            assert_eq!(
+                between, expected,
+                "Between unexpected at {min},{max} ∩ [{low},{high}]"
+            );
         }
     }
 

@@ -694,12 +694,7 @@ impl PredicateBuilder {
     /// rejected with [`Error::ConfigInvalid`] (the DataFusion translator turns
     /// that into a fall-open). Empty pattern → [`PredicateOperator::Eq`] of the
     /// empty string (SQL semantics: only the empty string matches).
-    pub fn like(
-        &self,
-        field: &str,
-        pattern: Datum,
-        escape: Option<char>,
-    ) -> Result<Predicate> {
+    pub fn like(&self, field: &str, pattern: Datum, escape: Option<char>) -> Result<Predicate> {
         let pattern_str = match &pattern {
             Datum::String(s) => s.clone(),
             other => {
@@ -719,9 +714,7 @@ impl PredicateBuilder {
 
         match optimize_like_pattern(&pattern_str) {
             LikeShape::EmptyOrLiteral(s) => self.equal(field, Datum::String(s)),
-            LikeShape::StartsWith(prefix) => {
-                self.starts_with(field, Datum::String(prefix))
-            }
+            LikeShape::StartsWith(prefix) => self.starts_with(field, Datum::String(prefix)),
             LikeShape::EndsWith(suffix) => self.ends_with(field, Datum::String(suffix)),
             LikeShape::Contains(mid) => self.contains(field, Datum::String(mid)),
             LikeShape::Residual => self.leaf(field, PredicateOperator::Like, vec![pattern]),
@@ -758,12 +751,7 @@ impl PredicateBuilder {
     /// Shared body for the three string operators: empty-string short-circuit
     /// and literal-type guard ([`leaf`] still cross-checks against the column
     /// type, so non-string columns are rejected there).
-    fn string_leaf(
-        &self,
-        field: &str,
-        op: PredicateOperator,
-        pattern: Datum,
-    ) -> Result<Predicate> {
+    fn string_leaf(&self, field: &str, op: PredicateOperator, pattern: Datum) -> Result<Predicate> {
         match &pattern {
             // Every non-null string starts with / ends with / contains the
             // empty string, and a NULL value matches none of them — i.e. the
@@ -1124,10 +1112,10 @@ fn optimize_like_pattern(pattern: &str) -> LikeShape {
     match percent_count {
         0 => LikeShape::EmptyOrLiteral(pattern.to_string()),
         1 => {
-            if pattern.ends_with('%') {
-                LikeShape::StartsWith(pattern[..pattern.len() - 1].to_string())
-            } else if pattern.starts_with('%') {
-                LikeShape::EndsWith(pattern[1..].to_string())
+            if let Some(prefix) = pattern.strip_suffix('%') {
+                LikeShape::StartsWith(prefix.to_string())
+            } else if let Some(suffix) = pattern.strip_prefix('%') {
+                LikeShape::EndsWith(suffix.to_string())
             } else {
                 LikeShape::Residual
             }
@@ -2285,7 +2273,9 @@ mod tests {
     fn test_builder_string_ops_reject_non_string_column() {
         let pb = PredicateBuilder::new(&test_fields());
         // `id` is Int, so a String literal fails the cross-check inside leaf().
-        assert!(pb.starts_with("id", Datum::String("x".to_string())).is_err());
+        assert!(pb
+            .starts_with("id", Datum::String("x".to_string()))
+            .is_err());
     }
 
     #[test]
@@ -2343,7 +2333,8 @@ mod tests {
         let pb = PredicateBuilder::new(&test_fields());
         // No wildcards → Eq.
         assert_leaf(
-            &pb.like("name", Datum::String("foo".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("foo".to_string()), None)
+                .unwrap(),
             PredicateOperator::Eq,
             "foo",
         );
@@ -2355,19 +2346,22 @@ mod tests {
         );
         // prefix% → StartsWith.
         assert_leaf(
-            &pb.like("name", Datum::String("foo%".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("foo%".to_string()), None)
+                .unwrap(),
             PredicateOperator::StartsWith,
             "foo",
         );
         // %suffix → EndsWith.
         assert_leaf(
-            &pb.like("name", Datum::String("%bar".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("%bar".to_string()), None)
+                .unwrap(),
             PredicateOperator::EndsWith,
             "bar",
         );
         // %mid% → Contains.
         assert_leaf(
-            &pb.like("name", Datum::String("%baz%".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("%baz%".to_string()), None)
+                .unwrap(),
             PredicateOperator::Contains,
             "baz",
         );
@@ -2378,13 +2372,15 @@ mod tests {
         let pb = PredicateBuilder::new(&test_fields());
         // `_` keeps Like leaf.
         assert_leaf(
-            &pb.like("name", Datum::String("f_o".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("f_o".to_string()), None)
+                .unwrap(),
             PredicateOperator::Like,
             "f_o",
         );
         // Multi-segment % keeps Like leaf.
         assert_leaf(
-            &pb.like("name", Datum::String("a%b%c".to_string()), None).unwrap(),
+            &pb.like("name", Datum::String("a%b%c".to_string()), None)
+                .unwrap(),
             PredicateOperator::Like,
             "a%b%c",
         );
@@ -2463,9 +2459,7 @@ mod tests {
     #[test]
     fn test_builder_not_between_low_above_high_short_circuits_to_is_not_null() {
         let pb = PredicateBuilder::new(&test_fields());
-        let pred = pb
-            .not_between("id", Datum::Int(10), Datum::Int(1))
-            .unwrap();
+        let pred = pb.not_between("id", Datum::Int(10), Datum::Int(1)).unwrap();
         match &pred {
             Predicate::Leaf { op, .. } => assert_eq!(*op, PredicateOperator::IsNotNull),
             other => panic!("expected IsNotNull leaf, got {other:?}"),

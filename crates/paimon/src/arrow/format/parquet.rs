@@ -22,7 +22,7 @@ use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Datum as ArrowDatum, Date32Array, Decimal128Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
     StringArray,
 };
@@ -1421,33 +1421,36 @@ mod tests {
         high: i32,
     ) -> arrow_array::BooleanArray {
         let dt = DataType::Int(IntType::new());
-        super::evaluate_exact_leaf_predicate(
-            &column,
-            &dt,
-            op,
-            &[Datum::Int(low), Datum::Int(high)],
-        )
-        .expect("BETWEEN should evaluate")
+        super::evaluate_exact_leaf_predicate(&column, &dt, op, &[Datum::Int(low), Datum::Int(high)])
+            .expect("BETWEEN should evaluate")
     }
 
     #[test]
     fn test_evaluate_between_int_array() {
-        let arr: arrow_array::ArrayRef =
-            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
         let mask = run_between(super::PredicateOperator::Between, arr, 5, 10);
-        let expected =
-            arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
+        let expected = arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
         assert_eq!(mask, expected);
     }
 
     #[test]
     fn test_evaluate_not_between_treats_null_as_false() {
-        let arr: arrow_array::ArrayRef =
-            Arc::new(Int32Array::from(vec![Some(1), Some(5), Some(10), Some(11), None]));
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
         let mask = run_between(super::PredicateOperator::NotBetween, arr, 5, 10);
         // NULL → false (residual filter convention; matches sanitize_filter_mask).
-        let expected =
-            arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
         assert_eq!(mask, expected);
     }
 

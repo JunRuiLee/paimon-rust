@@ -767,9 +767,8 @@ mod tests {
     #[test]
     fn test_translate_like_no_wildcards_rewrites_to_eq() {
         let fields = test_fields();
-        let predicate =
-            build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
-                .expect("LIKE without wildcards should translate to Eq");
+        let predicate = build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
+            .expect("LIKE without wildcards should translate to Eq");
         match predicate {
             Predicate::Leaf { op, .. } => {
                 assert_eq!(op, paimon::spec::PredicateOperator::Eq);
