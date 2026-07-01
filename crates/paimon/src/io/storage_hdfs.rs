@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use opendal::services::HdfsNativeConfig;
 use opendal::Operator;
@@ -96,29 +97,52 @@ fn external_hadoop_conf_enabled() -> bool {
 /// `HADOOP_HOME` as usual. Called only for `viewfs://` paths (see
 /// [`hdfs_config_build`]); plain `hdfs://` single-NameNode access needs no mount
 /// table and is never affected.
+///
+/// # Concurrency
+///
+/// The materialize-and-`set_var` step runs **exactly once per process**, gated
+/// by a [`OnceLock`]. Each `Storage::HdfsNative` instance has its own operator
+/// lock, but they all materialize to the same fixed path
+/// (`<prefix>/paimon-builtin-hadoop-conf/`). Without the gate, concurrent
+/// instances (multiple queries / splits) would race on `std::fs::write`, which
+/// truncates the target to zero before rewriting it — a reader building its
+/// operator could then read a mid-write empty file and hit hdfs-native's
+/// `the document does not have a root node` XML error. Doing the write once,
+/// before any hdfs-native `Configuration` reads the files, removes the race.
 fn ensure_builtin_hadoop_conf() -> Result<()> {
     if external_hadoop_conf_enabled() {
         // Deployer opted into their own HADOOP_CONF_DIR / HADOOP_HOME.
         return Ok(());
     }
 
+    // Materialize the built-in conf and point HADOOP_CONF_DIR at it exactly
+    // once. Subsequent calls return the cached result instead of rewriting the
+    // shared files (which would truncate them and race concurrent readers).
+    static MATERIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    MATERIALIZED
+        .get_or_init(materialize_builtin_hadoop_conf)
+        .clone()
+        .map_err(|message| Error::ConfigInvalid { message })
+}
+
+/// Write the embedded conf files and set `HADOOP_CONF_DIR`. Runs once, under
+/// the [`OnceLock`] in [`ensure_builtin_hadoop_conf`]. Returns a `String` error
+/// (not [`Error`]) so the result is `Clone`-able for caching in the `OnceLock`.
+fn materialize_builtin_hadoop_conf() -> std::result::Result<(), String> {
     let dir = builtin_hadoop_conf_dir_prefix().join("paimon-builtin-hadoop-conf");
-    let write = |name: &str, content: &str| -> Result<()> {
-        std::fs::write(dir.join(name), content).map_err(|e| Error::ConfigInvalid {
-            message: format!("Failed to write built-in hadoop conf {name} to {dir:?}: {e}"),
-        })
+    let write = |name: &str, content: &str| -> std::result::Result<(), String> {
+        std::fs::write(dir.join(name), content)
+            .map_err(|e| format!("Failed to write built-in hadoop conf {name} to {dir:?}: {e}"))
     };
 
-    std::fs::create_dir_all(&dir).map_err(|e| Error::ConfigInvalid {
-        message: format!("Failed to create built-in hadoop conf dir {dir:?}: {e}"),
-    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create built-in hadoop conf dir {dir:?}: {e}"))?;
     write("core-site.xml", BUILTIN_CORE_SITE)?;
     write("hdfs-site.xml", BUILTIN_HDFS_SITE)?;
 
     // Force HADOOP_CONF_DIR to the built-in dir, overriding any external value.
-    // hdfs-native reads it when the client is built; this runs under the HDFS
-    // operator's init lock (see storage.rs), so it is serialized with operator
-    // construction and never races a concurrent build.
+    // hdfs-native reads it when the client is built; gated by the OnceLock so
+    // this runs before any operator reads the files, never racing a rewrite.
     std::env::set_var("HADOOP_CONF_DIR", &dir);
     Ok(())
 }
