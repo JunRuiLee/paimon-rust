@@ -95,7 +95,7 @@ pub use write_builder::WriteBuilder;
 
 use crate::catalog::Identifier;
 use crate::io::FileIO;
-use crate::spec::{DataField, Snapshot, TableSchema};
+use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -210,7 +210,10 @@ impl Table {
         // scans of such a copy fail until `copy_with_time_travel` re-resolves
         // it). Unrelated options keep the snapshot/schema pair intact.
         let selector_changed = extra.keys().any(|k| {
-            k == crate::spec::SCAN_VERSION_OPTION || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+            k == crate::spec::SCAN_VERSION_OPTION
+                || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+                || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
+                || k == crate::spec::SCAN_TAG_NAME_OPTION
         });
         Self {
             file_io: self.file_io.clone(),
@@ -234,14 +237,18 @@ impl Table {
     ///
     /// Mirrors Java `AbstractFileStoreTable.copy(dynamicOptions)` →
     /// `tryTimeTravel`: if the merged options contain a time-travel selector
-    /// (`scan.version` / `scan.timestamp-millis`) that resolves to a snapshot,
-    /// the table's fields and keys come from that snapshot's schema while the
-    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
+    /// (`scan.version` / `scan.timestamp-millis` / `scan.snapshot-id` /
+    /// `scan.tag-name`) that resolves to a snapshot, the table's fields and
+    /// keys come from that snapshot's schema while the options stay the merged
+    /// ones (Java `TableSchema.copy(newOptions)`).
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
     pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
         let mut table = self.copy_with_options(extra);
+        // Reject unimplemented scan options on the merged view before any IO, so
+        // both table-level and per-read options are covered.
+        CoreOptions::new(table.schema().options()).validate_scan_options()?;
         // travel_to_snapshot returns Ok(None) without IO when the merged
         // options contain no selector.
         if let Ok(Some(snapshot)) =
@@ -263,6 +270,14 @@ impl Table {
     /// historical schema (see [`Table::copy_with_time_travel`]).
     pub fn is_time_traveled(&self) -> bool {
         self.time_traveled
+    }
+
+    /// Whether a time-travel selector in this copy's options resolved to a
+    /// snapshot. Lets external callers (e.g. the Python binding) distinguish
+    /// "selector set but unresolved" (silent fallback to latest) from a real
+    /// travelled read, so they can reject the former instead of reading latest.
+    pub fn has_resolved_travel_snapshot(&self) -> bool {
+        self.travel_snapshot.is_some()
     }
 
     /// The snapshot resolved by [`Table::copy_with_time_travel`] from this

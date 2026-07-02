@@ -627,8 +627,10 @@ impl<'a> TableScan<'a> {
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
-    /// - only one of `scan.version`, `scan.timestamp-millis` may be set
-    /// - `scan.version` → tag name (if exists) → snapshot id (if parseable) → error
+    /// - only one of `scan.version`, `scan.timestamp-millis`,
+    ///   `scan.snapshot-id`, `scan.tag-name` may be set
+    /// - `scan.version` / `scan.snapshot-id` / `scan.tag-name` → tag name (if
+    ///   exists) → snapshot id (if parseable) → error
     /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
     /// - otherwise → read the latest snapshot
     ///

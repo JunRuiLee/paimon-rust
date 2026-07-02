@@ -66,6 +66,13 @@ const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
+pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
+pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
+const INCREMENTAL_BETWEEN_OPTION: &str = "incremental-between";
+const INCREMENTAL_BETWEEN_TIMESTAMP_OPTION: &str = "incremental-between-timestamp";
+const INCREMENTAL_BETWEEN_SCAN_MODE_OPTION: &str = "incremental-between-scan-mode";
+const SCAN_WATERMARK_OPTION: &str = "scan.watermark";
+const SCAN_MODE_OPTION: &str = "scan.mode";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
@@ -190,14 +197,62 @@ pub struct CoreOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimeTravelSelector<'a> {
     TimestampMillis(i64),
-    /// Raw version string from `VERSION AS OF`. Resolved at scan time:
-    /// tag name (if tag exists) → snapshot id (if parseable as i64) → error.
-    Version(&'a str),
+    /// `scan.version` (SQL `VERSION AS OF`): ambiguous by design. Resolved at
+    /// scan time as tag name (if a tag exists) → snapshot id (if parseable) →
+    /// error. `option_name` is kept for error attribution.
+    Version {
+        value: &'a str,
+        option_name: &'static str,
+    },
+    /// `scan.snapshot-id`: an explicit snapshot id. Resolved strictly by
+    /// parsing `value` as an id — never falls back to a tag lookup.
+    SnapshotId {
+        value: &'a str,
+        option_name: &'static str,
+    },
+    /// `scan.tag-name`: an explicit tag name. Resolved strictly by tag lookup —
+    /// never falls back to a snapshot id.
+    TagName {
+        value: &'a str,
+        option_name: &'static str,
+    },
 }
 
 impl<'a> CoreOptions<'a> {
     pub fn new(options: &'a HashMap<String, String>) -> Self {
         Self { options }
+    }
+
+    /// Reject scan options whose semantics the Rust core does not yet implement.
+    ///
+    /// These are not malformed input — they are unimplemented scan modes — so
+    /// they surface as `Error::Unsupported` (mapped to `NotImplementedError` at
+    /// the Python boundary). `scan.mode` is allowed only when absent or
+    /// `"default"`, since the core has no `scan.mode` consumer yet.
+    pub fn validate_scan_options(&self) -> crate::Result<()> {
+        for key in [
+            INCREMENTAL_BETWEEN_OPTION,
+            INCREMENTAL_BETWEEN_TIMESTAMP_OPTION,
+            INCREMENTAL_BETWEEN_SCAN_MODE_OPTION,
+            SCAN_WATERMARK_OPTION,
+        ] {
+            if self.options.contains_key(key) {
+                return Err(crate::Error::Unsupported {
+                    message: format!("Scan option '{key}' is not supported by the Rust reader yet"),
+                });
+            }
+        }
+        if let Some(mode) = self.options.get(SCAN_MODE_OPTION) {
+            if !mode.eq_ignore_ascii_case("default") {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Scan option 'scan.mode={mode}' is not supported by the Rust reader yet \
+                         (only the default mode is implemented)"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn deletion_vectors_enabled(&self) -> bool {
@@ -387,12 +442,18 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(2);
+        let mut selectors = Vec::with_capacity(4);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
         }
         if self.options.contains_key(SCAN_VERSION_OPTION) {
             selectors.push(SCAN_VERSION_OPTION);
+        }
+        if self.options.contains_key(SCAN_SNAPSHOT_ID_OPTION) {
+            selectors.push(SCAN_SNAPSHOT_ID_OPTION);
+        }
+        if self.options.contains_key(SCAN_TAG_NAME_OPTION) {
+            selectors.push(SCAN_TAG_NAME_OPTION);
         }
         selectors
     }
@@ -415,8 +476,25 @@ impl<'a> CoreOptions<'a> {
 
         if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
-        } else if let Some(version) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
-            Ok(Some(TimeTravelSelector::Version(version)))
+        } else if let Some(value) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
+            Ok(Some(TimeTravelSelector::Version {
+                value,
+                option_name: SCAN_VERSION_OPTION,
+            }))
+        } else if let Some(value) = self
+            .options
+            .get(SCAN_SNAPSHOT_ID_OPTION)
+            .map(String::as_str)
+        {
+            Ok(Some(TimeTravelSelector::SnapshotId {
+                value,
+                option_name: SCAN_SNAPSHOT_ID_OPTION,
+            }))
+        } else if let Some(value) = self.options.get(SCAN_TAG_NAME_OPTION).map(String::as_str) {
+            Ok(Some(TimeTravelSelector::TagName {
+                value,
+                option_name: SCAN_TAG_NAME_OPTION,
+            }))
         } else {
             Ok(None)
         }
@@ -1023,7 +1101,10 @@ mod tests {
             version_core
                 .try_time_travel_selector()
                 .expect("version selector"),
-            Some(TimeTravelSelector::Version("my-tag"))
+            Some(TimeTravelSelector::Version {
+                value: "my-tag",
+                option_name: SCAN_VERSION_OPTION
+            })
         );
 
         let version_num_options =
@@ -1033,8 +1114,49 @@ mod tests {
             version_num_core
                 .try_time_travel_selector()
                 .expect("version numeric selector"),
-            Some(TimeTravelSelector::Version("3"))
+            Some(TimeTravelSelector::Version {
+                value: "3",
+                option_name: SCAN_VERSION_OPTION
+            })
         );
+    }
+
+    #[test]
+    fn test_snapshot_id_and_tag_name_map_to_distinct_selectors() {
+        let snap = HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "2".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&snap).try_time_travel_selector().unwrap(),
+            Some(TimeTravelSelector::SnapshotId {
+                value: "2",
+                option_name: SCAN_SNAPSHOT_ID_OPTION
+            })
+        );
+        let tag = HashMap::from([(SCAN_TAG_NAME_OPTION.to_string(), "t1".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&tag).try_time_travel_selector().unwrap(),
+            Some(TimeTravelSelector::TagName {
+                value: "t1",
+                option_name: SCAN_TAG_NAME_OPTION
+            })
+        );
+    }
+
+    #[test]
+    fn test_snapshot_id_conflicts_with_version_lists_original_keys() {
+        let options = HashMap::from([
+            (SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string()),
+            (SCAN_TAG_NAME_OPTION.to_string(), "t".to_string()),
+        ]);
+        let err = CoreOptions::new(&options)
+            .try_time_travel_selector()
+            .unwrap_err();
+        match err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains(SCAN_SNAPSHOT_ID_OPTION));
+                assert!(message.contains(SCAN_TAG_NAME_OPTION));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -1052,5 +1174,44 @@ mod tests {
         )]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.write_parquet_buffer_size(), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_validate_scan_options_rejects_unsupported() {
+        for key in [
+            "incremental-between",
+            "incremental-between-timestamp",
+            "incremental-between-scan-mode",
+            "scan.watermark",
+        ] {
+            let options = HashMap::from([(key.to_string(), "x".to_string())]);
+            let err = CoreOptions::new(&options)
+                .validate_scan_options()
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::Unsupported { message } if message.contains(key)));
+        }
+    }
+
+    #[test]
+    fn test_validate_scan_options_scan_mode_whitelist() {
+        // absent OK
+        assert!(CoreOptions::new(&HashMap::new())
+            .validate_scan_options()
+            .is_ok());
+        // default OK
+        let ok = HashMap::from([("scan.mode".to_string(), "default".to_string())]);
+        assert!(CoreOptions::new(&ok).validate_scan_options().is_ok());
+        // anything else Unsupported
+        let bad = HashMap::from([("scan.mode".to_string(), "compacted-full".to_string())]);
+        let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("scan.mode"))
+        );
+    }
+
+    #[test]
+    fn test_validate_scan_options_allows_supported_selectors() {
+        let options = HashMap::from([(SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string())]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
     }
 }

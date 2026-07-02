@@ -92,9 +92,10 @@ impl<'a> WriteBuilder<'a> {
             crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
         if !matches!(selector, Ok(None)) {
             return Err(crate::Error::Unsupported {
-                message: "Cannot write to a table with a time-travel option set \
-                          (scan.version / scan.timestamp-millis)"
-                    .to_string(),
+                message:
+                    "Cannot write to a table with a time-travel option set \
+                          (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                        .to_string(),
             });
         }
         let write = TableWrite::new(self.table, self.commit_user.clone())?;

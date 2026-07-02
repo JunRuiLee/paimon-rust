@@ -48,27 +48,63 @@ pub(crate) async fn travel_to_snapshot(
                 }),
             }
         }
-        Some(TimeTravelSelector::Version(v)) => {
-            // Tag first, then snapshot id, else error.
+        Some(TimeTravelSelector::Version {
+            value: v,
+            option_name,
+        }) => {
+            // `scan.version` is ambiguous by design: tag first, then snapshot id.
             let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
             if tag_manager.tag_exists(v).await? {
-                match tag_manager.get(v).await? {
-                    Some(s) => Ok(Some(s)),
-                    None => Err(Error::DataInvalid {
-                        message: format!("Tag '{v}' doesn't exist."),
-                        source: None,
-                    }),
-                }
+                resolve_tag(&tag_manager, v).await.map(Some)
             } else if let Ok(id) = v.parse::<i64>() {
                 snapshot_manager.get_snapshot(id).await.map(Some)
             } else {
                 Err(Error::DataInvalid {
-                    message: format!("Version '{v}' is not a valid tag name or snapshot id."),
+                    message: format!("{option_name} '{v}' is not a valid tag name or snapshot id."),
+                    source: None,
+                })
+            }
+        }
+        Some(TimeTravelSelector::SnapshotId {
+            value: v,
+            option_name,
+        }) => {
+            // An explicit snapshot id: parse strictly, never resolve a tag.
+            match v.parse::<i64>() {
+                Ok(id) => snapshot_manager.get_snapshot(id).await.map(Some),
+                Err(_) => Err(Error::DataInvalid {
+                    message: format!("{option_name} '{v}' is not a valid snapshot id."),
+                    source: None,
+                }),
+            }
+        }
+        Some(TimeTravelSelector::TagName {
+            value: v,
+            option_name: _,
+        }) => {
+            // An explicit tag name: resolve strictly by tag, never as a snapshot id.
+            let tag_manager = TagManager::new(file_io.clone(), table_path.to_string());
+            if tag_manager.tag_exists(v).await? {
+                resolve_tag(&tag_manager, v).await.map(Some)
+            } else {
+                Err(Error::DataInvalid {
+                    message: format!("Tag '{v}' doesn't exist."),
                     source: None,
                 })
             }
         }
         None => Ok(None),
+    }
+}
+
+/// Fetch a tag known to exist, mapping an unexpectedly-missing tag to an error.
+async fn resolve_tag(tag_manager: &TagManager, name: &str) -> crate::Result<Snapshot> {
+    match tag_manager.get(name).await? {
+        Some(s) => Ok(s),
+        None => Err(Error::DataInvalid {
+            message: format!("Tag '{name}' doesn't exist."),
+            source: None,
+        }),
     }
 }
 
@@ -376,6 +412,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_snapshot_id_error_names_original_option() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let opts = options(&[("scan.snapshot-id", "abc")]);
+        let err = super::travel_to_snapshot(&file_io, &table_path, &opts)
+            .await
+            .expect_err("non-numeric snapshot-id must fail");
+        match err {
+            crate::Error::DataInvalid { message, .. } => {
+                assert!(message.contains("scan.snapshot-id"), "got: {message}");
+                assert!(!message.contains("scan.version"), "got: {message}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_time_travel_read_uses_snapshot_schema() {
         use futures::TryStreamExt;
 
@@ -420,5 +472,105 @@ mod tests {
         assert_eq!(batches[0].schema().fields().len(), 3);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_copy_with_time_travel_rejects_unsupported_scan_option() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let table = latest_table(&file_io, &table_path);
+        let err = table
+            .copy_with_time_travel(options(&[("scan.watermark", "5")]))
+            .await
+            .expect_err("unsupported scan option must fail");
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("scan.watermark"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_resolved_travel_snapshot_reflects_resolution() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let table = latest_table(&file_io, &table_path);
+
+        let resolved = table
+            .copy_with_time_travel(options(&[("scan.snapshot-id", "1")]))
+            .await
+            .unwrap();
+        assert!(resolved.has_resolved_travel_snapshot());
+
+        // Nonexistent snapshot id: core silently falls back, helper reports false.
+        let unresolved = table
+            .copy_with_time_travel(options(&[("scan.snapshot-id", "999")]))
+            .await
+            .unwrap();
+        assert!(!unresolved.has_resolved_travel_snapshot());
+
+        // No selector at all: false.
+        let none = table.copy_with_time_travel(HashMap::new()).await.unwrap();
+        assert!(!none.has_resolved_travel_snapshot());
+    }
+
+    #[tokio::test]
+    async fn test_changing_snapshot_id_or_tag_selector_after_travel_invalidates_cache() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let table = latest_table(&file_io, &table_path);
+
+        let traveled = table
+            .copy_with_time_travel(options(&[("scan.version", "1")]))
+            .await
+            .unwrap();
+        assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(1));
+
+        // scan.snapshot-id and scan.tag-name are first-class time-travel
+        // selectors, so re-selecting through either on an already-travelled
+        // copy must invalidate the cached snapshot — otherwise the stale
+        // snapshot would be reused and the new selector silently ignored.
+        for selector in ["scan.snapshot-id", "scan.tag-name"] {
+            let stale = traveled.copy_with_options(options(&[(selector, "2")]));
+            assert!(
+                stale.travel_snapshot().is_none(),
+                "{selector} must invalidate the cached travel snapshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_id_selector_rejects_tag_name() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        // A tag named "v1-tag" exists, but it is not a valid snapshot id.
+        let sm = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let snapshot1 = sm.get_snapshot(1).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path.clone());
+        tm.create("v1-tag", &snapshot1).await.unwrap();
+
+        // scan.snapshot-id must only accept a numeric snapshot id; it must not
+        // fall back to resolving a tag of the same name.
+        let err = super::travel_to_snapshot(
+            &file_io,
+            &table_path,
+            &options(&[("scan.snapshot-id", "v1-tag")]),
+        )
+        .await
+        .expect_err("scan.snapshot-id must not resolve a tag name");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("scan.snapshot-id")),
+            "expected snapshot-id parse error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tag_name_selector_rejects_snapshot_id() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        // No tag named "1" exists, but snapshot 1 does.
+        let err =
+            super::travel_to_snapshot(&file_io, &table_path, &options(&[("scan.tag-name", "1")]))
+                .await
+                .expect_err("scan.tag-name must not resolve a snapshot id");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("Tag '1'")),
+            "expected missing-tag error, got {err:?}"
+        );
     }
 }
