@@ -294,6 +294,16 @@ def test_read_returns_expected_rows():
         assert t.sort_by("id").to_pydict() == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+def test_read_accepts_split_iterable():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        b = table.new_read_builder()
+        splits = b.new_scan().plan().splits()
+        batches = b.new_read().read(split for split in splits)
+        t = pa.Table.from_batches(batches)
+        assert t.num_rows == 3
+
+
 def test_read_empty_splits():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)

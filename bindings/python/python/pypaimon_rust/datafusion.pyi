@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeAlias, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, TypeAlias, Union
 
 import pyarrow
 
@@ -48,7 +48,7 @@ class TableScan:
     def plan(self) -> Plan: ...
 
 class TableRead:
-    def read(self, splits: Sequence[Split]) -> List[pyarrow.RecordBatch]: ...
+    def read(self, splits: Iterable[Split]) -> List[pyarrow.RecordBatch]: ...
 
 class ReadBuilder:
     def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
