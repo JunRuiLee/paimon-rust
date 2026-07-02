@@ -523,3 +523,109 @@ def test_read_with_filter_smoke():
         splits = b.new_scan().plan().splits()
         batches = b.new_read().read(splits)
         assert isinstance(batches, list)
+
+
+def _make_two_snapshot_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.tdb")
+    ctx.sql("CREATE TABLE paimon.tdb.t (id INT, name STRING)")
+    ctx.sql("INSERT INTO paimon.tdb.t VALUES (1, 'a')")            # snapshot 1
+    ctx.sql("INSERT INTO paimon.tdb.t VALUES (2, 'b'), (3, 'c')")  # snapshot 2
+    return ctx
+
+
+def _rows(batches):
+    return sum(b.num_rows for b in batches)
+
+
+def test_time_travel_by_snapshot_id():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        builder = table.new_read_builder({"scan.snapshot-id": "1"})
+        splits = builder.new_scan().plan().splits()
+        batches = builder.new_read().read(splits)
+        assert _rows(batches) == 1  # only snapshot 1's row
+
+
+def test_time_travel_by_tag_name():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_two_snapshot_table(warehouse)
+        ctx.sql("CALL sys.create_tag(table => 'tdb.t', tag => 'v1', snapshot_id => 1)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        builder = table.new_read_builder({"scan.tag-name": "v1"})
+        splits = builder.new_scan().plan().splits()
+        assert _rows(builder.new_read().read(splits)) == 1
+
+
+def test_time_travel_unresolved_snapshot_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(ValueError, match="did not resolve"):
+            table.new_read_builder({"scan.snapshot-id": "999"})
+
+
+def test_unsupported_scan_option_raises_not_implemented():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(NotImplementedError):
+            table.new_read_builder({"incremental-between": "1,2"})
+
+
+def test_scan_option_non_string_value_raises_type_error():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(TypeError):
+            table.new_read_builder({"scan.snapshot-id": 1})
+
+
+def test_new_read_builder_none_options_reads_latest():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        builder = table.new_read_builder()  # no options → latest
+        splits = builder.new_scan().plan().splits()
+        assert _rows(builder.new_read().read(splits)) == 3
+
+
+def test_time_travel_filter_uses_travelled_schema():
+    # Snapshot 1 predates the 'age' column. Travelling to it and filtering on
+    # 'age' must fail (not in the travelled schema), while filtering on a
+    # column present in that schema ('name') must succeed. This proves
+    # with_filter validates against the travelled schema, not the latest one.
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.edb")
+        ctx.sql("CREATE TABLE paimon.edb.t (id INT, name STRING)")
+        ctx.sql("INSERT INTO paimon.edb.t VALUES (1, 'a')")           # snapshot 1, schema 0
+        ctx.sql("ALTER TABLE paimon.edb.t ADD COLUMN age INT")
+        ctx.sql("INSERT INTO paimon.edb.t VALUES (2, 'b', 20)")       # snapshot 2, schema 1
+        catalog = PaimonCatalog({"warehouse": warehouse})
+
+        # Filtering on the post-travel-absent column must fail.
+        travelled = catalog.get_table("edb.t").new_read_builder({"scan.snapshot-id": "1"})
+        with pytest.raises(ValueError):
+            travelled.with_filter({"method": "equal", "field": "age", "literals": [20]})
+
+        # Filtering on a column present in the travelled schema must succeed.
+        travelled_ok = catalog.get_table("edb.t").new_read_builder({"scan.snapshot-id": "1"})
+        plan = travelled_ok.with_filter(
+            {"method": "equal", "field": "name", "literals": ["a"]}
+        ).new_scan().plan()
+        assert plan is not None
+
+
+def test_time_travel_conflicting_selectors_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(ValueError, match="Only one time-travel selector") as exc:
+            table.new_read_builder({"scan.snapshot-id": "1", "scan.tag-name": "t"})
+        # both offending keys are named
+        assert "scan.snapshot-id" in str(exc.value)
+        assert "scan.tag-name" in str(exc.value)

@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::PyErr;
 
 pub fn to_py_err(err: paimon::Error) -> PyErr {
-    PyValueError::new_err(err.to_string())
+    match err {
+        // Unimplemented scan semantics: distinct from malformed input so upper
+        // layers can catch NotImplementedError and decide on a fallback.
+        paimon::Error::Unsupported { .. } => PyNotImplementedError::new_err(err.to_string()),
+        _ => PyValueError::new_err(err.to_string()),
+    }
 }
 
 pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {

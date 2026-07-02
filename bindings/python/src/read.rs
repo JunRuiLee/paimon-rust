@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::pyarrow::ToPyArrow;
@@ -28,6 +29,38 @@ use pyo3::types::{PyBytes, PyDict};
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
+
+/// Time-travel selector option names, in the core's resolution priority order.
+const TIME_TRAVEL_SELECTORS: [&str; 4] = [
+    "scan.timestamp-millis",
+    "scan.version",
+    "scan.snapshot-id",
+    "scan.tag-name",
+];
+
+/// Extract a Python dict of scan options into a String->String map, requiring
+/// string keys and values (non-string → TypeError) so option semantics stay
+/// unambiguous.
+pub(crate) fn extract_options(options: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>> {
+    let mut out = HashMap::with_capacity(options.len());
+    for (k, v) in options.iter() {
+        let key: String = k
+            .extract()
+            .map_err(|_| PyTypeError::new_err("scan option keys must be strings"))?;
+        let val: String = v.extract().map_err(|_| {
+            PyTypeError::new_err(format!("scan option '{key}' value must be a string"))
+        })?;
+        out.insert(key, val);
+    }
+    Ok(out)
+}
+
+/// Return the first configured time-travel selector as (name, value), if any.
+fn find_time_travel_selector(opts: &HashMap<String, String>) -> Option<(&str, &str)> {
+    TIME_TRAVEL_SELECTORS
+        .iter()
+        .find_map(|&name| opts.get(name).map(|v| (name, v.as_str())))
+}
 
 /// Apply projection/limit/filter from a config snapshot onto a core ReadBuilder.
 /// Shared by PyTableScan::plan and PyTableRead::read so scan and read stay consistent.
@@ -84,6 +117,47 @@ impl PyReadBuilder {
             limit: None,
             filter: None,
         }
+    }
+
+    /// Build on a table copy resolved from scan options. Resolves time travel
+    /// (may do IO) so `with_filter` later validates against the travelled
+    /// schema. Raises if a selector is set but resolves to no snapshot, so a
+    /// mistyped snapshot-id can never silently read latest.
+    pub fn from_options(table: Arc<Table>, opts: HashMap<String, String>) -> PyResult<Self> {
+        // Reject conflicting time-travel selectors here. The core swallows the
+        // conflict error via its Java-parity silent fallback, so the strict
+        // gate below would otherwise misattribute the failure to a single
+        // selector. Surface the real conflict, listing the keys the user set.
+        let present: Vec<&str> = TIME_TRAVEL_SELECTORS
+            .iter()
+            .copied()
+            .filter(|name| opts.contains_key(*name))
+            .collect();
+        if present.len() > 1 {
+            return Err(PyValueError::new_err(format!(
+                "Only one time-travel selector may be set, found: {}",
+                present.join(", ")
+            )));
+        }
+        let selector =
+            find_time_travel_selector(&opts).map(|(n, v)| (n.to_string(), v.to_string()));
+        let rt = runtime();
+        let traveled = rt
+            .block_on(async { table.copy_with_time_travel(opts).await })
+            .map_err(to_py_err)?;
+        if let Some((name, value)) = selector {
+            if !traveled.has_resolved_travel_snapshot() {
+                return Err(PyValueError::new_err(format!(
+                    "time-travel selector {name}={value} did not resolve to any snapshot"
+                )));
+            }
+        }
+        Ok(Self {
+            table: Arc::new(traveled),
+            projection: None,
+            limit: None,
+            filter: None,
+        })
     }
 }
 

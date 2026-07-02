@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
@@ -49,9 +50,18 @@ impl PyTable {
         PyTableSchema::new(self.inner.schema().clone())
     }
 
-    /// Create a [`PyReadBuilder`] for DataFrame-style scan planning.
-    fn new_read_builder(&self) -> PyReadBuilder {
-        PyReadBuilder::new(Arc::clone(&self.inner))
+    /// Create a [`PyReadBuilder`]. With `options`, resolves scan options (incl.
+    /// time travel) before building, so filters validate against the resolved
+    /// schema. Empty/absent options are a zero-cost latest read.
+    #[pyo3(signature = (options=None))]
+    fn new_read_builder(&self, options: Option<&Bound<'_, PyDict>>) -> PyResult<PyReadBuilder> {
+        match options {
+            Some(dict) if !dict.is_empty() => {
+                let opts = crate::read::extract_options(dict)?;
+                PyReadBuilder::from_options(Arc::clone(&self.inner), opts)
+            }
+            _ => Ok(PyReadBuilder::new(Arc::clone(&self.inner))),
+        }
     }
 
     /// Create a [`PyWriteBuilder`] for the batch write loop.
