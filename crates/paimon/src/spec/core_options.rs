@@ -227,8 +227,13 @@ impl<'a> CoreOptions<'a> {
     ///
     /// These are not malformed input — they are unimplemented scan modes — so
     /// they surface as `Error::Unsupported` (mapped to `NotImplementedError` at
-    /// the Python boundary). `scan.mode` is allowed only when absent or
-    /// `"default"`, since the core has no `scan.mode` consumer yet.
+    /// the Python boundary). Explicit `scan.mode=from-snapshot` /
+    /// `from-timestamp` are the modes Java's `CoreOptions.setDefaultValues()`
+    /// writes next to the corresponding selector, so they are accepted when
+    /// that selector is present (the batch-read semantics are identical to
+    /// leaving the mode at `default`); an explicit mode without its selector
+    /// is malformed input (`Error::DataInvalid`), mirroring Java's
+    /// `SchemaValidation`. All other non-default modes are unimplemented.
     pub fn validate_scan_options(&self) -> crate::Result<()> {
         for key in [
             INCREMENTAL_BETWEEN_OPTION,
@@ -243,12 +248,33 @@ impl<'a> CoreOptions<'a> {
             }
         }
         if let Some(mode) = self.options.get(SCAN_MODE_OPTION) {
-            if !mode.eq_ignore_ascii_case("default") {
+            let selector_keys: &[&str] = if mode.eq_ignore_ascii_case("default") {
+                return Ok(());
+            } else if mode.eq_ignore_ascii_case("from-snapshot") {
+                &[
+                    SCAN_SNAPSHOT_ID_OPTION,
+                    SCAN_TAG_NAME_OPTION,
+                    SCAN_VERSION_OPTION,
+                ]
+            } else if mode.eq_ignore_ascii_case("from-timestamp") {
+                &[SCAN_TIMESTAMP_MILLIS_OPTION]
+            } else {
                 return Err(crate::Error::Unsupported {
                     message: format!(
-                        "Scan option 'scan.mode={mode}' is not supported by the Rust reader yet \
-                         (only the default mode is implemented)"
+                        "Scan option 'scan.mode={mode}' is not supported by the Rust reader yet"
                     ),
+                });
+            };
+            if !selector_keys
+                .iter()
+                .any(|key| self.options.contains_key(*key))
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Scan option 'scan.mode={mode}' requires one of {} to be set",
+                        selector_keys.join(", ")
+                    ),
+                    source: None,
                 });
             }
         }
@@ -1201,12 +1227,70 @@ mod tests {
         // default OK
         let ok = HashMap::from([("scan.mode".to_string(), "default".to_string())]);
         assert!(CoreOptions::new(&ok).validate_scan_options().is_ok());
-        // anything else Unsupported
-        let bad = HashMap::from([("scan.mode".to_string(), "compacted-full".to_string())]);
-        let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
+        // unimplemented modes Unsupported
+        for mode in ["compacted-full", "incremental", "latest", "latest-full"] {
+            let bad = HashMap::from([("scan.mode".to_string(), mode.to_string())]);
+            let err = CoreOptions::new(&bad).validate_scan_options().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { message } if message.contains("scan.mode")),
+                "scan.mode={mode} should be Unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_scan_options_explicit_mode_with_matching_selector() {
+        // Java's CoreOptions.setDefaultValues() writes scan.mode=from-snapshot
+        // next to scan.snapshot-id, so these combinations are standard input.
+        for selector in [
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+            SCAN_VERSION_OPTION,
+        ] {
+            let options = HashMap::from([
+                ("scan.mode".to_string(), "from-snapshot".to_string()),
+                (selector.to_string(), "1".to_string()),
+            ]);
+            assert!(
+                CoreOptions::new(&options).validate_scan_options().is_ok(),
+                "scan.mode=from-snapshot with {selector} should be accepted"
+            );
+        }
+        let options = HashMap::from([
+            ("scan.mode".to_string(), "from-timestamp".to_string()),
+            (SCAN_TIMESTAMP_MILLIS_OPTION.to_string(), "1".to_string()),
+        ]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
+    }
+
+    #[test]
+    fn test_validate_scan_options_explicit_mode_without_selector() {
+        // An explicit mode missing its selector must fail loudly instead of
+        // silently reading latest (mirrors Java SchemaValidation).
+        let options = HashMap::from([("scan.mode".to_string(), "from-snapshot".to_string())]);
+        let err = CoreOptions::new(&options)
+            .validate_scan_options()
+            .unwrap_err();
         assert!(
-            matches!(err, crate::Error::Unsupported { message } if message.contains("scan.mode"))
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("from-snapshot")),
+            "got {err:?}"
         );
+
+        let options = HashMap::from([("scan.mode".to_string(), "from-timestamp".to_string())]);
+        let err = CoreOptions::new(&options)
+            .validate_scan_options()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("from-timestamp")),
+            "got {err:?}"
+        );
+
+        // A mismatched selector doesn't satisfy the mode either.
+        let options = HashMap::from([
+            ("scan.mode".to_string(), "from-timestamp".to_string()),
+            (SCAN_SNAPSHOT_ID_OPTION.to_string(), "1".to_string()),
+        ]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_err());
     }
 
     #[test]

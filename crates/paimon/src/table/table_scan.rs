@@ -629,12 +629,16 @@ impl<'a> TableScan<'a> {
     /// Time travel is resolved from table options:
     /// - only one of `scan.version`, `scan.timestamp-millis`,
     ///   `scan.snapshot-id`, `scan.tag-name` may be set
-    /// - `scan.version` / `scan.snapshot-id` / `scan.tag-name` → tag name (if
-    ///   exists) → snapshot id (if parseable) → error
+    /// - `scan.version` → tag name (if exists) → snapshot id (if parseable) →
+    ///   error (ambiguous by design, like SQL `VERSION AS OF`)
+    /// - `scan.snapshot-id` → snapshot id only (never a tag lookup)
+    /// - `scan.tag-name` → tag name only (never parsed as a snapshot id)
     /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
     /// - otherwise → read the latest snapshot
     ///
     /// Reference: [TimeTravelUtil.tryTravelToSnapshot](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/snapshot/TimeTravelUtil.java)
+    /// for `scan.version`; the strict selectors mirror Java's typed
+    /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match self.resolve_snapshot().await? {

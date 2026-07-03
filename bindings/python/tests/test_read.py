@@ -575,6 +575,34 @@ def test_unsupported_scan_option_raises_not_implemented():
             table.new_read_builder({"incremental-between": "1,2"})
 
 
+def test_explicit_scan_mode_with_matching_selector_reads_snapshot():
+    # Java's CoreOptions.setDefaultValues() writes scan.mode=from-snapshot next
+    # to scan.snapshot-id, so configs from the Java toolchain carry both keys.
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        builder = table.new_read_builder(
+            {"scan.mode": "from-snapshot", "scan.snapshot-id": "1"})
+        splits = builder.new_scan().plan().splits()
+        assert _rows(builder.new_read().read(splits)) == 1
+
+
+def test_explicit_scan_mode_without_selector_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(ValueError, match="from-snapshot"):
+            table.new_read_builder({"scan.mode": "from-snapshot"})
+
+
+def test_unimplemented_scan_mode_raises_not_implemented():
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        with pytest.raises(NotImplementedError):
+            table.new_read_builder({"scan.mode": "incremental"})
+
+
 def test_scan_option_non_string_value_raises_type_error():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
