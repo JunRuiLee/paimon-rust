@@ -196,17 +196,97 @@ def test_filter_unsupported_operator_precedes_shape_errors():
 
 
 def test_filter_unsupported_type_raises():
-    # Build a table with a timestamp column, filter on it -> NotImplementedError
+    # Binary columns have no literal conversion -> NotImplementedError
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE SCHEMA paimon.tdb")
-        ctx.sql("CREATE TABLE paimon.tdb.tt (id INT, created_at TIMESTAMP)")
-        ctx.sql("INSERT INTO paimon.tdb.tt VALUES (1, TIMESTAMP '2024-01-01 00:00:00')")
+        ctx.sql("CREATE TABLE paimon.tdb.tt (id INT, payload BYTEA)")
+        ctx.sql("INSERT INTO paimon.tdb.tt VALUES (1, X'00')")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.tt")
         with pytest.raises(NotImplementedError):
             table.new_read_builder().with_filter(
-                {"method": "equal", "field": "created_at", "literals": [0]})
+                {"method": "equal", "field": "payload", "literals": [0]})
+
+
+def _make_temporal_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.tmp")
+    ctx.sql(
+        "CREATE TABLE paimon.tmp.tt (id INT, d DATE, ts TIMESTAMP, dec DECIMAL(10, 2))")
+    # Two separate INSERTs -> two files, so file stats can prune per-file.
+    ctx.sql(
+        "INSERT INTO paimon.tmp.tt VALUES "
+        "(1, DATE '2024-01-01', TIMESTAMP '2024-01-01 00:00:00', 12.34)")
+    ctx.sql(
+        "INSERT INTO paimon.tmp.tt VALUES "
+        "(2, DATE '2024-06-15', TIMESTAMP '2024-06-15 12:30:00', 56.78)")
+    return PaimonCatalog({"warehouse": warehouse}).get_table("tmp.tt")
+
+
+def test_filter_date_literal_prunes_and_reads():
+    import datetime
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "d", "literals": [datetime.date(2024, 1, 1)]})
+        splits = b.new_scan().plan().splits()
+        assert len(splits) == 1
+        t = pa.Table.from_batches(b.new_read().read(splits))
+        assert t.column("id").to_pylist() == [1]
+
+
+def test_filter_timestamp_literal_prunes_and_reads():
+    import datetime
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "greaterThan", "field": "ts",
+             "literals": [datetime.datetime(2024, 3, 1, 0, 0, 0)]})
+        splits = b.new_scan().plan().splits()
+        assert len(splits) == 1
+        t = pa.Table.from_batches(b.new_read().read(splits))
+        assert t.column("id").to_pylist() == [2]
+
+
+def test_filter_timestamp_rejects_aware_datetime():
+    import datetime
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        aware = datetime.datetime(2024, 3, 1, tzinfo=datetime.timezone.utc)
+        with pytest.raises(ValueError):
+            table.new_read_builder().with_filter(
+                {"method": "greaterThan", "field": "ts", "literals": [aware]})
+
+
+def test_filter_decimal_literal_prunes_and_reads():
+    from decimal import Decimal
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "equal", "field": "dec", "literals": [Decimal("12.34")]})
+        splits = b.new_scan().plan().splits()
+        assert len(splits) == 1
+        t = pa.Table.from_batches(b.new_read().read(splits))
+        assert t.column("id").to_pylist() == [1]
+
+
+def test_filter_decimal_rejects_float_and_rounding():
+    from decimal import Decimal
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_temporal_table(warehouse)
+        b = table.new_read_builder()
+        with pytest.raises(ValueError):
+            b.with_filter({"method": "equal", "field": "dec", "literals": [12.34]})
+        with pytest.raises(ValueError):
+            b.with_filter(
+                {"method": "equal", "field": "dec", "literals": [Decimal("0.005")]})
 
 
 def test_filter_unknown_field_raises():
