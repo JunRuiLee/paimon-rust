@@ -105,7 +105,7 @@ fn float_val(value: &Bound<'_, PyAny>) -> PyResult<f64> {
 
 /// Operators recognized by the lightweight dict format but not translatable to a
 /// Rust [`Predicate`] for pushdown.
-const METHOD_NOT_SUPPORTED: &[&str] = &["like", "startsWith", "endsWith", "contains", "not"];
+const METHOD_NOT_SUPPORTED: &[&str] = &["not"];
 
 /// Recursively convert a lightweight dict predicate into a Rust [`Predicate`].
 ///
@@ -242,6 +242,25 @@ fn leaf_to_predicate(
             }
             pb.is_not_in(&field, ds)
         }
+        "startsWith" => pb.starts_with(&field, one(to_datums(literals_obj)?)?),
+        "endsWith" => pb.ends_with(&field, one(to_datums(literals_obj)?)?),
+        "contains" => pb.contains(&field, one(to_datums(literals_obj)?)?),
+        "like" => {
+            // 1 literal: pattern with the default '\' escape.
+            // 2 literals: [pattern, escape] where escape is a single character
+            // (SQL `LIKE .. ESCAPE ..`).
+            let mut ds = to_datums(literals_obj)?;
+            let escape = match ds.len() {
+                1 => None,
+                2 => Some(escape_char(ds.pop().unwrap())?),
+                n => {
+                    return Err(PyValueError::new_err(format!(
+                        "'like' expects 1 or 2 literals (pattern[, escape]), got {n}"
+                    )));
+                }
+            };
+            pb.like(&field, ds.pop().unwrap(), escape)
+        }
         other => {
             return Err(PyNotImplementedError::new_err(format!(
                 "unknown or unsupported predicate operator '{other}'"
@@ -294,6 +313,21 @@ fn with_field_context(err: PyErr, field: &str, data_type: &DataType) -> PyErr {
             err
         }
     })
+}
+
+/// Extract a single-character `like` ESCAPE literal from an already-converted
+/// string `Datum`.
+fn escape_char(datum: Datum) -> PyResult<char> {
+    let Datum::String(s) = datum else {
+        return Err(PyValueError::new_err("'like' escape must be a str literal"));
+    };
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(PyValueError::new_err(format!(
+            "'like' escape must be a single character, got {s:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -357,22 +391,185 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_operator_like_raises_not_implemented() {
-        Python::attach(|py| {
-            let fields = test_fields();
-            let dict = leaf_dict(py, "like", "name", &[]);
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
-            assert!(err.is_instance_of::<PyNotImplementedError>(py));
-        });
-    }
-
-    #[test]
     fn unsupported_operator_not_raises_not_implemented() {
         Python::attach(|py| {
             let fields = test_fields();
             let dict = leaf_dict(py, "not", "id", &[1]);
             let err = dict_to_predicate(&dict, &fields).unwrap_err();
             assert!(err.is_instance_of::<PyNotImplementedError>(py));
+        });
+    }
+
+    // ---- string operators ----
+
+    /// Build a leaf dict with string literals.
+    fn str_leaf_dict<'py>(
+        py: Python<'py>,
+        method: &str,
+        field: &str,
+        literals: &[&str],
+    ) -> Bound<'py, PyDict> {
+        let d = PyDict::new(py);
+        d.set_item("method", method).unwrap();
+        d.set_item("field", field).unwrap();
+        let lits = PyList::empty(py);
+        for v in literals {
+            lits.append(*v).unwrap();
+        }
+        d.set_item("literals", lits).unwrap();
+        d
+    }
+
+    fn expect_leaf_op(pred: &Predicate, expected: PredicateOperator) {
+        match pred {
+            Predicate::Leaf { op, .. } => assert_eq!(*op, expected),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starts_with_leaf_converts() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "startsWith", "name", &["ab"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            expect_leaf_op(&pred, PredicateOperator::StartsWith);
+        });
+    }
+
+    #[test]
+    fn ends_with_leaf_converts() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "endsWith", "name", &["ab"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            expect_leaf_op(&pred, PredicateOperator::EndsWith);
+        });
+    }
+
+    #[test]
+    fn contains_leaf_converts() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "contains", "name", &["ab"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            expect_leaf_op(&pred, PredicateOperator::Contains);
+        });
+    }
+
+    #[test]
+    fn like_prefix_pattern_optimizes_to_starts_with() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["ab%"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            expect_leaf_op(&pred, PredicateOperator::StartsWith);
+        });
+    }
+
+    #[test]
+    fn like_residual_pattern_stays_like() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["a%b%c"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            expect_leaf_op(&pred, PredicateOperator::Like);
+        });
+    }
+
+    #[test]
+    fn like_accepts_backslash_escape_literal() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["100\\%%", "\\"]);
+            let pred = dict_to_predicate(&dict, &fields).unwrap();
+            // Escaped-wildcard patterns are not rewritten by the core's LIKE
+            // optimization; they stay as a residual Like leaf.
+            expect_leaf_op(&pred, PredicateOperator::Like);
+        });
+    }
+
+    #[test]
+    fn like_rejects_non_backslash_escape() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["100!%%", "!"]);
+            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn like_rejects_multi_char_escape() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["a%", "ab"]);
+            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn like_rejects_three_literals() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            let dict = str_leaf_dict(py, "like", "name", &["a%", "\\", "x"]);
+            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn string_op_empty_pattern_folds_to_is_not_null() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for method in ["startsWith", "endsWith", "contains"] {
+                let dict = str_leaf_dict(py, method, "name", &[""]);
+                let pred = dict_to_predicate(&dict, &fields).unwrap();
+                expect_leaf_op(&pred, PredicateOperator::IsNotNull);
+            }
+        });
+    }
+
+    #[test]
+    fn string_op_on_non_string_column_raises_value_error() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for method in ["startsWith", "endsWith", "contains", "like"] {
+                let dict = str_leaf_dict(py, method, "id", &["a"]);
+                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                assert!(err.is_instance_of::<PyValueError>(py), "{method}");
+            }
+        });
+    }
+
+    #[test]
+    fn string_op_wrong_literal_count_raises_value_error() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            for method in ["startsWith", "endsWith", "contains", "like"] {
+                let dict = str_leaf_dict(py, method, "name", &[]);
+                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                assert!(err.is_instance_of::<PyValueError>(py), "{method} zero");
+            }
+            for method in ["startsWith", "endsWith", "contains"] {
+                let dict = str_leaf_dict(py, method, "name", &["a", "b"]);
+                let err = dict_to_predicate(&dict, &fields).unwrap_err();
+                assert!(err.is_instance_of::<PyValueError>(py), "{method} two");
+            }
+        });
+    }
+
+    #[test]
+    fn string_op_unknown_field_raises_value_error() {
+        Python::attach(|py| {
+            let fields = test_fields();
+            // Now that string operators are supported, they follow the normal
+            // leaf path: field resolution happens first, so an unknown field is
+            // a ValueError (not NotImplementedError as before).
+            let dict = str_leaf_dict(py, "like", "nope", &["x"]);
+            let err = dict_to_predicate(&dict, &fields).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
 
@@ -385,18 +582,6 @@ mod tests {
             let dict = PyDict::new(py);
             dict.set_item("method", "not").unwrap();
             dict.set_item("children", PyList::empty(py)).unwrap();
-            let err = dict_to_predicate(&dict, &fields).unwrap_err();
-            assert!(err.is_instance_of::<PyNotImplementedError>(py));
-        });
-    }
-
-    #[test]
-    fn unsupported_operator_like_with_unknown_field_raises_not_implemented() {
-        Python::attach(|py| {
-            let fields = test_fields();
-            // 'like' with an unknown field: unsupported operator precedes field
-            // resolution, so NotImplementedError (not the unknown-field ValueError).
-            let dict = leaf_dict(py, "like", "nope", &[]);
             let err = dict_to_predicate(&dict, &fields).unwrap_err();
             assert!(err.is_instance_of::<PyNotImplementedError>(py));
         });
@@ -429,7 +614,7 @@ mod tests {
         Python::attach(|py| {
             let fields = test_fields();
             let ok = leaf_dict(py, "equal", "id", &[1]);
-            let bad = leaf_dict(py, "like", "name", &[]);
+            let bad = leaf_dict(py, "not", "name", &[]);
             let children = PyList::empty(py);
             children.append(ok).unwrap();
             children.append(bad).unwrap();

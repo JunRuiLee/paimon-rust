@@ -174,13 +174,12 @@ def test_filter_bool_literal_converts():
         assert plan is not None
 
 
-@pytest.mark.parametrize("method", ["like", "startsWith", "not"])
-def test_filter_unsupported_operator_raises(method):
+def test_filter_unsupported_operator_raises():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         with pytest.raises(NotImplementedError):
             table.new_read_builder().with_filter(
-                {"method": method, "field": "name", "literals": ["x"]})
+                {"method": "not", "field": "name", "literals": ["x"]})
 
 
 def test_filter_unsupported_operator_precedes_shape_errors():
@@ -190,9 +189,92 @@ def test_filter_unsupported_operator_precedes_shape_errors():
         # 'not' with no field -> NotImplementedError, not ValueError about missing field
         with pytest.raises(NotImplementedError):
             b.with_filter({"method": "not", "children": []})
-        # 'like' with unknown field -> NotImplementedError, not ValueError about unknown field
-        with pytest.raises(NotImplementedError):
-            b.with_filter({"method": "like", "field": "nope", "literals": ["x"]})
+
+
+def _make_string_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.sdb")
+    ctx.sql("CREATE TABLE paimon.sdb.st (id INT, name STRING)")
+    # Two separate INSERTs -> two files, so file stats can prune per-file.
+    ctx.sql("INSERT INTO paimon.sdb.st VALUES (1, 'apple'), (2, 'apricot')")
+    ctx.sql("INSERT INTO paimon.sdb.st VALUES (3, 'banana'), (4, 'cherry')")
+    return PaimonCatalog({"warehouse": warehouse}).get_table("sdb.st")
+
+
+def _read_ids(builder):
+    splits = builder.new_scan().plan().splits()
+    batches = builder.new_read().read(splits)
+    if not batches:
+        return []
+    return sorted(pa.Table.from_batches(batches).column("id").to_pylist())
+
+
+def test_filter_starts_with_prunes_and_reads():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "startsWith", "field": "name", "literals": ["ap"]})
+        assert len(b.new_scan().plan().splits()) == 1
+        assert _read_ids(b) == [1, 2]
+
+
+def test_filter_ends_with_reads_matching_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "endsWith", "field": "name", "literals": ["y"]})
+        assert _read_ids(b) == [4]
+
+
+def test_filter_contains_reads_matching_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "contains", "field": "name", "literals": ["an"]})
+        assert _read_ids(b) == [3]
+
+
+def test_filter_like_prefix_reads_matching_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder().with_filter(
+            {"method": "like", "field": "name", "literals": ["ap%"]})
+        assert _read_ids(b) == [1, 2]
+
+
+def test_filter_like_residual_pattern_reads_matching_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        # '_' single-char wildcard is not rewritten; exercises the Like evaluator.
+        b = table.new_read_builder().with_filter(
+            {"method": "like", "field": "name", "literals": ["b_nana"]})
+        assert _read_ids(b) == [3]
+
+
+def test_filter_like_escape_literal():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder()
+        # Optional second literal is the ESCAPE character; only '\\' is accepted.
+        assert b.with_filter(
+            {"method": "like", "field": "name",
+             "literals": ["100\\%%", "\\"]}).new_scan().plan() is not None
+        with pytest.raises(ValueError):
+            b.with_filter(
+                {"method": "like", "field": "name", "literals": ["100!%%", "!"]})
+        with pytest.raises(ValueError):
+            b.with_filter(
+                {"method": "like", "field": "name", "literals": ["a%", "ab"]})
+
+
+def test_filter_string_op_on_non_string_column_raises():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_string_table(warehouse)
+        b = table.new_read_builder()
+        for method in ["startsWith", "endsWith", "contains", "like"]:
+            with pytest.raises(ValueError):
+                b.with_filter({"method": method, "field": "id", "literals": ["a"]})
 
 
 def test_filter_unsupported_type_raises():
@@ -258,7 +340,9 @@ def test_filter_compound_with_unsupported_child_fails():
         table = _make_table_with_data(warehouse)
         pred = {"method": "and", "children": [
             {"method": "equal", "field": "id", "literals": [1]},
-            {"method": "like", "field": "name", "literals": ["a%"]},
+            {"method": "not", "children": [
+                {"method": "equal", "field": "name", "literals": ["a"]},
+            ]},
         ]}
         with pytest.raises(NotImplementedError):
             table.new_read_builder().with_filter(pred)
