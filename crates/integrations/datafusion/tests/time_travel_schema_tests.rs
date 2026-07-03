@@ -238,6 +238,47 @@ async fn test_session_scan_version_uses_snapshot_schema() {
 }
 
 #[tokio::test]
+async fn test_write_guard_rejects_snapshot_id_and_tag_name_selectors() {
+    // scan.snapshot-id and scan.tag-name are first-class time-travel selectors,
+    // so the SQL write guard must reject writes while either is set. Otherwise a
+    // write proceeds against the latest catalog table while reads in the same
+    // session resolve a historical snapshot (e.g. the data-evolution UPDATE path
+    // reads _ROW_ID from a pinned snapshot and then writes to the latest state,
+    // updating against stale row ids).
+    for (key, value) in [
+        ("paimon.scan.snapshot-id", "1"),
+        ("paimon.scan.tag-name", "some-tag"),
+    ] {
+        let (_tmp, sql_context) = setup_evolved_table().await;
+        sql_context
+            .sql(&format!("SET '{key}' = '{value}'"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        for sql in [
+            "UPDATE paimon.default.t SET name = 'x' WHERE id = 1",
+            "DELETE FROM paimon.default.t WHERE id = 1",
+            "TRUNCATE TABLE paimon.default.t",
+        ] {
+            let err = match sql_context.sql(sql).await {
+                Err(e) => e.to_string(),
+                Ok(df) => match df.collect().await {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("{sql} should fail while {key} is set"),
+                },
+            };
+            assert!(
+                err.contains("time-travel option"),
+                "{sql} should be rejected while {key} is set: {err}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_relation_planner_version_as_of_uses_snapshot_schema() {
     let (_tmp, sql_context) = setup_evolved_table().await;
 

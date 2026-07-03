@@ -960,10 +960,18 @@ impl SQLContext {
     /// with a clear message is safer than writing against a different schema
     /// than concurrent reads observe.
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
-        use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
+        use paimon::spec::{
+            SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_VERSION_OPTION,
+        };
 
         let options = self.dynamic_options.read().unwrap();
-        for key in [SCAN_VERSION_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION] {
+        for key in [
+            SCAN_VERSION_OPTION,
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+        ] {
             if options.contains_key(key) {
                 return Err(DataFusionError::Plan(format!(
                     "Cannot execute {operation} while time-travel option '{key}' is set; \
