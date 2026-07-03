@@ -207,22 +207,31 @@ fn timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
 /// Convert a timezone-aware `datetime.datetime` into `Datum::LocalZonedTimestamp`
 /// (the UTC instant).
 ///
-/// Naive datetimes are rejected rather than assumed to be in any timezone —
-/// parity with the DataFusion pushdown path, which refuses naive literals for
-/// TIMESTAMP WITH LOCAL TIME ZONE.
+/// Aware follows Python's definition: `tzinfo` is set AND `utcoffset()` is not
+/// `None`. A tzinfo whose `utcoffset()` returns `None` is naive — passing it to
+/// `astimezone` would interpret the value as process-local time, normalizing
+/// the same literal differently per machine. Naive datetimes are rejected
+/// rather than assumed to be in any timezone — parity with the DataFusion
+/// pushdown path, which refuses naive literals for TIMESTAMP WITH LOCAL TIME
+/// ZONE.
 fn local_zoned_timestamp_datum(value: &Bound<'_, PyAny>) -> PyResult<Datum> {
+    let py = value.py();
     let dt = value.cast::<PyDateTime>().map_err(|_| {
         PyValueError::new_err("expected a datetime.datetime literal for LocalZonedTimestamp field")
     })?;
-    if dt.get_tzinfo().is_none() {
+    // Python's aware/naive rule (datetime docs): aware iff tzinfo is not None
+    // and utcoffset() does not return None.
+    let aware =
+        dt.get_tzinfo().is_some() && !dt.call_method0(pyo3::intern!(py, "utcoffset"))?.is_none();
+    if !aware {
         return Err(PyValueError::new_err(
             "expected a timezone-aware datetime.datetime literal for LocalZonedTimestamp \
-             field (naive datetimes are ambiguous)",
+             field (naive datetimes, including tzinfo with utcoffset() = None, are \
+             ambiguous)",
         ));
     }
     // Normalize through `astimezone(utc)` so any tzinfo implementation
     // (zoneinfo, pytz, fixed offsets) is handled by Python itself.
-    let py = value.py();
     let utc = PyTzInfo::utc(py)?;
     let as_utc = dt.call_method1(pyo3::intern!(py, "astimezone"), (utc,))?;
     let instant: chrono::DateTime<chrono::Utc> = as_utc.extract()?;
@@ -1079,6 +1088,51 @@ mod tests {
             let v = py_datetime(py, 2024, 1, 1, 0, 0, 0, 0, None);
             let err =
                 py_to_datum(&v, &DataType::LocalZonedTimestamp(Default::default())).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    /// Build a datetime whose tzinfo subclass returns None from utcoffset() —
+    /// naive by Python's definition (docs: "aware if tzinfo is not None AND
+    /// utcoffset() does not return None") despite tzinfo being set.
+    fn pseudo_naive_datetime(py: Python<'_>) -> Bound<'_, PyAny> {
+        let ns = PyDict::new(py);
+        py.run(
+            c"import datetime
+class FloatingTz(datetime.tzinfo):
+    def utcoffset(self, dt): return None
+    def dst(self, dt): return None
+    def tzname(self, dt): return 'FLOATING'
+value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
+            None,
+            Some(&ns),
+        )
+        .unwrap();
+        ns.get_item("value").unwrap().unwrap()
+    }
+
+    #[test]
+    fn local_zoned_timestamp_field_rejects_pseudo_naive_tzinfo() {
+        Python::attach(|py| {
+            // tzinfo is set but utcoffset() is None: astimezone(utc) would
+            // interpret the value as process-local time, so the same literal
+            // would normalize differently per machine. Must be rejected.
+            let v = pseudo_naive_datetime(py);
+            let err =
+                py_to_datum(&v, &DataType::LocalZonedTimestamp(Default::default())).unwrap_err();
+            assert!(err.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
+    fn timestamp_field_rejects_pseudo_naive_tzinfo() {
+        Python::attach(|py| {
+            // Timestamp deliberately rejects ANY tzinfo, even one whose
+            // utcoffset() is None: stricter than Python's naive/aware
+            // definition, but explicit — the caller strips tzinfo to state
+            // wall-clock intent.
+            let v = pseudo_naive_datetime(py);
+            let err = py_to_datum(&v, &DataType::Timestamp(Default::default())).unwrap_err();
             assert!(err.is_instance_of::<PyValueError>(py));
         });
     }
