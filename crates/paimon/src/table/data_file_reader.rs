@@ -69,6 +69,32 @@ impl DataFileReader {
         self
     }
 
+    /// Reject projecting `_ROW_ID` alongside a data predicate. `_ROW_ID` is
+    /// assigned positionally from post-filter batch row counts, so a residual
+    /// filter that drops rows would desync it. (`_ROW_ID` predicates travel via
+    /// `row_ranges`, not `predicates`, so they do not trip this.)
+    fn reject_row_id_with_predicate(
+        read_type: &[DataField],
+        predicates: &[Predicate],
+    ) -> crate::Result<()> {
+        let projects_row_id = read_type
+            .iter()
+            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        // Only predicates that can actually drop rows desync positional `_ROW_ID`.
+        // A constant `AlwaysTrue` keeps every row in order and is harmless, so it
+        // must not trip the guard.
+        let has_row_filtering_predicate = predicates
+            .iter()
+            .any(|p| !matches!(p, Predicate::AlwaysTrue));
+        if projects_row_id && has_row_filtering_predicate {
+            return Err(crate::Error::Unsupported {
+                message: "reading _ROW_ID together with a data predicate is not supported yet"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Take a stream of DataSplits and read every data file in each split.
     /// Returns a stream of Arrow RecordBatches from all files.
     ///
@@ -147,6 +173,18 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // Guard at the true risk site: `_ROW_ID` is materialized positionally from
+        // each batch's row count (see `row_id_column_for_batch`), assuming the
+        // reader emits rows in original file order and count. The format readers
+        // apply an exact residual filter that drops non-matching rows *before*
+        // `_ROW_ID` is assigned here, which would desync the ids. So projecting
+        // `_ROW_ID` together with a data predicate is unsupported — fail loudly
+        // rather than return wrong ids. Placed here (not only in `read()`) because
+        // `read_single_file_stream` is also called directly by the KV and
+        // data-evolution readers; both strip/omit `_ROW_ID` from the read_type
+        // they pass, so this guard does not affect them.
+        Self::reject_row_id_with_predicate(&self.read_type, &self.predicates)?;
+
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
@@ -557,7 +595,9 @@ mod row_tests {
     use crate::arrow::format::create_format_writer;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, DataFileMeta, DataType, IntType, VarCharType};
+    use crate::spec::{
+        BinaryRow, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, VarCharType,
+    };
     use crate::table::source::DataSplitBuilder;
     use arrow_array::{Int32Array, StringArray};
     use futures::TryStreamExt;
@@ -657,6 +697,189 @@ mod row_tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(scores.values(), &[10, 20, 30]);
+    }
+
+    /// End-to-end guard: a non-partition predicate on a `.row` file must be
+    /// applied exactly by the time batches leave `DataFileReader`. The Row
+    /// format has no pushdown, so without a residual filter this would return
+    /// every row; the residual filter makes it exact. Guards against a
+    /// regression if the per-reader wiring is later refactored.
+    #[tokio::test]
+    async fn row_read_applies_exact_residual_filter_end_to_end() {
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "age", DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_residual";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.row";
+        let file_path = format!("{bucket_path}/{file_name}");
+        let output = file_io.new_output(&file_path).unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap() as i64;
+
+        let schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, file_size, 5, schema_id)])
+            .build()
+            .unwrap();
+
+        // age > 25 -> only [30, 40, 50] must survive.
+        let predicate: Predicate = PredicateBuilder::new(&fields)
+            .greater_than("age", Datum::Int(25))
+            .unwrap();
+        let read_type = vec![fields[1].clone()];
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            schema_id,
+            fields,
+            read_type,
+            vec![predicate],
+        );
+
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let ages: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    /// Guard: projecting `_ROW_ID` together with a data predicate must fail
+    /// loudly rather than assign wrong row ids. `_ROW_ID` is materialized
+    /// positionally from post-filter batch row counts, so the readers' residual
+    /// filter dropping rows would desync it. See the guard in `read()`.
+    #[tokio::test]
+    async fn read_rejects_row_id_projection_with_data_predicate() {
+        // Write a real .row file so read() reaches read_single_file_stream (where
+        // the guard lives). Project _ROW_ID alongside a data predicate → Unsupported.
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "age", DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_id_guard";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap() as i64;
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, file_size, 3, 1)])
+            .build()
+            .unwrap();
+
+        let row_id = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(crate::spec::BigIntType::new()),
+        );
+        // read_type projects _ROW_ID alongside a real column; predicate on age.
+        let read_type = vec![fields[1].clone(), row_id];
+        let predicate: Predicate = PredicateBuilder::new(&fields)
+            .greater_than("age", Datum::Int(25))
+            .unwrap();
+
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            1,
+            fields,
+            read_type,
+            vec![predicate],
+        );
+
+        // The guard is inside read_single_file_stream, reached while consuming the
+        // stream, so the error surfaces on collect.
+        let result = reader.read(&[split]).unwrap().try_collect::<Vec<_>>().await;
+        let err = match result {
+            Ok(_) => panic!("must reject _ROW_ID + predicate"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, crate::Error::Unsupported { message } if message.contains("_ROW_ID")),
+            "expected Unsupported mentioning _ROW_ID, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_row_id_guard_allows_constant_always_true_predicate() {
+        // A constant AlwaysTrue keeps every row in order, so it cannot desync
+        // positional _ROW_ID and must NOT trip the guard.
+        let row_id = DataField::new(
+            crate::spec::ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(crate::spec::BigIntType::new()),
+        );
+        let read_type = vec![row_id];
+        // AlwaysTrue alone -> allowed.
+        assert!(
+            DataFileReader::reject_row_id_with_predicate(&read_type, &[Predicate::AlwaysTrue])
+                .is_ok(),
+            "AlwaysTrue must not trip the _ROW_ID guard"
+        );
+        // A real filtering predicate -> rejected.
+        let filtering = PredicateBuilder::new(&[field(0, "age", DataType::Int(IntType::new()))])
+            .greater_than("age", Datum::Int(1))
+            .unwrap();
+        assert!(
+            DataFileReader::reject_row_id_with_predicate(&read_type, &[filtering]).is_err(),
+            "a row-filtering predicate must trip the _ROW_ID guard"
+        );
     }
 }
 
