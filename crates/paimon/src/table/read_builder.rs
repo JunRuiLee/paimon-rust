@@ -24,7 +24,6 @@ use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_
 use super::partition_filter::PartitionFilter;
 use super::table_read::TableRead;
 use super::{Table, TableScan};
-use crate::arrow::filtering::reader_pruning_predicates;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
@@ -236,10 +235,13 @@ impl<'a> ReadBuilder<'a> {
             Some(projected) => self.resolve_projected_fields(projected)?,
         };
 
+        // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
+        // Pushdown/stats skip compound nodes; the residual pass enforces the full
+        // predicate exactly. Pruning here would drop compound predicates.
         Ok(TableRead::new(
             self.table,
             read_type,
-            reader_pruning_predicates(self.filter.data_predicates.clone()),
+            self.filter.data_predicates.clone(),
         ))
     }
 
@@ -687,6 +689,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(collect_int_column(&batches, "id"), vec![2, 3, 4]);
+    }
+
+    /// Real-path regression: an `Or` predicate must be applied exactly through the
+    /// public ReadBuilder/TableRead path. The data predicate set is no longer
+    /// pruned before the reader, so the residual pass receives the full `Or` and
+    /// filters exactly. Single row group so stats pruning cannot exclude anything.
+    #[tokio::test]
+    async fn test_new_read_applies_or_predicate_exactly_via_public_path() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 20, 30, 40])],
+            None,
+        );
+        let file_size = fs::metadata(&parquet_path).unwrap().len() as i64;
+
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            table_path,
+            table_schema,
+            None,
+        );
+
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file("data.parquet", 4, file_size)])
+            .build()
+            .unwrap();
+
+        // id = 1 OR value = 40  ->  rows {id=1} and {id=4}.
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = crate::spec::Predicate::or(vec![
+            pb.equal("id", crate::spec::Datum::Int(1)).unwrap(),
+            pb.equal("value", crate::spec::Datum::Int(40)).unwrap(),
+        ]);
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_column(&batches, "id"), vec![1, 4]);
     }
 
     #[tokio::test]

@@ -19,13 +19,6 @@ use crate::arrow::schema_evolution::create_index_mapping;
 pub(crate) use crate::predicate_stats::{predicates_may_match_with_schema, StatsAccessor};
 use crate::spec::{DataField, Predicate, PredicateOperator};
 
-pub(crate) fn reader_pruning_predicates(data_predicates: Vec<Predicate>) -> Vec<Predicate> {
-    data_predicates
-        .into_iter()
-        .filter(predicate_supported_for_reader_pruning)
-        .collect()
-}
-
 /// Remap predicates from table-level indices to file-level indices.
 /// Predicates referencing fields not present in the file are resolved based on
 /// NULL semantics: the missing column is treated as all-NULL, so `IS NULL`
@@ -125,34 +118,6 @@ pub(crate) fn build_field_mapping(
         create_index_mapping(table_fields, file_fields),
         table_fields.len(),
     )
-}
-
-fn predicate_supported_for_reader_pruning(predicate: &Predicate) -> bool {
-    match predicate {
-        Predicate::AlwaysFalse => true,
-        Predicate::Leaf { op, .. } => {
-            matches!(
-                op,
-                PredicateOperator::IsNull
-                    | PredicateOperator::IsNotNull
-                    | PredicateOperator::Eq
-                    | PredicateOperator::NotEq
-                    | PredicateOperator::Lt
-                    | PredicateOperator::LtEq
-                    | PredicateOperator::Gt
-                    | PredicateOperator::GtEq
-                    | PredicateOperator::In
-                    | PredicateOperator::NotIn
-                    | PredicateOperator::StartsWith
-                    | PredicateOperator::EndsWith
-                    | PredicateOperator::Contains
-                    | PredicateOperator::Like
-                    | PredicateOperator::Between
-                    | PredicateOperator::NotBetween
-            )
-        }
-        Predicate::AlwaysTrue | Predicate::And(_) | Predicate::Or(_) | Predicate::Not(_) => false,
-    }
 }
 
 fn identity_field_mapping(num_fields: usize) -> Vec<Option<usize>> {

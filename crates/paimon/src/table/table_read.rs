@@ -20,7 +20,6 @@ use super::data_file_reader::DataFileReader;
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::filtering::reader_pruning_predicates;
 use crate::spec::{CoreOptions, DataField, MergeEngine, Predicate};
 use crate::DataSplit;
 
@@ -66,7 +65,11 @@ impl<'a> TableRead<'a> {
     /// Set a filter predicate for conservative read-side pruning.
     pub fn with_filter(mut self, filter: Predicate) -> Self {
         let (_, data_predicates) = split_scan_predicates(self.table, filter);
-        self.data_predicates = reader_pruning_predicates(data_predicates);
+        // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
+        // pushdown / stats pruning skip compound nodes they cannot use, and the
+        // residual pass applies the full predicate exactly. Pruning here would
+        // drop compound predicates before the residual could enforce them.
+        self.data_predicates = data_predicates;
         self
     }
 
