@@ -22,20 +22,7 @@ use crate::io::{FileRead, OutputFile};
 use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, Scalar,
-    StringArray,
-};
-use arrow_ord::cmp::{
-    eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
-    neq as arrow_neq,
-};
-use arrow_schema::ArrowError;
-use arrow_string::like::{
-    contains as arrow_contains, ends_with as arrow_ends_with, like as arrow_like,
-    starts_with as arrow_starts_with,
-};
+use arrow_array::{BooleanArray, RecordBatch};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -215,8 +202,33 @@ impl FormatFileReader for ParquetFormatReader {
                 .await?;
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
+
+        // Determine whether the Arrow row filter enforces every pushed-down
+        // predicate exactly. It only accepts top-level supported leaves; `Or`,
+        // `Not`, and unsupported leaves fall through to conservative pruning
+        // only, which is NOT exact. When any predicate is not fully enforced we
+        // add a row-level residual backstop over the decoded batch.
+        //
+        // Fast path (the common case, including all-AND-of-simple-leaves): every
+        // predicate is fully enforced, so we decode exactly `read_fields`, skip
+        // the residual pass entirely, and return the stream as before — zero
+        // added overhead.
+        let all_enforced = preds
+            .iter()
+            .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
+
+        // Residual branch must decode the predicate columns too, or the residual
+        // pass could not see a predicate on a non-projected column (Gap A). The
+        // projection MASK here (which columns to DECODE) is distinct from
+        // `DataFileReader`'s by-name output projection applied downstream.
+        let scan_fields: Vec<DataField> = if all_enforced {
+            read_fields.to_vec()
+        } else {
+            crate::arrow::residual::widen_scan_fields(read_fields, predicates)
+        };
+
         let root_schema = parquet_schema.root_schema();
-        let root_indices: Vec<usize> = read_fields
+        let root_indices: Vec<usize> = scan_fields
             .iter()
             .filter_map(|f| {
                 root_schema
@@ -261,7 +273,33 @@ impl FormatFileReader for ParquetFormatReader {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
         }
 
-        Ok(batch_stream_builder.build()?.map_err(Error::from).boxed())
+        let batch_stream = batch_stream_builder.build()?;
+
+        if all_enforced {
+            // Fast path: the row filter enforced every predicate exactly during
+            // decode. Return the stream directly — no residual pass.
+            return Ok(batch_stream.map(|r| r.map_err(Error::from)).boxed());
+        }
+
+        // Residual backstop: at least one predicate (`Or`/`Not`/unsupported leaf)
+        // was not fully enforced by the row filter, so apply the exact residual
+        // filter per batch over the widened `scan_fields`. The row filter (for
+        // whatever leaves it accepted) still ran during decode for I/O pruning;
+        // double-filtering an accepted leaf is idempotent. `DataFileReader`
+        // projects the filtered batch to `read_fields` by name.
+        let residual_predicates = FilePredicates {
+            predicates: preds.to_vec(),
+            file_fields: file_fields.to_vec(),
+        };
+        let stream = batch_stream.map(move |result| {
+            let batch = result.map_err(Error::from)?;
+            crate::arrow::residual::filter_record_batch_by_predicates(
+                batch,
+                &residual_predicates,
+                &scan_fields,
+            )
+        });
+        Ok(stream.boxed())
     }
 }
 
@@ -309,19 +347,16 @@ fn build_parquet_arrow_predicate(
     else {
         return Ok(None);
     };
-    if !predicate_supported_for_parquet_row_filter(*op) {
+    // Gate on the shared acceptance test so this builder and
+    // `predicate_fully_enforced_by_row_filter` cannot disagree about which
+    // leaves the row filter enforces.
+    if !parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields)? {
         return Ok(None);
     }
-
-    let Some(file_field) = file_fields.get(*index) else {
-        return Ok(None);
-    };
-    let Some(root_index) = parquet_root_index(parquet_schema, file_field.name()) else {
-        return Ok(None);
-    };
-    if !parquet_row_filter_literals_supported(*op, literals, file_field.data_type())? {
-        return Ok(None);
-    }
+    // Accepted: the field and its root column are guaranteed present.
+    let file_field = &file_fields[*index];
+    let root_index = parquet_root_index(parquet_schema, file_field.name())
+        .expect("root index resolvable for accepted leaf");
 
     let projection = ProjectionMask::roots(parquet_schema, [root_index]);
     let op = *op;
@@ -333,9 +368,62 @@ fn build_parquet_arrow_predicate(
             let Some(column) = batch.columns().first() else {
                 return Ok(BooleanArray::new_null(batch.num_rows()));
             };
-            evaluate_exact_leaf_predicate(column, &data_type, op, &literals)
+            crate::arrow::residual::evaluate_exact_leaf_predicate(column, &data_type, op, &literals)
         },
     ))))
+}
+
+/// `true` iff [`build_parquet_arrow_predicate`] would return `Some` for
+/// `predicate` — i.e. it is a `Leaf` with a supported operator, resolvable
+/// column, and a literal set the Arrow row filter can enforce. Such a predicate
+/// is applied exactly during decode by the [`RowFilter`], so it needs no
+/// residual backstop.
+///
+/// Shares the leaf-acceptance test with `build_parquet_arrow_predicate` (via
+/// `parquet_leaf_row_filter_accepted`) so the two cannot drift: whatever the
+/// builder accepts, this reports as fully enforced, and vice versa. Any
+/// non-`Leaf` node (`Or`, `Not`, `And`, ...) is NOT fully enforced.
+fn predicate_fully_enforced_by_row_filter(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+) -> bool {
+    let Predicate::Leaf {
+        index,
+        op,
+        literals,
+        ..
+    } = predicate
+    else {
+        return false;
+    };
+    parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields)
+        .unwrap_or(false)
+}
+
+/// Shared leaf-acceptance test for the Parquet Arrow row filter: a leaf is
+/// accepted iff its operator is supported, its column resolves to a root parquet
+/// column, and its literals are representable for the Arrow filter.
+///
+/// Returning an error only propagates a genuine failure from literal conversion;
+/// an unsupported (but well-formed) leaf yields `Ok(false)`.
+fn parquet_leaf_row_filter_accepted(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    index: usize,
+    op: PredicateOperator,
+    literals: &[Datum],
+    file_fields: &[DataField],
+) -> crate::Result<bool> {
+    if !predicate_supported_for_parquet_row_filter(op) {
+        return Ok(false);
+    }
+    let Some(file_field) = file_fields.get(index) else {
+        return Ok(false);
+    };
+    if parquet_root_index(parquet_schema, file_field.name()).is_none() {
+        return Ok(false);
+    }
+    parquet_row_filter_literals_supported(op, literals, file_field.data_type())
 }
 
 fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
@@ -376,11 +464,16 @@ fn parquet_row_filter_literals_supported(
             let Some(literal) = literals.first() else {
                 return Ok(false);
             };
-            Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
+            Ok(
+                crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_some(),
+            )
         }
         PredicateOperator::In | PredicateOperator::NotIn => {
             for literal in literals {
-                if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
+                if crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_none()
+                {
                     return Ok(false);
                 }
             }
@@ -399,14 +492,19 @@ fn parquet_row_filter_literals_supported(
             let Some(literal) = literals.first() else {
                 return Ok(false);
             };
-            Ok(literal_scalar_for_parquet_filter(literal, file_data_type)?.is_some())
+            Ok(
+                crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_some(),
+            )
         }
         PredicateOperator::Between | PredicateOperator::NotBetween => {
             if literals.len() != 2 {
                 return Ok(false);
             }
             for literal in literals {
-                if literal_scalar_for_parquet_filter(literal, file_data_type)?.is_none() {
+                if crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_none()
+                {
                     return Ok(false);
                 }
             }
@@ -424,231 +522,6 @@ fn parquet_root_index(
         .get_fields()
         .iter()
         .position(|field| field.name() == root_name)
-}
-
-// ---------------------------------------------------------------------------
-// Predicate evaluation helpers
-// ---------------------------------------------------------------------------
-
-fn evaluate_exact_leaf_predicate(
-    array: &ArrayRef,
-    data_type: &DataType,
-    op: PredicateOperator,
-    literals: &[Datum],
-) -> Result<BooleanArray, ArrowError> {
-    match op {
-        PredicateOperator::IsNull => Ok(boolean_mask_from_predicate(array.len(), |row_index| {
-            array.is_null(row_index)
-        })),
-        PredicateOperator::IsNotNull => Ok(boolean_mask_from_predicate(array.len(), |row_index| {
-            array.is_valid(row_index)
-        })),
-        PredicateOperator::In | PredicateOperator::NotIn => {
-            evaluate_set_membership_predicate(array, data_type, op, literals)
-        }
-        PredicateOperator::Eq
-        | PredicateOperator::NotEq
-        | PredicateOperator::Lt
-        | PredicateOperator::LtEq
-        | PredicateOperator::Gt
-        | PredicateOperator::GtEq
-        | PredicateOperator::StartsWith
-        | PredicateOperator::EndsWith
-        | PredicateOperator::Contains
-        | PredicateOperator::Like => {
-            let Some(literal) = literals.first() else {
-                return Ok(BooleanArray::from(vec![true; array.len()]));
-            };
-            let Some(scalar) = literal_scalar_for_parquet_filter(literal, data_type)
-                .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-            else {
-                return Ok(BooleanArray::from(vec![true; array.len()]));
-            };
-            let result = evaluate_column_predicate(array, &scalar, op)?;
-            Ok(sanitize_filter_mask(result))
-        }
-        PredicateOperator::Between | PredicateOperator::NotBetween => {
-            evaluate_between_predicate(array, data_type, op, literals)
-        }
-    }
-}
-
-/// `Between` / `NotBetween` translate to `gt_eq(col, low) & lt_eq(col, high)`
-/// (and its negation). `arrow_ord::cmp` produces nullable masks: any null
-/// row makes the comparison null, so a fully-built `Between` mask preserves
-/// nulls. `NotBetween` then negates valid rows and leaves nulls null —
-/// matching SQL three-valued logic; `sanitize_filter_mask` collapses nulls
-/// into `false` to match the predicate evaluator's "NULL → false" rule.
-fn evaluate_between_predicate(
-    array: &ArrayRef,
-    data_type: &DataType,
-    op: PredicateOperator,
-    literals: &[Datum],
-) -> Result<BooleanArray, ArrowError> {
-    let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
-        return Ok(BooleanArray::from(vec![true; array.len()]));
-    };
-    let Some(low_scalar) = literal_scalar_for_parquet_filter(low, data_type)
-        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-    else {
-        return Ok(BooleanArray::from(vec![true; array.len()]));
-    };
-    let Some(high_scalar) = literal_scalar_for_parquet_filter(high, data_type)
-        .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-    else {
-        return Ok(BooleanArray::from(vec![true; array.len()]));
-    };
-    let lo_mask = arrow_gt_eq(array, &low_scalar)?;
-    let hi_mask = arrow_lt_eq(array, &high_scalar)?;
-    let between = arrow_arith::boolean::and_kleene(&lo_mask, &hi_mask)?;
-    let result = match op {
-        PredicateOperator::Between => between,
-        PredicateOperator::NotBetween => arrow_arith::boolean::not(&between)?,
-        _ => unreachable!(),
-    };
-    Ok(sanitize_filter_mask(result))
-}
-
-fn evaluate_set_membership_predicate(
-    array: &ArrayRef,
-    data_type: &DataType,
-    op: PredicateOperator,
-    literals: &[Datum],
-) -> Result<BooleanArray, ArrowError> {
-    if literals.is_empty() {
-        return Ok(match op {
-            PredicateOperator::In => BooleanArray::from(vec![false; array.len()]),
-            PredicateOperator::NotIn => {
-                boolean_mask_from_predicate(array.len(), |row_index| array.is_valid(row_index))
-            }
-            _ => unreachable!(),
-        });
-    }
-
-    let mut combined = match op {
-        PredicateOperator::In => BooleanArray::from(vec![false; array.len()]),
-        PredicateOperator::NotIn => {
-            boolean_mask_from_predicate(array.len(), |row_index| array.is_valid(row_index))
-        }
-        _ => unreachable!(),
-    };
-
-    for literal in literals {
-        let Some(scalar) = literal_scalar_for_parquet_filter(literal, data_type)
-            .map_err(|e| ArrowError::ComputeError(e.to_string()))?
-        else {
-            return Ok(BooleanArray::from(vec![true; array.len()]));
-        };
-        let comparison_op = match op {
-            PredicateOperator::In => PredicateOperator::Eq,
-            PredicateOperator::NotIn => PredicateOperator::NotEq,
-            _ => unreachable!(),
-        };
-        let mask = sanitize_filter_mask(evaluate_column_predicate(array, &scalar, comparison_op)?);
-        combined = combine_filter_masks(&combined, &mask, matches!(op, PredicateOperator::In));
-    }
-
-    Ok(combined)
-}
-
-fn evaluate_column_predicate(
-    column: &ArrayRef,
-    scalar: &Scalar<ArrayRef>,
-    op: PredicateOperator,
-) -> Result<BooleanArray, ArrowError> {
-    match op {
-        PredicateOperator::Eq => arrow_eq(column, scalar),
-        PredicateOperator::NotEq => arrow_neq(column, scalar),
-        PredicateOperator::Lt => arrow_lt(column, scalar),
-        PredicateOperator::LtEq => arrow_lt_eq(column, scalar),
-        PredicateOperator::Gt => arrow_gt(column, scalar),
-        PredicateOperator::GtEq => arrow_gt_eq(column, scalar),
-        PredicateOperator::StartsWith
-        | PredicateOperator::EndsWith
-        | PredicateOperator::Contains
-        | PredicateOperator::Like => {
-            let pattern = pattern_scalar_for_string_kernel(scalar, column.data_type())?;
-            match op {
-                PredicateOperator::StartsWith => arrow_starts_with(column, &pattern),
-                PredicateOperator::EndsWith => arrow_ends_with(column, &pattern),
-                PredicateOperator::Contains => arrow_contains(column, &pattern),
-                PredicateOperator::Like => arrow_like(column, &pattern),
-                _ => unreachable!(),
-            }
-        }
-        PredicateOperator::IsNull
-        | PredicateOperator::IsNotNull
-        | PredicateOperator::In
-        | PredicateOperator::NotIn
-        | PredicateOperator::Between
-        | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
-    }
-}
-
-/// `arrow_string::like::*` kernels reject mismatched string types — Utf8 column
-/// against Utf8 pattern is fine, but a LargeUtf8 / Utf8View column needs a
-/// pattern of the same flavour. The shared scalar built upstream is always
-/// `StringArray` (Utf8); promote it to match the column when needed.
-fn pattern_scalar_for_string_kernel(
-    scalar: &Scalar<ArrayRef>,
-    column_type: &arrow_schema::DataType,
-) -> Result<Scalar<ArrayRef>, ArrowError> {
-    use arrow_array::{LargeStringArray, StringArray, StringViewArray};
-    use arrow_schema::DataType as ArrowDataType;
-
-    let arr = scalar.get().0;
-    let value = arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .and_then(|s| (s.len() == 1 && s.is_valid(0)).then(|| s.value(0).to_string()));
-    let Some(value) = value else {
-        return Ok(scalar.clone());
-    };
-    Ok(match column_type {
-        ArrowDataType::Utf8 => Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef),
-        ArrowDataType::LargeUtf8 => {
-            Scalar::new(Arc::new(LargeStringArray::from(vec![value])) as ArrayRef)
-        }
-        ArrowDataType::Utf8View => {
-            Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef)
-        }
-        ArrowDataType::Dictionary(_, value_type) if value_type.as_ref() == &ArrowDataType::Utf8 => {
-            Scalar::new(Arc::new(StringArray::from(vec![value])) as ArrayRef)
-        }
-        other => {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "string predicate against non-string column type {other:?}"
-            )))
-        }
-    })
-}
-
-fn sanitize_filter_mask(mask: BooleanArray) -> BooleanArray {
-    if mask.null_count() == 0 {
-        return mask;
-    }
-
-    boolean_mask_from_predicate(mask.len(), |row_index| {
-        mask.is_valid(row_index) && mask.value(row_index)
-    })
-}
-
-fn combine_filter_masks(left: &BooleanArray, right: &BooleanArray, use_or: bool) -> BooleanArray {
-    debug_assert_eq!(left.len(), right.len());
-    boolean_mask_from_predicate(left.len(), |row_index| {
-        if use_or {
-            left.value(row_index) || right.value(row_index)
-        } else {
-            left.value(row_index) && right.value(row_index)
-        }
-    })
-}
-
-fn boolean_mask_from_predicate(
-    len: usize,
-    mut predicate: impl FnMut(usize) -> bool,
-) -> BooleanArray {
-    BooleanArray::from((0..len).map(&mut predicate).collect::<Vec<_>>())
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,135 +1039,6 @@ fn exact_parquet_value<'a, T>(
 }
 
 // ---------------------------------------------------------------------------
-// Literal → Arrow scalar conversion
-// ---------------------------------------------------------------------------
-
-fn literal_scalar_for_parquet_filter(
-    literal: &Datum,
-    file_data_type: &DataType,
-) -> crate::Result<Option<Scalar<ArrayRef>>> {
-    let array: ArrayRef = match file_data_type {
-        DataType::Boolean(_) => match literal {
-            Datum::Bool(value) => Arc::new(BooleanArray::new_scalar(*value).into_inner()),
-            _ => return Ok(None),
-        },
-        DataType::TinyInt(_) => {
-            match integer_literal(literal).and_then(|value| i8::try_from(value).ok()) {
-                Some(value) => Arc::new(Int8Array::new_scalar(value).into_inner()),
-                None => return Ok(None),
-            }
-        }
-        DataType::SmallInt(_) => {
-            match integer_literal(literal).and_then(|value| i16::try_from(value).ok()) {
-                Some(value) => Arc::new(Int16Array::new_scalar(value).into_inner()),
-                None => return Ok(None),
-            }
-        }
-        DataType::Int(_) => {
-            match integer_literal(literal).and_then(|value| i32::try_from(value).ok()) {
-                Some(value) => Arc::new(Int32Array::new_scalar(value).into_inner()),
-                None => return Ok(None),
-            }
-        }
-        DataType::BigInt(_) => {
-            match integer_literal(literal).and_then(|value| i64::try_from(value).ok()) {
-                Some(value) => Arc::new(Int64Array::new_scalar(value).into_inner()),
-                None => return Ok(None),
-            }
-        }
-        DataType::Float(_) => match float32_literal(literal) {
-            Some(value) => Arc::new(Float32Array::new_scalar(value).into_inner()),
-            None => return Ok(None),
-        },
-        DataType::Double(_) => match float64_literal(literal) {
-            Some(value) => Arc::new(Float64Array::new_scalar(value).into_inner()),
-            None => return Ok(None),
-        },
-        DataType::Char(_) | DataType::VarChar(_) => match literal {
-            Datum::String(value) => Arc::new(StringArray::new_scalar(value.as_str()).into_inner()),
-            _ => return Ok(None),
-        },
-        DataType::Binary(_) | DataType::VarBinary(_) => match literal {
-            Datum::Bytes(value) => Arc::new(BinaryArray::new_scalar(value.as_slice()).into_inner()),
-            _ => return Ok(None),
-        },
-        DataType::Date(_) => match literal {
-            Datum::Date(value) => Arc::new(Date32Array::new_scalar(*value).into_inner()),
-            _ => return Ok(None),
-        },
-        DataType::Decimal(decimal) => match literal {
-            Datum::Decimal {
-                unscaled,
-                precision,
-                scale,
-            } if *precision <= decimal.precision() && *scale == decimal.scale() => {
-                let precision =
-                    u8::try_from(decimal.precision()).map_err(|_| Error::Unsupported {
-                        message: "Decimal precision exceeds Arrow decimal128 range".to_string(),
-                    })?;
-                let scale =
-                    i8::try_from(decimal.scale() as i32).map_err(|_| Error::Unsupported {
-                        message: "Decimal scale exceeds Arrow decimal128 range".to_string(),
-                    })?;
-                Arc::new(
-                    Decimal128Array::new_scalar(*unscaled)
-                        .into_inner()
-                        .with_precision_and_scale(precision, scale)
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!(
-                                "Failed to build decimal scalar for parquet row filter: {e}"
-                            ),
-                            source: Some(Box::new(e)),
-                        })?,
-                )
-            }
-            _ => return Ok(None),
-        },
-        DataType::Time(_)
-        | DataType::Timestamp(_)
-        | DataType::LocalZonedTimestamp(_)
-        | DataType::Variant(_)
-        | DataType::Blob(_)
-        | DataType::Array(_)
-        | DataType::Map(_)
-        | DataType::Multiset(_)
-        | DataType::Row(_)
-        | DataType::Vector(_) => return Ok(None),
-    };
-
-    Ok(Some(Scalar::new(array)))
-}
-
-fn integer_literal(literal: &Datum) -> Option<i128> {
-    match literal {
-        Datum::TinyInt(value) => Some(i128::from(*value)),
-        Datum::SmallInt(value) => Some(i128::from(*value)),
-        Datum::Int(value) => Some(i128::from(*value)),
-        Datum::Long(value) => Some(i128::from(*value)),
-        _ => None,
-    }
-}
-
-fn float32_literal(literal: &Datum) -> Option<f32> {
-    match literal {
-        Datum::Float(value) => Some(*value),
-        Datum::Double(value) => {
-            let casted = *value as f32;
-            ((casted as f64) == *value).then_some(casted)
-        }
-        _ => None,
-    }
-}
-
-fn float64_literal(literal: &Datum) -> Option<f64> {
-    match literal {
-        Datum::Float(value) => Some(f64::from(*value)),
-        Datum::Double(value) => Some(*value),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Row selection helpers (DV, row ranges)
 // ---------------------------------------------------------------------------
 
@@ -1648,17 +1392,19 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::build_parquet_row_filter;
-    use super::ParquetFormatWriter;
     use super::{
-        AsyncArrowWriter, PageIndexPolicy, ParquetMetaDataReader, Predicate, PredicateOperator,
-        RowSelection,
+        AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
+        PredicateOperator, RowSelection,
     };
-    use crate::arrow::format::{create_format_reader, create_format_writer, FormatFileWriter};
+    use super::{FilePredicates, ParquetFormatReader, ParquetFormatWriter};
+    use crate::arrow::format::{
+        create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
+    };
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
     use crate::io::FileIOBuilder;
     use crate::spec::{DataField, DataType, Datum, IntType, PredicateBuilder, VariantType};
     use crate::variant::GenericVariant;
-    use arrow_array::{BinaryArray, Int32Array, RecordBatch, StructArray};
+    use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
@@ -1719,7 +1465,7 @@ mod tests {
     ) -> arrow_array::BooleanArray {
         use crate::spec::VarCharType;
         let dt = DataType::VarChar(VarCharType::default());
-        super::evaluate_exact_leaf_predicate(
+        crate::arrow::residual::evaluate_exact_leaf_predicate(
             &column,
             &dt,
             op,
@@ -1807,8 +1553,13 @@ mod tests {
         high: i32,
     ) -> arrow_array::BooleanArray {
         let dt = DataType::Int(IntType::new());
-        super::evaluate_exact_leaf_predicate(&column, &dt, op, &[Datum::Int(low), Datum::Int(high)])
-            .expect("BETWEEN should evaluate")
+        crate::arrow::residual::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::Int(low), Datum::Int(high)],
+        )
+        .expect("BETWEEN should evaluate")
     }
 
     #[test]
@@ -2629,6 +2380,281 @@ mod tests {
             sel.is_none(),
             "column without a ColumnIndex must fall open (got {sel:?})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Residual backstop for compound / unsupported-leaf predicates (Gap B)
+    // -----------------------------------------------------------------------
+
+    /// Write a single-row-group parquet file with columns `(id, name, age)`:
+    /// `id=[1..=5]`, `name=[a,b,c,d,e]`, `age=[10,20,30,40,50]`. One row group so
+    /// row-group / page pruning cannot exclude the non-matching rows — the only
+    /// way to return exact rows is the row-level residual filter.
+    async fn write_id_name_age_parquet() -> Vec<u8> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("age", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    "a", "b", "c", "d", "e",
+                ])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        // Single row group covering every row so no row-group pruning is possible.
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(5))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    fn residual_test_field(index: i32, name: &str, data_type: DataType) -> DataField {
+        DataField::new(index, name.to_string(), data_type)
+    }
+
+    fn residual_leaf(
+        column: &str,
+        index: usize,
+        data_type: DataType,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Predicate {
+        Predicate::Leaf {
+            column: column.to_string(),
+            index,
+            data_type,
+            op,
+            literals,
+        }
+    }
+
+    /// File-level schema `(id, name, age)` used to resolve predicate indices.
+    fn id_name_age_file_fields() -> Vec<DataField> {
+        use crate::spec::VarCharType;
+        vec![
+            residual_test_field(0, "id", DataType::Int(IntType::new())),
+            residual_test_field(1, "name", DataType::VarChar(VarCharType::string_type())),
+            residual_test_field(2, "age", DataType::Int(IntType::new())),
+        ]
+    }
+
+    /// Read `[name]` from the `(id, name, age)` parquet file under `predicates`
+    /// and collect the surviving `name` values in row order. The reader-level
+    /// batch may include extra (predicate) columns — we look `name` up by name.
+    async fn read_names_under_predicate(
+        read_fields: &[DataField],
+        predicate: Predicate,
+    ) -> Vec<String> {
+        use crate::io::FileIOBuilder;
+        use futures::StreamExt;
+
+        let bytes = write_id_name_age_parquet().await;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_residual_backstop.parquet";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(bytes)).await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader_input = input.reader().await.unwrap();
+
+        let predicates = FilePredicates {
+            predicates: vec![predicate],
+            file_fields: id_name_age_file_fields(),
+        };
+
+        let reader = ParquetFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let name_idx = batch.schema().index_of("name").unwrap();
+            let col = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn test_parquet_or_predicate_returns_exact_rows() {
+        use crate::spec::VarCharType;
+        // Read only [name]; predicate `age > 25 OR name = 'a'`.
+        // age>25 -> c,d,e (rows 3,4,5); name='a' -> a (row 1). Union: a,c,d,e.
+        // Or is not accepted by the row filter, so before the fix it falls
+        // through to pruning only (single row group -> all 5 rows returned).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let predicate = Predicate::Or(vec![
+            residual_leaf(
+                "age",
+                2,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Int(25)],
+            ),
+            residual_leaf(
+                "name",
+                1,
+                DataType::VarChar(VarCharType::string_type()),
+                PredicateOperator::Eq,
+                vec![Datum::String("a".to_string())],
+            ),
+        ]);
+        let names = read_names_under_predicate(&read_fields, predicate).await;
+        assert_eq!(names, vec!["a", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_not_predicate_returns_exact_complement() {
+        use crate::spec::VarCharType;
+        // `NOT (age > 25)` -> age <= 25 -> a,b (rows 1,2).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let predicate = Predicate::Not(Box::new(residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(25)],
+        )));
+        let names = read_names_under_predicate(&read_fields, predicate).await;
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_and_of_supported_leaves_takes_fast_path() {
+        use crate::spec::VarCharType;
+        // Fast-path guard: a top-level AND of two supported leaves stays on the
+        // row-filter fast path (no residual pass) and still returns exact rows.
+        // `age > 15 AND age < 45` -> b,c,d (rows 2,3,4).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+
+        // Both leaves must be fully enforced by the row filter -> fast path taken.
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message test_schema {
+                  OPTIONAL INT32 id;
+                  OPTIONAL BYTE_ARRAY name (UTF8);
+                  OPTIONAL INT32 age;
+                }
+                ",
+            )
+            .expect("test schema should parse"),
+        ));
+        let file_fields = id_name_age_file_fields();
+        let leaf_gt = residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(15)],
+        );
+        let leaf_lt = residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Lt,
+            vec![Datum::Int(45)],
+        );
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &leaf_gt,
+            &file_fields
+        ));
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &leaf_lt,
+            &file_fields
+        ));
+        // An Or is NOT fully enforced -> residual pass would engage.
+        let or_pred = Predicate::Or(vec![leaf_gt.clone(), leaf_lt.clone()]);
+        assert!(!super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &or_pred,
+            &file_fields
+        ));
+
+        // Both leaves reach the reader split into the top-level predicate list
+        // (split_and flattens AND), so we pass them as two separate predicates.
+        use crate::io::FileIOBuilder;
+        use futures::StreamExt;
+        let bytes = write_id_name_age_parquet().await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_fast_path_and.parquet";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(bytes)).await.unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader_input = input.reader().await.unwrap();
+        let predicates = FilePredicates {
+            predicates: vec![leaf_gt, leaf_lt],
+            file_fields,
+        };
+        let reader = ParquetFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let name_idx = batch.schema().index_of("name").unwrap();
+            let col = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+        assert_eq!(names, vec!["b", "c", "d"]);
     }
 
     #[test]

@@ -17,6 +17,7 @@
 
 pub(crate) mod filtering;
 pub(crate) mod format;
+pub(crate) mod residual;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
 
