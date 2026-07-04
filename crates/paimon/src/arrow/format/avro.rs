@@ -46,7 +46,7 @@ impl FormatFileReader for AvroFormatReader {
         reader: Box<dyn FileRead>,
         file_size: u64,
         read_fields: &[DataField],
-        _predicates: Option<&FilePredicates>,
+        predicates: Option<&FilePredicates>,
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -54,9 +54,18 @@ impl FormatFileReader for AvroFormatReader {
         // This is fine for typical Paimon data files but may be problematic for very large files.
         let file_bytes = reader.read(0..file_size).await?;
 
-        let read_fields = read_fields.to_vec();
-        let target_schema = build_target_arrow_schema(&read_fields)?;
+        // Widen the decoded schema to include any predicate columns that are not
+        // in the projection, so residual filtering can see them. DataFileReader
+        // projects the returned batch to `read_fields` by name, dropping extras.
+        let scan_fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
+        let target_schema = build_target_arrow_schema(&scan_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        // Own the predicates so the returned 'static stream does not borrow the
+        // caller's `&FilePredicates` (FilePredicates is not `Clone`; rebuild it).
+        let predicates = predicates.map(|fp| FilePredicates {
+            predicates: fp.predicates.clone(),
+            file_fields: fp.file_fields.clone(),
+        });
 
         // Collect Avro records directly as apache_avro::Value, avoiding intermediate conversion.
         let all_records: Vec<Value> = Reader::new(&file_bytes[..])
@@ -87,7 +96,15 @@ impl FormatFileReader for AvroFormatReader {
 
         Ok(try_stream! {
             for chunk in records.chunks(batch_size) {
-                let batch = records_to_batch(chunk, &read_fields, &target_schema)?;
+                let batch = records_to_batch(chunk, &scan_fields, &target_schema)?;
+                let batch = match predicates.as_ref() {
+                    Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
+                        batch,
+                        fp,
+                        &scan_fields,
+                    )?,
+                    None => batch,
+                };
                 yield batch;
             }
         }
@@ -942,5 +959,233 @@ mod tests {
         let records: Vec<Value> = vec![];
         let batch = records_to_batch(&records, &fields, &schema).unwrap();
         assert_eq!(batch.num_rows(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact residual predicate filtering on read
+    // -----------------------------------------------------------------------
+
+    use crate::spec::{Datum, Predicate, PredicateOperator};
+
+    fn leaf(
+        index: usize,
+        data_type: DataType,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Predicate {
+        Predicate::Leaf {
+            column: format!("c{index}"),
+            index,
+            data_type,
+            op,
+            literals,
+        }
+    }
+
+    /// Write the given records into an in-memory Avro OCF file, returning the
+    /// encoded bytes. The Avro schema mirrors `age: long, name: string`.
+    fn write_avro_age_name(rows: &[(i64, &str)]) -> Vec<u8> {
+        use apache_avro::{Codec, Schema, Writer};
+
+        let schema = Schema::parse_str(
+            r#"{"type": "record", "name": "row", "fields": [
+                {"name": "age", "type": "long"},
+                {"name": "name", "type": "string"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut writer = Writer::with_codec(&schema, Vec::new(), Codec::Null);
+        for (age, name) in rows {
+            let mut record = apache_avro::types::Record::new(&schema).unwrap();
+            record.put("age", *age);
+            record.put("name", *name);
+            writer.append(record).unwrap();
+        }
+        writer.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn avro_reader_applies_exact_residual_filter_int() {
+        use crate::btree::test_util::BytesFileRead;
+        use crate::spec::{BigIntType, VarCharType};
+        use futures::TryStreamExt;
+
+        let bytes = write_avro_age_name(&[(10, "a"), (20, "b"), (30, "c"), (40, "d"), (50, "e")]);
+
+        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
+        let name = DataField::new(
+            1,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::new(50).unwrap()),
+        );
+        let read_fields = vec![age.clone(), name.clone()];
+        let file_fields = vec![age.clone(), name.clone()];
+
+        // age > 25 → [30, 40, 50].
+        let predicates = FilePredicates {
+            predicates: vec![leaf(
+                0,
+                DataType::BigInt(BigIntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Long(25)],
+            )],
+            file_fields,
+        };
+
+        let batches = AvroFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone().into())),
+                bytes.len() as u64,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+        let ages: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn avro_reader_filters_on_non_projected_predicate_column() {
+        use crate::btree::test_util::BytesFileRead;
+        use crate::spec::{BigIntType, VarCharType};
+        use futures::TryStreamExt;
+
+        let bytes = write_avro_age_name(&[(10, "a"), (20, "b"), (30, "c"), (40, "d"), (50, "e")]);
+
+        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
+        let name = DataField::new(
+            1,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::new(50).unwrap()),
+        );
+        // Project ONLY `name`; the predicate is on `age`, which is NOT projected.
+        let read_fields = vec![name.clone()];
+        let file_fields = vec![age.clone(), name.clone()];
+
+        // age > 25 → rows c, d, e (age is a BigInt/long, so literal is Datum::Long).
+        let predicates = FilePredicates {
+            predicates: vec![leaf(
+                0,
+                DataType::BigInt(BigIntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Long(25)],
+            )],
+            file_fields,
+        };
+
+        let batches = AvroFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone().into())),
+                bytes.len() as u64,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Assert on the FILTERED rows/values, not an exact column set (the batch
+        // may contain the extra `age` column — DataFileReader projects it away).
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec!["c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn avro_reader_applies_exact_residual_filter_like() {
+        use crate::btree::test_util::BytesFileRead;
+        use crate::spec::{BigIntType, VarCharType};
+        use futures::TryStreamExt;
+
+        let bytes = write_avro_age_name(&[
+            (10, "apple"),
+            (20, "banana"),
+            (30, "apricot"),
+            (40, "cherry"),
+        ]);
+
+        let age = DataField::new(0, "age".to_string(), DataType::BigInt(BigIntType::new()));
+        let name = DataField::new(
+            1,
+            "name".to_string(),
+            DataType::VarChar(VarCharType::new(50).unwrap()),
+        );
+        let read_fields = vec![age.clone(), name.clone()];
+
+        // name LIKE 'a%' → ["apple", "apricot"].
+        let predicates = FilePredicates {
+            predicates: vec![leaf(
+                1,
+                DataType::VarChar(VarCharType::new(50).unwrap()),
+                PredicateOperator::Like,
+                vec![Datum::String("a%".to_string())],
+            )],
+            file_fields: vec![age, name],
+        };
+
+        let batches = AvroFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone().into())),
+                bytes.len() as u64,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec!["apple", "apricot"]);
     }
 }

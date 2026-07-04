@@ -229,7 +229,7 @@ impl FormatFileReader for RowFormatReader {
         reader: Box<dyn FileRead>,
         file_size: u64,
         read_fields: &[DataField],
-        _predicates: Option<&FilePredicates>,
+        predicates: Option<&FilePredicates>,
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -298,6 +298,10 @@ impl FormatFileReader for RowFormatReader {
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
 
         let blocks_to_read = blocks_to_read(&index, total_rows, row_selection.as_deref());
+        let predicates = predicates.map(|fp| FilePredicates {
+            predicates: fp.predicates.clone(),
+            file_fields: fp.file_fields.clone(),
+        });
         Ok(try_stream! {
             let mut blocks = futures::stream::iter(blocks_to_read.into_iter().map(|block_idx| {
                 read_row_block(reader.as_ref(), &index, block_idx)
@@ -319,6 +323,12 @@ impl FormatFileReader for RowFormatReader {
 
                 for chunk in selected.chunks(batch_size) {
                     let batch = decode_row_block(&data, &row_type, schema.clone(), chunk)?;
+                    let batch = match predicates.as_ref() {
+                        Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
+                            batch, fp, &row_type,
+                        )?,
+                        None => batch,
+                    };
                     yield batch;
                 }
             }
@@ -2312,9 +2322,9 @@ mod tests {
     use crate::btree::test_util::BytesFileRead;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        ArrayType, BigIntType, BooleanType, DataType, DateType, DecimalType, DoubleType, FloatType,
-        IntType, MapType, MultisetType, RowType, TimeType, TimestampType, VarBinaryType,
-        VarCharType, VariantType,
+        ArrayType, BigIntType, BooleanType, DataType, DateType, Datum, DecimalType, DoubleType,
+        FloatType, IntType, MapType, MultisetType, Predicate, PredicateOperator, RowType, TimeType,
+        TimestampType, VarBinaryType, VarCharType, VariantType,
     };
     use crate::variant::GenericVariant;
     use futures::TryStreamExt;
@@ -2375,6 +2385,147 @@ mod tests {
         let index = RowBlockIndex::new(vec![1], vec![1], vec![2]).unwrap();
         let message = expect_data_invalid(index.validate_for_file(3, 10));
         assert!(message.contains("first block row start must be 0"));
+    }
+
+    #[tokio::test]
+    async fn row_reader_applies_exact_residual_filter() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-residual/data-1.row";
+        let output = file_io.new_output(path).unwrap();
+        let fields = vec![DataField::new(
+            0,
+            "age".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50]))],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let predicates = FilePredicates {
+            predicates: vec![Predicate::Leaf {
+                column: "age".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Gt,
+                literals: vec![Datum::Int(25)],
+            }],
+            file_fields: fields.clone(),
+        };
+
+        let input = file_io.new_input(path).unwrap();
+        let bytes = input.read().await.unwrap();
+        let batches = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                Some(&predicates),
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn row_reader_filters_on_full_physical_batch_predicate_on_non_first_column() {
+        // Regression for Gap A (Row): the reader is handed the FULL physical
+        // schema `(id, name, age)` (exactly as DataFileReader passes for `.row`,
+        // see data_file_reader.rs:186-190) and a predicate on `age`. It must apply
+        // the residual filter on the full batch, keeping only the rows where
+        // age > 25, so the `name` column ends up as [c, d, e]. Without the filter
+        // the reader returns all 5 rows.
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-residual/data-full-schema.row";
+        let output = file_io.new_output(path).unwrap();
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+            DataField::new(2, "age".to_string(), DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let predicates = FilePredicates {
+            predicates: vec![Predicate::Leaf {
+                column: "age".to_string(),
+                index: 2,
+                data_type: DataType::Int(IntType::new()),
+                op: PredicateOperator::Gt,
+                literals: vec![Datum::Int(25)],
+            }],
+            file_fields: fields.clone(),
+        };
+
+        let input = file_io.new_input(path).unwrap();
+        let bytes = input.read().await.unwrap();
+        // read_fields is the FULL physical schema, as DataFileReader passes for `.row`.
+        let batches = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                Some(&predicates),
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+        let names: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..col.len())
+                    .map(|i| col.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec!["c", "d", "e"]);
     }
 
     #[tokio::test]

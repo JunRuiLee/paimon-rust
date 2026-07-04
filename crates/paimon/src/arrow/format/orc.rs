@@ -20,7 +20,6 @@ use crate::io::FileRead;
 use crate::spec::{DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{future::BoxFuture, StreamExt};
@@ -53,12 +52,15 @@ impl FormatFileReader for OrcFormatReader {
                 source: Some(Box::new(e)),
             })?;
 
-        let mut projected_names: Vec<String> =
-            read_fields.iter().map(|f| f.name().to_string()).collect();
+        // Widen the scan to include predicate columns so the residual filter can
+        // see every column it references, even when a predicate column is not part
+        // of the requested projection. DataFileReader projects the returned batch
+        // to the requested output by name afterwards, so the extra columns are
+        // harmless.
+        let scan_fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
+        let projected_names: Vec<String> =
+            scan_fields.iter().map(|f| f.name().to_string()).collect();
         let orc_predicate = build_orc_predicate(predicates);
-        if let Some(ref predicate) = orc_predicate {
-            collect_orc_predicate_columns(predicate, &mut projected_names);
-        }
         let projection =
             ProjectionMask::named_roots(builder.file_metadata().root_data_type(), &projected_names);
 
@@ -84,15 +86,38 @@ impl FormatFileReader for OrcFormatReader {
         }
 
         let stream = builder.build_async();
-        let requested_names: Vec<String> =
-            read_fields.iter().map(|f| f.name().to_string()).collect();
+        // Stripe/row-group pruning above only skips whole stripes whose stats cannot
+        // match; non-matching rows inside a selected stripe survive. Apply the exact
+        // residual filter on each emitted batch so the reader returns exactly the rows
+        // matching the pushed-down predicate. The batch is widened with predicate
+        // columns; DataFileReader projects to the requested output by name afterwards.
+        // Own the predicate context (scan_fields + cloned FilePredicates) for the
+        // 'static stream.
+        let residual: Option<(FilePredicates, Vec<DataField>)> = predicates.map(|fp| {
+            (
+                FilePredicates {
+                    predicates: fp.predicates.clone(),
+                    file_fields: fp.file_fields.clone(),
+                },
+                scan_fields,
+            )
+        });
         Ok(stream
             .map(move |r| {
                 let batch = r.map_err(|e| Error::UnexpectedError {
                     message: format!("ORC read error: {e}"),
                     source: Some(Box::new(e)),
                 })?;
-                project_orc_batch_to_requested_fields(batch, &requested_names)
+                match &residual {
+                    Some((fp, scan_fields)) => {
+                        crate::arrow::residual::filter_record_batch_by_predicates(
+                            batch,
+                            fp,
+                            scan_fields,
+                        )
+                    }
+                    None => Ok(batch),
+                }
             })
             .boxed())
     }
@@ -302,59 +327,6 @@ fn datum_to_orc_value(datum: &Datum, data_type: &DataType) -> Option<PredicateVa
     }
 }
 
-fn collect_orc_predicate_columns(
-    predicate: &orc_rust::predicate::Predicate,
-    projected_names: &mut Vec<String>,
-) {
-    collect_orc_predicate_columns_inner(predicate, projected_names);
-}
-
-fn collect_orc_predicate_columns_inner(
-    predicate: &orc_rust::predicate::Predicate,
-    projected_names: &mut Vec<String>,
-) {
-    match predicate {
-        orc_rust::predicate::Predicate::Comparison { column, .. }
-        | orc_rust::predicate::Predicate::IsNull { column }
-        | orc_rust::predicate::Predicate::IsNotNull { column } => {
-            if !projected_names.iter().any(|name| name == column) {
-                projected_names.push(column.clone());
-            }
-        }
-        orc_rust::predicate::Predicate::And(children)
-        | orc_rust::predicate::Predicate::Or(children) => {
-            for child in children {
-                collect_orc_predicate_columns_inner(child, projected_names);
-            }
-        }
-        orc_rust::predicate::Predicate::Not(child) => {
-            collect_orc_predicate_columns_inner(child, projected_names);
-        }
-    }
-}
-
-fn project_orc_batch_to_requested_fields(
-    batch: RecordBatch,
-    requested_names: &[String],
-) -> crate::Result<RecordBatch> {
-    let indices: Vec<usize> = requested_names
-        .iter()
-        .map(|name| {
-            batch
-                .schema()
-                .index_of(name)
-                .map_err(|e| Error::UnexpectedError {
-                    message: format!("ORC batch is missing requested column '{name}': {e}"),
-                    source: Some(Box::new(e)),
-                })
-        })
-        .collect::<crate::Result<_>>()?;
-    batch.project(&indices).map_err(|e| Error::UnexpectedError {
-        message: format!("Failed to project ORC batch: {e}"),
-        source: Some(Box::new(e)),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Row ranges → orc_rust::RowSelection
 // ---------------------------------------------------------------------------
@@ -428,7 +400,7 @@ impl AsyncChunkReader for OrcFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use orc_rust::row_selection::RowSelector;
     use std::sync::Arc;
@@ -731,63 +703,253 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_collect_orc_predicate_columns_adds_filter_columns_once() {
-        let predicate = orc_rust::predicate::Predicate::and(vec![
-            orc_rust::predicate::Predicate::eq(
-                "category",
-                PredicateValue::Utf8(Some("a".to_string())),
-            ),
-            orc_rust::predicate::Predicate::gt("score", PredicateValue::Int32(Some(1))),
-        ]);
-        let mut projected_names = vec!["name".to_string()];
-
-        collect_orc_predicate_columns(&predicate, &mut projected_names);
-        collect_orc_predicate_columns(&predicate, &mut projected_names);
-
-        assert_eq!(projected_names, vec!["name", "category", "score"]);
+    /// Encode a single-stripe ORC file (all rows in one stripe) into memory bytes.
+    fn write_single_stripe_orc(schema: Arc<Schema>, batch: &RecordBatch) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = orc_rust::ArrowWriterBuilder::new(&mut buf, schema)
+            // Large stripe byte size keeps all rows in a single stripe so stripe
+            // stats cannot exclude the non-matching rows.
+            .with_stripe_byte_size(64 * 1024 * 1024)
+            .try_build()
+            .unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        buf
     }
 
-    #[test]
-    fn test_project_orc_batch_to_requested_fields() {
-        let schema = Arc::new(Schema::new(vec![
+    #[tokio::test]
+    async fn test_orc_read_applies_exact_residual_filter() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::{IntType, VarCharType};
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("age", ArrowDataType::Int32, true),
             Field::new("name", ArrowDataType::Utf8, true),
-            Field::new("id", ArrowDataType::Int32, true),
         ]));
         let batch = RecordBatch::try_new(
-            schema,
+            arrow_schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec![
+                    "apple", "banana", "apricot", "cherry", "avocado",
+                ])),
             ],
         )
         .unwrap();
 
-        let projected = project_orc_batch_to_requested_fields(batch, &["name".to_string()])
-            .expect("project ORC batch");
+        let orc_bytes = write_single_stripe_orc(arrow_schema, &batch);
 
-        assert_eq!(projected.num_columns(), 1);
-        assert_eq!(projected.schema().field(0).name(), "name");
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_orc_residual_filter.orc";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(orc_bytes)).await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+
+        let read_fields = vec![
+            field(0, "age", DataType::Int(IntType::new())),
+            field(1, "name", DataType::VarChar(VarCharType::string_type())),
+        ];
+
+        // age > 25 -> [30, 40, 50]; single stripe means stripe pruning cannot drop
+        // the non-matching rows, so the exact residual filter must do it.
+        let predicates = file_predicates(
+            vec![leaf(0, PredicateOperator::Gt, vec![Datum::Int(25)])],
+            read_fields.clone(),
+        );
+
+        let reader_input = input.reader().await.unwrap();
+        let reader = OrcFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut ages: Vec<i32> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ages.extend(col.values().iter().copied());
+        }
+
+        assert_eq!(ages, vec![30, 40, 50]);
     }
 
-    #[test]
-    fn test_project_orc_batch_to_requested_fields_errors_on_missing_column() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
+    /// Encode a single-stripe ORC file with three columns (id, name, age).
+    fn write_single_stripe_orc_three_cols(schema: Arc<Schema>, batch: &RecordBatch) -> Vec<u8> {
+        write_single_stripe_orc(schema, batch)
+    }
+
+    #[tokio::test]
+    async fn test_orc_read_filters_on_non_projected_predicate_column() {
+        // Gap A: read only [name] but filter on the non-projected [age] column.
+        // The reader must scan the predicate column, filter exactly, and still
+        // return the matching rows. (DataFileReader later projects to [name] by
+        // name; the reader-level batch may keep the extra `age` column.)
+        use crate::io::FileIOBuilder;
+        use crate::spec::{IntType, VarCharType};
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true),
+            Field::new("name", ArrowDataType::Utf8, true),
+            Field::new("age", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let orc_bytes = write_single_stripe_orc_three_cols(arrow_schema, &batch);
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_orc_non_projected_predicate.orc";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(orc_bytes)).await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+
+        // Read only [name] (NOT age).
+        let read_fields = vec![field(
+            1,
             "name",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a"]))]).unwrap();
+            DataType::VarChar(VarCharType::string_type()),
+        )];
 
-        let error = project_orc_batch_to_requested_fields(batch, &["id".to_string()])
-            .expect_err("missing requested column should error");
+        // File-level schema for predicate resolution: (id, name, age).
+        let file_fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "name", DataType::VarChar(VarCharType::string_type())),
+            field(2, "age", DataType::Int(IntType::new())),
+        ];
 
-        assert!(
-            error
-                .to_string()
-                .contains("ORC batch is missing requested column 'id'"),
-            "unexpected error: {error}"
+        // age > 25 -> rows c, d, e. `age` is not in read_fields, so before the fix
+        // the residual evaluator can't see it and silently returns all 5 names.
+        let predicates = file_predicates(
+            vec![leaf(2, PredicateOperator::Gt, vec![Datum::Int(25)])],
+            file_fields,
         );
+
+        let reader_input = input.reader().await.unwrap();
+        let reader = OrcFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let name_idx = batch.schema().index_of("name").unwrap();
+            let col = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+
+        // Assert on FILTERED ROWS/values, not on an exact column set.
+        assert_eq!(names, vec!["c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn test_orc_read_applies_exact_residual_filter_like() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::{IntType, VarCharType};
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("age", ArrowDataType::Int32, true),
+            Field::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec![
+                    "apple", "banana", "apricot", "cherry", "avocado",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let orc_bytes = write_single_stripe_orc(arrow_schema, &batch);
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_orc_residual_filter_like.orc";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(orc_bytes)).await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+
+        let read_fields = vec![
+            field(0, "age", DataType::Int(IntType::new())),
+            field(1, "name", DataType::VarChar(VarCharType::string_type())),
+        ];
+
+        // name like 'a%' -> apple, apricot, avocado (3 rows). `Like` is not pushed
+        // into ORC stripe pruning, so this exercises the residual filter directly.
+        let predicates = file_predicates(
+            vec![Predicate::Leaf {
+                column: "name".to_string(),
+                index: 1,
+                data_type: DataType::VarChar(VarCharType::string_type()),
+                op: PredicateOperator::Like,
+                literals: vec![Datum::String("a%".to_string())],
+            }],
+            read_fields.clone(),
+        );
+
+        let reader_input = input.reader().await.unwrap();
+        let reader = OrcFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+
+        assert_eq!(names, vec!["apple", "apricot", "avocado"]);
     }
 }
