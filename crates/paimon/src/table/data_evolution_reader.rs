@@ -1634,7 +1634,7 @@ mod tests {
     };
     use crate::table::{DataSplitBuilder, Table, TableRead};
     use arrow_array::{
-        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
+        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
     };
     use futures::TryStreamExt;
     use std::fs;
@@ -3651,6 +3651,23 @@ mod tests {
             .collect()
     }
 
+    fn collect_long_values(batches: &[RecordBatch], column_name: &str) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let idx = batch.schema().index_of(column_name).unwrap();
+                let array = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..array.len())
+                    .map(|row| array.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn collect_binary_values(batches: &[RecordBatch], column_name: &str) -> Vec<Option<Vec<u8>>> {
         batches
             .iter()
@@ -3862,5 +3879,121 @@ mod tests {
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["id"]);
         }
+    }
+
+    /// _ROW_ID + predicate, raw branch: surviving rows keep their ORIGINAL row
+    /// ids (ids are attached before the residual filter), not renumbered ones.
+    #[tokio::test]
+    async fn test_evolution_read_row_id_with_predicate_raw_branch() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(&parquet_path, vec![("id", vec![1, 2, 3, 4])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                100,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            )])
+            .build()
+            .unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = pb.greater_or_equal("id", Datum::Int(3)).unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
+            .with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
+        // Original ids 102, 103 — NOT renumbered to 100, 101.
+        assert_eq!(
+            collect_long_values(&batches, crate::spec::ROW_ID_FIELD_NAME),
+            vec![102, 103]
+        );
+    }
+
+    /// _ROW_ID + predicate, merge branch: same guarantee across a column merge.
+    #[tokio::test]
+    async fn test_evolution_read_row_id_with_predicate_merge_branch() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![1, 2, 3, 4])], None);
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(&value_path, vec![("value", vec![5, 20, 30, 40])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    100,
+                    4,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    100,
+                    4,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = pb.equal("value", Datum::Int(40)).unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id", crate::spec::ROW_ID_FIELD_NAME])
+            .with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![4]);
+        assert_eq!(
+            collect_long_values(&batches, crate::spec::ROW_ID_FIELD_NAME),
+            vec![103]
+        );
     }
 }
