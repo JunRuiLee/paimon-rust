@@ -3996,4 +3996,98 @@ mod tests {
             vec![103]
         );
     }
+
+    /// A predicate on a column that one file group lacks (null-filled):
+    /// comparisons drop those rows, IS NULL keeps exactly them.
+    #[tokio::test]
+    async fn test_evolution_read_null_filled_predicate_column_semantics() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Split 1 (merge group, rows 0-1): id + value.
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![1, 2])], None);
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(&value_path, vec![("value", vec![10, 20])], None);
+        // Split 2 (raw, rows 2-3): id only -> value null-filled on read.
+        let old_path = bucket_dir.join("old.parquet");
+        write_int_parquet_file(&old_path, vec![("id", vec![3, 4])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split_merged = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    0,
+                    2,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    0,
+                    2,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+        let split_raw = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "old.parquet",
+                2,
+                2,
+                1,
+                old_path.metadata().unwrap().len() as i64,
+                Some(vec!["id"]),
+            )])
+            .build()
+            .unwrap();
+        let splits = [split_merged, split_raw];
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+
+        // Comparison: value = 10 matches only row {id=1}; null-filled rows drop.
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id"])
+            .with_filter(pb.equal("value", Datum::Int(10)).unwrap());
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&splits)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1]);
+
+        // IS NULL: keeps exactly the null-filled rows {id=3, id=4}.
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id"])
+            .with_filter(pb.is_null("value").unwrap());
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&splits)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![3, 4]);
+    }
 }
