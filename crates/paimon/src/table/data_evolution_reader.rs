@@ -20,9 +20,10 @@ use super::data_file_reader::{
     DataFileReader,
 };
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::format::FilePredicates;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, DataType, ROW_ID_FIELD_NAME};
+use crate::spec::{DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME};
 use crate::table::blob_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
@@ -82,23 +83,35 @@ pub(crate) struct DataEvolutionReader {
     schema_manager: SchemaManager,
     table_schema_id: i64,
     table_fields: Vec<DataField>,
-    /// read_type with _ROW_ID filtered out — used for file reads.
-    file_read_type: Vec<DataField>,
+    /// read_type with _ROW_ID filtered out, widened with predicate-only
+    /// columns (appended strictly at the END) — used for file reads and the
+    /// column-merge plan.
+    wide_file_read_type: Vec<DataField>,
     /// Position of _ROW_ID in the original read_type, if requested.
     row_id_index: Option<usize>,
-    /// Arrow schema for the full output (including _ROW_ID if requested).
+    /// Arrow schema of the FINAL output (the caller's read_type, including
+    /// _ROW_ID if requested). Batches are projected back to this after the
+    /// residual filter.
     output_schema: Arc<arrow_schema::Schema>,
+    /// Arrow schema of wide batches at the _ROW_ID attach point: the original
+    /// read_type columns in caller order, then the extra predicate columns.
+    wide_output_schema: Arc<arrow_schema::Schema>,
+    /// Data predicates (table-schema leaf indices). Applied exactly to every
+    /// batch after _ROW_ID attachment, before yielding.
+    predicates: Vec<Predicate>,
     blob_as_descriptor: bool,
     blob_descriptor_fields: HashSet<String>,
 }
 
 impl DataEvolutionReader {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_io: FileIO,
         schema_manager: SchemaManager,
         table_schema_id: i64,
         table_fields: Vec<DataField>,
         read_type: Vec<DataField>,
+        predicates: Vec<Predicate>,
         blob_as_descriptor: bool,
         blob_descriptor_fields: HashSet<String>,
     ) -> crate::Result<Self> {
@@ -110,14 +123,35 @@ impl DataEvolutionReader {
             .collect();
         let output_schema = build_target_arrow_schema(&read_type)?;
 
+        // Widen the file read set with predicate columns not already projected
+        // so the residual filter can evaluate every leaf. Extras land strictly
+        // at the END: `filter_and_project_output` relies on that to project the
+        // final batch back to `read_type` by prefix. Predicate leaf indices
+        // point into the table schema, so `file_fields` = `table_fields`.
+        let file_predicates = (!predicates.is_empty()).then(|| FilePredicates {
+            predicates: predicates.clone(),
+            file_fields: table_fields.clone(),
+        });
+        let wide_file_read_type =
+            crate::arrow::residual::widen_scan_fields(&file_read_type, file_predicates.as_ref());
+        // Wide batches at the _ROW_ID attach point: original read_type columns
+        // (caller order, _ROW_ID at row_id_index) followed by the extras.
+        // row_id_index <= file_read_type.len(), so inserting _ROW_ID never
+        // displaces a trailing extra column.
+        let mut wide_read_type = read_type;
+        wide_read_type.extend_from_slice(&wide_file_read_type[file_read_type.len()..]);
+        let wide_output_schema = build_target_arrow_schema(&wide_read_type)?;
+
         Ok(Self {
             file_io,
             schema_manager,
             table_schema_id,
             table_fields,
-            file_read_type,
+            wide_file_read_type,
             row_id_index,
             output_schema,
+            wide_output_schema,
+            predicates,
             blob_as_descriptor,
             blob_descriptor_fields,
         })
@@ -133,7 +167,7 @@ impl DataEvolutionReader {
                 self.schema_manager.clone(),
                 self.table_schema_id,
                 self.table_fields.clone(),
-                self.file_read_type.clone(),
+                self.wide_file_read_type.clone(),
                 Vec::new(),
             );
 
@@ -198,17 +232,23 @@ impl DataEvolutionReader {
                             let num_rows = batch.num_rows();
                             if let Some(idx) = self.row_id_index {
                                 if !has_row_id {
-                                    yield append_null_row_id_column(batch, idx, &self.output_schema)?;
+                                    yield self.filter_and_project_output(
+                                        append_null_row_id_column(batch, idx, &self.wide_output_schema)?,
+                                    )?;
                                 } else if let Some(ref ids) = selected_row_ids {
-                                    yield attach_row_id(batch, idx, ids, &mut row_id_offset, &self.output_schema)?;
+                                    yield self.filter_and_project_output(
+                                        attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?,
+                                    )?;
                                 } else {
                                     let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
                                     row_id_cursor += num_rows as i64;
                                     let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                    yield insert_column_at(batch, array, idx, &self.output_schema)?;
+                                    yield self.filter_and_project_output(
+                                        insert_column_at(batch, array, idx, &self.wide_output_schema)?,
+                                    )?;
                                 }
                             } else {
-                                yield batch;
+                                yield self.filter_and_project_output(batch)?;
                             }
                         }
                     }
@@ -260,21 +300,79 @@ impl DataEvolutionReader {
                         let num_rows = batch.num_rows();
                         if let Some(idx) = self.row_id_index {
                             if let Some(ref ids) = selected_row_ids {
-                                yield attach_row_id(batch, idx, ids, &mut row_id_offset, &self.output_schema)?;
+                                yield self.filter_and_project_output(
+                                    attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?,
+                                )?;
                             } else {
                                 let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
                                 row_id_cursor += num_rows as i64;
                                 let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                yield insert_column_at(batch, array, idx, &self.output_schema)?;
+                                yield self.filter_and_project_output(
+                                    insert_column_at(batch, array, idx, &self.wide_output_schema)?,
+                                )?;
                             }
                         } else {
-                            yield batch;
+                            yield self.filter_and_project_output(batch)?;
                         }
                     }
                 }
             }
         }
         .boxed())
+    }
+
+    /// Apply the residual predicates to a wide batch (post `_ROW_ID` attach)
+    /// and project it back to the caller's read_type.
+    ///
+    /// Layout invariant: the first `output_schema.fields().len()` columns of
+    /// `batch` are exactly the original read_type columns — extras were
+    /// appended at the end by `widen_scan_fields`, and `_ROW_ID` insertion at
+    /// `row_id_index` keeps them trailing. `_ROW_ID` correctness: ids are
+    /// attached before this filter, so surviving rows keep their original ids.
+    ///
+    /// No predicates implies no widening (extras only come from predicates),
+    /// so the empty-predicate fast path returns the batch untouched.
+    fn filter_and_project_output(&self, batch: RecordBatch) -> crate::Result<RecordBatch> {
+        let filtered =
+            if self.predicates.is_empty() {
+                batch
+            } else {
+                let mask = crate::arrow::residual::evaluate_predicates_mask(
+                    &batch,
+                    &self.predicates,
+                    &self.table_fields,
+                    &self.wide_file_read_type,
+                )?;
+                match mask {
+                    Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask)
+                        .map_err(|e| Error::DataInvalid {
+                            message: format!(
+                                "Failed to filter data-evolution batch by predicates: {e}"
+                            ),
+                            source: Some(Box::new(e)),
+                        })?,
+                    None => batch,
+                }
+            };
+
+        let final_width = self.output_schema.fields().len();
+        if filtered.num_columns() == final_width {
+            return Ok(filtered);
+        }
+        let columns = filtered.columns()[..final_width].to_vec();
+        let projected = if columns.is_empty() {
+            RecordBatch::try_new_with_options(
+                self.output_schema.clone(),
+                columns,
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(filtered.num_rows())),
+            )
+        } else {
+            RecordBatch::try_new(self.output_schema.clone(), columns)
+        };
+        projected.map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to project data-evolution batch to read_type: {e}"),
+            source: Some(Box::new(e)),
+        })
     }
 
     /// Merge multiple logical sources column-wise for data evolution.
@@ -299,7 +397,15 @@ impl DataEvolutionReader {
         let table_schema_id = self.table_schema_id;
         let split = split.clone();
         let prepared_group = prepared_group.clone();
-        let read_type = self.file_read_type.clone();
+        // The merge plan reads the WIDE field set so widened predicate columns
+        // are materialized for the residual filter. Blob-descriptor note: if a
+        // widened predicate column is a blob-descriptor field,
+        // `resolve_descriptor_columns` resolves it by name in the wide batch
+        // before the residual runs, so with `blob_as_descriptor = false` the
+        // residual compares resolved bytes; with `true` it compares descriptor
+        // bytes. Resolution before filtering can do IO for rows the filter then
+        // drops — accepted trade-off.
+        let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
@@ -1522,7 +1628,10 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, BlobType, FloatType, IntType, Schema, TableSchema, VectorType};
+    use crate::spec::{
+        BinaryRow, BlobType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema,
+        VectorType,
+    };
     use crate::table::{DataSplitBuilder, Table, TableRead};
     use arrow_array::{
         Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
@@ -3557,5 +3666,201 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    fn two_col_evolution_table(table_path: String) -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "resid_t"),
+            table_path,
+            table_schema,
+            None,
+        )
+    }
+
+    /// Raw-convertible branch: a leaf predicate is applied exactly through the
+    /// public ReadBuilder -> TableRead -> to_arrow path.
+    #[tokio::test]
+    async fn test_evolution_read_applies_leaf_predicate_exactly_raw_branch() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 20, 30, 40])],
+            None,
+        );
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                0,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id", "value"]),
+            )])
+            .build()
+            .unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = pb.greater_than("value", Datum::Int(15)).unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![2, 3, 4]);
+        assert_eq!(collect_int_values(&batches, "value"), vec![20, 30, 40]);
+    }
+
+    /// Raw-convertible branch: a compound `Or` predicate referencing a
+    /// NON-projected column filters exactly, and the widened predicate column
+    /// does not leak into the output schema.
+    #[tokio::test]
+    async fn test_evolution_read_applies_or_predicate_no_projection_leak() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let parquet_path = bucket_dir.join("data.parquet");
+        write_int_parquet_file(
+            &parquet_path,
+            vec![("id", vec![1, 2, 3, 4]), ("value", vec![5, 20, 30, 40])],
+            None,
+        );
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file_meta_with_path(
+                "data.parquet",
+                0,
+                4,
+                1,
+                parquet_path.metadata().unwrap().len() as i64,
+                Some(vec!["id", "value"]),
+            )])
+            .build()
+            .unwrap();
+
+        // id = 1 OR value = 40 -> rows {id=1} and {id=4}.
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = Predicate::or(vec![
+            pb.equal("id", Datum::Int(1)).unwrap(),
+            pb.equal("value", Datum::Int(40)).unwrap(),
+        ]);
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 4]);
+        // Widened predicate column `value` must NOT leak into the output.
+        for batch in &batches {
+            let schema = batch.schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["id"]);
+        }
+    }
+
+    /// Column-merge branch: predicate on a column from file B while projecting
+    /// only the column from file A. Exact rows, no schema leak.
+    #[tokio::test]
+    async fn test_evolution_read_merge_branch_cross_file_predicate() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        // Two partial-column files covering the SAME rows 0..4 -> merge branch.
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![1, 2, 3, 4])], None);
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(&value_path, vec![("value", vec![5, 20, 30, 40])], None);
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    0,
+                    4,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    0,
+                    4,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let predicate = pb.equal("value", Datum::Int(20)).unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).with_filter(predicate);
+        let read = builder.new_read().unwrap();
+        let batches = read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![2]);
+        for batch in &batches {
+            let schema = batch.schema();
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(names, vec!["id"]);
+        }
     }
 }

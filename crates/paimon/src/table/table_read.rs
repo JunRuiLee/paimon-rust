@@ -193,6 +193,7 @@ impl<'a> TableRead<'a> {
             self.table.schema().id(),
             self.table.schema.fields().to_vec(),
             self.read_type().to_vec(),
+            self.data_predicates.clone(),
             core_options.blob_as_descriptor(),
             core_options.blob_descriptor_fields(),
         )?;
