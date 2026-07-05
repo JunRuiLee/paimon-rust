@@ -147,10 +147,11 @@ impl<'a> ReadBuilder<'a> {
     ///
     /// [`TableRead`] may use supported non-partition data predicates on formats
     /// with reader pruning for conservative row-group pruning. Parquet may also
-    /// use native row filtering. Row-level exactness is enforced on the read
-    /// side: format readers apply an exact residual filter (see
-    /// `FormatFileReader::read_batch_stream` for per-format exceptions), and
-    /// data-evolution reads filter merged batches exactly before yielding.
+    /// use native row filtering. Row-level exactness is enforced on append and
+    /// data-evolution read paths: format readers apply an exact residual filter
+    /// (see `FormatFileReader::read_batch_stream` for per-format exceptions),
+    /// and data-evolution reads filter batches exactly before yielding.
+    /// Primary-key merge reads currently apply only primary-key conjuncts.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);
         self.try_extract_row_id_ranges();
