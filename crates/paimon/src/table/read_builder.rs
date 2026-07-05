@@ -147,9 +147,10 @@ impl<'a> ReadBuilder<'a> {
     ///
     /// [`TableRead`] may use supported non-partition data predicates on formats
     /// with reader pruning for conservative row-group pruning. Parquet may also
-    /// use native row filtering. Unsupported predicates, formats without reader
-    /// pruning, and data-evolution reads remain residual and should still be
-    /// applied by the caller if exact filtering semantics are required.
+    /// use native row filtering. Row-level exactness is enforced on the read
+    /// side: format readers apply an exact residual filter (see
+    /// `FormatFileReader::read_batch_stream` for per-format exceptions), and
+    /// data-evolution reads filter merged batches exactly before yielding.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = normalize_filter(self.table, filter);
         self.try_extract_row_id_ranges();

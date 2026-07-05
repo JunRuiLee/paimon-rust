@@ -62,7 +62,9 @@ impl<'a> TableRead<'a> {
         self.table
     }
 
-    /// Set a filter predicate for conservative read-side pruning.
+    /// Set a filter predicate. Used conservatively for read-side pruning and
+    /// enforced exactly by the residual filter on all read paths (including
+    /// data-evolution reads).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
         let (_, data_predicates) = split_scan_predicates(self.table, filter);
         // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
