@@ -21,7 +21,7 @@ use crate::lumina::{
 };
 use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
-    GlobalIndexMeta, IndexFileMeta, IndexManifest, ROW_ID_FIELD_NAME,
+    GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::{
@@ -141,11 +141,16 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
             return Ok(0);
         }
 
-        validate_existing_index_overlap(
+        crate::table::global_index_build_common::validate_existing_index_overlap(
             self.table,
             snapshot.index_manifest(),
+            LUMINA_IDENTIFIER,
             index_field.id(),
-            &shards,
+            None,
+            &shards
+                .iter()
+                .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
+                .collect::<Vec<_>>(),
         )
         .await?;
 
@@ -557,51 +562,6 @@ fn bucket_path(
     ))
 }
 
-async fn validate_existing_index_overlap(
-    table: &Table,
-    index_manifest_name: Option<&str>,
-    index_field_id: i32,
-    shards: &[LuminaIndexShard],
-) -> Result<()> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
-    for entry in entries {
-        if entry.kind != FileKind::Add {
-            continue;
-        }
-        let Some(meta) = entry.index_file.global_index_meta else {
-            continue;
-        };
-        if meta.index_field_id != index_field_id {
-            continue;
-        }
-        if shards.iter().any(|shard| {
-            ranges_overlap(
-                meta.row_range_start,
-                meta.row_range_end,
-                shard.row_range_start,
-                shard.row_range_end,
-            )
-        }) {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Existing global index file '{}' overlaps requested row range for field {}",
-                    entry.index_file.file_name, index_field_id
-                ),
-                source: None,
-            });
-        }
-    }
-    Ok(())
-}
-
 async fn extract_vectors(
     table: &Table,
     shard: &LuminaIndexShard,
@@ -895,10 +855,6 @@ async fn copy_local_file_to_output(
     writer.close().await
 }
 
-fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> bool {
-    left_start <= right_end && right_start <= left_end
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,7 +864,8 @@ mod tests {
     use crate::lumina::LUMINA_DIMENSION_OPTION;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, DoubleType, FloatType, IntType, ManifestEntry, Schema, TableSchema, VectorType,
+        ArrayType, DoubleType, FloatType, IndexManifest, IntType, ManifestEntry, Schema,
+        TableSchema, VectorType,
     };
     use crate::table::TableWrite;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, Int64Builder, ListBuilder};

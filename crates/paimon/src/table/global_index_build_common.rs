@@ -26,13 +26,18 @@
 
 use crate::spec::{FileKind, IndexManifest};
 use crate::table::{merge_row_ranges, RowRange, Table};
-use crate::Result;
+use crate::{Error, Result};
 
 /// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
-fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {
+pub(crate) fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {
     let a = a.unwrap_or(&[]);
     let b = b.unwrap_or(&[]);
     a == b
+}
+
+/// Inclusive `[start, end]` range overlap.
+fn ranges_overlap(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
+    a_start <= b_end && b_start <= a_end
 }
 
 /// Row ranges already covered by `index_type` global-index files for
@@ -70,4 +75,55 @@ pub(crate) async fn indexed_row_ranges(
         ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
     }
     Ok(merge_row_ranges(ranges))
+}
+
+/// Guard against building a global index over a row range that an existing index
+/// file of the SAME identity already covers. Identity is the full
+/// `(index_type, index_field_id, extra_field_ids)` tuple -- matching
+/// `indexed_row_ranges` and Java `GlobalIndexIdentifier` -- so a different index
+/// type (or different `extra_field_ids`) on the same field coexists. Two files
+/// of the same identity with overlapping ranges are still rejected.
+pub(crate) async fn validate_existing_index_overlap(
+    table: &Table,
+    index_manifest_name: Option<&str>,
+    index_type: &str,
+    index_field_id: i32,
+    extra_field_ids: Option<&[i32]>,
+    planned: &[RowRange],
+) -> Result<()> {
+    let Some(index_manifest_name) = index_manifest_name else {
+        return Ok(());
+    };
+    let path = format!(
+        "{}/manifest/{}",
+        table.location().trim_end_matches('/'),
+        index_manifest_name
+    );
+    let entries = IndexManifest::read(table.file_io(), &path).await?;
+    for entry in entries {
+        if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
+            continue;
+        }
+        let Some(meta) = entry.index_file.global_index_meta else {
+            continue;
+        };
+        if meta.index_field_id != index_field_id
+            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
+        {
+            continue;
+        }
+        if planned
+            .iter()
+            .any(|r| ranges_overlap(meta.row_range_start, meta.row_range_end, r.from(), r.to()))
+        {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Existing global index file '{}' overlaps requested row range for field {}",
+                    entry.index_file.file_name, index_field_id
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }

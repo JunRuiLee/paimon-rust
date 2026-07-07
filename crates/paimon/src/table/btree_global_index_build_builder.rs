@@ -18,7 +18,7 @@
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
 use crate::spec::{
     bucket_dir_name, extract_datum_from_arrow, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    DataType, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifest, ROW_ID_FIELD_NAME,
+    DataType, FileKind, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::source::is_data_evolution_normal_file;
@@ -114,11 +114,16 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             return Ok(0);
         }
 
-        validate_existing_index_overlap(
+        crate::table::global_index_build_common::validate_existing_index_overlap(
             self.table,
             snapshot.index_manifest(),
+            BTREE_INDEX_TYPE,
             index_field.id(),
-            &shards,
+            None,
+            &shards
+                .iter()
+                .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
+                .collect::<Vec<_>>(),
         )
         .await?;
 
@@ -524,51 +529,6 @@ fn bucket_path(
     ))
 }
 
-async fn validate_existing_index_overlap(
-    table: &Table,
-    index_manifest_name: Option<&str>,
-    index_field_id: i32,
-    shards: &[BTreeGlobalIndexShard],
-) -> Result<()> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
-    for entry in entries {
-        if entry.kind != FileKind::Add {
-            continue;
-        }
-        let Some(meta) = entry.index_file.global_index_meta else {
-            continue;
-        };
-        if meta.index_field_id != index_field_id {
-            continue;
-        }
-        if shards.iter().any(|shard| {
-            ranges_overlap(
-                meta.row_range_start,
-                meta.row_range_end,
-                shard.row_range_start,
-                shard.row_range_end,
-            )
-        }) {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Existing global index file '{}' overlaps requested row range for field {}",
-                    entry.index_file.file_name, index_field_id
-                ),
-                source: None,
-            });
-        }
-    }
-    Ok(())
-}
-
 async fn extract_index_rows(
     table: &Table,
     shard: &BTreeGlobalIndexShard,
@@ -745,8 +705,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryType, GlobalIndexSearchMode, IntType, ManifestEntry, PredicateBuilder, Schema,
-        TableSchema, VarBinaryType, VarCharType,
+        BinaryType, GlobalIndexSearchMode, IndexManifest, IntType, ManifestEntry, PredicateBuilder,
+        Schema, TableSchema, VarBinaryType, VarCharType,
     };
     use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
     use crate::table::{merge_row_ranges, SnapshotManager, TableCommit, TableWrite};

@@ -17,7 +17,7 @@
 
 use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
-    GlobalIndexMeta, IndexFileMeta, IndexManifest, ROW_ID_FIELD_NAME,
+    GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::{
@@ -140,11 +140,16 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             return Ok(0);
         }
 
-        validate_existing_index_overlap(
+        crate::table::global_index_build_common::validate_existing_index_overlap(
             self.table,
             snapshot.index_manifest(),
+            &self.index_type,
             index_field.id(),
-            &shards,
+            None,
+            &shards
+                .iter()
+                .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
+                .collect::<Vec<_>>(),
         )
         .await?;
 
@@ -538,51 +543,6 @@ fn bucket_path(
     ))
 }
 
-async fn validate_existing_index_overlap(
-    table: &Table,
-    index_manifest_name: Option<&str>,
-    index_field_id: i32,
-    shards: &[VindexIndexShard],
-) -> Result<()> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
-    for entry in entries {
-        if entry.kind != FileKind::Add {
-            continue;
-        }
-        let Some(meta) = entry.index_file.global_index_meta else {
-            continue;
-        };
-        if meta.index_field_id != index_field_id {
-            continue;
-        }
-        if shards.iter().any(|shard| {
-            ranges_overlap(
-                meta.row_range_start,
-                meta.row_range_end,
-                shard.row_range_start,
-                shard.row_range_end,
-            )
-        }) {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Existing global index file '{}' overlaps requested row range for field {}",
-                    entry.index_file.file_name, index_field_id
-                ),
-                source: None,
-            });
-        }
-    }
-    Ok(())
-}
-
 async fn extract_vectors(
     table: &Table,
     shard: &VindexIndexShard,
@@ -817,17 +777,15 @@ fn validate_vector_buffer(vectors: &[f32], row_count: i32, dimension: i32) -> Re
     Ok(())
 }
 
-fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> bool {
-    left_start <= right_end && right_start <= left_end
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{ArrayType, FloatType, IntType, ManifestEntry, Schema, TableSchema};
+    use crate::spec::{
+        ArrayType, FloatType, IndexManifest, IntType, ManifestEntry, Schema, TableSchema,
+    };
     use crate::table::TableWrite;
     use crate::vindex::IVF_FLAT_IDENTIFIER;
     use arrow_array::builder::{Float32Builder, Int64Builder, ListBuilder};
@@ -1351,6 +1309,71 @@ mod tests {
                 );
             }
             Err(other) => panic!("unexpected error from incremental build: {other:?}"),
+        }
+    }
+
+    /// A field that already carries a DIFFERENT index type (`lumina`) over an
+    /// overlapping row range must not block a vindex (`ivf-flat`) build on the
+    /// same field: the two indexes have distinct identities and coexist. Before
+    /// the full-identity fix, the overlap guard keyed only on field id + range
+    /// and spuriously rejected this build with the "overlaps requested row
+    /// range" error.
+    #[tokio::test]
+    async fn vindex_build_coexists_with_different_index_type_on_same_field() {
+        let table_path = "memory:/test_vindex_coexist_diff_type";
+        let table = vindex_e2e_table(table_path, "10");
+        setup_dirs(table.file_io(), table_path).await;
+
+        write_vectors(
+            &table,
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        )
+        .await;
+
+        // Pre-existing `lumina` index covering the full data range on the SAME
+        // field the vindex build will target.
+        let coverage = data_row_id_coverage(&table).await;
+        assert_eq!(coverage.len(), 1, "data must be one contiguous range");
+        let field_id = find_index_field(&table, "embedding").unwrap().id();
+        let lumina = IndexFileMeta {
+            index_type: "lumina".to_string(),
+            file_name: "lumina-synthetic-0.index".to_string(),
+            file_size: 1,
+            row_count: (coverage[0].to() - coverage[0].from() + 1) as i32,
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: coverage[0].from(),
+                row_range_end: coverage[0].to(),
+                index_field_id: field_id,
+                extra_field_ids: None,
+                index_meta: None,
+            }),
+        };
+        let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
+        message.new_index_files = vec![lumina];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // Building `ivf-flat` on the same field must NOT trip the overlap guard.
+        // A native-build failure over the tiny synthetic dataset is tolerated;
+        // only the overlap error is forbidden.
+        let result = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(Error::DataInvalid { message, .. }) => {
+                assert!(
+                    !message.contains("overlaps requested row range"),
+                    "vindex build must coexist with a different-type index on the same field; got: {message}"
+                );
+            }
+            Err(other) => panic!("unexpected error from vindex build: {other:?}"),
         }
     }
 

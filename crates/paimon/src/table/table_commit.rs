@@ -30,6 +30,7 @@ use crate::spec::{
     PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::global_index_build_common::same_extra_field_ids;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
@@ -1384,6 +1385,11 @@ impl TableCommit {
                     continue;
                 };
                 if retained_meta.index_field_id == added_meta.index_field_id
+                    && retained.index_file.index_type == added.index_file.index_type
+                    && same_extra_field_ids(
+                        retained_meta.extra_field_ids.as_deref(),
+                        added_meta.extra_field_ids.as_deref(),
+                    )
                     && ranges_overlap(
                         retained_meta.row_range_start,
                         retained_meta.row_range_end,
@@ -1419,6 +1425,11 @@ impl TableCommit {
                     continue;
                 };
                 if left_meta.index_field_id == right_meta.index_field_id
+                    && left.index_file.index_type == right.index_file.index_type
+                    && same_extra_field_ids(
+                        left_meta.extra_field_ids.as_deref(),
+                        right_meta.extra_field_ids.as_deref(),
+                    )
                     && ranges_overlap(
                         left_meta.row_range_start,
                         left_meta.row_range_end,
@@ -3320,6 +3331,132 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(index_entries.len(), 2);
+    }
+
+    fn add_index_entry(file: IndexFileMeta) -> IndexManifestEntry {
+        IndexManifestEntry {
+            kind: FileKind::Add,
+            partition: vec![],
+            bucket: 0,
+            index_file: file,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn test_global_index_overlap_allows_different_index_type() {
+        // Same field id (0) and overlapping row ranges, but the retained entry is
+        // a `lumina` index and the added one is `btree`: distinct identities that
+        // must coexist rather than trip the overlap guard.
+        let lumina = test_global_index_file("lumina-0.index", 0, 0, 9);
+        let mut btree = test_global_index_file("btree-0.index", 0, 5, 14);
+        btree.index_type = "btree".to_string();
+        let retained = vec![add_index_entry(lumina)];
+        let added = vec![add_index_entry(btree)];
+        TableCommit::validate_global_index_overlap(&retained, &added)
+            .expect("different index types on the same field must coexist");
+    }
+
+    #[test]
+    fn test_global_index_overlap_allows_different_extra_field_ids() {
+        // Same index type and field id, overlapping ranges, but different
+        // `extra_field_ids` -> distinct identities, must coexist.
+        let retained = vec![add_index_entry(test_global_index_file_with_extra_fields(
+            "lumina-0.index",
+            0,
+            vec![1],
+            0,
+            9,
+        ))];
+        let added = vec![add_index_entry(test_global_index_file_with_extra_fields(
+            "lumina-1.index",
+            0,
+            vec![2],
+            5,
+            14,
+        ))];
+        TableCommit::validate_global_index_overlap(&retained, &added)
+            .expect("same field but different extra_field_ids must coexist");
+    }
+
+    #[test]
+    fn test_global_index_overlap_rejects_same_identity() {
+        // Identical identity (same type + field + extra) with overlapping ranges
+        // must still be rejected.
+        let retained = vec![add_index_entry(test_global_index_file(
+            "lumina-0.index",
+            0,
+            0,
+            9,
+        ))];
+        let added = vec![add_index_entry(test_global_index_file(
+            "lumina-1.index",
+            0,
+            5,
+            14,
+        ))];
+        let result = TableCommit::validate_global_index_overlap(&retained, &added);
+        let err_msg = result.expect_err("same-identity overlap must be rejected");
+        let err_msg = err_msg.to_string();
+        assert!(
+            err_msg.contains("overlapping row range"),
+            "expected overlap error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_added_global_index_overlap_allows_different_index_type() {
+        // Two entries added within the same commit: same field id (0) and
+        // overlapping row ranges, but distinct index types (`lumina` vs `btree`).
+        // These are distinct global-index identities that must coexist.
+        let lumina = test_global_index_file("lumina-0.index", 0, 0, 9);
+        let mut btree = test_global_index_file("btree-0.index", 0, 5, 14);
+        btree.index_type = "btree".to_string();
+        let added = vec![add_index_entry(lumina), add_index_entry(btree)];
+        TableCommit::validate_added_global_index_overlap(&added)
+            .expect("different index types on the same field must coexist within a commit");
+    }
+
+    #[test]
+    fn test_added_global_index_overlap_allows_different_extra_field_ids() {
+        // Two entries added within the same commit: same index type and field id,
+        // overlapping ranges, but different `extra_field_ids` -> distinct
+        // identities, must coexist.
+        let added = vec![
+            add_index_entry(test_global_index_file_with_extra_fields(
+                "lumina-0.index",
+                0,
+                vec![1],
+                0,
+                9,
+            )),
+            add_index_entry(test_global_index_file_with_extra_fields(
+                "lumina-1.index",
+                0,
+                vec![2],
+                5,
+                14,
+            )),
+        ];
+        TableCommit::validate_added_global_index_overlap(&added)
+            .expect("same field but different extra_field_ids must coexist within a commit");
+    }
+
+    #[test]
+    fn test_added_global_index_overlap_rejects_same_identity() {
+        // Two entries added within the same commit with identical identity
+        // (same type + field + extra) and overlapping ranges must be rejected.
+        let added = vec![
+            add_index_entry(test_global_index_file("lumina-0.index", 0, 0, 9)),
+            add_index_entry(test_global_index_file("lumina-1.index", 0, 5, 14)),
+        ];
+        let result = TableCommit::validate_added_global_index_overlap(&added);
+        let err_msg = result.expect_err("same-identity overlap must be rejected");
+        let err_msg = err_msg.to_string();
+        assert!(
+            err_msg.contains("overlapping row range"),
+            "expected overlap error, got: {err_msg}"
+        );
     }
 
     #[tokio::test]
