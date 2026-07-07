@@ -59,7 +59,7 @@ use paimon::spec::{
     TableSchema, VectorType,
 };
 use paimon::table::{CommitMessage, SchemaManager, Table, TableCommit};
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexWriter};
+use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
 use std::sync::Arc;
 
@@ -235,8 +235,8 @@ async fn write_ann_segment(
     ]);
     let config = VectorIndexConfig::from_options(&native_options).unwrap();
 
-    let mut writer = VectorIndexWriter::new(config).unwrap();
-    writer.train(&flat, n).unwrap();
+    let training = VectorIndexTrainer::train(config, &flat, n).unwrap();
+    let mut writer = VectorIndexWriter::new(training);
     writer.add_vectors(&ids, &flat, n).unwrap();
     let mut bytes = Vec::new();
     {

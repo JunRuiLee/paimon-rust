@@ -1253,7 +1253,7 @@ mod tests {
     /// serialized bytes. `nlist = 1` keeps training trivial and deterministic; the
     /// only thing the metric check cares about is the persisted metadata metric.
     fn build_vindex_segment_bytes(metric: &str) -> Vec<u8> {
-        use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexWriter};
+        use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
         use paimon_vindex_core::io::PosWriter;
 
         const DIM: usize = 2;
@@ -1267,8 +1267,8 @@ mod tests {
             ("metric".to_string(), metric.to_string()),
         ]);
         let config = VectorIndexConfig::from_options(&options).unwrap();
-        let mut writer = VectorIndexWriter::new(config).unwrap();
-        writer.train(&vectors, n).unwrap();
+        let training = VectorIndexTrainer::train(config, &vectors, n).unwrap();
+        let mut writer = VectorIndexWriter::new(training);
         writer.add_vectors(&ids, &vectors, n).unwrap();
         let mut bytes = Vec::new();
         {
