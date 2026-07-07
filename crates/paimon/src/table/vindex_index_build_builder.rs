@@ -19,6 +19,7 @@ use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
     GlobalIndexMeta, IndexFileMeta, IndexManifest, ROW_ID_FIELD_NAME,
 };
+use crate::table::source::exclude_row_ranges;
 use crate::table::{
     CommitMessage, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
@@ -117,6 +118,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
             .await?;
+        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
+            self.table,
+            snapshot.index_manifest(),
+            &self.index_type,
+            index_field.id(),
+            None, // single-column build; no extra fields today
+        )
+        .await?;
         let shards = plan_vindex_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
@@ -125,6 +134,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             snapshot.id(),
             manifest_entries,
             rows_per_shard,
+            &indexed,
         )?;
         if shards.is_empty() {
             return Ok(0);
@@ -336,6 +346,7 @@ fn validate_vector_field(field: &DataField) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_vindex_shards(
     table_location: &str,
     partition_keys: &[String],
@@ -344,6 +355,7 @@ fn plan_vindex_shards(
     snapshot_id: i64,
     entries: Vec<crate::spec::ManifestEntry>,
     rows_per_shard: i64,
+    indexed: &[RowRange],
 ) -> Result<Vec<VindexIndexShard>> {
     if rows_per_shard <= 0 {
         return Err(Error::DataInvalid {
@@ -426,19 +438,30 @@ fn plan_vindex_shards(
                     .map(|file| file.row_id_range().unwrap().1)
                     .max()
                     .unwrap();
-                let row_range_start = group_start.max(shard_start);
-                let row_range_end = group_end.min(shard_end);
-                result.push(VindexIndexShard {
-                    partition: partition.clone(),
-                    partition_bytes: partition_bytes.clone(),
-                    files: group,
-                    row_range_start,
-                    row_range_end,
-                    snapshot_id,
-                    source_bucket,
-                    total_buckets,
-                    bucket_path: bucket_path.clone(),
-                });
+                // Coverage of this group clamped to the current shard cell. Then
+                // subtract the already-indexed ranges so the build only covers
+                // the gap. Because grid-clamp and gap-subtraction are both range
+                // intersections, applying the gap here is equivalent to btree's
+                // "exclude then split" -- and each surviving segment stays inside
+                // one shard cell, preserving per-shard row-id contiguity (the
+                // reader errors on a row-id gap within a shard).
+                let coverage_start = group_start.max(shard_start);
+                let coverage_end = group_end.min(shard_end);
+                let build_segments =
+                    exclude_row_ranges(&[RowRange::new(coverage_start, coverage_end)], indexed);
+                for seg in build_segments {
+                    result.push(VindexIndexShard {
+                        partition: partition.clone(),
+                        partition_bytes: partition_bytes.clone(),
+                        files: group.clone(),
+                        row_range_start: seg.from(),
+                        row_range_end: seg.to(),
+                        snapshot_id,
+                        source_bucket,
+                        total_buckets,
+                        bucket_path: bucket_path.clone(),
+                    });
+                }
             }
         }
     }
@@ -802,11 +825,13 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 mod tests {
     use super::*;
     use crate::catalog::Identifier;
-    use crate::io::FileIOBuilder;
+    use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{ArrayType, FloatType, IntType, ManifestEntry, Schema, TableSchema};
+    use crate::table::TableWrite;
+    use crate::vindex::IVF_FLAT_IDENTIFIER;
     use arrow_array::builder::{Float32Builder, Int64Builder, ListBuilder};
-    use arrow_array::ArrayRef;
+    use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};
     use std::sync::Arc;
@@ -876,6 +901,14 @@ mod tests {
     }
 
     fn plan(entries: Vec<ManifestEntry>, rows_per_shard: i64) -> Result<Vec<VindexIndexShard>> {
+        plan_with_indexed(entries, rows_per_shard, &[])
+    }
+
+    fn plan_with_indexed(
+        entries: Vec<ManifestEntry>,
+        rows_per_shard: i64,
+        indexed: &[RowRange],
+    ) -> Result<Vec<VindexIndexShard>> {
         let table = test_table(table_options(&rows_per_shard.to_string()));
         let core = CoreOptions::new(table.schema().options());
         plan_vindex_shards(
@@ -886,6 +919,7 @@ mod tests {
             1,
             entries,
             rows_per_shard,
+            indexed,
         )
     }
 
@@ -991,5 +1025,458 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("dimension mismatch"))
         );
+    }
+
+    fn test_table_with_io(file_io: FileIO, table_path: &str, schema: Schema) -> Table {
+        Table::new(
+            file_io,
+            Identifier::new("default", "test_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn vindex_schema_builder(options: HashMap<String, String>) -> crate::spec::SchemaBuilder {
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .options(options)
+    }
+
+    fn vindex_e2e_options(rows_per_shard: &str) -> HashMap<String, String> {
+        let mut options = table_options(rows_per_shard);
+        // A small, valid IVF config so the (optional) native build can run; the
+        // no-op/incremental fix is exercised before or independently of it.
+        options.insert("ivf-flat.dimension".to_string(), "2".to_string());
+        options.insert("ivf-flat.nlist".to_string(), "2".to_string());
+        options
+    }
+
+    fn vindex_e2e_table(table_path: &str, rows_per_shard: &str) -> Table {
+        test_table_with_io(
+            FileIOBuilder::new("memory").build().unwrap(),
+            table_path,
+            vindex_schema_builder(vindex_e2e_options(rows_per_shard))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+    }
+
+    fn build_vector_batch(ids: Vec<i32>, vectors: Vec<Vec<f32>>) -> RecordBatch {
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+        for vector in vectors {
+            for value in vector {
+                vector_builder.values().append_value(value);
+            }
+            vector_builder.append(true);
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(vector_builder.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn write_vectors(table: &Table, ids: Vec<i32>, vectors: Vec<Vec<f32>>) {
+        let mut table_write = TableWrite::new(table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&build_vector_batch(ids, vectors))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+
+    /// Commit a synthetic vindex `IndexFileMeta` covering `[start, end]` for
+    /// `field_id` directly into the index manifest, without invoking the native
+    /// builder. Mirrors the Lumina/btree tests so the incremental gap logic can
+    /// be exercised without a trained vector index. Writes the same `index_type`
+    /// (`ivf-flat`) the builder-under-test uses, so the gap helper matches it.
+    async fn commit_synthetic_vindex_index(table: &Table, field_id: i32, start: i64, end: i64) {
+        let synthetic = IndexFileMeta {
+            index_type: IVF_FLAT_IDENTIFIER.to_string(),
+            file_name: format!("vector-ivf-flat-synthetic-{start}-{end}.index"),
+            file_size: 1,
+            row_count: (end - start + 1) as i32,
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: start,
+                row_range_end: end,
+                index_field_id: field_id,
+                extra_field_ids: None,
+                index_meta: None,
+            }),
+        };
+        let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
+        message.new_index_files = vec![synthetic];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+    }
+
+    async fn latest_vindex_index_files(table: &Table) -> Vec<IndexFileMeta> {
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(index_manifest_name) = snapshot.index_manifest() else {
+            return Vec::new();
+        };
+        IndexManifest::read(
+            table.file_io(),
+            &snapshot_manager.manifest_path(index_manifest_name),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Add && entry.index_file.index_type == IVF_FLAT_IDENTIFIER
+        })
+        .map(|entry| entry.index_file)
+        .collect()
+    }
+
+    /// Row-id coverage of the committed data files, read back from the data
+    /// manifest (never hard-coded) and merged into contiguous ranges. Mirrors
+    /// how `execute` gathers `manifest_entries`.
+    async fn data_row_id_coverage(table: &Table) -> Vec<RowRange> {
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let entries = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        let ranges = entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+            .filter_map(|entry| {
+                entry
+                    .file()
+                    .row_id_range()
+                    .map(|(start, end)| RowRange::new(start, end))
+            })
+            .collect::<Vec<_>>();
+        crate::table::merge_row_ranges(ranges)
+    }
+
+    /// Second build with the whole coverage already indexed must be a clean
+    /// no-op (returns 0), not an overlap error. Reaches `Ok(0)` before the
+    /// native build, so it runs in CI without a trained index. This is the core
+    /// bug fix: today the second call errors with the overlap message.
+    #[tokio::test]
+    async fn vindex_second_build_without_new_data_is_noop() {
+        let table_path = "memory:/test_vindex_second_build_noop";
+        let table = vindex_e2e_table(table_path, "10");
+        setup_dirs(table.file_io(), table_path).await;
+
+        write_vectors(
+            &table,
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        )
+        .await;
+
+        // Fully index the coverage via a synthetic manifest entry.
+        let coverage = data_row_id_coverage(&table).await;
+        assert_eq!(coverage.len(), 1, "data must be one contiguous range");
+        let field_id = find_index_field(&table, "embedding").unwrap().id();
+        commit_synthetic_vindex_index(&table, field_id, coverage[0].from(), coverage[0].to()).await;
+
+        let names_before = latest_vindex_index_files(&table)
+            .await
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!names_before.is_empty());
+
+        let built = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(built, 0, "fully-indexed table must build nothing on re-run");
+
+        let names_after = latest_vindex_index_files(&table)
+            .await
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names_before, names_after,
+            "re-run must not add or remove index manifest entries"
+        );
+    }
+
+    /// Build over an already-indexed prefix, then append new rows: the second
+    /// build must target only the appended gap and must NOT fail with the
+    /// overlap error. White-box asserts the planner targets only the gap; the
+    /// end-to-end `execute` must not surface the overlap error (a native-build
+    /// error over the tiny synthetic dataset is tolerated).
+    #[tokio::test]
+    async fn vindex_incremental_build_indexes_only_new_rows() {
+        let table_path = "memory:/test_vindex_incremental";
+        let table = vindex_e2e_table(table_path, "10");
+        setup_dirs(table.file_io(), table_path).await;
+
+        // Initial batch, then mark it fully indexed via a synthetic entry.
+        write_vectors(
+            &table,
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        )
+        .await;
+        let indexed_coverage = data_row_id_coverage(&table).await;
+        assert_eq!(indexed_coverage.len(), 1);
+        let n = indexed_coverage[0].to() + 1;
+        let field_id = find_index_field(&table, "embedding").unwrap().id();
+        commit_synthetic_vindex_index(
+            &table,
+            field_id,
+            indexed_coverage[0].from(),
+            indexed_coverage[0].to(),
+        )
+        .await;
+
+        // Append a second batch (new row-ids [n..]).
+        write_vectors(
+            &table,
+            vec![4, 5, 6],
+            vec![vec![2.0, 0.0], vec![0.0, 2.0], vec![2.0, 2.0]],
+        )
+        .await;
+
+        // White-box: fed the real indexed ranges from the manifest, the planner
+        // must target only the appended gap [n, ..], never the already-indexed
+        // prefix. Computed with the builder's actual `index_type` (`ivf-flat`),
+        // and before `execute` so it is independent of the native build.
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest_entries = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
+            &table,
+            snapshot.index_manifest(),
+            IVF_FLAT_IDENTIFIER,
+            field_id,
+            None,
+        )
+        .await
+        .unwrap();
+        let core = CoreOptions::new(table.schema().options());
+        let shards = plan_vindex_shards(
+            table.location(),
+            table.schema().partition_keys(),
+            table.schema().fields(),
+            &core,
+            snapshot.id(),
+            manifest_entries,
+            10,
+            &indexed,
+        )
+        .unwrap();
+        assert!(!shards.is_empty(), "appended gap must produce build shards");
+        for shard in &shards {
+            assert!(
+                shard.row_range_start >= n,
+                "shard [{}, {}] must start at or after the indexed prefix end {n}",
+                shard.row_range_start,
+                shard.row_range_end
+            );
+        }
+
+        // End-to-end: the incremental build must no longer fail with the overlap
+        // error. A native-build failure over the tiny synthetic dataset is
+        // tolerated; only the overlap error is forbidden.
+        let result = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(Error::DataInvalid { message, .. }) => {
+                assert!(
+                    !message.contains("overlaps requested row range"),
+                    "incremental build must not fail with the overlap error; got: {message}"
+                );
+            }
+            Err(other) => panic!("unexpected error from incremental build: {other:?}"),
+        }
+    }
+
+    /// Regression: a first build (no existing index) must equal the pre-change
+    /// full build -- subtracting an empty `indexed` yields full coverage.
+    #[test]
+    fn vindex_first_build_indexes_full_coverage() {
+        let full = plan(vec![manifest_entry(data_file("a", Some(0), 25))], 10).unwrap();
+        let gapped =
+            plan_with_indexed(vec![manifest_entry(data_file("a", Some(0), 25))], 10, &[]).unwrap();
+        // Empty `indexed` must not alter the shard layout.
+        assert_eq!(
+            full.iter()
+                .map(|s| (s.row_range_start, s.row_range_end))
+                .collect::<Vec<_>>(),
+            gapped
+                .iter()
+                .map(|s| (s.row_range_start, s.row_range_end))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            full.iter()
+                .map(|s| (s.row_range_start, s.row_range_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 9), (10, 19), (20, 24)],
+            "first build must cover the full row range across shards"
+        );
+    }
+
+    /// Planner-level mid-coverage hole, mirroring btree/lumina: with a single
+    /// shard cell (rows_per_shard large enough to hold all data) the grid never
+    /// splits, so the only split is the indexed hole itself. An indexed range
+    /// strictly inside the data coverage must carve the build into exactly the
+    /// two contiguous segments on either side of the hole -- both bounds pinned,
+    /// and neither segment may span or touch the hole.
+    #[test]
+    fn vindex_plan_splits_gap_around_mid_coverage_indexed_hole() {
+        // Data row-ids [0, 9]; one shard cell [0, 99] so the grid never splits.
+        let n = 9;
+        let hole_start = 4;
+        let hole_end = 6;
+        let shards = plan_with_indexed(
+            vec![manifest_entry(data_file("a", Some(0), n + 1))],
+            100,
+            &[RowRange::new(hole_start, hole_end)],
+        )
+        .unwrap();
+
+        let ranges = shards
+            .iter()
+            .map(|s| (s.row_range_start, s.row_range_end))
+            .collect::<Vec<_>>();
+        // Exactly the two contiguous segments around the hole.
+        assert_eq!(
+            ranges,
+            vec![(0, hole_start - 1), (hole_end + 1, n)],
+            "mid-coverage hole must split into exactly the two segments around it"
+        );
+        // Every emitted range is contiguous and none spans or touches the hole.
+        for (start, end) in &ranges {
+            assert!(end >= start, "range must be non-empty: [{start}, {end}]");
+            assert!(
+                *end < hole_start || *start > hole_end,
+                "shard [{start}, {end}] must not overlap indexed hole [{hole_start}, {hole_end}]"
+            );
+        }
+        // Together the shards cover exactly coverage - indexed.
+        let expected = exclude_row_ranges(
+            &[RowRange::new(0, n)],
+            &[RowRange::new(hole_start, hole_end)],
+        )
+        .into_iter()
+        .map(|r| (r.from(), r.to()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            ranges, expected,
+            "shards must cover exactly coverage minus the indexed hole"
+        );
+    }
+
+    /// Planner-level incremental prefix. Strengthens
+    /// `vindex_incremental_build_indexes_only_new_rows`, which asserts only a
+    /// one-sided lower bound (`row_range_start >= n`): an indexed prefix [0, k]
+    /// must leave EXACTLY the suffix [k+1, N] on both bounds, split along the
+    /// shard grid, with nothing re-indexed inside the prefix.
+    #[test]
+    fn vindex_plan_incremental_prefix_leaves_suffix() {
+        // Data row-ids [0, 24], rows_per_shard = 10 -> cells [0,9],[10,19],[20,29].
+        // Indexed prefix [0, 9] fully fills the first cell, so the build must be
+        // exactly [10, 19] and [20, 24] (the suffix split along the grid).
+        let n = 24;
+        let k = 9; // prefix [0, k] == the first full shard cell
+        let shards = plan_with_indexed(
+            vec![manifest_entry(data_file("a", Some(0), n + 1))],
+            10,
+            &[RowRange::new(0, k)],
+        )
+        .unwrap();
+
+        let ranges = shards
+            .iter()
+            .map(|s| (s.row_range_start, s.row_range_end))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            vec![(k + 1, 19), (20, n)],
+            "indexed prefix must leave exactly the suffix, split along the shard grid"
+        );
+        // Both bounds pinned (this is what the one-sided existing check omits).
+        assert_eq!(ranges.first().unwrap().0, k + 1, "suffix must start at k+1");
+        assert_eq!(ranges.last().unwrap().1, n, "suffix must end at N");
+        // Contiguous, and no shard reaches back into the indexed prefix.
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[1].0,
+                pair[0].1 + 1,
+                "ranges must be contiguous: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for (start, end) in &ranges {
+            assert!(
+                *start > k,
+                "shard [{start}, {end}] must not re-index the prefix [0, {k}]"
+            );
+        }
     }
 }
