@@ -1205,35 +1205,46 @@ mod tests {
         );
     }
 
-    /// Build over an already-indexed prefix, then append new rows: the second
-    /// build must target only the appended gap and must NOT fail with the
-    /// overlap error. White-box asserts the planner targets only the gap; the
-    /// end-to-end `execute` must not surface the overlap error (a native-build
-    /// error over the tiny synthetic dataset is tolerated).
+    /// Real end-to-end incremental build. `paimon-vindex-core` is pure Rust and
+    /// trains/serializes an IVF-flat index in CI without a native lib, so this
+    /// asserts SUCCESS end-to-end (mirroring btree's incremental test): build #1
+    /// indexes the initial rows, an appended batch is indexed by build #2, every
+    /// new index file's row range lies entirely in the appended gap `[n, ..]`
+    /// (`n` derived from the manifest, never hard-coded), and build-#1's index
+    /// files are retained untouched (append-only). No overlap error, no tolerated
+    /// native-build failure -- the build must actually succeed.
     #[tokio::test]
     async fn vindex_incremental_build_indexes_only_new_rows() {
         let table_path = "memory:/test_vindex_incremental";
         let table = vindex_e2e_table(table_path, "10");
         setup_dirs(table.file_io(), table_path).await;
 
-        // Initial batch, then mark it fully indexed via a synthetic entry.
+        // Build #1 over the initial batch via a real end-to-end build.
         write_vectors(
             &table,
             vec![1, 2, 3],
             vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
         )
         .await;
+        let first_built = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap();
+        assert!(first_built > 0, "first build must index the initial rows");
+
+        // First appended row-id, derived from the data manifest (never hard-coded).
         let indexed_coverage = data_row_id_coverage(&table).await;
         assert_eq!(indexed_coverage.len(), 1);
         let n = indexed_coverage[0].to() + 1;
-        let field_id = find_index_field(&table, "embedding").unwrap().id();
-        commit_synthetic_vindex_index(
-            &table,
-            field_id,
-            indexed_coverage[0].from(),
-            indexed_coverage[0].to(),
-        )
-        .await;
+
+        let first_names = latest_vindex_index_files(&table)
+            .await
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!first_names.is_empty(), "build #1 must write index files");
 
         // Append a second batch (new row-ids [n..]).
         write_vectors(
@@ -1243,72 +1254,45 @@ mod tests {
         )
         .await;
 
-        // White-box: fed the real indexed ranges from the manifest, the planner
-        // must target only the appended gap [n, ..], never the already-indexed
-        // prefix. Computed with the builder's actual `index_type` (`ivf-flat`),
-        // and before `execute` so it is independent of the native build.
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
-        let snapshot = snapshot_manager
-            .get_latest_snapshot()
-            .await
-            .unwrap()
-            .unwrap();
-        let manifest_entries = table
-            .new_read_builder()
-            .new_scan()
-            .with_scan_all_files()
-            .plan_manifest_entries(&snapshot)
-            .await
-            .unwrap();
-        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
-            &table,
-            snapshot.index_manifest(),
-            IVF_FLAT_IDENTIFIER,
-            field_id,
-            None,
-        )
-        .await
-        .unwrap();
-        let core = CoreOptions::new(table.schema().options());
-        let shards = plan_vindex_shards(
-            table.location(),
-            table.schema().partition_keys(),
-            table.schema().fields(),
-            &core,
-            snapshot.id(),
-            manifest_entries,
-            10,
-            &indexed,
-        )
-        .unwrap();
-        assert!(!shards.is_empty(), "appended gap must produce build shards");
-        for shard in &shards {
-            assert!(
-                shard.row_range_start >= n,
-                "shard [{}, {}] must start at or after the indexed prefix end {n}",
-                shard.row_range_start,
-                shard.row_range_end
-            );
-        }
-
-        // End-to-end: the incremental build must no longer fail with the overlap
-        // error. A native-build failure over the tiny synthetic dataset is
-        // tolerated; only the overlap error is forbidden.
-        let result = table
+        // End-to-end: build #2 must SUCCEED and index the appended rows.
+        let second_built = table
             .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
             .with_index_column("embedding")
             .execute()
-            .await;
-        match result {
-            Ok(_) => {}
-            Err(Error::DataInvalid { message, .. }) => {
-                assert!(
-                    !message.contains("overlaps requested row range"),
-                    "incremental build must not fail with the overlap error; got: {message}"
-                );
-            }
-            Err(other) => panic!("unexpected error from incremental build: {other:?}"),
+            .await
+            .unwrap();
+        assert!(second_built > 0, "appended rows must be indexed");
+
+        let all_files = latest_vindex_index_files(&table).await;
+        let all_names = all_files
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Every build-#1 file is still present (append-only, no rewrite/delete).
+        assert!(
+            first_names.iter().all(|name| all_names.contains(name)),
+            "build #1 index files must be retained untouched"
+        );
+
+        // Every build-#2 file covers only the appended gap [n, ..], never the
+        // already-indexed prefix.
+        let new_files = all_files
+            .iter()
+            .filter(|f| !first_names.contains(&f.file_name))
+            .collect::<Vec<_>>();
+        assert!(!new_files.is_empty(), "build #2 must add new index files");
+        for file in new_files {
+            let meta = file
+                .global_index_meta
+                .as_ref()
+                .expect("global index meta on new vindex file");
+            assert!(
+                meta.row_range_start >= n,
+                "new index file range must start at or after {n}, got [{}, {}]",
+                meta.row_range_start,
+                meta.row_range_end
+            );
         }
     }
 
