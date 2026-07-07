@@ -130,6 +130,44 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
     merged
 }
 
+/// Subtract `subtract` from `base`, returning the remaining sorted, non-overlapping
+/// inclusive ranges. Mirrors Java `Range.exclude`. Inputs need not be sorted or
+/// merged; the result is normalized (sorted, merged-adjacent, non-empty ranges).
+pub fn exclude_row_ranges(base: &[RowRange], subtract: &[RowRange]) -> Vec<RowRange> {
+    let base = merge_row_ranges(base.to_vec());
+    let subtract = merge_row_ranges(subtract.to_vec());
+    let mut result = Vec::new();
+    for seg in base {
+        // Current uncovered cursor within [seg.from, seg.to].
+        let mut cursor = seg.from();
+        // Set once a cut covers through seg.to(); the trailing suffix must then
+        // be suppressed. Distinguishing this from `cursor > seg.to()` is what
+        // keeps the i64::MAX edge correct: at i64::MAX, `saturating_add(1)`
+        // cannot push the cursor past seg.to(), so we rely on this flag instead.
+        let mut exhausted = false;
+        for cut in &subtract {
+            if cut.to() < cursor || cut.from() > seg.to() {
+                continue; // cut entirely before the cursor or beyond this segment
+            }
+            if cut.from() > cursor {
+                // Emit the gap before this cut.
+                result.push(RowRange::new(cursor, cut.from() - 1));
+            }
+            if cut.to() >= seg.to() {
+                // The cut reaches or passes the segment end; nothing remains.
+                exhausted = true;
+                break;
+            }
+            // Advance the cursor past the cut (never move it backwards).
+            cursor = cursor.max(cut.to() + 1);
+        }
+        if !exhausted && cursor <= seg.to() {
+            result.push(RowRange::new(cursor, seg.to()));
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod row_range_tests {
     use super::*;
@@ -904,5 +942,106 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(unknown.merged_row_count(), None);
+    }
+
+    fn r(from: i64, to: i64) -> RowRange {
+        RowRange::new(from, to)
+    }
+
+    fn pairs(ranges: &[RowRange]) -> Vec<(i64, i64)> {
+        ranges.iter().map(|x| (x.from(), x.to())).collect()
+    }
+
+    #[test]
+    fn exclude_empty_subtract_returns_base_merged() {
+        // No subtraction -> base, normalized (sorted, merged-adjacent).
+        let base = vec![r(0, 4), r(5, 9)];
+        assert_eq!(pairs(&exclude_row_ranges(&base, &[])), vec![(0, 9)]);
+    }
+
+    #[test]
+    fn exclude_empty_base_returns_empty() {
+        assert!(exclude_row_ranges(&[], &[r(0, 9)]).is_empty());
+    }
+
+    #[test]
+    fn exclude_no_overlap_returns_base() {
+        let base = vec![r(10, 19)];
+        let sub = vec![r(0, 9), r(20, 29)];
+        assert_eq!(pairs(&exclude_row_ranges(&base, &sub)), vec![(10, 19)]);
+    }
+
+    #[test]
+    fn exclude_prefix_leaves_suffix() {
+        // The core incremental case: indexed [0,2], data [0,9] -> build [3,9].
+        let base = vec![r(0, 9)];
+        let sub = vec![r(0, 2)];
+        assert_eq!(pairs(&exclude_row_ranges(&base, &sub)), vec![(3, 9)]);
+    }
+
+    #[test]
+    fn exclude_middle_hole_splits_range() {
+        let base = vec![r(0, 9)];
+        let sub = vec![r(3, 5)];
+        assert_eq!(
+            pairs(&exclude_row_ranges(&base, &sub)),
+            vec![(0, 2), (6, 9)]
+        );
+    }
+
+    #[test]
+    fn exclude_full_cover_returns_empty() {
+        let base = vec![r(0, 9)];
+        let sub = vec![r(0, 9)];
+        assert!(exclude_row_ranges(&base, &sub).is_empty());
+    }
+
+    #[test]
+    fn exclude_superset_cover_returns_empty() {
+        let base = vec![r(2, 7)];
+        let sub = vec![r(0, 100)];
+        assert!(exclude_row_ranges(&base, &sub).is_empty());
+    }
+
+    #[test]
+    fn exclude_multiple_subtract_ranges_and_boundaries() {
+        // Adjacent subtract ranges must not leave a spurious 1-row gap.
+        let base = vec![r(0, 20)];
+        let sub = vec![r(0, 4), r(5, 9), r(15, 15)];
+        assert_eq!(
+            pairs(&exclude_row_ranges(&base, &sub)),
+            vec![(10, 14), (16, 20)]
+        );
+    }
+
+    #[test]
+    fn exclude_multi_base_segments() {
+        let base = vec![r(0, 4), r(10, 14)];
+        let sub = vec![r(2, 11)];
+        assert_eq!(
+            pairs(&exclude_row_ranges(&base, &sub)),
+            vec![(0, 1), (12, 14)]
+        );
+    }
+
+    #[test]
+    fn exclude_saturates_at_i64_max_boundary() {
+        // A cut covering through i64::MAX must exhaust the segment, not emit a
+        // spurious (i64::MAX, i64::MAX). Guards the shared primitive against the
+        // i64::MAX saturation edge (read + write paths both rely on this fn).
+        let base = vec![RowRange::new(5, i64::MAX)];
+        let sub = vec![RowRange::new(5, i64::MAX)];
+        assert!(exclude_row_ranges(&base, &sub).is_empty());
+
+        // Partial cut up to i64::MAX from the middle leaves the prefix only.
+        let base = vec![RowRange::new(0, i64::MAX)];
+        let sub = vec![RowRange::new(10, i64::MAX)];
+        assert_eq!(
+            exclude_row_ranges(&base, &sub)
+                .iter()
+                .map(|r| (r.from(), r.to()))
+                .collect::<Vec<_>>(),
+            vec![(0, 9)]
+        );
     }
 }

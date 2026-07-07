@@ -568,43 +568,6 @@ fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     result
 }
 
-fn exclude_row_ranges(data_ranges: &[RowRange], indexed_ranges: &[RowRange]) -> Vec<RowRange> {
-    let data_ranges = super::merge_row_ranges(data_ranges.to_vec());
-    if data_ranges.is_empty() {
-        return Vec::new();
-    }
-    let indexed_ranges = super::merge_row_ranges(indexed_ranges.to_vec());
-    if indexed_ranges.is_empty() {
-        return data_ranges;
-    }
-
-    let mut result = Vec::new();
-    for data_range in data_ranges {
-        let mut cursor = data_range.from();
-        let mut exhausted = false;
-        for indexed_range in &indexed_ranges {
-            if indexed_range.to() < cursor {
-                continue;
-            }
-            if indexed_range.from() > data_range.to() {
-                break;
-            }
-            if indexed_range.from() > cursor {
-                result.push(RowRange::new(cursor, indexed_range.from() - 1));
-            }
-            if indexed_range.to() >= data_range.to() {
-                exhausted = true;
-                break;
-            }
-            cursor = cursor.max(indexed_range.to() + 1);
-        }
-        if !exhausted && cursor <= data_range.to() {
-            result.push(RowRange::new(cursor, data_range.to()));
-        }
-    }
-    super::merge_row_ranges(result)
-}
-
 fn data_ranges_for_search_mode(
     search_mode: GlobalIndexSearchMode,
     next_row_id: Option<i64>,
@@ -659,7 +622,7 @@ fn unindexed_ranges_for_coverage(
         return Vec::new();
     };
     let indexed_ranges = indexed_ranges_from_coverage(coverage_by_field, field_ids);
-    exclude_row_ranges(&data_ranges, &indexed_ranges)
+    super::exclude_row_ranges(&data_ranges, &indexed_ranges)
 }
 
 /// Compute row ranges not covered by a family of global index files.
