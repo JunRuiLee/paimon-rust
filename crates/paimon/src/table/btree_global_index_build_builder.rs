@@ -23,7 +23,8 @@ use crate::spec::{
 use crate::table::source::is_data_evolution_normal_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{
-    CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
+    exclude_row_ranges, merge_row_ranges, CommitMessage, DataSplit, DataSplitBuilder, RowRange,
+    SnapshotManager, Table, TableCommit,
 };
 use crate::{Error, Result};
 use arrow_array::{Array, Int64Array, RecordBatch};
@@ -90,6 +91,14 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
             .await?;
+        let indexed = indexed_row_ranges(
+            self.table,
+            snapshot.index_manifest(),
+            index_field.id(),
+            None, // single-column build; no extra fields today
+        )
+        .await?;
+
         let shards = plan_btree_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
@@ -98,6 +107,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             snapshot.id(),
             manifest_entries,
             records_per_range,
+            &indexed,
         )?;
         if shards.is_empty() {
             return Ok(0);
@@ -309,6 +319,49 @@ fn is_btree_supported_data_type(data_type: &DataType) -> bool {
     )
 }
 
+/// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
+fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {
+    let a = a.unwrap_or(&[]);
+    let b = b.unwrap_or(&[]);
+    a == b
+}
+
+/// Row ranges already covered by btree global-index files for `index_field_id`
+/// (and matching `extra_field_ids`). Mirrors Java `GlobalIndexBuilderUtils.indexedRowRanges`.
+async fn indexed_row_ranges(
+    table: &Table,
+    index_manifest_name: Option<&str>,
+    index_field_id: i32,
+    extra_field_ids: Option<&[i32]>,
+) -> Result<Vec<RowRange>> {
+    let Some(index_manifest_name) = index_manifest_name else {
+        return Ok(Vec::new());
+    };
+    let path = format!(
+        "{}/manifest/{}",
+        table.location().trim_end_matches('/'),
+        index_manifest_name
+    );
+    let entries = IndexManifest::read(table.file_io(), &path).await?;
+    let mut ranges = Vec::new();
+    for entry in entries {
+        if entry.kind != FileKind::Add || entry.index_file.index_type != BTREE_INDEX_TYPE {
+            continue;
+        }
+        let Some(meta) = entry.index_file.global_index_meta else {
+            continue;
+        };
+        if meta.index_field_id != index_field_id
+            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
+        {
+            continue;
+        }
+        ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
+    }
+    Ok(merge_row_ranges(ranges))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_btree_shards(
     table_location: &str,
     partition_keys: &[String],
@@ -317,6 +370,7 @@ fn plan_btree_shards(
     snapshot_id: i64,
     entries: Vec<crate::spec::ManifestEntry>,
     records_per_range: i64,
+    indexed: &[RowRange],
 ) -> Result<Vec<BTreeGlobalIndexShard>> {
     if records_per_range <= 0 {
         return Err(Error::DataInvalid {
@@ -366,24 +420,30 @@ fn plan_btree_shards(
         let normal_groups = group_normal_file_ranges(files)?;
         for group in normal_groups {
             let (coverage_start, coverage_end) = normal_coverage_range(&group.files)?;
-            let start_range = coverage_start / records_per_range;
-            let end_range = coverage_end / records_per_range;
-            for range_id in start_range..=end_range {
-                let range_start = range_id * records_per_range;
-                let range_end = range_start + records_per_range - 1;
-                let row_range_start = coverage_start.max(range_start);
-                let row_range_end = coverage_end.min(range_end);
-                result.push(BTreeGlobalIndexShard {
-                    partition: partition.clone(),
-                    partition_bytes: partition_bytes.clone(),
-                    files: group.files.clone(),
-                    row_range_start,
-                    row_range_end,
-                    snapshot_id,
-                    source_bucket,
-                    total_buckets,
-                    bucket_path: bucket_path.clone(),
-                });
+            let build_segments =
+                exclude_row_ranges(&[RowRange::new(coverage_start, coverage_end)], indexed);
+            for seg in build_segments {
+                let seg_start = seg.from();
+                let seg_end = seg.to();
+                let start_range = seg_start / records_per_range;
+                let end_range = seg_end / records_per_range;
+                for range_id in start_range..=end_range {
+                    let range_start = range_id * records_per_range;
+                    let range_end = range_start + records_per_range - 1;
+                    let row_range_start = seg_start.max(range_start);
+                    let row_range_end = seg_end.min(range_end);
+                    result.push(BTreeGlobalIndexShard {
+                        partition: partition.clone(),
+                        partition_bytes: partition_bytes.clone(),
+                        files: group.files.clone(),
+                        row_range_start,
+                        row_range_end,
+                        snapshot_id,
+                        source_bucket,
+                        total_buckets,
+                        bucket_path: bucket_path.clone(),
+                    });
+                }
             }
         }
     }
@@ -829,6 +889,7 @@ mod tests {
             1,
             entries,
             records_per_range,
+            &[],
         )
     }
 
@@ -1197,15 +1258,74 @@ mod tests {
         assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
     }
 
+    async fn latest_btree_index_files(table: &Table) -> Vec<IndexFileMeta> {
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(index_manifest_name) = snapshot.index_manifest() else {
+            return Vec::new();
+        };
+        IndexManifest::read(
+            table.file_io(),
+            &snapshot_manager.manifest_path(index_manifest_name),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Add && entry.index_file.index_type == BTREE_INDEX_TYPE
+        })
+        .map(|entry| entry.index_file)
+        .collect()
+    }
+
+    /// Row-id coverage of the committed data files, read back from the data
+    /// manifest (never hard-coded) and merged into contiguous ranges. Mirrors
+    /// how `execute` gathers `manifest_entries` so tests observe the exact
+    /// row-ids the writer assigned.
+    async fn data_row_id_coverage(table: &Table) -> Vec<RowRange> {
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let entries = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        let ranges = entries
+            .iter()
+            .filter(|entry| *entry.kind() == FileKind::Add)
+            .filter_map(|entry| {
+                entry
+                    .file()
+                    .row_id_range()
+                    .map(|(start, end)| RowRange::new(start, end))
+            })
+            .collect::<Vec<_>>();
+        merge_row_ranges(ranges)
+    }
+
+    /// Second build with no new data must be a clean no-op (returns 0), not an
+    /// overlap error. This is the core bug fix: today the second call errors.
     #[tokio::test]
-    async fn test_execute_rejects_existing_overlap_before_commit() {
-        let table_path = "memory:/test_btree_global_index_builder_overlap";
+    async fn second_build_without_new_data_is_noop() {
+        let table_path = "memory:/test_btree_global_index_second_build_noop";
         let table = test_table_with_path(table_path, table_options("10"));
         setup_dirs(&table).await;
 
         let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
         table_write
-            .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
             .await
             .unwrap();
         let messages = table_write.prepare_commit().await.unwrap();
@@ -1214,21 +1334,397 @@ mod tests {
             .await
             .unwrap();
 
-        table
+        let first_built = table
             .new_btree_global_index_build_builder()
             .with_index_column("name")
             .execute()
             .await
             .unwrap();
+        assert!(first_built > 0, "first build must index the initial rows");
 
-        let err = table
+        let files_after_first = latest_btree_index_files(&table).await;
+        assert!(!files_after_first.is_empty());
+
+        let built = table
             .new_btree_global_index_build_builder()
             .with_index_column("name")
             .execute()
             .await
-            .expect_err("second build should overlap existing index");
-        assert!(
-            matches!(err, Error::DataInvalid { message, .. } if message.contains("overlaps requested row range"))
+            .unwrap();
+        assert_eq!(built, 0, "fully-indexed table must build nothing on re-run");
+
+        let files_after_second = latest_btree_index_files(&table).await;
+        let names_first = files_after_first
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let names_second = files_after_second
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names_first, names_second,
+            "re-run must not add or remove index manifest entries"
         );
+    }
+
+    /// Build, append new rows, build again -> only the appended row range is
+    /// indexed; the first build's index files are retained untouched (append-only).
+    #[tokio::test]
+    async fn incremental_build_indexes_only_new_rows() {
+        let table_path = "memory:/test_btree_global_index_incremental";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        // Build #1 over rows [0..3).
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let first_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert!(first_built > 0);
+
+        let first_files = latest_btree_index_files(&table).await;
+        let first_names = first_files
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let n: i64 = 3;
+
+        // Append a second batch (new row-ids [3..6)).
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![4, 5, 6], vec!["dave", "erin", "frank"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let second_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert!(second_built > 0, "appended rows must be indexed");
+
+        let all_files = latest_btree_index_files(&table).await;
+        let all_names = all_files
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Every build-#1 file is still present (append-only, no rewrite/delete).
+        assert!(
+            first_names.iter().all(|name| all_names.contains(name)),
+            "build #1 index files must be retained untouched"
+        );
+
+        // Every build-#2 file covers only the appended range [N, ..].
+        let new_files = all_files
+            .iter()
+            .filter(|f| !first_names.contains(&f.file_name))
+            .collect::<Vec<_>>();
+        assert!(!new_files.is_empty(), "build #2 must add new index files");
+        for file in new_files {
+            let meta = file
+                .global_index_meta
+                .as_ref()
+                .expect("global index meta on new btree file");
+            assert!(
+                meta.row_range_start >= n,
+                "new index file range must start at or after {}, got [{}, {}]",
+                n,
+                meta.row_range_start,
+                meta.row_range_end
+            );
+        }
+    }
+
+    /// Regression: first build (no existing index) must equal the pre-change
+    /// full build -- subtraction with empty `indexed` = full coverage.
+    #[tokio::test]
+    async fn first_build_indexes_full_coverage() {
+        let table_path = "memory:/test_btree_global_index_first_full_coverage";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            built, 1,
+            "first build must index the full coverage in one shard"
+        );
+
+        let files = latest_btree_index_files(&table).await;
+        assert_eq!(files.len(), 1);
+        let meta = files[0]
+            .global_index_meta
+            .as_ref()
+            .expect("global index meta");
+        assert_eq!(meta.row_range_start, 0);
+        assert_eq!(meta.row_range_end, 2);
+    }
+
+    /// Grid boundary (spec edge 4): with `records-per-range = 4`, an appended
+    /// gap that spans several grid cells must be split so each new index file's
+    /// range stays inside one cell, the ranges are contiguous, and together
+    /// they exactly cover the gap. Row-ids are read back from the manifests,
+    /// never hard-coded.
+    #[tokio::test]
+    async fn incremental_build_splits_gap_across_records_per_range_grid() {
+        const RPR: i64 = 4;
+        let table_path = "memory:/test_btree_global_index_grid_boundary";
+        let table = test_table_with_path(table_path, table_options("4"));
+        setup_dirs(&table).await;
+
+        // Build #1 over an initial batch (row-ids the writer assigns).
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let first_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert!(first_built > 0, "first build must index the initial rows");
+
+        // Row range already covered by build #1 (read back, not hard-coded).
+        let first_index_files = latest_btree_index_files(&table).await;
+        let indexed_before = merge_row_ranges(
+            first_index_files
+                .iter()
+                .filter_map(|f| f.global_index_meta.as_ref())
+                .map(|m| RowRange::new(m.row_range_start, m.row_range_end))
+                .collect(),
+        );
+        assert_eq!(
+            indexed_before.len(),
+            1,
+            "build #1 should cover one contiguous range"
+        );
+        let gap_start = indexed_before[0].to() + 1;
+        let before_names = first_index_files
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Append rows so the new gap crosses records_per_range (=4) boundaries.
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(
+                vec![4, 5, 6, 7, 8, 9, 10],
+                vec!["d", "e", "f", "g", "h", "i", "j"],
+            ))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        // Total data coverage read back from the data manifest.
+        let coverage = data_row_id_coverage(&table).await;
+        assert_eq!(
+            coverage.len(),
+            1,
+            "appended data must be contiguous with build #1"
+        );
+        let gap_end = coverage[0].to();
+        assert!(
+            gap_end - gap_start + 1 > RPR,
+            "gap [{gap_start}, {gap_end}] must span more than one records_per_range cell"
+        );
+
+        let second_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert!(second_built > 0, "appended rows must be indexed");
+
+        // Only the newly written index files (build #1 files are retained).
+        let mut new_metas = latest_btree_index_files(&table)
+            .await
+            .into_iter()
+            .filter(|f| !before_names.contains(&f.file_name))
+            .filter_map(|f| f.global_index_meta)
+            .map(|m| (m.row_range_start, m.row_range_end))
+            .collect::<Vec<_>>();
+        new_metas.sort();
+        assert!(!new_metas.is_empty(), "build #2 must add new index files");
+
+        // (a) Each range lies within a single grid cell: no multiple of RPR is
+        //     strictly interior, i.e. start and end share the same cell index.
+        for (start, end) in &new_metas {
+            assert!(end >= start, "range must be non-empty: [{start}, {end}]");
+            assert_eq!(
+                start / RPR,
+                end / RPR,
+                "range [{start}, {end}] straddles a records_per_range boundary"
+            );
+        }
+        // (b) Contiguous with no gaps or overlaps.
+        for pair in new_metas.windows(2) {
+            assert_eq!(
+                pair[1].0,
+                pair[0].1 + 1,
+                "ranges must be contiguous: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // (c) Together they exactly cover the appended gap [gap_start, gap_end].
+        assert_eq!(
+            new_metas.first().unwrap().0,
+            gap_start,
+            "coverage must start at the gap start"
+        );
+        assert_eq!(
+            new_metas.last().unwrap().1,
+            gap_end,
+            "coverage must end at the gap end"
+        );
+    }
+
+    /// Hole splitting (spec edge 5) at build level: a mid-coverage indexed range
+    /// (constructed directly, as the drop-builder tests build `GlobalIndexMeta`
+    /// entries) must carve the data coverage into two build segments, one on
+    /// each side, and the hole itself must not be re-indexed.
+    #[tokio::test]
+    async fn incremental_build_splits_gap_around_mid_coverage_indexed_hole() {
+        let table_path = "memory:/test_btree_global_index_mid_hole";
+        // records-per-range large so the grid never splits: the only split is
+        // the hole itself.
+        let table = test_table_with_path(table_path, table_options("100"));
+        setup_dirs(&table).await;
+
+        // Real data spanning row-ids [0, 9].
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(
+                (1..=10).collect(),
+                vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+            ))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let coverage = data_row_id_coverage(&table).await;
+        assert_eq!(coverage.len(), 1, "data must be one contiguous range");
+        assert_eq!(coverage[0].from(), 0);
+        let last_row = coverage[0].to();
+        assert!(last_row >= 9, "need at least 10 rows for a mid hole");
+
+        // Inject a mid-coverage indexed range [hole_start, hole_end] for the
+        // `name` field directly into the index manifest.
+        let name_field_id = find_index_field(&table, "name").unwrap().id();
+        let hole_start = 4;
+        let hole_end = 6;
+        let synthetic = IndexFileMeta {
+            index_type: BTREE_INDEX_TYPE.to_string(),
+            file_name: "btree-synthetic-hole.index".to_string(),
+            file_size: 1,
+            row_count: (hole_end - hole_start + 1) as i32,
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: hole_start,
+                row_range_end: hole_end,
+                index_field_id: name_field_id,
+                extra_field_ids: None,
+                index_meta: None,
+            }),
+        };
+        let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
+        message.new_index_files = vec![synthetic];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let before_names = latest_btree_index_files(&table)
+            .await
+            .into_iter()
+            .map(|f| f.file_name)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        // Build: gap = coverage minus the hole = [0, hole_start-1] and
+        // [hole_end+1, last_row]; two shards since the grid does not split here.
+        let built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            built, 2,
+            "mid-coverage hole must split the gap into two shards"
+        );
+
+        let mut new_metas = latest_btree_index_files(&table)
+            .await
+            .into_iter()
+            .filter(|f| !before_names.contains(&f.file_name))
+            .filter_map(|f| f.global_index_meta)
+            .map(|m| (m.row_range_start, m.row_range_end))
+            .collect::<Vec<_>>();
+        new_metas.sort();
+
+        assert_eq!(
+            new_metas,
+            vec![(0, hole_start - 1), (hole_end + 1, last_row)],
+            "new shards must fill the coverage on both sides of the indexed hole"
+        );
+        for (start, end) in &new_metas {
+            assert!(
+                *end < hole_start || *start > hole_end,
+                "new shard [{start}, {end}] must not overlap indexed hole [{hole_start}, {hole_end}]"
+            );
+        }
     }
 }
