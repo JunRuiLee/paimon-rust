@@ -622,7 +622,7 @@ fn unindexed_ranges_for_coverage(
         return Vec::new();
     };
     let indexed_ranges = indexed_ranges_from_coverage(coverage_by_field, field_ids);
-    super::exclude_row_ranges(&data_ranges, &indexed_ranges)
+    super::source::exclude_row_ranges(&data_ranges, &indexed_ranges)
 }
 
 /// Compute row ranges not covered by a family of global index files.

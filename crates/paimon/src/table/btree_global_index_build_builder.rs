@@ -20,11 +20,11 @@ use crate::spec::{
     bucket_dir_name, extract_datum_from_arrow, BinaryRow, CoreOptions, DataField, DataFileMeta,
     DataType, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifest, ROW_ID_FIELD_NAME,
 };
+use crate::table::source::exclude_row_ranges;
 use crate::table::source::is_data_evolution_normal_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{
-    exclude_row_ranges, merge_row_ranges, CommitMessage, DataSplit, DataSplitBuilder, RowRange,
-    SnapshotManager, Table, TableCommit,
+    CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
 use crate::{Error, Result};
 use arrow_array::{Array, Int64Array, RecordBatch};
@@ -91,9 +91,10 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)
             .await?;
-        let indexed = indexed_row_ranges(
+        let indexed = crate::table::global_index_build_common::indexed_row_ranges(
             self.table,
             snapshot.index_manifest(),
+            BTREE_INDEX_TYPE,
             index_field.id(),
             None, // single-column build; no extra fields today
         )
@@ -317,48 +318,6 @@ fn is_btree_supported_data_type(data_type: &DataType) -> bool {
             | DataType::Time(_)
             | DataType::Timestamp(_)
     )
-}
-
-/// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
-fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {
-    let a = a.unwrap_or(&[]);
-    let b = b.unwrap_or(&[]);
-    a == b
-}
-
-/// Row ranges already covered by btree global-index files for `index_field_id`
-/// (and matching `extra_field_ids`). Mirrors Java `GlobalIndexBuilderUtils.indexedRowRanges`.
-async fn indexed_row_ranges(
-    table: &Table,
-    index_manifest_name: Option<&str>,
-    index_field_id: i32,
-    extra_field_ids: Option<&[i32]>,
-) -> Result<Vec<RowRange>> {
-    let Some(index_manifest_name) = index_manifest_name else {
-        return Ok(Vec::new());
-    };
-    let path = format!(
-        "{}/manifest/{}",
-        table.location().trim_end_matches('/'),
-        index_manifest_name
-    );
-    let entries = IndexManifest::read(table.file_io(), &path).await?;
-    let mut ranges = Vec::new();
-    for entry in entries {
-        if entry.kind != FileKind::Add || entry.index_file.index_type != BTREE_INDEX_TYPE {
-            continue;
-        }
-        let Some(meta) = entry.index_file.global_index_meta else {
-            continue;
-        };
-        if meta.index_field_id != index_field_id
-            || !same_extra_field_ids(meta.extra_field_ids.as_deref(), extra_field_ids)
-        {
-            continue;
-        }
-        ranges.push(RowRange::new(meta.row_range_start, meta.row_range_end));
-    }
-    Ok(merge_row_ranges(ranges))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,7 +749,7 @@ mod tests {
         TableSchema, VarBinaryType, VarCharType,
     };
     use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
-    use crate::table::{SnapshotManager, TableCommit, TableWrite};
+    use crate::table::{merge_row_ranges, SnapshotManager, TableCommit, TableWrite};
     use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};

@@ -133,7 +133,7 @@ pub fn merge_row_ranges(mut ranges: Vec<RowRange>) -> Vec<RowRange> {
 /// Subtract `subtract` from `base`, returning the remaining sorted, non-overlapping
 /// inclusive ranges. Mirrors Java `Range.exclude`. Inputs need not be sorted or
 /// merged; the result is normalized (sorted, merged-adjacent, non-empty ranges).
-pub fn exclude_row_ranges(base: &[RowRange], subtract: &[RowRange]) -> Vec<RowRange> {
+pub(crate) fn exclude_row_ranges(base: &[RowRange], subtract: &[RowRange]) -> Vec<RowRange> {
     let base = merge_row_ranges(base.to_vec());
     let subtract = merge_row_ranges(subtract.to_vec());
     let mut result = Vec::new();

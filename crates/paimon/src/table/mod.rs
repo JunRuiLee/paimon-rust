@@ -38,6 +38,7 @@ mod data_file_reader;
 mod data_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
+pub(crate) mod global_index_build_common;
 pub(crate) mod global_index_scanner;
 mod hybrid_search_builder;
 mod kv_file_reader;
@@ -91,8 +92,7 @@ pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{
-    exclude_row_ranges, merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile,
-    PartitionBucket, Plan, RowRange,
+    merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;
