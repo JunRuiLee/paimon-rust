@@ -82,23 +82,38 @@ mod tests {
     #[test]
     fn sorted_types_canonicalize_case_insensitively() {
         assert_eq!(normalize_global_index_type_for_drop("BTREE"), Some("btree"));
-        assert_eq!(normalize_global_index_type_for_drop("Bitmap"), Some("bitmap"));
+        assert_eq!(
+            normalize_global_index_type_for_drop("Bitmap"),
+            Some("bitmap")
+        );
     }
 
     #[test]
     fn lumina_aliases_canonicalize_to_lumina() {
-        assert_eq!(normalize_global_index_type_for_drop("lumina"), Some("lumina"));
+        assert_eq!(
+            normalize_global_index_type_for_drop("lumina"),
+            Some("lumina")
+        );
         assert_eq!(
             normalize_global_index_type_for_drop("lumina-vector-ann"),
             Some("lumina")
         );
-        assert_eq!(normalize_global_index_type_for_drop("LUMINA"), Some("lumina"));
+        assert_eq!(
+            normalize_global_index_type_for_drop("LUMINA"),
+            Some("lumina")
+        );
     }
 
     #[test]
     fn vindex_types_keep_distinct_identity() {
-        assert_eq!(normalize_global_index_type_for_drop("ivf-flat"), Some("ivf-flat"));
-        assert_eq!(normalize_global_index_type_for_drop("IVF-PQ"), Some("ivf-pq"));
+        assert_eq!(
+            normalize_global_index_type_for_drop("ivf-flat"),
+            Some("ivf-flat")
+        );
+        assert_eq!(
+            normalize_global_index_type_for_drop("IVF-PQ"),
+            Some("ivf-pq")
+        );
         assert_eq!(
             normalize_global_index_type_for_drop("ivf-hnsw-flat"),
             Some("ivf-hnsw-flat")

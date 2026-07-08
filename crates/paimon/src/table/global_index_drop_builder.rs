@@ -50,14 +50,15 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
-        let index_type = normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
-            Error::Unsupported {
-                message: format!(
-                    "unsupported global index type '{}'; supported: {}",
-                    self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
-                ),
-            }
-        })?;
+        let index_type =
+            normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
+                Error::Unsupported {
+                    message: format!(
+                        "unsupported global index type '{}'; supported: {}",
+                        self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
+                    ),
+                }
+            })?;
         let index_column = self
             .index_column
             .as_deref()
@@ -90,7 +91,8 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             if entry.kind != FileKind::Add {
                 continue;
             }
-            if normalize_global_index_type_for_drop(&entry.index_file.index_type) != Some(index_type)
+            if normalize_global_index_type_for_drop(&entry.index_file.index_type)
+                != Some(index_type)
             {
                 continue;
             }

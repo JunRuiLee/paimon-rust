@@ -22,7 +22,6 @@ pub(crate) mod bin_pack;
 mod bitmap_global_index_reader;
 mod branch_manager;
 mod btree_global_index_build_builder;
-mod global_index_drop_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -40,6 +39,7 @@ mod dedicated_format_file_writer;
 #[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
+mod global_index_drop_builder;
 pub(crate) mod global_index_scanner;
 mod global_index_types;
 mod hybrid_search_builder;
@@ -76,13 +76,13 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
-pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
+pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use global_index_types::{
     normalize_global_index_type_for_drop, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
