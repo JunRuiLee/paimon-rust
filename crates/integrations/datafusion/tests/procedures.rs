@@ -373,7 +373,41 @@ async fn test_drop_global_index_rejects_unsupported_index_type() {
     assert_sql_error(
         &sql_context,
         "CALL sys.drop_global_index(table => 'test_db.global_index_drop_bad_type', index_column => 'id', index_type => 'full-text')",
-        "only supports index_type => 'btree' or 'bitmap'",
+        "unsupported global index type",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_drop_global_index_accepts_lumina_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("lumina_drop_accepted").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.lumina_drop_accepted (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+
+    // No lumina index exists; the call must be accepted and succeed (no-match Ok),
+    // NOT rejected as an unsupported type.
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.lumina_drop_accepted', index_column => 'id', index_type => 'lumina')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_drop_global_index_accepts_vindex_type() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("vindex_drop_accepted").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.vindex_drop_accepted (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.vindex_drop_accepted', index_column => 'id', index_type => 'ivf-pq')",
     )
     .await;
 }

@@ -26,8 +26,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'lumina', or a vindex type such as 'ivf-pq')
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 
 use std::collections::HashMap;
@@ -44,7 +43,10 @@ use datafusion::sql::sqlparser::ast::{
 };
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::Snapshot;
-use paimon::table::{SnapshotManager, Table, TagManager};
+use paimon::table::{
+    normalize_global_index_type_for_drop, SnapshotManager, Table, TagManager,
+    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+};
 use paimon::vindex::is_vindex_index_type;
 
 use crate::error::to_datafusion_error;
@@ -587,23 +589,23 @@ async fn proc_drop_global_index(
         .get("index_type")
         .map(String::as_str)
         .unwrap_or("btree");
-    if !is_sorted_global_index_type(index_type) {
+    if normalize_global_index_type_for_drop(index_type).is_none() {
         return Err(DataFusionError::NotImplemented(format!(
-            "drop_global_index only supports index_type => 'btree' or 'bitmap', got '{index_type}'"
+            "unsupported global index type '{index_type}'; supported: {SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP}"
         )));
     }
     if args.contains_key("partitions") {
         return Err(DataFusionError::NotImplemented(
-            "drop_global_index partitions are not supported for btree yet".to_string(),
+            "drop_global_index partitions are not supported yet".to_string(),
         ));
     }
     if args.contains_key("dry_run") {
         return Err(DataFusionError::NotImplemented(
-            "drop_global_index dry_run is not supported for btree yet".to_string(),
+            "drop_global_index dry_run is not supported yet".to_string(),
         ));
     }
 
-    let mut builder = table.new_btree_global_index_drop_builder();
+    let mut builder = table.new_global_index_drop_builder();
     builder.with_index_column(index_column);
     builder.with_index_type(index_type);
     builder.execute().await.map_err(to_datafusion_error)?;
