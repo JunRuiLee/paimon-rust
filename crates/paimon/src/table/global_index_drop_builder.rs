@@ -28,6 +28,7 @@ pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
+    dry_run: bool,
 }
 
 impl<'a> GlobalIndexDropBuilder<'a> {
@@ -36,6 +37,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            dry_run: false,
         }
     }
 
@@ -46,6 +48,11 @@ impl<'a> GlobalIndexDropBuilder<'a> {
 
     pub fn with_index_type(&mut self, index_type: &str) -> &mut Self {
         self.index_type = index_type.to_string();
+        self
+    }
+
+    pub fn with_dry_run(&mut self, dry_run: bool) -> &mut Self {
+        self.dry_run = dry_run;
         self
     }
 
@@ -107,6 +114,9 @@ impl<'a> GlobalIndexDropBuilder<'a> {
                 .entry((entry.partition, entry.bucket))
                 .or_default()
                 .push(entry.index_file);
+        }
+        if self.dry_run {
+            return Ok(dropped);
         }
         if dropped == 0 {
             return Ok(0);
@@ -476,5 +486,84 @@ mod tests {
             Error::Unsupported { message }
                 if message.contains("unsupported global index type") && message.contains("ivf-pq")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_previews_without_committing() {
+        let table = test_table("memory:/test_drop_dry_run_preview");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-id.index",
+            0,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // dry-run: returns the matched count, commits nothing.
+        let would_drop = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_dry_run(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(would_drop, 1);
+
+        // Entry is still present (no commit happened).
+        let after_dry = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|e| e.index_file.file_name)
+            .collect::<Vec<_>>();
+        assert_eq!(after_dry, vec!["btree-id.index".to_string()]);
+
+        // A real drop (dry_run defaults false) removes it.
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+        assert!(latest_index_entries(&table).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_without_match_returns_zero() {
+        let table = test_table("memory:/test_drop_dry_run_no_match");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(vec![], 0, vec![data_file("data-0.parquet")]);
+        message.new_index_files = vec![global_index_file(
+            BTREE_GLOBAL_INDEX_TYPE,
+            "btree-name.index",
+            1,
+            0,
+            9,
+        )];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let would_drop = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_dry_run(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(would_drop, 0);
     }
 }
