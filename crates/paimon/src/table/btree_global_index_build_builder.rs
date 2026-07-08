@@ -113,7 +113,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let indexed = crate::table::global_index_build_common::indexed_row_ranges(
             self.table,
             snapshot.index_manifest(),
-            BTREE_GLOBAL_INDEX_TYPE,
+            index_type,
             index_field.id(),
             None, // single-column build; no extra fields today
         )
@@ -136,7 +136,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         crate::table::global_index_build_common::validate_existing_index_overlap(
             self.table,
             snapshot.index_manifest(),
-            BTREE_GLOBAL_INDEX_TYPE,
+            index_type,
             index_field.id(),
             None,
             &shards
@@ -1338,6 +1338,234 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+    }
+
+    /// Bitmap is built through the same sorted builder; a second build with no
+    /// new data must be a no-op keyed on the bitmap coverage — not error, and
+    /// not be confused by any btree coverage of the same field.
+    #[tokio::test]
+    async fn bitmap_second_build_without_new_data_is_noop() {
+        let table_path = "memory:/test_bitmap_global_index_second_build_noop";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let first_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert!(
+            first_built > 0,
+            "first bitmap build must index initial rows"
+        );
+
+        let files_after_first = latest_bitmap_index_files(&table).await;
+        assert!(!files_after_first.is_empty());
+
+        let built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            built, 0,
+            "fully-indexed bitmap table must build nothing on re-run"
+        );
+
+        let names_first = files_after_first
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let names_second = latest_bitmap_index_files(&table)
+            .await
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names_first, names_second, "re-run must not change entries");
+    }
+
+    /// A btree index over the SAME field must NOT count as bitmap coverage: a
+    /// bitmap build after a btree build over identical rows must still produce a
+    /// bitmap index (regression guard for the index_type-keyed gap computation —
+    /// the merge-residual bug hard-coded btree here, which would have skipped
+    /// these rows for a bitmap build).
+    #[tokio::test]
+    async fn bitmap_build_after_btree_on_same_field_still_indexes() {
+        let table_path = "memory:/test_bitmap_after_btree_same_field";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let btree_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+        assert!(btree_built > 0);
+
+        let bitmap_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert!(
+            bitmap_built > 0,
+            "bitmap build must index rows even when a btree index already covers the same field"
+        );
+
+        let bitmap_files = latest_bitmap_index_files(&table).await;
+        assert!(
+            !bitmap_files.is_empty(),
+            "a bitmap index file must be written"
+        );
+        let coverage = data_row_id_coverage(&table).await;
+        let bitmap_start = bitmap_files
+            .iter()
+            .filter_map(|f| f.global_index_meta.as_ref())
+            .map(|m| m.row_range_start)
+            .min()
+            .unwrap();
+        assert_eq!(
+            bitmap_start,
+            coverage[0].from(),
+            "bitmap coverage must span from the first data row, not skip btree-covered rows"
+        );
+    }
+
+    /// Bitmap incremental: build, append, build again → only the appended range
+    /// gets a new bitmap file; the first bitmap file is retained (append-only).
+    #[tokio::test]
+    async fn bitmap_incremental_build_indexes_only_new_rows() {
+        let table_path = "memory:/test_bitmap_global_index_incremental";
+        let table = test_table_with_path(table_path, table_options("10"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let first_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert!(first_built > 0);
+        let first_names = latest_bitmap_index_files(&table)
+            .await
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let n: i64 = 3;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![4, 5, 6], vec!["dave", "erin", "frank"]))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let second_built = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert!(second_built > 0, "appended rows must be indexed");
+
+        let all_files = latest_bitmap_index_files(&table).await;
+        let all_names = all_files
+            .iter()
+            .map(|f| f.file_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            first_names.iter().all(|name| all_names.contains(name)),
+            "build #1 bitmap files must be retained untouched"
+        );
+        let new_files = all_files
+            .iter()
+            .filter(|f| !first_names.contains(&f.file_name))
+            .collect::<Vec<_>>();
+        assert!(!new_files.is_empty(), "build #2 must add new bitmap files");
+        for file in new_files {
+            let meta = file
+                .global_index_meta
+                .as_ref()
+                .expect("global index meta on new bitmap file");
+            assert!(
+                meta.row_range_start >= n,
+                "new bitmap file range must start at or after {}, got [{}, {}]",
+                n,
+                meta.row_range_start,
+                meta.row_range_end
+            );
+        }
+    }
+
+    async fn latest_bitmap_index_files(table: &Table) -> Vec<IndexFileMeta> {
+        let snapshot_manager =
+            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(index_manifest_name) = snapshot.index_manifest() else {
+            return Vec::new();
+        };
+        IndexManifest::read(
+            table.file_io(),
+            &snapshot_manager.manifest_path(index_manifest_name),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Add && entry.index_file.index_type == BITMAP_GLOBAL_INDEX_TYPE
+        })
+        .map(|entry| entry.index_file)
+        .collect()
     }
 
     async fn latest_btree_index_files(table: &Table) -> Vec<IndexFileMeta> {
