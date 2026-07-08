@@ -15,19 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::global_index_types::{normalize_sorted_global_index_type, BTREE_GLOBAL_INDEX_TYPE};
+use super::global_index_types::{
+    normalize_global_index_type_for_drop, BTREE_GLOBAL_INDEX_TYPE,
+    SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
+};
 use crate::spec::{DataField, FileKind, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
-pub struct BTreeGlobalIndexDropBuilder<'a> {
+pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
 }
 
-impl<'a> BTreeGlobalIndexDropBuilder<'a> {
+impl<'a> GlobalIndexDropBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -47,11 +50,11 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
     }
 
     pub async fn execute(&self) -> Result<usize> {
-        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+        let index_type = normalize_global_index_type_for_drop(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Sorted global index drop only supports index_type => 'btree' or 'bitmap', got '{}'",
-                    self.index_type
+                    "unsupported global index type '{}'; supported: {}",
+                    self.index_type, SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP
                 ),
             }
         })?;
@@ -84,7 +87,11 @@ impl<'a> BTreeGlobalIndexDropBuilder<'a> {
             HashMap::new();
         let mut dropped = 0;
         for entry in index_entries {
-            if entry.kind != FileKind::Add || entry.index_file.index_type != index_type {
+            if entry.kind != FileKind::Add {
+                continue;
+            }
+            if normalize_global_index_type_for_drop(&entry.index_file.index_type) != Some(index_type)
+            {
                 continue;
             }
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
@@ -310,7 +317,7 @@ mod tests {
             .unwrap();
 
         let dropped = table
-            .new_btree_global_index_drop_builder()
+            .new_global_index_drop_builder()
             .with_index_column("id")
             .execute()
             .await
@@ -353,7 +360,7 @@ mod tests {
             .unwrap();
 
         let dropped = table
-            .new_btree_global_index_drop_builder()
+            .new_global_index_drop_builder()
             .with_index_column("id")
             .execute()
             .await
@@ -363,5 +370,109 @@ mod tests {
         let remaining = latest_index_entries(&table).await;
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].index_file.file_name, "btree-name.index");
+    }
+
+    #[tokio::test]
+    async fn test_drop_lumina_matches_legacy_alias_entry() {
+        let table = test_table("memory:/test_drop_lumina_legacy");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        // Stored under the LEGACY identifier; request uses the canonical name.
+        message.new_index_files = vec![
+            global_index_file("lumina-vector-ann", "lumina-id.index", 0, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_index_type("lumina")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+
+        let mut remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|entry| entry.index_file.file_name)
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, vec!["btree-id.index".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_vindex_preserves_other_types_case_insensitive() {
+        let table = test_table("memory:/test_drop_vindex_identity");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file("ivf-flat", "ivf-flat-id.index", 0, 0, 9),
+            global_index_file("ivf-pq", "ivf-pq-id.index", 0, 0, 9),
+            global_index_file("lumina", "lumina-id.index", 0, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-id.index", 0, 0, 9),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        // Uppercase request must canonicalize and drop ONLY ivf-flat.
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_index_type("IVF-FLAT")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1);
+
+        let mut remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|entry| entry.index_file.file_name)
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "btree-id.index".to_string(),
+                "ivf-pq-id.index".to_string(),
+                "lumina-id.index".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_unsupported_type_errors() {
+        let table = test_table("memory:/test_drop_unsupported");
+        setup_dirs(&table).await;
+
+        let err = table
+            .new_global_index_drop_builder()
+            .with_index_column("id")
+            .with_index_type("full-text")
+            .execute()
+            .await
+            .expect_err("unsupported type must error");
+        assert!(matches!(
+            err,
+            Error::Unsupported { message }
+                if message.contains("unsupported global index type") && message.contains("ivf-pq")
+        ));
     }
 }

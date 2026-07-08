@@ -22,7 +22,7 @@ pub(crate) mod bin_pack;
 mod bitmap_global_index_reader;
 mod branch_manager;
 mod btree_global_index_build_builder;
-mod btree_global_index_drop_builder;
+mod global_index_drop_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -76,7 +76,7 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
 pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
-pub use btree_global_index_drop_builder::BTreeGlobalIndexDropBuilder;
+pub use global_index_drop_builder::GlobalIndexDropBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -222,8 +222,8 @@ impl Table {
         BTreeGlobalIndexBuildBuilder::new(self)
     }
 
-    pub fn new_btree_global_index_drop_builder(&self) -> BTreeGlobalIndexDropBuilder<'_> {
-        BTreeGlobalIndexDropBuilder::new(self)
+    pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
+        GlobalIndexDropBuilder::new(self)
     }
 
     pub fn new_vindex_index_build_builder(&self, index_type: &str) -> VindexIndexBuildBuilder<'_> {
