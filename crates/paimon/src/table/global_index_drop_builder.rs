@@ -63,7 +63,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             .index_column
             .as_deref()
             .ok_or_else(|| Error::DataInvalid {
-                message: "Sorted global index column is required".to_string(),
+                message: "Global index column is required".to_string(),
                 source: None,
             })?;
         let index_field = find_index_field(self.table, index_column)?;
