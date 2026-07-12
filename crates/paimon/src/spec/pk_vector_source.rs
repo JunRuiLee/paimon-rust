@@ -427,4 +427,26 @@ mod tests {
         let parsed = PkVectorSourceMeta::from_global_index_meta(&meta).unwrap();
         assert_eq!(parsed.source_files()[0].file_name(), "f0");
     }
+
+    #[test]
+    fn resolve_rejects_row_count_overflow() {
+        // Two individually-valid row counts whose prefix sum overflows i64.
+        // Resolving past the first file forces the checked_add on the second.
+        let meta = PkVectorSourceMeta::new(vec![
+            PkVectorSourceFile::new("f0".to_string(), i64::MAX).unwrap(),
+            PkVectorSourceFile::new("f1".to_string(), 1).unwrap(),
+        ])
+        .unwrap();
+        assert!(meta.resolve(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn read_java_utf_rejects_lone_high_surrogate() {
+        // U+D800 (a lone high surrogate) as 3-byte modified UTF-8: ED A0 80.
+        // It decodes to a single UTF-16 code unit that is not valid on its own,
+        // so String::from_utf16 must reject it (not panic).
+        let bytes = [0x00, 0x03, 0xED, 0xA0, 0x80];
+        let mut cursor = DataInputCursor::new(&bytes);
+        assert!(read_java_utf(&mut cursor).is_err());
+    }
 }
