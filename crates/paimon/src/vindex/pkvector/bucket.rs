@@ -14,3 +14,21 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+use crate::spec::PkVectorSourceMeta;
+
+/// One ANN segment to be searched by the bucket kernel: the vindex index bytes
+/// plus the source metadata resolving segment ordinals back to physical
+/// `(data file, position)`. The index-byte identity (which physical index the
+/// segment reads) is a PR4 concern — PR2 only needs `source_meta` for ordinal
+/// mapping and live-row masking; the reader wiring is added in PR4.
+pub(crate) struct BucketAnnSegment {
+    pub source_meta: PkVectorSourceMeta,
+}
+
+/// A data file participating in the bucket search, with its row count. Used by
+/// the bucket kernel (Task 6) to plan exact vs. ANN search over active files.
+pub(crate) struct BucketActiveFile {
+    pub file_name: String,
+    pub row_count: i64,
+}
