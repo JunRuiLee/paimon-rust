@@ -71,7 +71,8 @@ pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
                     {"name": "_ROW_RANGE_END", "type": "long"},
                     {"name": "_INDEX_FIELD_ID", "type": "int"},
                     {"name": "_EXTRA_FIELD_IDS", "type": ["null", {"type": "array", "items": "int"}], "default": null},
-                    {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null}
+                    {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null},
+                    {"name": "_SOURCE_META", "type": ["null", "bytes"], "default": null}
                 ]
             }]
         }
@@ -173,7 +174,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::*;
-    use crate::spec::DeletionVectorMeta;
+    use crate::spec::{DeletionVectorMeta, GlobalIndexMeta};
 
     #[test]
     fn test_read_index_manifest_file() {
@@ -275,5 +276,145 @@ mod tests {
             other => from_value(&other).unwrap(),
         };
         assert_eq!(sample, decoded);
+    }
+
+    fn global_index_entry(source_meta: Option<Vec<u8>>) -> IndexManifestEntry {
+        IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6],
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "GLOBAL_INDEX".into(),
+                file_name: "gi-1".into(),
+                file_size: 42,
+                row_count: 7,
+                deletion_vectors_ranges: None,
+                global_index_meta: Some(GlobalIndexMeta {
+                    row_range_start: 10,
+                    row_range_end: 20,
+                    index_field_id: 3,
+                    extra_field_ids: Some(vec![4, 5]),
+                    index_meta: Some(vec![9, 8, 7]),
+                    source_meta,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn source_meta_round_trips_through_index_manifest() {
+        // New-format writer schema carries _SOURCE_META; a Some(..) value must round-trip.
+        let entry = global_index_entry(Some(vec![1, 2, 3]));
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            INDEX_MANIFEST_ENTRY_SCHEMA,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded[0], entry);
+        assert_eq!(
+            decoded[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .source_meta,
+            Some(vec![1, 2, 3])
+        );
+
+        // A None source_meta must also round-trip as None.
+        let entry_none = global_index_entry(None);
+        let bytes_none = crate::spec::to_avro_bytes_with_compression(
+            INDEX_MANIFEST_ENTRY_SCHEMA,
+            std::slice::from_ref(&entry_none),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+        let decoded_none = IndexManifest::read_from_bytes(&bytes_none).unwrap();
+        assert_eq!(decoded_none[0], entry_none);
+        assert_eq!(
+            decoded_none[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .source_meta,
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_five_field_global_index_decodes_without_source_meta() {
+        // 5-field _GLOBAL_INDEX schema (pre-#8549): no _SOURCE_META. Identical to
+        // INDEX_MANIFEST_ENTRY_SCHEMA with the trailing _SOURCE_META line removed.
+        const LEGACY_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "org.apache.paimon.avro.generated.record",
+    "fields": [
+        {"name": "_VERSION", "type": "int"},
+        {"name": "_KIND", "type": "int"},
+        {"name": "_PARTITION", "type": "bytes"},
+        {"name": "_BUCKET", "type": "int"},
+        {"name": "_INDEX_TYPE", "type": "string"},
+        {"name": "_FILE_NAME", "type": "string"},
+        {"name": "_FILE_SIZE", "type": "long"},
+        {"name": "_ROW_COUNT", "type": "long"},
+        {
+            "default": null,
+            "name": "_DELETIONS_VECTORS_RANGES",
+            "type": ["null", {
+                "type": "array",
+                "items": ["null", {
+                    "type": "record",
+                    "name": "org.apache.paimon.avro.generated.record__DELETIONS_VECTORS_RANGES",
+                    "fields": [
+                        {"name": "f0", "type": "string"},
+                        {"name": "f1", "type": "int"},
+                        {"name": "f2", "type": "int"},
+                        {"name": "_CARDINALITY", "type": ["null", "long"], "default": null}
+                    ]
+                }]
+            }]
+        },
+        {
+            "default": null,
+            "name": "_GLOBAL_INDEX",
+            "type": ["null", {
+                "type": "record",
+                "name": "org.apache.paimon.avro.generated.record__GLOBAL_INDEX",
+                "fields": [
+                    {"name": "_ROW_RANGE_START", "type": "long"},
+                    {"name": "_ROW_RANGE_END", "type": "long"},
+                    {"name": "_INDEX_FIELD_ID", "type": "int"},
+                    {"name": "_EXTRA_FIELD_IDS", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                    {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null}
+                ]
+            }]
+        }
+    ]
+}"#;
+
+        // Written by a pre-#8549 writer (5-field record, source_meta absent).
+        let entry = global_index_entry(None);
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            LEGACY_SCHEMA,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+        // Decoding with the current 6-field reader must not misalign the stream.
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded[0], entry);
+        assert_eq!(
+            decoded[0]
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .source_meta,
+            None
+        );
     }
 }
