@@ -21,6 +21,13 @@
 //! search`) at commit `a50a36ff8`. Read-only, synthetically tested; real ANN
 //! index-byte validation is deferred to PR4 (Java-written fixtures).
 
+// PR2 ports the PK-vector bucket-local search kernel before PR3/PR4 wires it
+// into the read path. The kernel is crate-private with no production caller
+// yet, so its items are unreachable outside their own tests. Suppress the
+// resulting dead_code lint at the module boundary; remove this allow once
+// PR3/PR4 lands production callers.
+#![allow(dead_code)]
+
 pub(crate) mod ann;
 pub(crate) mod bucket;
 pub(crate) mod exact;
