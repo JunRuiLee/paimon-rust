@@ -46,6 +46,9 @@ pub struct GlobalIndexMeta {
 
     #[serde(default, rename = "_INDEX_META", with = "serde_bytes")]
     pub index_meta: Option<Vec<u8>>,
+
+    #[serde(default, rename = "_SOURCE_META", with = "serde_bytes")]
+    pub source_meta: Option<Vec<u8>>,
 }
 
 /// Metadata of index file.

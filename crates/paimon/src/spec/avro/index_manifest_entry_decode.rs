@@ -198,5 +198,6 @@ fn decode_nullable_global_index(
         index_field_id,
         extra_field_ids,
         index_meta,
+        source_meta: None,
     }))
 }

@@ -1439,6 +1439,7 @@ mod tests {
                     row_range_end,
                     index_field_id: field_id,
                     extra_field_ids: None,
+                    source_meta: None,
                     index_meta: Some(meta.serialize()),
                 }),
             },

@@ -241,6 +241,7 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
                 row_range_end: shard.row_range_end,
                 index_field_id,
                 extra_field_ids: None,
+                source_meta: None,
                 index_meta: Some(index_meta),
             }),
         })
@@ -1697,6 +1698,7 @@ mod tests {
                 row_range_end: end,
                 index_field_id: field_id,
                 extra_field_ids: None,
+                source_meta: None,
                 index_meta: None,
             }),
         };

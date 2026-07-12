@@ -1897,6 +1897,7 @@ mod tests {
                     row_range_end: 9,
                     index_field_id,
                     extra_field_ids: None,
+                    source_meta: None,
                     index_meta: None,
                 }),
             },

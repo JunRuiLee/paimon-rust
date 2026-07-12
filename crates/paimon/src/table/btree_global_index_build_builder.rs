@@ -286,6 +286,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 row_range_end: shard.row_range_end,
                 index_field_id: index_field.id(),
                 extra_field_ids: None,
+                source_meta: None,
                 index_meta: Some(index_meta.serialize()),
             }),
         })
@@ -1989,6 +1990,7 @@ mod tests {
                 row_range_end: hole_end,
                 index_field_id: name_field_id,
                 extra_field_ids: None,
+                source_meta: None,
                 index_meta: None,
             }),
         };
