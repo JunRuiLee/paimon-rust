@@ -58,7 +58,10 @@ pub(crate) fn build_live_row_ids(
         }
         if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
             for position in dv.iter() {
-                deleted.insert(file_offset + position);
+                let global = file_offset
+                    .checked_add(position)
+                    .ok_or_else(|| data_invalid("vector source deleted position overflows u64"))?;
+                deleted.insert(global);
             }
         }
         file_offset = end;
@@ -121,7 +124,10 @@ pub(crate) trait PkVectorAnnSearcher {
 }
 
 /// Scorer seam: drives the underlying vindex ANN reader. Returns `ordinal ->
-/// score` (higher-is-better), with negative labels already dropped by the reader.
+/// score` (higher-is-better). Any negative labels are skipped by the existing
+/// `vindex` reader (`collect_results` drops `row_id < 0`), so this seam only
+/// ever yields non-negative `u64` ordinals — no signed-label handling is needed
+/// downstream.
 /// The real implementation (driving `VindexVectorGlobalIndexReader::visit_vector_search`
 /// with a segment's index bytes) is supplied by PR4; PR2 tests inject a synthetic
 /// scorer. This is the fixture-deferred boundary — the adapter's own logic
