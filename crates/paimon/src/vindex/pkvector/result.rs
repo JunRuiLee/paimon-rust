@@ -14,3 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+/// One vector search result addressed by source data-file row position.
+/// Mirrors Java `org.apache.paimon.index.pkvector.PkVectorSearchResult`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PkVectorSearchResult {
+    pub data_file_name: String,
+    /// Zero-based physical row position within the source data file.
+    pub row_position: i64,
+    /// Lower-is-better distance.
+    pub distance: f32,
+}

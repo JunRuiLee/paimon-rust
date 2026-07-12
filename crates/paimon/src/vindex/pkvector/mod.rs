@@ -21,12 +21,12 @@
 //! search`) at commit `a50a36ff8`. Read-only, synthetically tested; real ANN
 //! index-byte validation is deferred to PR4 (Java-written fixtures).
 
-pub(crate) mod metric;
-pub(crate) mod result;
-pub(crate) mod reader;
-pub(crate) mod exact;
 pub(crate) mod ann;
 pub(crate) mod bucket;
+pub(crate) mod exact;
+pub(crate) mod metric;
+pub(crate) mod reader;
+pub(crate) mod result;
 
 /// Shared constructor for validation failures in this module (mirrors Java
 /// `checkArgument` / `IllegalArgumentException`).
