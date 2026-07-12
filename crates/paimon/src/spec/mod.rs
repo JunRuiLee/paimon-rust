@@ -64,6 +64,9 @@ pub use manifest_file_meta::*;
 mod index_file_meta;
 pub use index_file_meta::*;
 
+mod pk_vector_source;
+pub use pk_vector_source::*;
+
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
 mod manifest;
