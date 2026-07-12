@@ -50,17 +50,18 @@ pub(crate) fn build_live_row_ids(
     for source_file in source_files {
         let row_count = u64::try_from(source_file.row_count())
             .map_err(|_| data_invalid("vector source row count must not be negative"))?;
+        let end = file_offset
+            .checked_add(row_count)
+            .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
         if row_count > 0 {
-            live.insert_range(file_offset..file_offset + row_count);
+            live.insert_range(file_offset..end);
         }
         if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
             for position in dv.iter() {
                 deleted.insert(file_offset + position);
             }
         }
-        file_offset = file_offset
-            .checked_add(row_count)
-            .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
+        file_offset = end;
     }
     live -= deleted;
     Ok(Some(live))
