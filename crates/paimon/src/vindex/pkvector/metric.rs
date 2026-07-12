@@ -159,7 +159,10 @@ mod tests {
         let s = [1.0f32, 0.0];
         assert_eq!(VectorSearchMetric::L2.compute_distance(&q, &s), 1.0);
         assert_eq!(VectorSearchMetric::Cosine.compute_distance(&q, &s), 0.0);
-        assert_eq!(VectorSearchMetric::InnerProduct.compute_distance(&q, &s), -2.0);
+        assert_eq!(
+            VectorSearchMetric::InnerProduct.compute_distance(&q, &s),
+            -2.0
+        );
     }
 
     #[test]
@@ -199,7 +202,10 @@ mod tests {
     fn test_score_to_distance_l2_zero_score_is_infinite() {
         assert!(VectorSearchMetric::L2.score_to_distance(0.0).is_infinite());
         assert_eq!(VectorSearchMetric::L2.score_to_distance(0.5), 1.0); // 1/0.5 - 1
-        assert_eq!(VectorSearchMetric::InnerProduct.score_to_distance(2.0), -2.0);
+        assert_eq!(
+            VectorSearchMetric::InnerProduct.score_to_distance(2.0),
+            -2.0
+        );
         assert_eq!(VectorSearchMetric::Cosine.score_to_distance(1.0), 0.0);
     }
 }
