@@ -91,6 +91,42 @@ impl PkVectorSourceMeta {
         &self.source_files
     }
 
+    /// Build from the `_SOURCE_META` bytes carried on a [`GlobalIndexMeta`].
+    /// Errors if the metadata carries no source blob.
+    pub fn from_global_index_meta(meta: &GlobalIndexMeta) -> crate::Result<Self> {
+        let bytes = meta
+            .source_meta
+            .as_deref()
+            .ok_or_else(|| data_invalid("global index meta has no vector source metadata"))?;
+        Self::deserialize(bytes)
+    }
+
+    /// Map an ANN segment ordinal to `(data file name, physical row position)`.
+    ///
+    /// Ordinals concatenate source files in stored order: file `i` owns
+    /// `[sum(rows[..i]), sum(rows[..=i]))`. The returned position is local to
+    /// its file.
+    pub fn resolve(&self, ordinal: i64) -> crate::Result<(String, i64)> {
+        if ordinal < 0 {
+            return Err(data_invalid(format!(
+                "vector ordinal must not be negative: {ordinal}"
+            )));
+        }
+        let mut cumulative: i64 = 0;
+        for file in &self.source_files {
+            let next = cumulative
+                .checked_add(file.row_count)
+                .ok_or_else(|| data_invalid("vector source row counts overflow i64"))?;
+            if ordinal < next {
+                return Ok((file.file_name.clone(), ordinal - cumulative));
+            }
+            cumulative = next;
+        }
+        Err(data_invalid(format!(
+            "vector ordinal {ordinal} is out of range (total rows {cumulative})"
+        )))
+    }
+
     /// Parse a Java `PkVectorSourceMeta`-serialized `_SOURCE_META` blob.
     pub fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
         let mut cursor = DataInputCursor::new(bytes);
@@ -102,9 +138,7 @@ impl PkVectorSourceMeta {
         }
         let count = cursor.read_i32_be()?;
         if count <= 0 {
-            return Err(data_invalid(
-                "a vector index must reference source files",
-            ));
+            return Err(data_invalid("a vector index must reference source files"));
         }
         // NOT Vec::with_capacity(count): count is untrusted and may be huge.
         let mut source_files = Vec::new();
@@ -195,10 +229,7 @@ fn read_java_utf(cursor: &mut DataInputCursor<'_>) -> crate::Result<String> {
             i += 2;
         } else if b0 & 0xF0 == 0xE0 {
             // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
-            if i + 2 >= len
-                || bytes[i + 1] & 0xC0 != 0x80
-                || bytes[i + 2] & 0xC0 != 0x80
-            {
+            if i + 2 >= len || bytes[i + 1] & 0xC0 != 0x80 || bytes[i + 2] & 0xC0 != 0x80 {
                 return Err(data_invalid("malformed modified UTF-8 (3-byte)"));
             }
             let u = (((b0 & 0x0F) as u16) << 12)
@@ -340,5 +371,60 @@ mod tests {
     #[test]
     fn new_rejects_empty() {
         assert!(PkVectorSourceMeta::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn resolve_single_file() {
+        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        assert_eq!(meta.resolve(0).unwrap(), ("f0".to_string(), 0));
+        assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2));
+    }
+
+    #[test]
+    fn resolve_multi_file_prefix_sum_boundaries() {
+        // f0 owns ordinals 0..=2, f1 owns 3..=7.
+        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3), ("f1", 5)])).unwrap();
+        assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2)); // last of f0
+        assert_eq!(meta.resolve(3).unwrap(), ("f1".to_string(), 0)); // first of f1
+        assert_eq!(meta.resolve(7).unwrap(), ("f1".to_string(), 4)); // last of f1
+    }
+
+    #[test]
+    fn resolve_rejects_negative_ordinal() {
+        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        assert!(meta.resolve(-1).is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_ordinal_at_or_past_total() {
+        let meta = PkVectorSourceMeta::deserialize(&frame(&[("f0", 3)])).unwrap();
+        assert!(meta.resolve(3).is_err()); // total == 3, valid range 0..=2
+    }
+
+    #[test]
+    fn from_global_index_meta_errors_without_source_meta() {
+        let meta = GlobalIndexMeta {
+            row_range_start: 0,
+            row_range_end: 0,
+            index_field_id: 0,
+            extra_field_ids: None,
+            index_meta: None,
+            source_meta: None,
+        };
+        assert!(PkVectorSourceMeta::from_global_index_meta(&meta).is_err());
+    }
+
+    #[test]
+    fn from_global_index_meta_parses_source_meta() {
+        let meta = GlobalIndexMeta {
+            row_range_start: 0,
+            row_range_end: 0,
+            index_field_id: 0,
+            extra_field_ids: None,
+            index_meta: None,
+            source_meta: Some(frame(&[("f0", 3)])),
+        };
+        let parsed = PkVectorSourceMeta::from_global_index_meta(&meta).unwrap();
+        assert_eq!(parsed.source_files()[0].file_name(), "f0");
     }
 }
