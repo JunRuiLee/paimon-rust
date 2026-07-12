@@ -17,6 +17,8 @@
 
 pub mod reader;
 
+pub mod pkvector;
+
 use crate::spec::{DataField, DataType};
 use paimon_vindex_core::index::VectorIndexConfig;
 use std::collections::HashMap;
