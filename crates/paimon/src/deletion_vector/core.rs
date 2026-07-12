@@ -59,6 +59,15 @@ impl DeletionVector {
         self.bitmap.len()
     }
 
+    /// Returns true if `position` is deleted. Positions above `u32::MAX` cannot be
+    /// present in a roaring32 bitmap and are therefore reported as not deleted.
+    /// Mirrors Java `BitmapDeletionVector#isDeleted` / the searchers' `LongPredicate`.
+    pub fn is_deleted(&self, position: u64) -> bool {
+        u32::try_from(position)
+            .ok()
+            .is_some_and(|p| self.bitmap.contains(p))
+    }
+
     /// Returns an iterator over deleted positions that supports [DeletionVectorIterator::advance_to].
     /// Required for efficient row selection building when skipping row groups (avoid re-scanning
     /// deletes in skipped ranges).
@@ -248,5 +257,16 @@ mod tests {
 
         let expected_bitmap = RoaringBitmap::from_iter([1u32, 2u32]);
         assert_eq!(dv.bitmap(), &expected_bitmap, "bitmap should be [1, 2]");
+    }
+
+    #[test]
+    fn test_is_deleted_reports_membership_and_guards_u32_overflow() {
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(2);
+        let dv = DeletionVector::from_bitmap(bitmap);
+        assert!(dv.is_deleted(2), "position 2 was deleted");
+        assert!(!dv.is_deleted(0), "position 0 was not deleted");
+        // Positions above u32::MAX cannot exist in a roaring32 bitmap -> not deleted.
+        assert!(!dv.is_deleted(u64::from(u32::MAX) + 1));
     }
 }
