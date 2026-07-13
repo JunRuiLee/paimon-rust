@@ -71,6 +71,35 @@ impl DataFileReader {
         self
     }
 
+    // These three accessors exist for the sibling `pk_vector_position_read`,
+    // `pk_vector_indexed_split_read`, and `pk_vector_orchestrator` modules. The
+    // read path that drives that chain lands in a later change, so under clippy
+    // -D warnings they read as dead_code until then.
+    /// Return a copy with a replaced read-type. Used by `pk_vector_position_read`
+    /// to inject the internal `_ROW_ID` column for physical-position recovery.
+    #[allow(dead_code)]
+    pub(super) fn with_read_type(mut self, read_type: Vec<DataField>) -> Self {
+        self.read_type = read_type;
+        self
+    }
+
+    /// The effective read-type (requested output fields) of this reader.
+    /// Exposed for the sibling `pk_vector_position_read` module.
+    #[allow(dead_code)]
+    pub(super) fn read_type(&self) -> &[DataField] {
+        &self.read_type
+    }
+
+    /// True if any configured predicate can actually drop rows. A lone
+    /// `Predicate::AlwaysTrue` keeps every row in order and is not row-filtering,
+    /// matching `reject_row_id_with_predicate`'s notion.
+    #[allow(dead_code)]
+    pub(super) fn has_row_filtering_predicate(&self) -> bool {
+        self.predicates
+            .iter()
+            .any(|p| !matches!(p, Predicate::AlwaysTrue))
+    }
+
     /// Reject projecting `_ROW_ID` alongside a data predicate. `_ROW_ID` is
     /// assigned positionally from post-filter batch row counts, so a residual
     /// filter that drops rows would desync it. (`_ROW_ID` predicates travel via
@@ -111,35 +140,16 @@ impl DataFileReader {
         Ok(try_stream! {
             for split in splits {
                 // Create DV factory for this split only.
-                let dv_factory = if split
-                    .data_deletion_files()
-                    .is_some_and(|files| files.iter().any(Option::is_some))
-                {
-                    Some(
-                        DeletionVectorFactory::new(
-                            &reader.file_io,
-                            split.data_files(),
-                            split.data_deletion_files(),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
+                let dv_factory = reader.build_split_dv_factory(&split).await?;
 
                 for file_meta in split.data_files().to_vec() {
-                    let dv = dv_factory
-                        .as_ref()
-                        .and_then(|factory| factory.get_deletion_vector(&file_meta.file_name))
-                        .cloned();
+                    let dv = DataFileReader::deletion_vector_for_file(
+                        dv_factory.as_ref(),
+                        &file_meta.file_name,
+                    );
 
                     // Load data file's schema if it differs from the table schema.
-                    let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != reader.table_schema_id {
-                        let data_schema = reader.schema_manager.schema(file_meta.schema_id).await?;
-                        Some(data_schema.fields().to_vec())
-                    } else {
-                        None
-                    };
+                    let data_fields = reader.derive_data_fields(&file_meta).await?;
 
                     let mut stream = reader.read_single_file_stream(
                         &split,
@@ -155,6 +165,55 @@ impl DataFileReader {
             }
         }
         .boxed())
+    }
+
+    /// Build the deletion-vector factory for a split, or `None` when the split
+    /// carries no deletion files. One factory per split (not per file), matching
+    /// `read`. Shared with `pk_vector_indexed_split_read` so that path reuses the
+    /// exact production derivation instead of duplicating it.
+    pub(super) async fn build_split_dv_factory(
+        &self,
+        split: &DataSplit,
+    ) -> crate::Result<Option<DeletionVectorFactory>> {
+        if split
+            .data_deletion_files()
+            .is_some_and(|files| files.iter().any(Option::is_some))
+        {
+            Ok(Some(
+                DeletionVectorFactory::new(
+                    &self.file_io,
+                    split.data_files(),
+                    split.data_deletion_files(),
+                )
+                .await?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Look up the deletion vector for one file from a split-level factory.
+    pub(super) fn deletion_vector_for_file(
+        factory: Option<&DeletionVectorFactory>,
+        file_name: &str,
+    ) -> Option<Arc<DeletionVector>> {
+        factory
+            .and_then(|factory| factory.get_deletion_vector(file_name))
+            .cloned()
+    }
+
+    /// Load the data file's own schema fields when its `schema_id` differs from
+    /// the table schema id (schema evolution); `None` when they match.
+    pub(super) async fn derive_data_fields(
+        &self,
+        file_meta: &DataFileMeta,
+    ) -> crate::Result<Option<Vec<DataField>>> {
+        if file_meta.schema_id != self.table_schema_id {
+            let data_schema = self.schema_manager.schema(file_meta.schema_id).await?;
+            Ok(Some(data_schema.fields().to_vec()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Read a single parquet file from a split, returning a lazy stream of batches.
@@ -993,6 +1052,58 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::io;
+
+    #[test]
+    fn test_accessors_expose_read_type_and_row_filtering_predicate() {
+        use crate::spec::{DataField, DataType, IntType};
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), "memory:/acc".to_string());
+
+        let no_pred = DataFileReader::new(
+            file_io.clone(),
+            schema_manager.clone(),
+            1,
+            fields.clone(),
+            fields.clone(),
+            vec![],
+        );
+        assert_eq!(no_pred.read_type().len(), 1);
+        assert!(!no_pred.has_row_filtering_predicate());
+
+        let always_true = DataFileReader::new(
+            file_io.clone(),
+            schema_manager.clone(),
+            1,
+            fields.clone(),
+            fields.clone(),
+            vec![crate::spec::Predicate::AlwaysTrue],
+        );
+        assert!(
+            !always_true.has_row_filtering_predicate(),
+            "AlwaysTrue is not row-filtering"
+        );
+
+        let filtering = PredicateBuilder::new(&fields)
+            .equal("id", crate::spec::Datum::Int(10))
+            .unwrap();
+        let with_filter = DataFileReader::new(
+            file_io.clone(),
+            schema_manager.clone(),
+            1,
+            fields.clone(),
+            fields.clone(),
+            vec![filtering],
+        );
+        assert!(
+            with_filter.has_row_filtering_predicate(),
+            "a real (non-AlwaysTrue) predicate is row-filtering"
+        );
+    }
 
     struct MemOutputFile {
         data: Vec<u8>,
