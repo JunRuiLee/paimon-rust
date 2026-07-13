@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::ann::PkVectorAnnSearcher;
@@ -43,41 +44,50 @@ pub(crate) struct BucketActiveFile {
     pub row_count: i64,
 }
 
-/// True if `candidate` ranks strictly better (BEST_FIRST) than `weakest`:
-/// distance ASC, then data_file_name ASC, then row_position ASC.
-fn is_better_than(candidate: &PkVectorSearchResult, weakest: &PkVectorSearchResult) -> bool {
-    candidate
-        .distance
-        .total_cmp(&weakest.distance)
-        .then_with(|| candidate.data_file_name.cmp(&weakest.data_file_name))
-        .then_with(|| candidate.row_position.cmp(&weakest.row_position))
-        == std::cmp::Ordering::Less
+/// Total BEST_FIRST order over results: distance ASC, then data_file_name ASC,
+/// then row_position ASC. `total_cmp` keeps it NaN-safe and panic-free.
+fn best_first(a: &PkVectorSearchResult, b: &PkVectorSearchResult) -> Ordering {
+    a.distance
+        .total_cmp(&b.distance)
+        .then_with(|| a.data_file_name.cmp(&b.data_file_name))
+        .then_with(|| a.row_position.cmp(&b.row_position))
 }
 
-fn add_candidate(
-    heap: &mut Vec<PkVectorSearchResult>,
-    candidate: PkVectorSearchResult,
-    limit: usize,
-) {
-    if heap.len() < limit {
-        heap.push(candidate);
-        return;
+/// A candidate wrapped so a max-heap keeps the WORST (BEST_FIRST-largest)
+/// candidate on top; popping evicts the least-wanted one. Mirrors the
+/// `PriorityQueue<>(limit, BEST_FIRST.reversed())` in Java
+/// `PrimaryKeyVectorBucketSearch`.
+struct WorstFirst(PkVectorSearchResult);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        best_first(&self.0, &other.0) == Ordering::Equal
     }
-    // Find the current worst (BEST_FIRST-largest) and replace if the candidate beats it.
-    let worst_idx = heap
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.data_file_name.cmp(&b.data_file_name))
-                .then_with(|| a.row_position.cmp(&b.row_position))
-        })
-        .map(|(i, _)| i);
-    if let Some(i) = worst_idx {
-        if is_better_than(&candidate, &heap[i]) {
-            heap[i] = candidate;
-        }
+}
+impl Eq for WorstFirst {}
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> Ordering {
+        best_first(&self.0, &other.0)
+    }
+}
+
+/// Add `candidate` to a bounded (size `limit`) BEST_FIRST Top-K max-heap: push if
+/// under capacity, else replace the current worst iff the candidate beats it.
+/// `O(log limit)` per call. Mirrors Java `PrimaryKeyVectorBucketSearch.add`.
+fn add_candidate(heap: &mut BinaryHeap<WorstFirst>, candidate: PkVectorSearchResult, limit: usize) {
+    if heap.len() < limit {
+        heap.push(WorstFirst(candidate));
+    } else if heap
+        .peek()
+        .is_some_and(|worst| best_first(&candidate, &worst.0) == Ordering::Less)
+    {
+        heap.pop();
+        heap.push(WorstFirst(candidate));
     }
 }
 
@@ -123,21 +133,29 @@ pub(crate) fn bucket_search(
         }
     }
 
-    let mut heap: Vec<PkVectorSearchResult> = Vec::with_capacity(limit + 1);
+    let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
+    let active_source_files: HashSet<String> =
+        files_by_name.keys().map(|name| name.to_string()).collect();
     let mut covered: HashSet<String> = HashSet::new();
 
     for segment in ann_segments {
         for source in segment.source_meta.source_files() {
+            // An ANN source that is no longer an active file (e.g. compacted away)
+            // is skipped, not rejected: its ordinal range is masked out of the ANN
+            // live-row bitmap and the remaining active sources are still searched.
+            // Mirrors Java master `PrimaryKeyVectorBucketSearch` (`file == null`
+            // -> continue). Active sources still require a row-count match.
             match files_by_name.get(source.file_name()) {
                 Some(active) if active.row_count == source.row_count() => {
                     covered.insert(source.file_name().to_string());
                 }
-                _ => {
+                Some(_) => {
                     return Err(data_invalid(format!(
                         "ANN source {} does not match the active data file",
                         source.file_name()
                     )));
                 }
+                None => continue,
             }
         }
         let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
@@ -146,6 +164,7 @@ pub(crate) fn bucket_search(
             query,
             metric,
             limit,
+            &active_source_files,
             deletion_vectors,
             search_options,
         )? {
@@ -179,13 +198,9 @@ pub(crate) fn bucket_search(
         }
     }
 
-    heap.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.data_file_name.cmp(&b.data_file_name))
-            .then_with(|| a.row_position.cmp(&b.row_position))
-    });
-    Ok(heap)
+    let mut results: Vec<PkVectorSearchResult> = heap.into_iter().map(|w| w.0).collect();
+    results.sort_by(best_first);
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -225,6 +240,7 @@ mod tests {
             _query: &[f32],
             _metric: VectorSearchMetric,
             _limit: usize,
+            _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
         ) -> crate::Result<Vec<PkVectorSearchResult>> {
@@ -249,6 +265,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("positive"));
+    }
+
+    #[test]
+    fn test_bounded_heap_evicts_by_best_first_tiebreak_over_limit() {
+        // All candidates share distance 1.0, so eviction is decided purely by the
+        // BEST_FIRST tie-break (data_file_name ASC, then row_position ASC). Feed
+        // more than `limit` ANN hits and assert the kept set is the smallest
+        // (file, position) pairs in that order. Locks the bounded-heap merge.
+        let segment = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 3)]),
+        };
+        let hit = |file: &str, pos: i64| PkVectorSearchResult {
+            data_file_name: file.into(),
+            row_position: pos,
+            distance: 1.0,
+        };
+        // Deliberately unsorted input across two files at the same distance.
+        let ann = FakeAnnSearcher {
+            result: vec![
+                hit("data-2", 0),
+                hit("data-1", 2),
+                hit("data-1", 0),
+                hit("data-2", 1),
+                hit("data-1", 1),
+            ],
+        };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let results = bucket_search(
+            Some(&ann),
+            &[segment],
+            &[active("data-1", 3)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            3,
+            &HashMap::new(),
+        )
+        .unwrap();
+        // Top-3 BEST_FIRST: (data-1,0), (data-1,1), (data-1,2) — the larger
+        // data_file_name "data-2" entries are evicted despite equal distance.
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| (r.data_file_name.as_str(), r.row_position))
+                .collect::<Vec<_>>(),
+            vec![("data-1", 0), ("data-1", 1), ("data-1", 2)]
+        );
     }
 
     #[test]
@@ -373,9 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_ann_source_missing_or_mismatched_active_file() {
+    fn test_rejects_ann_source_row_count_mismatch_for_active_file() {
         let ann = FakeAnnSearcher { result: vec![] };
-        // Segment references data-1 with 2 rows, but active file has 3 rows.
+        // Segment references data-1 with 2 rows, but the active file has 3 rows.
+        // An active source with a mismatched row count is still a hard error.
         let segment = BucketAnnSegment {
             source_meta: meta(&[("data-1", 2)]),
         };
@@ -396,6 +462,52 @@ mod tests {
         assert!(
             err.to_string().contains("does not match") || err.to_string().contains("ANN source")
         );
+    }
+
+    #[test]
+    fn test_skips_inactive_ann_source_and_searches_active_ones() {
+        // Segment covers [data-1, data-2] but only data-1 is still active
+        // (data-2 was compacted away). Java master skips the inactive source
+        // instead of failing the whole query; data-2 is neither covered (so it
+        // is not treated as ANN-covered) nor an active file (so it is not exact
+        // scanned). The ANN searcher still runs for the segment.
+        let segment = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2), ("data-2", 2)]),
+        };
+        let ann = FakeAnnSearcher {
+            result: vec![PkVectorSearchResult {
+                data_file_name: "data-1".into(),
+                row_position: 0,
+                distance: 0.5,
+            }],
+        };
+        let calls = RefCell::new(Vec::<String>::new());
+        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+            calls.borrow_mut().push(f.file_name.clone());
+            unreachable!("only data-1 is active and it is ANN-covered")
+        };
+        let results = bucket_search(
+            Some(&ann),
+            &[segment],
+            &[active("data-1", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            2,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            results,
+            vec![PkVectorSearchResult {
+                data_file_name: "data-1".into(),
+                row_position: 0,
+                distance: 0.5
+            }]
+        );
+        // No exact fallback ran: data-1 is ANN-covered, data-2 is not active.
+        assert!(calls.borrow().is_empty());
     }
 
     #[test]

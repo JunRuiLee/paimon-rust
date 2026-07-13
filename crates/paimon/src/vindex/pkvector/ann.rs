@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::bucket::BucketAnnSegment;
@@ -30,17 +30,25 @@ use crate::vector_search::VectorSearch;
 /// segment-ordinal space (source files concatenated in order). Mirrors Java
 /// `PkVectorAnnSegmentSearcher.liveRowPositions`.
 ///
-/// Returns `None` when no deletion vector is relevant to these source files
-/// (empty map, or no source file has a matching DV) — nothing to mask. When at
-/// least one source file has a matching DV, returns the masked live ids.
+/// Only source files present in `active_source_files` contribute live ordinals;
+/// inactive sources' ordinal ranges are masked out entirely (their rows are no
+/// longer readable in this snapshot). Deletion vectors are applied only to active
+/// sources.
+///
+/// Returns `None` only when every source file is active AND no deletion vector is
+/// relevant — nothing to mask. Otherwise returns the masked live ids.
 pub(crate) fn build_live_row_ids(
     source_files: &[PkVectorSourceFile],
+    active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
 ) -> crate::Result<Option<roaring::RoaringTreemap>> {
+    let all_active = source_files
+        .iter()
+        .all(|f| active_source_files.contains(f.file_name()));
     let has_relevant_dv = source_files
         .iter()
         .any(|f| deletion_vectors.contains_key(f.file_name()));
-    if !has_relevant_dv {
+    if all_active && !has_relevant_dv {
         return Ok(None);
     }
 
@@ -53,15 +61,18 @@ pub(crate) fn build_live_row_ids(
         let end = file_offset
             .checked_add(row_count)
             .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
-        if row_count > 0 {
+        let active = active_source_files.contains(source_file.file_name());
+        if active && row_count > 0 {
             live.insert_range(file_offset..end);
         }
-        if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
-            for position in dv.iter() {
-                let global = file_offset
-                    .checked_add(position)
-                    .ok_or_else(|| data_invalid("vector source deleted position overflows u64"))?;
-                deleted.insert(global);
+        if active {
+            if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
+                for position in dv.iter() {
+                    let global = file_offset.checked_add(position).ok_or_else(|| {
+                        data_invalid("vector source deleted position overflows u64")
+                    })?;
+                    deleted.insert(global);
+                }
             }
         }
         file_offset = end;
@@ -71,12 +82,14 @@ pub(crate) fn build_live_row_ids(
 }
 
 /// Map ANN `(ordinal, score)` pairs to physical `(data file, position)` results,
-/// validating ordinals against source metadata and rejecting hits on
-/// snapshot-deleted rows. Mirrors the post-processing loop of Java
-/// `PkVectorAnnSegmentSearcher.search`. Results are sorted BEST_FIRST.
+/// validating ordinals against source metadata, rejecting hits that resolve to an
+/// inactive source file, and rejecting hits on snapshot-deleted rows. Mirrors the
+/// post-processing loop of Java `PkVectorAnnSegmentSearcher.search`. Results are
+/// sorted BEST_FIRST.
 pub(crate) fn map_ann_results(
     scored: &[(u64, f32)],
     source_meta: &PkVectorSourceMeta,
+    active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
     metric: VectorSearchMetric,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
@@ -85,6 +98,11 @@ pub(crate) fn map_ann_results(
         let ordinal_i64 = i64::try_from(ordinal)
             .map_err(|_| data_invalid(format!("ANN ordinal {ordinal} exceeds i64::MAX")))?;
         let (data_file_name, row_position) = source_meta.resolve(ordinal_i64)?;
+        if !active_source_files.contains(&data_file_name) {
+            return Err(data_invalid(format!(
+                "ANN segment returned inactive source {data_file_name}"
+            )));
+        }
         if let Some(dv) = deletion_vectors.get(&data_file_name) {
             let pos = u64::try_from(row_position)
                 .map_err(|_| data_invalid("resolved row position must not be negative"))?;
@@ -112,12 +130,14 @@ pub(crate) fn map_ann_results(
 /// One ANN segment's search dependency for the bucket kernel. Bucket tests fake
 /// this (mirroring Java's mock of `PkVectorAnnSegmentSearcher`).
 pub(crate) trait PkVectorAnnSearcher {
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         segment: &BucketAnnSegment,
         query: &[f32],
         metric: VectorSearchMetric,
         limit: usize,
+        active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
     ) -> crate::Result<Vec<PkVectorSearchResult>>;
@@ -154,6 +174,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         query: &[f32],
         metric: VectorSearchMetric,
         limit: usize,
+        active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
@@ -163,7 +184,8 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         let source_files = segment.source_meta.source_files();
         let mut search = VectorSearch::new(query.to_vec(), limit, self.field_name.clone())?
             .with_options(search_options.clone());
-        if let Some(live) = build_live_row_ids(source_files, deletion_vectors)? {
+        if let Some(live) = build_live_row_ids(source_files, active_source_files, deletion_vectors)?
+        {
             search = search.with_include_row_ids(live);
         }
         let scored = match (self.scorer)(&search)? {
@@ -171,7 +193,13 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
             None => return Ok(Vec::new()),
         };
         let scored: Vec<(u64, f32)> = scored.into_iter().collect();
-        map_ann_results(&scored, &segment.source_meta, deletion_vectors, metric)
+        map_ann_results(
+            &scored,
+            &segment.source_meta,
+            active_source_files,
+            deletion_vectors,
+            metric,
+        )
     }
 }
 
@@ -196,17 +224,36 @@ mod tests {
         Arc::new(DeletionVector::from_bitmap(bitmap))
     }
 
+    fn active_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
     #[test]
-    fn test_build_live_row_ids_none_when_no_relevant_dv() {
+    fn test_build_live_row_ids_none_when_all_active_and_no_relevant_dv() {
         let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
-        // Empty map -> None.
-        assert!(build_live_row_ids(&files, &HashMap::new())
+        let active = active_set(&["f0"]);
+        // All active + empty map -> None.
+        assert!(build_live_row_ids(&files, &active, &HashMap::new())
             .unwrap()
             .is_none());
-        // Non-empty map but no matching file name -> None.
+        // All active + non-empty map but no matching file name -> None.
         let mut dvs = HashMap::new();
         dvs.insert("other".to_string(), dv(&[0]));
-        assert!(build_live_row_ids(&files, &dvs).unwrap().is_none());
+        assert!(build_live_row_ids(&files, &active, &dvs).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_build_live_row_ids_masks_inactive_source_ordinal_range() {
+        // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4). f1 is inactive,
+        // so its whole ordinal range is masked out; f0 stays fully live. No DV.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let live = build_live_row_ids(&files, &active_set(&["f0"]), &HashMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -219,7 +266,9 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1])); // deletes global 1
         dvs.insert("f1".to_string(), dv(&[0])); // deletes global 3
-        let live = build_live_row_ids(&files, &dvs).unwrap().unwrap();
+        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs)
+            .unwrap()
+            .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2, 4]);
     }
 
@@ -228,8 +277,14 @@ mod tests {
         let meta = source_meta(&[("f0", 3), ("f1", 5)]);
         // ordinal 3 -> (f1, 0); ordinal 0 -> (f0, 0). l2 score_to_distance(0.5)=1.0.
         let scored = [(3u64, 0.5f32), (0u64, 0.5f32)];
-        let results =
-            map_ann_results(&scored, &meta, &HashMap::new(), VectorSearchMetric::L2).unwrap();
+        let results = map_ann_results(
+            &scored,
+            &meta,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            VectorSearchMetric::L2,
+        )
+        .unwrap();
         assert_eq!(
             results,
             vec![
@@ -253,6 +308,7 @@ mod tests {
         let err = map_ann_results(
             &[(3u64, 0.5)],
             &meta,
+            &active_set(&["f0"]),
             &HashMap::new(),
             VectorSearchMetric::L2,
         )
@@ -261,11 +317,33 @@ mod tests {
     }
 
     #[test]
+    fn test_map_ann_results_rejects_hit_resolving_to_inactive_source() {
+        // ordinal 3 resolves to f1, which is not in the active set -> error.
+        let meta = source_meta(&[("f0", 3), ("f1", 5)]);
+        let err = map_ann_results(
+            &[(3u64, 0.5)],
+            &meta,
+            &active_set(&["f0"]),
+            &HashMap::new(),
+            VectorSearchMetric::L2,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("inactive"));
+    }
+
+    #[test]
     fn test_map_ann_results_rejects_hit_on_deleted_position() {
         let meta = source_meta(&[("f0", 3)]);
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1])); // position 1 deleted
-        let err = map_ann_results(&[(1u64, 0.5)], &meta, &dvs, VectorSearchMetric::L2).unwrap_err();
+        let err = map_ann_results(
+            &[(1u64, 0.5)],
+            &meta,
+            &active_set(&["f0"]),
+            &dvs,
+            VectorSearchMetric::L2,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("deleted"));
     }
 
@@ -309,6 +387,7 @@ mod tests {
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
                 2,
+                &active_set(&["f0", "f1"]),
                 &dvs,
                 &HashMap::new(),
             )
@@ -342,6 +421,7 @@ mod tests {
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
                 0,
+                &active_set(&["f0"]),
                 &HashMap::new(),
                 &HashMap::new(),
             )
@@ -368,6 +448,7 @@ mod tests {
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
                 2,
+                &active_set(&["f0"]),
                 &HashMap::new(),
                 &HashMap::new(),
             )
