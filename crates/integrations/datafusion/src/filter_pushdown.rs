@@ -34,8 +34,12 @@ pub(crate) struct FilterPushdownAnalysis {
     pub(crate) has_untranslated_residual: bool,
 }
 
-fn analyze_filter(filter: &Expr, fields: &[DataField]) -> SingleFilterAnalysis {
-    let translator = FilterTranslator::new(fields);
+fn analyze_filter(
+    filter: &Expr,
+    fields: &[DataField],
+    case_sensitive: bool,
+) -> SingleFilterAnalysis {
+    let translator = FilterTranslator::new(fields, case_sensitive);
     if let Some(predicate) = translator.translate(filter) {
         return SingleFilterAnalysis {
             translated_predicates: vec![predicate],
@@ -52,12 +56,16 @@ fn analyze_filter(filter: &Expr, fields: &[DataField]) -> SingleFilterAnalysis {
     }
 }
 
-pub(crate) fn analyze_filters(filters: &[Expr], fields: &[DataField]) -> FilterPushdownAnalysis {
+pub(crate) fn analyze_filters(
+    filters: &[Expr],
+    fields: &[DataField],
+    case_sensitive: bool,
+) -> FilterPushdownAnalysis {
     let mut translated_predicates = Vec::new();
     let mut has_untranslated_residual = false;
 
     for filter in filters {
-        let analysis = analyze_filter(filter, fields);
+        let analysis = analyze_filter(filter, fields, case_sensitive);
         translated_predicates.extend(analysis.translated_predicates);
         has_untranslated_residual |= analysis.has_untranslated_residual;
     }
@@ -74,18 +82,29 @@ pub(crate) fn analyze_filters(filters: &[Expr], fields: &[DataField]) -> FilterP
 
 #[cfg(test)]
 pub(crate) fn build_pushed_predicate(filters: &[Expr], fields: &[DataField]) -> Option<Predicate> {
-    analyze_filters(filters, fields).pushed_predicate
+    analyze_filters(filters, fields, true).pushed_predicate
 }
 
 pub(crate) fn classify_filter_pushdown<F>(
     filter: &Expr,
     fields: &[DataField],
+    case_sensitive: bool,
     is_exact_filter_pushdown: F,
 ) -> TableProviderFilterPushDown
 where
     F: Fn(&Predicate) -> bool,
 {
-    let translator = FilterTranslator::new(fields);
+    // `FilterTranslator` still supports case-insensitive column resolution for
+    // direct ReadBuilder API callers (and its own unit tests), but the DataFusion
+    // TableProvider/SQL path always passes `case_sensitive = true`: the planner
+    // resolves columns against the schema before `scan`, so SQL reads are
+    // case-sensitive. Reporting `Exact` tells DataFusion to drop its residual
+    // filter, so it must only be returned when column resolution is unambiguous.
+    // Under case-sensitive resolution a reference matches exactly one field, so
+    // ASCII case-folding collisions elsewhere in the schema (e.g. an unrelated
+    // `Name`/`name` pair) never make a resolved filter ambiguous and must not
+    // downgrade its classification.
+    let translator = FilterTranslator::new(fields, case_sensitive);
     if let Some(predicate) = translator.translate(filter) {
         if is_exact_filter_pushdown(&predicate) {
             TableProviderFilterPushDown::Exact
@@ -120,13 +139,15 @@ fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
 struct FilterTranslator<'a> {
     fields: &'a [DataField],
     predicate_builder: PredicateBuilder,
+    case_sensitive: bool,
 }
 
 impl<'a> FilterTranslator<'a> {
-    fn new(fields: &'a [DataField]) -> Self {
+    fn new(fields: &'a [DataField], case_sensitive: bool) -> Self {
         Self {
             fields,
-            predicate_builder: PredicateBuilder::new(fields),
+            predicate_builder: PredicateBuilder::new_with_case_sensitive(fields, case_sensitive),
+            case_sensitive,
         }
     }
 
@@ -263,9 +284,7 @@ impl<'a> FilterTranslator<'a> {
 
         // Native Between leaf: lets the planner / b-tree recognize the range
         // as a single op (see `btree::query::extract_between`).
-        self.predicate_builder
-            .between(field.name(), low, high)
-            .ok()
+        self.predicate_builder.between(field.name(), low, high).ok()
     }
 
     fn translate_scalar_function(&self, func: &ScalarFunction) -> Option<Predicate> {
@@ -310,7 +329,21 @@ impl<'a> FilterTranslator<'a> {
             return None;
         };
 
-        self.fields.iter().find(|field| field.name() == name)
+        if self.case_sensitive {
+            return self.fields.iter().find(|field| field.name() == name);
+        }
+        // Case-insensitive: ASCII-fold and require a unique match. An ambiguous
+        // (2+) collision returns None so the filter is left as a residual for
+        // DataFusion to apply exactly — safe, just not pushed.
+        let mut matches = self
+            .fields
+            .iter()
+            .filter(|field| field.name().eq_ignore_ascii_case(name));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 }
 
@@ -469,7 +502,34 @@ mod tests {
         let filter = Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01"));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
+            TableProviderFilterPushDown::Exact
+        );
+    }
+
+    #[test]
+    fn test_classify_exact_for_case_colliding_unrelated_schema() {
+        use paimon::spec::{DataField, DataType, IntType};
+        // The SQL path is case-sensitive, so an unrelated `Name`/`name` pair
+        // that only collides under ASCII case-folding must not affect the
+        // classification of a filter on a different column: the partition
+        // column `dt` resolves to exactly one field and stays `Exact`.
+        let mut fields = test_fields();
+        let next_id = fields.len() as i32;
+        fields.push(DataField::new(
+            next_id,
+            "Name".to_string(),
+            DataType::Int(IntType::new()),
+        ));
+        fields.push(DataField::new(
+            next_id + 1,
+            "name".to_string(),
+            DataType::Int(IntType::new()),
+        ));
+        let filter = Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01"));
+
+        assert_eq!(
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Exact
         );
     }
@@ -478,7 +538,7 @@ mod tests {
     fn test_analyze_filters_for_supported_data_filter_has_no_untranslated_residual() {
         let fields = test_fields();
         let filters = vec![Expr::Column(Column::from_name("id")).gt(lit(10))];
-        let analysis = analyze_filters(&filters, &fields);
+        let analysis = analyze_filters(&filters, &fields, true);
 
         assert_eq!(
             analysis
@@ -498,7 +558,7 @@ mod tests {
             .and(Expr::Not(Box::new(
                 Expr::Column(Column::from_name("hr")).eq(lit(10)),
             )))];
-        let analysis = analyze_filters(&filters, &fields);
+        let analysis = analyze_filters(&filters, &fields, true);
 
         assert_eq!(
             analysis
@@ -516,10 +576,69 @@ mod tests {
         let filters = vec![Expr::Not(Box::new(
             Expr::Column(Column::from_name("dt")).eq(lit("2024-01-01")),
         ))];
-        let analysis = analyze_filters(&filters, &fields);
+        let analysis = analyze_filters(&filters, &fields, true);
 
         assert!(analysis.pushed_predicate.is_none());
         assert!(analysis.has_untranslated_residual);
+    }
+
+    /// Fields whose only string column is spelled `Name` (mixed case), used to
+    /// prove case-insensitive column resolution in pushdown.
+    fn mixed_case_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "Name".to_string(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_case_insensitive_pushdown_translates_to_canonical_name() {
+        let fields = mixed_case_fields();
+        // Request uses the lowercase spelling `name`; schema field is `Name`.
+        let filters = vec![Expr::Column(Column::from_name("name")).eq(lit("bob"))];
+
+        // Case-sensitive (default): no match, so nothing is pushed.
+        assert!(
+            analyze_filters(&filters, &fields, true)
+                .pushed_predicate
+                .is_none(),
+            "exact matching must not resolve a differently-cased column"
+        );
+
+        // Case-insensitive: resolves to the canonical `Name` and pushes.
+        let analysis = analyze_filters(&filters, &fields, false);
+        assert_eq!(
+            analysis
+                .pushed_predicate
+                .expect("case-insensitive filter should push")
+                .to_string(),
+            "Name = 'bob'"
+        );
+        assert!(
+            !analysis.has_untranslated_residual,
+            "a translated equality is exact, not residual-only"
+        );
+    }
+
+    #[test]
+    fn test_case_insensitive_pushdown_ambiguous_falls_open() {
+        // Two fields collide under ASCII folding: resolution is ambiguous, so the
+        // filter is left as a residual (not pushed) rather than picking one.
+        let fields = vec![
+            DataField::new(0, "Col".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "col".to_string(), DataType::Int(IntType::new())),
+        ];
+        let filters = vec![Expr::Column(Column::from_name("COL")).eq(lit(1))];
+        assert!(
+            analyze_filters(&filters, &fields, false)
+                .pushed_predicate
+                .is_none(),
+            "ambiguous case-insensitive column must not be pushed"
+        );
     }
 
     #[test]
@@ -578,7 +697,7 @@ mod tests {
         let filter = Expr::Column(Column::from_name("id")).gt(lit(10));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Inexact
         );
     }
@@ -604,7 +723,7 @@ mod tests {
             .and(Expr::Column(Column::from_name("id")).gt(lit(10)));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Inexact
         );
     }
@@ -630,7 +749,7 @@ mod tests {
         ));
 
         assert_eq!(
-            classify_filter_pushdown(&filter, &fields, is_exact_filter_pushdown),
+            classify_filter_pushdown(&filter, &fields, true, is_exact_filter_pushdown),
             TableProviderFilterPushDown::Unsupported
         );
     }
@@ -783,9 +902,8 @@ mod tests {
     #[test]
     fn test_translate_like_no_wildcards_rewrites_to_eq() {
         let fields = test_fields();
-        let predicate =
-            build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
-                .expect("LIKE without wildcards should translate to Eq");
+        let predicate = build_pushed_predicate(&[like_filter("2024-01-01", false, false)], &fields)
+            .expect("LIKE without wildcards should translate to Eq");
         match predicate {
             Predicate::Leaf { op, .. } => {
                 assert_eq!(op, paimon::spec::PredicateOperator::Eq);

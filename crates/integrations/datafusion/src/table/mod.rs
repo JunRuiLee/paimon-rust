@@ -166,6 +166,9 @@ pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) target_partitions: usize,
     pub(crate) filter_exact: bool,
+    /// Column-name case sensitivity, carried into the physical scan so execute()
+    /// resolves names the same way planning did.
+    pub(crate) case_sensitive: bool,
 }
 
 impl PaimonScanBuilder<'_> {
@@ -207,6 +210,7 @@ impl PaimonScanBuilder<'_> {
             planned_partitions,
             self.limit,
             self.filter_exact,
+            self.case_sensitive,
         )))
     }
 }
@@ -238,9 +242,23 @@ impl TableProvider for PaimonTableProvider {
         // the override is uniformly visible without mutating self.table.
         let scoped_table = self.resolve_scoped_table(state);
 
+        // Column-name matching is case-sensitive on the DataFusion path.
+        //
+        // DataFusion resolves projection/filter columns against the provider
+        // schema (`schema()`, which exposes the original field casing) during
+        // logical planning, *before* `scan` is called. `enable_ident_normalization`
+        // only lowercases unquoted identifiers at parse time; it does not make
+        // schema resolution case-insensitive. So a genuine case mismatch
+        // (`SELECT name` against a `Name` field) already fails at planning and
+        // never reaches this code — see the negative test in `tests/read_tables.rs`.
+        // Case-insensitive column matching is therefore offered only through the
+        // direct ReadBuilder API (core / C / Python), not via SQL.
+        let case_sensitive = true;
         // Plan splits eagerly so we know partition count upfront.
-        let filter_analysis = analyze_filters(filters, scoped_table.schema().fields());
+        let filter_analysis =
+            analyze_filters(filters, scoped_table.schema().fields(), case_sensitive);
         let mut read_builder = scoped_table.new_read_builder();
+        read_builder.with_case_sensitive(case_sensitive);
         if let Some(filter) = filter_analysis.pushed_predicate.clone() {
             read_builder.with_filter(filter);
         }
@@ -272,6 +290,7 @@ impl TableProvider for PaimonTableProvider {
             limit: pushed_limit,
             target_partitions: target,
             filter_exact,
+            case_sensitive,
         }
         .build()
     }
@@ -300,12 +319,15 @@ impl TableProvider for PaimonTableProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         let fields = self.table.schema().fields();
+        // SQL reads resolve columns case-sensitively (see `scan`), so classify
+        // pushdown the same way.
+        let case_sensitive = true;
         let read_builder = self.table.new_read_builder();
 
         Ok(filters
             .iter()
             .map(|filter| {
-                classify_filter_pushdown(filter, fields, |predicate| {
+                classify_filter_pushdown(filter, fields, case_sensitive, |predicate| {
                     read_builder.is_exact_filter_pushdown(predicate)
                 })
             })

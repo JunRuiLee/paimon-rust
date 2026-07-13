@@ -550,6 +550,9 @@ async fn test_read_projection_duplicate_column() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "simple_log_table").await;
 
+    // `id` exists, so with_projection passes its best-effort early check; the
+    // duplicate is a case-dependent outcome resolved lazily, so it surfaces when
+    // the read is built.
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&["id", "id"]);
     let err = read_builder

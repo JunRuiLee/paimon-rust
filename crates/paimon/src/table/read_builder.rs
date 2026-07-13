@@ -119,6 +119,9 @@ pub struct ReadBuilder<'a> {
     filter: NormalizedFilter,
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Whether column-name matching (projection and predicate column
+    /// resolution) is case-sensitive. Defaults to `true` (exact match).
+    case_sensitive: bool,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -129,14 +132,38 @@ impl<'a> ReadBuilder<'a> {
             filter: NormalizedFilter::default(),
             limit: None,
             row_ranges: None,
+            case_sensitive: true,
         }
     }
 
     /// Set column projection by name. Output order follows the caller-specified order.
-    /// Unknown or duplicate names cause `new_read()` to fail; an empty list is a valid
-    /// zero-column projection.
+    /// An empty list is a valid zero-column projection.
+    ///
+    /// Name resolution is deferred to read build time (order-independent with
+    /// [`with_case_sensitive`](Self::with_case_sensitive)): the names are stored
+    /// and resolved against the schema in [`new_read`](Self::new_read) using the
+    /// case sensitivity effective then. Unknown, duplicate, or (under
+    /// case-insensitive matching) ambiguous names cause `new_read()` to fail.
     pub fn with_projection(&mut self, columns: &[&str]) -> &mut Self {
         self.projected_fields = Some(columns.iter().map(|c| (*c).to_string()).collect());
+        self
+    }
+
+    /// Set whether column-name matching (projection and predicate column
+    /// resolution) is case-sensitive. Defaults to `true` (exact match). When set
+    /// to `false`, names are matched by ASCII case-folding and an ambiguous
+    /// (case-colliding) request errors. This mirrors the per-read case
+    /// sensitivity engines like Spark drive from `spark.sql.caseSensitive`,
+    /// rather than being a table property.
+    ///
+    /// Projection resolution is lazy, so this affects a projection set via
+    /// [`with_projection`](Self::with_projection) regardless of call order (the
+    /// projected names are resolved at read build time using the flag effective
+    /// then). Predicates built via `PredicateBuilder` capture case sensitivity at
+    /// their own construction time, so this flag does not retroactively change a
+    /// predicate already passed to [`with_filter`](Self::with_filter).
+    pub fn with_case_sensitive(&mut self, case_sensitive: bool) -> &mut Self {
+        self.case_sensitive = case_sensitive;
         self
     }
 
@@ -244,50 +271,99 @@ impl<'a> ReadBuilder<'a> {
         ))
     }
 
+    /// Resolve the projected column names against the schema using the effective
+    /// case sensitivity (order-independent with `with_case_sensitive` because
+    /// resolution is deferred to read build time).
     fn resolve_projected_fields(&self, projected_fields: &[String]) -> Result<Vec<DataField>> {
-        if projected_fields.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let full_name = self.table.identifier().full_name();
-        let field_map: HashMap<&str, &DataField> = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .map(|field| (field.name(), field))
-            .collect();
-
-        let mut seen = HashSet::with_capacity(projected_fields.len());
-        let mut resolved = Vec::with_capacity(projected_fields.len());
-
-        for name in projected_fields {
-            if !seen.insert(name.as_str()) {
-                return Err(Error::ConfigInvalid {
-                    message: format!("Duplicate projection column '{name}' for table {full_name}"),
-                });
-            }
-
-            if name == crate::spec::ROW_ID_FIELD_NAME {
-                resolved.push(DataField::new(
-                    crate::spec::ROW_ID_FIELD_ID,
-                    crate::spec::ROW_ID_FIELD_NAME.to_string(),
-                    crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
-                ));
-                continue;
-            }
-
-            let field = field_map
-                .get(name.as_str())
-                .ok_or_else(|| Error::ColumnNotExist {
-                    full_name: full_name.clone(),
-                    column: name.clone(),
-                })?;
-            resolved.push((*field).clone());
-        }
-
-        Ok(resolved)
+        resolve_projected_fields(
+            self.table.identifier().full_name(),
+            self.table.schema.fields(),
+            projected_fields,
+            self.case_sensitive,
+        )
     }
+}
+
+pub(super) fn resolve_projected_fields(
+    full_name: String,
+    fields: &[DataField],
+    projection_names: &[String],
+    case_sensitive: bool,
+) -> Result<Vec<DataField>> {
+    if projection_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build the name index once (O(fields)) so resolution is O(fields +
+    // projections) rather than scanning the whole schema per projected name.
+    // Case-sensitive: exact name -> field. Case-insensitive: ASCII-folded name
+    // -> the unique field, or `None` when two or more fields collide under
+    // folding (ambiguous, mirroring Spark's `AMBIGUOUS` behavior).
+    let sensitive_index: HashMap<&str, &DataField> = if case_sensitive {
+        fields.iter().map(|f| (f.name(), f)).collect()
+    } else {
+        HashMap::new()
+    };
+    let mut folded_index: HashMap<String, Option<&DataField>> = HashMap::new();
+    if !case_sensitive {
+        for f in fields {
+            folded_index
+                .entry(f.name().to_ascii_lowercase())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(f));
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::with_capacity(projection_names.len());
+    let mut resolved = Vec::with_capacity(projection_names.len());
+
+    for name in projection_names {
+        // Dedup under the same case sensitivity used for resolution: with
+        // `case-sensitive=false`, `["Name","name"]` must flag a duplicate rather
+        // than resolve the same field twice.
+        let dedup_key = if case_sensitive {
+            name.clone()
+        } else {
+            name.to_ascii_lowercase()
+        };
+        if !seen.insert(dedup_key) {
+            return Err(Error::ConfigInvalid {
+                message: format!("Duplicate projection column '{name}' for table {full_name}"),
+            });
+        }
+
+        if name == crate::spec::ROW_ID_FIELD_NAME {
+            resolved.push(DataField::new(
+                crate::spec::ROW_ID_FIELD_ID,
+                crate::spec::ROW_ID_FIELD_NAME.to_string(),
+                crate::spec::DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
+            ));
+            continue;
+        }
+
+        let field = if case_sensitive {
+            sensitive_index.get(name.as_str()).copied()
+        } else {
+            match folded_index.get(&name.to_ascii_lowercase()) {
+                Some(Some(f)) => Some(*f),
+                Some(None) => {
+                    return Err(Error::ConfigInvalid {
+                        message: format!(
+                            "Ambiguous projection column '{name}' for table {full_name}: multiple fields match case-insensitively"
+                        ),
+                    });
+                }
+                None => None,
+            }
+        };
+        let field = field.ok_or_else(|| Error::ColumnNotExist {
+            full_name: full_name.clone(),
+            column: name.clone(),
+        })?;
+        resolved.push(field.clone());
+    }
+
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -297,10 +373,12 @@ mod tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_utils.rs"));
     }
 
+    use super::ReadBuilder;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        BinaryRow, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema, VarCharType,
+        BinaryRow, DataField, DataType, IntType, Predicate, PredicateBuilder, Schema, TableSchema,
+        VarCharType,
     };
     use crate::table::{DataSplitBuilder, Table};
     use arrow_array::{Int32Array, RecordBatch};
@@ -363,6 +441,218 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_with_projection_validates_unknown_projection() {
+        // kwai defers resolution to new_read(): a column that cannot match under
+        // any case sensitivity surfaces the error there.
+        let table = simple_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["missing"]);
+        let err = builder.new_read().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::ColumnNotExist {
+                full_name,
+                column,
+            } if full_name == "default.t" && column == "missing"
+        ));
+    }
+
+    #[test]
+    fn test_with_projection_validates_duplicate_projection() {
+        // Resolution is deferred: the duplicate error surfaces at new_read().
+        let table = simple_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["id", "id"]);
+        let err = builder.new_read().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::ConfigInvalid { message }
+                if message.contains("Duplicate projection column 'id'")
+        ));
+    }
+
+    fn mixed_case_table() -> Table {
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("Name", DataType::VarChar(VarCharType::new(50).unwrap()))
+                .build()
+                .unwrap(),
+        );
+        Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "/tmp/test-read-builder-ci".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_read_builder_default_case_sensitive_rejects_wrong_case() {
+        // Default (case-sensitive=true): a wrong-case projection must not resolve.
+        // Resolution is deferred, so the error surfaces at new_read().
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["NAME"]);
+        let err = builder.new_read().unwrap_err();
+        assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
+    }
+
+    #[test]
+    fn test_read_builder_with_case_sensitive_false_resolves_to_canonical() {
+        // After with_case_sensitive(false), a wrong-case projection resolves to
+        // the canonical schema field name.
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder
+            .with_case_sensitive(false)
+            .with_projection(&["nAmE"]);
+        let read = builder.new_read().unwrap();
+        assert_eq!(read.read_type().len(), 1);
+        assert_eq!(read.read_type()[0].name(), "Name");
+    }
+
+    #[test]
+    fn test_projection_then_case_sensitive_false_is_order_independent() {
+        // with_projection BEFORE with_case_sensitive(false): the wrong-case name
+        // still resolves case-insensitively because resolution is deferred.
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["name"]);
+        builder.with_case_sensitive(false);
+        let read = builder.new_read().unwrap();
+        assert_eq!(read.read_type().len(), 1);
+        assert_eq!(read.read_type()[0].name(), "Name");
+    }
+
+    #[test]
+    fn test_case_sensitive_false_then_projection_is_order_independent() {
+        // with_case_sensitive(false) BEFORE with_projection: same result.
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_case_sensitive(false);
+        builder.with_projection(&["name"]);
+        let read = builder.new_read().unwrap();
+        assert_eq!(read.read_type().len(), 1);
+        assert_eq!(read.read_type()[0].name(), "Name");
+    }
+
+    #[test]
+    fn test_default_case_sensitive_wrong_case_errors_at_new_read() {
+        // Default (no with_case_sensitive) + wrong-case projection errors at read.
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["name"]);
+        let err = builder.new_read().unwrap_err();
+        assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
+    }
+
+    #[test]
+    fn test_new_scan_defers_projection_error_to_new_read() {
+        // Contract: new_scan is infallible — it does not resolve the projection,
+        // while the same resolution surfaces the error from new_read.
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_projection(&["name"]); // case-only match, default sensitive
+        let _scan = builder.new_scan(); // must not panic / must succeed
+        let err = builder.new_read().unwrap_err();
+        assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
+    }
+
+    fn ci_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "Name".to_string(),
+                DataType::VarChar(VarCharType::new(50).unwrap()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_resolve_projection_case_sensitive_exact() {
+        // Default (case-sensitive): exact names resolve, wrong case does not.
+        let out = super::resolve_projected_fields(
+            "db.t".to_string(),
+            &ci_fields(),
+            &["Name".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name(), "Name");
+
+        let err = super::resolve_projected_fields(
+            "db.t".to_string(),
+            &ci_fields(),
+            &["NAME".into()],
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
+    }
+
+    #[test]
+    fn test_resolve_projection_case_insensitive_matches_and_keeps_canonical() {
+        // Case-insensitive: wrong-case request resolves to the canonical field.
+        let out = super::resolve_projected_fields(
+            "db.t".to_string(),
+            &ci_fields(),
+            &["nAmE".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name(), "Name", "canonical schema name is preserved");
+        assert_eq!(out[0].id(), 1);
+    }
+
+    #[test]
+    fn test_resolve_projection_case_insensitive_ambiguous_errors() {
+        let fields = vec![
+            DataField::new(0, "Col".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "col".to_string(), DataType::Int(IntType::new())),
+        ];
+        let err =
+            super::resolve_projected_fields("db.t".to_string(), &fields, &["COL".into()], false)
+                .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn test_resolve_projection_case_insensitive_dedups_by_folded_name() {
+        // With case-insensitive matching, `["Name","name"]` both resolve to the
+        // canonical `Name` field, so it must be flagged as a duplicate rather
+        // than returning the column twice.
+        let err = super::resolve_projected_fields(
+            "db.t".to_string(),
+            &ci_fields(),
+            &["Name".into(), "name".into()],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { message }
+            if message.contains("Duplicate projection column")));
+
+        // A single request still resolves cleanly.
+        let out = super::resolve_projected_fields(
+            "db.t".to_string(),
+            &ci_fields(),
+            &["Name".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name(), "Name");
     }
 
     #[test]

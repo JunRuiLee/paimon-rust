@@ -57,6 +57,9 @@ pub struct PaimonTableScan {
     /// Whether the pushed predicate is exact (no residual filtering needed).
     /// When true and all splits have known merged_row_count, statistics can be exact.
     filter_exact: bool,
+    /// Column-name case sensitivity carried from planning to execution so the
+    /// read path resolves names the same way the scan was planned.
+    case_sensitive: bool,
 }
 
 impl PaimonTableScan {
@@ -68,6 +71,7 @@ impl PaimonTableScan {
         planned_partitions: Vec<Arc<[DataSplit]>>,
         limit: Option<usize>,
         filter_exact: bool,
+        case_sensitive: bool,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -83,6 +87,7 @@ impl PaimonTableScan {
             plan_properties,
             limit,
             filter_exact,
+            case_sensitive,
         }
     }
 
@@ -145,10 +150,12 @@ impl ExecutionPlan for PaimonTableScan {
         let schema = self.schema();
         let projected_columns = self.projected_columns.clone();
         let pushed_predicate = self.pushed_predicate.clone();
+        let case_sensitive = self.case_sensitive;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
 
+            read_builder.with_case_sensitive(case_sensitive);
             if let Some(ref columns) = projected_columns {
                 let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
                 read_builder.with_projection(&col_refs);
@@ -290,6 +297,7 @@ mod tests {
             vec![Arc::from(Vec::new())],
             None,
             false,
+            true,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 1);
     }
@@ -310,6 +318,7 @@ mod tests {
             planned_partitions,
             None,
             false,
+            true,
         );
         assert_eq!(scan.properties().output_partitioning().partition_count(), 3);
     }
@@ -387,6 +396,7 @@ mod tests {
             vec![Arc::from(vec![split])],
             None,
             false,
+            true,
         );
 
         let ctx = SessionContext::new();
