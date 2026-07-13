@@ -17,15 +17,12 @@
 
 //! Primary-key vector (bucket-local ANN) search kernel.
 //!
-//! Mirrors Java PR apache/paimon#8569 (`[core] Add primary-key vector bucket
-//! search`) at commit `a50a36ff8`. Read-only, synthetically tested; real ANN
-//! index-byte validation is deferred to PR4 (Java-written fixtures).
+//! Read-only bucket-local approximate-nearest-neighbour search over the
+//! primary-key vector index.
 
-// PR2 ports the PK-vector bucket-local search kernel before PR3/PR4 wires it
-// into the read path. The kernel is crate-private with no production caller
-// yet, so its items are unreachable outside their own tests. Suppress the
-// resulting dead_code lint at the module boundary; remove this allow once
-// PR3/PR4 lands production callers.
+// The kernel is crate-private and has no production caller yet, so its items
+// are unreachable outside their own tests. Suppress the resulting dead_code
+// lint at the module boundary until the read path wires it in.
 #![allow(dead_code)]
 
 pub(crate) mod ann;

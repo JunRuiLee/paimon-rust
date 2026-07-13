@@ -148,10 +148,11 @@ pub(crate) trait PkVectorAnnSearcher {
 /// `vindex` reader (`collect_results` drops `row_id < 0`), so this seam only
 /// ever yields non-negative `u64` ordinals — no signed-label handling is needed
 /// downstream.
-/// The real implementation (driving `VindexVectorGlobalIndexReader::visit_vector_search`
-/// with a segment's index bytes) is supplied by PR4; PR2 tests inject a synthetic
-/// scorer. This is the fixture-deferred boundary — the adapter's own logic
-/// (live-row masking, ordinal mapping, deletion checks, ordering) is fully tested.
+///
+/// The production scorer drives `VindexVectorGlobalIndexReader::visit_vector_search`
+/// with a segment's index bytes; tests inject a synthetic scorer. The adapter's
+/// own logic (live-row masking, ordinal mapping, deletion checks, ordering) is
+/// exercised independently of the scorer.
 type Scorer = Box<dyn Fn(&VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>>;
 
 /// Structural vindex-backed `PkVectorAnnSearcher`. Composes the pure helpers
