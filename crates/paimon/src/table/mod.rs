@@ -55,6 +55,7 @@ mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
 mod partition_filter;
 mod partition_stat;
+mod pk_vector_indexed_split_read;
 mod pk_vector_position_read;
 mod postpone_file_writer;
 mod prepared_files;
