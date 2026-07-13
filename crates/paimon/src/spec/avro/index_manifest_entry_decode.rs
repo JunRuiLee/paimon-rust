@@ -18,7 +18,8 @@
 use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
-    normalize_partition, read_bytes_field, read_int_field, read_long_field, read_string_field,
+    extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
+    read_string_field,
 };
 use super::schema::{skip_nullable_field, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
@@ -65,7 +66,8 @@ impl AvroRecordDecode for IndexManifestEntry {
                     deletion_vectors_ranges = decode_nullable_dv_ranges(cursor, field.nullable)?;
                 }
                 "_GLOBAL_INDEX" => {
-                    global_index_meta = decode_nullable_global_index(cursor, field.nullable)?;
+                    global_index_meta =
+                        decode_nullable_global_index(cursor, field.nullable, &field.schema)?;
                 }
                 _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
             }
@@ -145,6 +147,7 @@ fn decode_nullable_dv_ranges(
 fn decode_nullable_global_index(
     cursor: &mut AvroCursor,
     nullable: bool,
+    schema: &super::schema::FieldSchema,
 ) -> crate::Result<Option<GlobalIndexMeta>> {
     if nullable {
         let idx = cursor.read_union_index()?;
@@ -192,11 +195,29 @@ fn decode_nullable_global_index(
         }
     };
 
+    // _SOURCE_META: nullable bytes — only present in >= #8549 writer schemas.
+    // Guard on the writer's nested field list so a legacy 5-field _GLOBAL_INDEX
+    // record does not misalign the cursor into the next record.
+    let has_source_meta = extract_record_schema(schema)
+        .map(|s| s.fields.iter().any(|f| f.name == "_SOURCE_META"))
+        .unwrap_or(false);
+    let source_meta = if has_source_meta {
+        let u_idx = cursor.read_union_index()?;
+        if u_idx == 0 {
+            None
+        } else {
+            Some(cursor.read_bytes()?.to_vec())
+        }
+    } else {
+        None
+    };
+
     Ok(Some(GlobalIndexMeta {
         row_range_start,
         row_range_end,
         index_field_id,
         extra_field_ids,
         index_meta,
+        source_meta,
     }))
 }
