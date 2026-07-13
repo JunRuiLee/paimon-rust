@@ -82,6 +82,21 @@ impl VectorSearchMetric {
             Self::InnerProduct => -score,
         }
     }
+
+    /// Convert a lower-is-better canonical distance (as produced by
+    /// `bucket_search`) to a higher-is-better score. Mirrors Java
+    /// `PrimaryKeyVectorResult.score(distance)`. No clamping — natural f32
+    /// behavior (L2 with `distance=inf` -> `0.0`), consistent with the sibling
+    /// `score_to_distance`.
+    /// NOTE: cosine here is `1 - distance` applied directly to the canonical
+    /// distance; it does NOT reuse `score_to_distance`'s clamp.
+    pub(crate) fn distance_to_score(&self, distance: f32) -> f32 {
+        match self {
+            Self::L2 => 1.0 / (1.0 + distance),
+            Self::Cosine => 1.0 - distance,
+            Self::InnerProduct => -distance,
+        }
+    }
 }
 
 fn squared_l2(query: &[f32], stored: &[f32]) -> f32 {
@@ -207,5 +222,34 @@ mod tests {
             -2.0
         );
         assert_eq!(VectorSearchMetric::Cosine.score_to_distance(1.0), 0.0);
+    }
+
+    #[test]
+    fn test_distance_to_score_per_metric_formula() {
+        // L2: 1/(1+d); Cosine: 1-d; InnerProduct: -d.
+        assert_eq!(VectorSearchMetric::L2.distance_to_score(0.0), 1.0);
+        assert_eq!(VectorSearchMetric::L2.distance_to_score(1.0), 0.5);
+        assert_eq!(VectorSearchMetric::L2.distance_to_score(3.0), 0.25);
+        assert_eq!(VectorSearchMetric::Cosine.distance_to_score(0.0), 1.0);
+        assert_eq!(VectorSearchMetric::Cosine.distance_to_score(1.0), 0.0);
+        assert_eq!(VectorSearchMetric::InnerProduct.distance_to_score(0.0), 0.0);
+        assert_eq!(
+            VectorSearchMetric::InnerProduct.distance_to_score(3.0),
+            -3.0
+        );
+    }
+
+    #[test]
+    fn test_distance_to_score_inverts_score_to_distance_off_boundary() {
+        // Avoid boundary values (no L2 score=0/distance=inf, no cosine/ip infinities):
+        // distance_to_score(score_to_distance(s)) == s for representative s.
+        for (metric, s) in [
+            (VectorSearchMetric::L2, 0.5f32),
+            (VectorSearchMetric::Cosine, 0.25f32),
+            (VectorSearchMetric::InnerProduct, 2.0f32),
+        ] {
+            let d = metric.score_to_distance(s);
+            assert_eq!(metric.distance_to_score(d), s, "metric {metric:?}");
+        }
     }
 }
