@@ -26,14 +26,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::StreamExt;
-
 use crate::deletion_vector::DeletionVector;
 use crate::spec::BinaryRow;
 use crate::table::data_file_reader::DataFileReader;
-use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, RowRange};
-use crate::table::ArrowRecordBatchStream;
 use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
 use crate::vindex::pkvector::bucket::{bucket_search, BucketActiveFile, BucketAnnSegment};
 use crate::vindex::pkvector::metric::{java_float_compare, VectorSearchMetric};
@@ -104,10 +101,7 @@ fn global_top_k(mut candidates: Vec<PkVectorCandidate>, limit: usize) -> Vec<PkV
 /// source bucket split, and build one `PkVectorIndexedSplit` per file. Groups are
 /// emitted in ascending group-key order (deterministic file/position output
 /// order). Mirrors Java `PrimaryKeyVectorResult.splits()`.
-// Part of the row-materialization path (`read`), which no production caller
-// drives yet; the wired search path returns candidates directly.
-#[allow(dead_code)]
-fn build_indexed_splits(
+pub(crate) fn build_indexed_splits(
     survivors: Vec<PkVectorCandidate>,
     splits: &[PkVectorSearchSplit],
     metric: VectorSearchMetric,
@@ -319,60 +313,6 @@ impl PkVectorOrchestrator {
         }
 
         Ok(global_top_k(candidates, limit))
-    }
-
-    /// Run the eager per-bucket search phase, then return a stream that lazily
-    /// materializes the surviving rows. `async` because the eager search phase is
-    /// genuine async IO
-    /// needing the borrowed `exact_reader_factory` / `ann_searcher`; the returned
-    /// stream owns only the built splits + a reader clone (so it is `'static`).
-    ///
-    /// The wired vector search returns matched row-ids and scores via
-    /// `search_candidates`; no production caller drives row materialization yet.
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn read(
-        &self,
-        splits: &[PkVectorSearchSplit],
-        query: &[f32],
-        metric: VectorSearchMetric,
-        limit: usize,
-        ann_searcher: Option<&dyn PkVectorAnnSearcher>,
-        exact_reader_factory: &mut dyn FnMut(
-            &BucketActiveFile,
-        ) -> crate::Result<Box<dyn PkVectorReader>>,
-        search_options: &HashMap<String, String>,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        // Wrap the per-file factory into the split-scoped shape search_candidates
-        // expects; the split index/split are unused on this back-compat path.
-        let mut wrapped =
-            |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| exact_reader_factory(f);
-        let survivors = self
-            .search_candidates(
-                splits,
-                query,
-                metric,
-                limit,
-                ann_searcher,
-                &mut wrapped,
-                search_options,
-                false,
-            )
-            .await?;
-        let indexed_splits = build_indexed_splits(survivors, splits, metric)?;
-
-        // Lazy materialization: own the splits + a reader clone.
-        let reader = self.reader.clone();
-        let stream = async_stream::try_stream! {
-            for indexed in indexed_splits {
-                let inner = PkVectorIndexedSplitRead::new(reader.clone()).read(&indexed)?;
-                futures::pin_mut!(inner);
-                while let Some(batch) = inner.next().await {
-                    yield batch?;
-                }
-            }
-        };
-        Ok(Box::pin(stream))
     }
 }
 
@@ -643,6 +583,7 @@ mod e2e_tests {
     use crate::spec::{
         DataField, DataFileMeta, DataType, IntType, PkVectorSourceFile, PkVectorSourceMeta,
     };
+    use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
     use crate::table::pk_vector_position_read::{
         PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
     };
@@ -887,17 +828,54 @@ mod e2e_tests {
         }
     }
 
+    /// Run the eager per-bucket search + global Top-K, group survivors into indexed
+    /// splits, then materialize each split in file/position order. This is the
+    /// materialization path the production best-first read reorders on top of; the
+    /// tests below drive it directly through its `pub(crate)` components.
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_via_splits(
+        reader: DataFileReader,
+        splits: &[PkVectorSearchSplit],
+        query: &[f32],
+        metric: VectorSearchMetric,
+        limit: usize,
+        ann: Option<&dyn PkVectorAnnSearcher>,
+        factory: &mut dyn FnMut(&BucketActiveFile) -> crate::Result<Box<dyn PkVectorReader>>,
+        opts: &HashMap<String, String>,
+    ) -> crate::Result<Vec<RecordBatch>> {
+        let orch = PkVectorOrchestrator::new(reader.clone());
+        // Wrap the per-file factory into the split-scoped shape search_candidates
+        // expects; the split index/split are unused here.
+        let mut wrapped = |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| factory(f);
+        let survivors = orch
+            .search_candidates(splits, query, metric, limit, ann, &mut wrapped, opts, false)
+            .await?;
+        let indexed_splits = build_indexed_splits(survivors, splits, metric)?;
+        let mut out = Vec::new();
+        for indexed in indexed_splits {
+            let batches: Vec<RecordBatch> = PkVectorIndexedSplitRead::new(reader.clone())
+                .read(&indexed)?
+                .try_collect()
+                .await?;
+            out.extend(batches);
+        }
+        Ok(out)
+    }
+
     #[tokio::test]
     async fn eager_rejects_zero_limit() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let reader = make_reader(file_io, "memory:/pkvo_zero");
         let splits: Vec<PkVectorSearchSplit> = Vec::new();
-        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           _: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
             unreachable!("no bucket search on eager-rejected input")
         };
         let opts = HashMap::new();
         let err = PkVectorOrchestrator::new(reader)
-            .read(
+            .search_candidates(
                 &splits,
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
@@ -905,6 +883,7 @@ mod e2e_tests {
                 None,
                 &mut factory,
                 &opts,
+                false,
             )
             .await
             .map(|_| ())
@@ -917,12 +896,15 @@ mod e2e_tests {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let reader = make_reader(file_io, "memory:/pkvo_empty_query");
         let splits: Vec<PkVectorSearchSplit> = Vec::new();
-        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           _: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
             unreachable!("no bucket search on eager-rejected input")
         };
         let opts = HashMap::new();
         let err = PkVectorOrchestrator::new(reader)
-            .read(
+            .search_candidates(
                 &splits,
                 &[],
                 VectorSearchMetric::L2,
@@ -930,6 +912,7 @@ mod e2e_tests {
                 None,
                 &mut factory,
                 &opts,
+                false,
             )
             .await
             .map(|_| ())
@@ -979,21 +962,18 @@ mod e2e_tests {
             Ok(Box::new(ArrayReader::new(2, vectors)))
         };
         let opts = HashMap::new();
-        let batches = PkVectorOrchestrator::new(make_reader(file_io, table_path))
-            .read(
-                &[split],
-                &[0.0, 0.0],
-                VectorSearchMetric::L2,
-                3,
-                Some(&ann),
-                &mut factory,
-                &opts,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = materialize_via_splits(
+            make_reader(file_io, table_path),
+            &[split],
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            3,
+            Some(&ann),
+            &mut factory,
+            &opts,
+        )
+        .await
+        .unwrap();
 
         // Output is ascending group (file name) then ascending position:
         // ann.mosaic pos1 -> id 101; exact.mosaic pos0,1 -> ids 200,201.
@@ -1072,21 +1052,18 @@ mod e2e_tests {
             Ok(Box::new(ArrayReader::new(2, vectors)))
         };
         let opts = HashMap::new();
-        let batches = PkVectorOrchestrator::new(make_reader(file_io, table_path))
-            .read(
-                &[split0, split1],
-                &[0.0, 0.0],
-                VectorSearchMetric::L2,
-                3,
-                None,
-                &mut factory,
-                &opts,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = materialize_via_splits(
+            make_reader(file_io, table_path),
+            &[split0, split1],
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            3,
+            None,
+            &mut factory,
+            &opts,
+        )
+        .await
+        .unwrap();
 
         // Ascending group order: bucket0 "b0.mosaic" pos0 -> 10; bucket1 "b1.mosaic"
         // pos0,1 -> 20,21.
@@ -1140,21 +1117,18 @@ mod e2e_tests {
             Ok(Box::new(ArrayReader::new(2, vectors)))
         };
         let opts = HashMap::new();
-        let batches = PkVectorOrchestrator::new(make_reader(file_io, table_path))
-            .read(
-                &[split],
-                &[0.0, 0.0],
-                VectorSearchMetric::L2,
-                4,
-                None,
-                &mut factory,
-                &opts,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = materialize_via_splits(
+            make_reader(file_io, table_path),
+            &[split],
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            4,
+            None,
+            &mut factory,
+            &opts,
+        )
+        .await
+        .unwrap();
 
         // Position 1 (id 31) is absent. Remaining ascending positions 0,2,3.
         assert_eq!(collect_i32(&batches, "id"), vec![30, 32, 33]);
@@ -1203,21 +1177,18 @@ mod e2e_tests {
             Ok(Box::new(ArrayReader::new(2, vectors)))
         };
         let opts = HashMap::new();
-        let batches = PkVectorOrchestrator::new(make_reader(file_io, table_path))
-            .read(
-                &[split],
-                &[0.0, 0.0],
-                VectorSearchMetric::L2,
-                3,
-                None,
-                &mut factory,
-                &opts,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batches = materialize_via_splits(
+            make_reader(file_io, table_path),
+            &[split],
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            3,
+            None,
+            &mut factory,
+            &opts,
+        )
+        .await
+        .unwrap();
 
         // Ascending physical position order, not best-first distance order.
         assert_eq!(collect_i32(&batches, "id"), vec![40, 41, 42]);

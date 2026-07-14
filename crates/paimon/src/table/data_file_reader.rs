@@ -80,8 +80,7 @@ impl DataFileReader {
 
     /// The effective read-type (requested output fields) of this reader.
     /// Exposed for the sibling `pk_vector_position_read` module, which drives the
-    /// PK-vector materialization read path (no production caller yet).
-    #[allow(dead_code)]
+    /// PK-vector materialization read path.
     pub(super) fn read_type(&self) -> &[DataField] {
         &self.read_type
     }
@@ -89,8 +88,7 @@ impl DataFileReader {
     /// True if any configured predicate can actually drop rows. A lone
     /// `Predicate::AlwaysTrue` keeps every row in order and is not row-filtering,
     /// matching `reject_row_id_with_predicate`'s notion. Consumed by
-    /// `pk_vector_position_read` (materialization read path; no production caller yet).
-    #[allow(dead_code)]
+    /// `pk_vector_position_read` (materialization read path).
     pub(super) fn has_row_filtering_predicate(&self) -> bool {
         self.predicates
             .iter()

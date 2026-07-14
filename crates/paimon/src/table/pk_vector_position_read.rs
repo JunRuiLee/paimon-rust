@@ -24,12 +24,6 @@
 //! `pk_vector_indexed_split_read` and `pk_vector_orchestrator` modules build the
 //! indexed-split contract and cross-bucket merge on top of it.
 
-// This materialization read path is exercised only by its own tests: the wired
-// vector search returns matched row-ids and scores directly, so no production
-// caller drives row materialization yet. Suppress dead_code at the module
-// boundary until a materializing caller exists.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

@@ -28,11 +28,18 @@ use crate::table::global_index_scanner::{
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
 use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
+use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
 use crate::table::pk_vector_orchestrator::{
-    PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+    build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
 };
-use crate::table::pk_vector_scan::PkVectorScan;
-use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
+use crate::table::pk_vector_position_read::{
+    PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
+};
+use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
+use crate::table::read_builder::resolve_projected_fields;
+use crate::table::{
+    find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
+};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
@@ -41,7 +48,8 @@ use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
-use futures::TryStreamExt;
+use arrow_select::interleave::interleave_record_batch;
+use futures::{stream, TryStreamExt};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::VectorIndexReader as VIndexReader;
 use roaring::RoaringTreemap;
@@ -82,6 +90,7 @@ pub struct VectorSearchBuilder<'a> {
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
     options: HashMap<String, String>,
+    projection: Option<Vec<String>>,
 }
 
 pub struct BatchVectorSearchBuilder<'a> {
@@ -100,6 +109,7 @@ impl<'a> VectorSearchBuilder<'a> {
             query_vector: None,
             limit: None,
             options: HashMap::new(),
+            projection: None,
         }
     }
 
@@ -120,6 +130,15 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
+        self
+    }
+
+    /// Restrict the columns materialized by [`execute_read`](Self::execute_read)
+    /// to `cols` (plus the always-appended `_PKEY_VECTOR_SCORE`). Without this
+    /// call `execute_read` materializes every user table column. Only affects
+    /// `execute_read`; the search-only paths ignore it.
+    pub fn with_projection(&mut self, cols: &[&str]) -> &mut Self {
+        self.projection = Some(cols.iter().map(|c| c.to_string()).collect());
         self
     }
 
@@ -184,6 +203,55 @@ impl<'a> VectorSearchBuilder<'a> {
         Ok(results.remove(0))
     }
 
+    /// Run the vector search and materialize the matching rows as Arrow batches,
+    /// ordered best-first. Only supported for primary-key vector indexes; a
+    /// data-evolution table or a query targeting a non-PK-vector column fails
+    /// loud. Output columns are the projected user table columns (all user
+    /// columns by default, or those set via
+    /// [`with_projection`](Self::with_projection)) plus `_PKEY_VECTOR_SCORE`;
+    /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
+    pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let query_vector =
+            self.query_vector
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vector must be set via with_query_vector()".to_string(),
+                })?;
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        // Only the primary-key vector path can materialize rows. The data-evolution
+        // (global-index) path returns data-derived row-ids, not table rows, so a
+        // read against it (or against a non-PK-vector column) fails loud.
+        if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+            if targets_pk_column {
+                let pk_col = core.primary_key_vector_index_column()?;
+                return self
+                    .execute_primary_key_vector_read(&core, &pk_col, query_vector, limit)
+                    .await;
+            }
+        }
+
+        Err(crate::Error::DataInvalid {
+            message: "vector search read is only supported for primary-key vector indexes".into(),
+            source: None,
+        })
+    }
+
     /// Run the primary-key bucket-local vector search: plan the per-bucket splits,
     /// build the real vindex ANN scorer and (outside FAST mode) the exact-fallback
     /// readers, run the orchestrator, and convert the best-first candidates into a
@@ -195,6 +263,26 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<SearchResult> {
+        let (candidates, plan, metric) = self
+            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
+            .await?;
+        candidates_to_search_result(&candidates, &plan.splits, metric)
+    }
+
+    /// Shared PK-vector search core for both the search-only and search-and-read
+    /// paths: plan the per-bucket splits, verify the configured metric against each
+    /// ANN segment, build the real vindex ANN scorer and (outside FAST mode) the
+    /// exact-fallback readers, and run the orchestrator. Returns the best-first
+    /// candidates together with the plan and resolved metric so the caller can
+    /// either serialize them to a `SearchResult` or materialize their rows. An
+    /// empty plan yields empty candidates.
+    async fn plan_and_search_pk_candidates(
+        &self,
+        core: &CoreOptions<'_>,
+        pk_col: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
         // Residual-filter guard: PK vector search accepts partition filters only.
         // This builder exposes no data-predicate setter, so there is nothing to
         // reject here; the guard mirrors Java `checkArgument(filter == null)` and,
@@ -230,7 +318,7 @@ impl<'a> VectorSearchBuilder<'a> {
             .plan()
             .await?;
         if plan.splits.is_empty() {
-            return Ok(SearchResult::empty());
+            return Ok((Vec::new(), plan, metric));
         }
 
         // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
@@ -318,7 +406,132 @@ impl<'a> VectorSearchBuilder<'a> {
             )
             .await?;
 
-        candidates_to_search_result(&candidates, &plan.splits, metric)
+        Ok((candidates, plan, metric))
+    }
+
+    /// Materialize the best-first PK-vector search hits into Arrow rows. Mirrors
+    /// Java `PrimaryKeyVectorRead` feeding its result splits into an ordinary table
+    /// read: the search decides which rows, a subsequent read decides which
+    /// columns.
+    ///
+    /// Output columns are the projected user table columns (all user columns when
+    /// [`with_projection`](Self::with_projection) was not called) plus
+    /// `_PKEY_VECTOR_SCORE`; `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always
+    /// hidden. Rows are emitted best-first (the candidate order), which differs
+    /// from the file/position order the orchestrator materializes in.
+    async fn execute_primary_key_vector_read(
+        &self,
+        core: &CoreOptions<'_>,
+        pk_col: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let (candidates, plan, metric) = self
+            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
+            .await?;
+
+        // Resolve the materialization read-type up front so an invalid projection
+        // (unknown column, or a reserved metadata / row-id name) fails loud
+        // unconditionally, even when the plan is empty and no rows will be read.
+        // Default (no `with_projection`) is every user table column.
+        let read_type = self.resolve_materialize_read_type()?;
+
+        if candidates.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        // A separate, predicate-free materialization reader projecting the user
+        // columns (the search reader projects only the vector column). Mirrors
+        // `table_read.rs::new_data_file_reader` with an empty predicate list.
+        let materialize_reader = DataFileReader::new(
+            self.table.file_io().clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema().fields().to_vec(),
+            read_type,
+            Vec::new(),
+        );
+
+        // Rank each candidate by its best-first position, then reduce the physical
+        // materialization order back to best-first. The orchestrator emits rows in
+        // ascending (partition, bucket, file, position); the rank map keyed by
+        // (partition bytes, bucket, file, position) recovers the candidate order.
+        let mut rank_of: HashMap<(Vec<u8>, i32, String, i64), usize> = HashMap::new();
+        for (rank, c) in candidates.iter().enumerate() {
+            rank_of.insert(
+                (
+                    c.partition.to_serialized_bytes(),
+                    c.bucket,
+                    c.data_file_name.clone(),
+                    c.row_position,
+                ),
+                rank,
+            );
+        }
+
+        let indexed_splits = build_indexed_splits(candidates, &plan.splits, metric)?;
+
+        // Materialize every indexed split, retaining each batch and, per row, the
+        // (rank, batch_index, row_index) tuple so we can reorder to best-first.
+        // Top-K is small, so full in-memory collection is acceptable.
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut ranked: Vec<RankedRow> = Vec::new();
+        for indexed in indexed_splits {
+            let partition_bytes = indexed.split.partition().to_serialized_bytes();
+            let bucket = indexed.split.bucket();
+            let file_name = indexed.split.data_files()[0].file_name.clone();
+            let mut stream =
+                PkVectorIndexedSplitRead::new(materialize_reader.clone()).read(&indexed)?;
+            while let Some(batch) = stream.try_next().await? {
+                let batch_index = batches.len();
+                collect_ranked_rows(
+                    &batch,
+                    batch_index,
+                    &partition_bytes,
+                    bucket,
+                    &file_name,
+                    &rank_of,
+                    &mut ranked,
+                )?;
+                batches.push(batch);
+            }
+        }
+
+        // Reorder to best-first and drop the position column.
+        let output = reorder_and_strip_position(&batches, ranked)?;
+        Ok(Box::pin(stream::iter(output.into_iter().map(Ok))))
+    }
+
+    /// Resolve the projected fields for the materialization read-type. Default
+    /// (no projection set) is all user table fields; otherwise the requested
+    /// names resolved via `resolve_projected_fields`. Rejects reserved metadata
+    /// names and `_ROW_ID` so a user cannot request a hidden column.
+    fn resolve_materialize_read_type(&self) -> crate::Result<Vec<DataField>> {
+        let fields = match &self.projection {
+            None => self.table.schema().fields().to_vec(),
+            Some(names) => {
+                for name in names {
+                    if name == PKEY_VECTOR_POSITION_COLUMN
+                        || name == PKEY_VECTOR_SCORE_COLUMN
+                        || name == ROW_ID_FIELD_NAME
+                    {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "vector search read projection must not request reserved column '{name}'"
+                            ),
+                            source: None,
+                        });
+                    }
+                }
+                resolve_projected_fields(
+                    self.table.identifier().full_name(),
+                    self.table.schema().fields(),
+                    names,
+                    true,
+                )?
+            }
+        };
+        Ok(fields)
     }
 }
 
@@ -818,6 +1031,111 @@ fn candidates_to_search_result(
     }
     // Order preserved: best-first, as produced by the orchestrator.
     Ok(SearchResult::new(row_ids, scores))
+}
+
+/// One materialized row tagged with its best-first `rank` and its `(batch_index,
+/// row_index)` location in the retained materialization batches.
+struct RankedRow {
+    rank: usize,
+    batch_index: usize,
+    row_index: usize,
+}
+
+/// For each row in a materialized batch, look up its best-first rank via the
+/// `(partition bytes, bucket, file, position)` key and record its location. The
+/// `_PKEY_VECTOR_POSITION` column supplies the physical position; every row must
+/// map to a candidate rank (the batch came from that candidate's file), so a miss
+/// fails loud rather than silently dropping a row.
+#[allow(clippy::too_many_arguments)]
+fn collect_ranked_rows(
+    batch: &RecordBatch,
+    batch_index: usize,
+    partition_bytes: &[u8],
+    bucket: i32,
+    file_name: &str,
+    rank_of: &HashMap<(Vec<u8>, i32, String, i64), usize>,
+    out: &mut Vec<RankedRow>,
+) -> crate::Result<()> {
+    let position_idx = batch
+        .schema()
+        .index_of(PKEY_VECTOR_POSITION_COLUMN)
+        .map_err(|_| crate::Error::DataInvalid {
+            message: format!("materialized batch missing {PKEY_VECTOR_POSITION_COLUMN} column"),
+            source: None,
+        })?;
+    let positions = batch
+        .column(position_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("{PKEY_VECTOR_POSITION_COLUMN} column is not Int64"),
+            source: None,
+        })?;
+    for row_index in 0..batch.num_rows() {
+        let position = positions.value(row_index);
+        let key = (
+            partition_bytes.to_vec(),
+            bucket,
+            file_name.to_string(),
+            position,
+        );
+        let rank = *rank_of.get(&key).ok_or_else(|| crate::Error::DataInvalid {
+            message: format!(
+                "materialized row (file {file_name}, position {position}) has no matching search candidate"
+            ),
+            source: None,
+        })?;
+        out.push(RankedRow {
+            rank,
+            batch_index,
+            row_index,
+        });
+    }
+    Ok(())
+}
+
+/// Reorder the materialized rows into best-first order and drop the internal
+/// `_PKEY_VECTOR_POSITION` column, yielding a single output batch (empty input
+/// yields no batches). The projected user columns and `_PKEY_VECTOR_SCORE` are
+/// retained.
+fn reorder_and_strip_position(
+    batches: &[RecordBatch],
+    mut ranked: Vec<RankedRow>,
+) -> crate::Result<Vec<RecordBatch>> {
+    if ranked.is_empty() {
+        return Ok(Vec::new());
+    }
+    ranked.sort_by_key(|r| r.rank);
+    let indices: Vec<(usize, usize)> = ranked
+        .iter()
+        .map(|r| (r.batch_index, r.row_index))
+        .collect();
+    let refs: Vec<&RecordBatch> = batches.iter().collect();
+    let reordered =
+        interleave_record_batch(&refs, &indices).map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to reorder vector search read rows: {e}"),
+            source: None,
+        })?;
+
+    // Drop the internal position column; keep every other column (projected user
+    // columns + _PKEY_VECTOR_SCORE) in order.
+    let position_idx = reordered
+        .schema()
+        .index_of(PKEY_VECTOR_POSITION_COLUMN)
+        .map_err(|_| crate::Error::DataInvalid {
+            message: format!("reordered batch missing {PKEY_VECTOR_POSITION_COLUMN} column"),
+            source: None,
+        })?;
+    let keep: Vec<usize> = (0..reordered.num_columns())
+        .filter(|i| *i != position_idx)
+        .collect();
+    let projected = reordered
+        .project(&keep)
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("failed to drop position column: {e}"),
+            source: None,
+        })?;
+    Ok(vec![projected])
 }
 
 fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
@@ -1634,8 +1952,13 @@ mod tests {
     use crate::vindex::IVF_FLAT_IDENTIFIER;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     use arrow_array::ArrayRef;
+    use arrow_array::Int32Array;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
+
+    fn l2_score(distance: f32) -> f32 {
+        VectorSearchMetric::L2.distance_to_score(distance)
+    }
 
     fn make_field(id: i32, name: &str) -> DataField {
         DataField::new(id, name.to_string(), DataType::Int(IntType::default()))
@@ -2514,5 +2837,273 @@ mod tests {
             },
             version: 1,
         }
+    }
+
+    // ---- Task B: search-and-read (`execute_read`) tests ----
+
+    /// Build a small materialization batch: user column `id: Int32`, the internal
+    /// `_PKEY_VECTOR_POSITION: Int64`, and `_PKEY_VECTOR_SCORE: Float32` (mirroring
+    /// what `PkVectorIndexedSplitRead` emits for a single file).
+    fn materialized_batch(rows: &[(i32, i64, f32)]) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new(PKEY_VECTOR_POSITION_COLUMN, ArrowDataType::Int64, false),
+            ArrowField::new(PKEY_VECTOR_SCORE_COLUMN, ArrowDataType::Float32, false),
+        ]));
+        let ids = Int32Array::from(rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>());
+        let positions = Int64Array::from(rows.iter().map(|(_, pos, _)| *pos).collect::<Vec<_>>());
+        let scores = Float32Array::from(rows.iter().map(|(_, _, s)| *s).collect::<Vec<_>>());
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(positions), Arc::new(scores)],
+        )
+        .unwrap()
+    }
+
+    fn i32_col(batch: &RecordBatch, name: &str) -> Vec<i32> {
+        let idx = batch.schema().index_of(name).unwrap();
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+    fn f32_col(batch: &RecordBatch, name: &str) -> Vec<f32> {
+        let idx = batch.schema().index_of(name).unwrap();
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn reorder_and_strip_position_recovers_best_first_and_drops_position() {
+        // Single file, one bucket. The materialization reader emits rows in
+        // ascending physical position [pos0, pos1, pos2] -> ids [40,41,42]. The
+        // search candidates ranked them best-first as pos1(rank0), pos2(rank1),
+        // pos0(rank2), which is NEITHER position order nor score order-by-batch.
+        // The reorder must yield ids [41,42,40] and drop _PKEY_VECTOR_POSITION.
+        let batch = materialized_batch(&[
+            (40, 0, l2_score(9.0)),
+            (41, 1, l2_score(1.0)),
+            (42, 2, l2_score(4.0)),
+        ]);
+        let batches = vec![batch];
+        let part = BinaryRow::new(0).to_serialized_bytes();
+        let mut rank_of: HashMap<(Vec<u8>, i32, String, i64), usize> = HashMap::new();
+        rank_of.insert((part.clone(), 0, "o.mosaic".to_string(), 1), 0);
+        rank_of.insert((part.clone(), 0, "o.mosaic".to_string(), 2), 1);
+        rank_of.insert((part.clone(), 0, "o.mosaic".to_string(), 0), 2);
+
+        let mut ranked = Vec::new();
+        collect_ranked_rows(&batches[0], 0, &part, 0, "o.mosaic", &rank_of, &mut ranked).unwrap();
+        let out = reorder_and_strip_position(&batches, ranked).unwrap();
+        assert_eq!(out.len(), 1);
+        let out = &out[0];
+
+        // Best-first row order, not ascending position order.
+        assert_eq!(i32_col(out, "id"), vec![41, 42, 40]);
+        // Score column preserved and aligned to the reordered rows.
+        assert_eq!(
+            f32_col(out, PKEY_VECTOR_SCORE_COLUMN),
+            vec![l2_score(1.0), l2_score(4.0), l2_score(9.0)]
+        );
+        // Position column dropped; _ROW_ID never present.
+        assert!(out.schema().index_of(PKEY_VECTOR_POSITION_COLUMN).is_err());
+        assert!(out.schema().index_of("_ROW_ID").is_err());
+    }
+
+    #[test]
+    fn reorder_and_strip_position_merges_rows_across_files() {
+        // Two files (two materialization batches). Best-first interleaves them:
+        // file-b pos0 (rank0), file-a pos1 (rank1), file-a pos0 (rank2). The
+        // reorder must pull rows from both batches into one best-first output.
+        let batch_a = materialized_batch(&[(10, 0, l2_score(9.0)), (11, 1, l2_score(1.0))]);
+        let batch_b = materialized_batch(&[(20, 0, l2_score(0.5))]);
+        let batches = vec![batch_a, batch_b];
+        let part = BinaryRow::new(0).to_serialized_bytes();
+        let mut rank_of: HashMap<(Vec<u8>, i32, String, i64), usize> = HashMap::new();
+        rank_of.insert((part.clone(), 0, "b".to_string(), 0), 0);
+        rank_of.insert((part.clone(), 0, "a".to_string(), 1), 1);
+        rank_of.insert((part.clone(), 0, "a".to_string(), 0), 2);
+
+        let mut ranked = Vec::new();
+        collect_ranked_rows(&batches[0], 0, &part, 0, "a", &rank_of, &mut ranked).unwrap();
+        collect_ranked_rows(&batches[1], 1, &part, 0, "b", &rank_of, &mut ranked).unwrap();
+        let out = reorder_and_strip_position(&batches, ranked).unwrap();
+        assert_eq!(i32_col(&out[0], "id"), vec![20, 11, 10]);
+        assert_eq!(
+            f32_col(&out[0], PKEY_VECTOR_SCORE_COLUMN),
+            vec![l2_score(0.5), l2_score(1.0), l2_score(9.0)]
+        );
+    }
+
+    #[test]
+    fn reorder_and_strip_position_empty_yields_no_batches() {
+        let out = reorder_and_strip_position(&[], Vec::new()).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_ranked_rows_missing_candidate_fails_loud() {
+        // A materialized position with no candidate rank must fail loud rather than
+        // silently drop the row.
+        let batch = materialized_batch(&[(40, 7, l2_score(1.0))]);
+        let part = BinaryRow::new(0).to_serialized_bytes();
+        let rank_of: HashMap<(Vec<u8>, i32, String, i64), usize> = HashMap::new();
+        let mut ranked = Vec::new();
+        let err = collect_ranked_rows(&batch, 0, &part, 0, "f", &rank_of, &mut ranked)
+            .expect_err("missing candidate must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("no matching search candidate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_de_table_fails_loud() {
+        // No pk-vector index configured: execute_read must fail loud (the DE path
+        // has no row materialization).
+        let table = pk_vector_table(&[]);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("DE read must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supported for primary-key")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_non_pk_column_fails_loud() {
+        // pk-vector index configured for "embedding", but the query targets a
+        // different column -> read is unsupported.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("other")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("non-PK column read must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supported for primary-key")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_empty_plan_reserved_projection_fails_loud() {
+        // Empty plan (no snapshot) must still fail loud on a reserved-name
+        // projection: projection validity does not depend on whether the search
+        // matched any rows. A regression that resolved the projection only after
+        // the `candidates.is_empty()` early return would yield an empty stream here
+        // instead of an error.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        for reserved in [
+            ROW_ID_FIELD_NAME,
+            PKEY_VECTOR_POSITION_COLUMN,
+            PKEY_VECTOR_SCORE_COLUMN,
+        ] {
+            let mut builder = table.new_vector_search_builder();
+            builder
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1.0])
+                .with_limit(5)
+                .with_projection(&["id", reserved]);
+            let err = builder
+                .execute_read()
+                .await
+                .map(|_| ())
+                .expect_err("empty plan + reserved projection must fail loud");
+            assert!(
+                matches!(err, crate::Error::DataInvalid { ref message, .. }
+                    if message.contains("reserved column")),
+                "unexpected error for {reserved}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_read_projection_reserved_name_fails_loud() {
+        // Projecting a reserved metadata / row-id column must fail loud. The guard
+        // lives in `resolve_materialize_read_type`, which `execute_read` invokes
+        // before the empty-plan early return; assert on the resolver directly here.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        for reserved in [
+            ROW_ID_FIELD_NAME,
+            PKEY_VECTOR_POSITION_COLUMN,
+            PKEY_VECTOR_SCORE_COLUMN,
+        ] {
+            let mut builder = table.new_vector_search_builder();
+            builder
+                .with_vector_column("embedding")
+                .with_query_vector(vec![1.0])
+                .with_limit(5)
+                .with_projection(&["id", reserved]);
+            let err = builder
+                .resolve_materialize_read_type()
+                .expect_err("reserved projection must fail loud");
+            assert!(
+                matches!(err, crate::Error::DataInvalid { ref message, .. }
+                    if message.contains("reserved column")),
+                "unexpected error for {reserved}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_materialize_read_type_default_is_all_user_columns() {
+        // No with_projection -> every user table column (id + embedding).
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let builder = table.new_vector_search_builder();
+        let fields = builder.resolve_materialize_read_type().unwrap();
+        let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["id", "embedding"]);
+    }
+
+    #[test]
+    fn resolve_materialize_read_type_projection_selects_named_columns() {
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let mut builder = table.new_vector_search_builder();
+        builder.with_projection(&["id"]);
+        let fields = builder.resolve_materialize_read_type().unwrap();
+        let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["id"]);
     }
 }
