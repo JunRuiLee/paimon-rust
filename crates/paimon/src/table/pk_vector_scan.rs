@@ -144,21 +144,17 @@ impl BucketAccumulator {
     }
 }
 
-/// The snapshot id plus the per-bucket search splits produced by planning.
-#[allow(dead_code)]
+/// The per-bucket search splits produced by planning.
 pub(crate) struct PkVectorScanPlan {
-    pub snapshot_id: i64,
     pub splits: Vec<PkVectorSearchSplit>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct PkVectorScan<'a> {
     table: &'a Table,
     vector_field_id: i32,
     index_type: String,
 }
 
-#[allow(dead_code)]
 impl<'a> PkVectorScan<'a> {
     pub(crate) fn new(table: &'a Table, vector_field_id: i32, index_type: String) -> Self {
         Self {
@@ -172,12 +168,7 @@ impl<'a> PkVectorScan<'a> {
         let snapshot_manager = self.table.snapshot_manager();
         let snapshot = match snapshot_manager.get_latest_snapshot().await? {
             Some(s) => s,
-            None => {
-                return Ok(PkVectorScanPlan {
-                    snapshot_id: -1,
-                    splits: Vec::new(),
-                })
-            }
+            None => return Ok(PkVectorScanPlan { splits: Vec::new() }),
         };
         let snapshot_id = snapshot.id();
 
@@ -229,17 +220,13 @@ impl<'a> PkVectorScan<'a> {
         }
 
         let splits = plan_from_inputs(snapshot_id, data_splits, entries)?;
-        Ok(PkVectorScanPlan {
-            snapshot_id,
-            splits,
-        })
+        Ok(PkVectorScanPlan { splits })
     }
 }
 
 /// Pure planning core, drivable without a live snapshot: group ANN payloads and
 /// data splits by `(partition, bucket)`, then assemble one search split per
 /// bucket that has data. Index-only buckets are dropped, not errored.
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 fn plan_from_inputs(
     snapshot_id: i64,
@@ -259,9 +246,11 @@ fn plan_from_inputs(
             .or_default()
             .push(BucketAnnSegment {
                 source_meta,
-                file_name,
                 path,
                 file_size,
+                // Not consumed on the search path: the vindex reader loads its
+                // metadata from the index file bytes and ignores this field, so an
+                // absent value defaulting to an empty vec is acceptable.
                 index_meta: gim.index_meta.clone().unwrap_or_default(),
             });
     }
@@ -424,7 +413,6 @@ mod tests {
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].ann_segments.len(), 1);
         let seg = &splits[0].ann_segments[0];
-        assert_eq!(seg.file_name, "seg0");
         assert_eq!(seg.path, "idx/seg0");
         assert_eq!(seg.file_size, 10);
         assert_eq!(seg.source_meta.resolve(0).unwrap(), ("d0".to_string(), 0));

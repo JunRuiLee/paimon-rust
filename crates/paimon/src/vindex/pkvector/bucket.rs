@@ -34,7 +34,6 @@ use crate::spec::PkVectorSourceMeta;
 /// scorer that reads it.
 pub(crate) struct BucketAnnSegment {
     pub source_meta: PkVectorSourceMeta,
-    pub file_name: String,
     /// Resolved index-file path (globally unique; the scorer's preload key).
     pub path: String,
     pub file_size: u64,
@@ -48,7 +47,6 @@ impl BucketAnnSegment {
     pub(crate) fn for_test(source_meta: PkVectorSourceMeta) -> Self {
         Self {
             source_meta,
-            file_name: "seg".to_string(),
             path: "seg".to_string(),
             file_size: 0,
             index_meta: Vec::new(),

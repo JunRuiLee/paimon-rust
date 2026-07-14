@@ -22,13 +22,23 @@ use crate::spec::{
     CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
     IndexManifestEntry, ROW_ID_FIELD_NAME,
 };
+use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
+use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
+use crate::table::pk_vector_orchestrator::{
+    PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+};
+use crate::table::pk_vector_scan::PkVectorScan;
 use crate::table::{find_field_id_by_name, merge_row_ranges, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
+use crate::vindex::pkvector::ann::VindexAnnSearcher;
+use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
+use crate::vindex::pkvector::metric::VectorSearchMetric;
+use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use futures::TryStreamExt;
@@ -119,7 +129,8 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -136,6 +147,30 @@ impl<'a> VectorSearchBuilder<'a> {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
 
+        // Primary-key vector search branch: mirrors Java `PrimaryKeyVectorRead`.
+        // Only taken when the table enables the PK-vector index AND this query
+        // targets a configured PK-vector column; otherwise fall through to the
+        // data-evolution (DE) global-index path below.
+        //
+        // Membership is resolved first via the non-erroring columns accessor so a
+        // malformed PK-vector config (e.g. more than one column, or a blank list)
+        // cannot abort an unrelated DE query. The exactly-one-column rule is
+        // enforced only once this query is known to target a PK-vector column,
+        // keeping fail-loud behavior for a genuinely-broken config on the path
+        // where erroring is correct.
+        if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+            if targets_pk_column {
+                let pk_col = core.primary_key_vector_index_column()?;
+                return self
+                    .execute_primary_key_vector_search(&core, &pk_col, query_vector, limit)
+                    .await;
+            }
+        }
+
         let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
         let mut results = batch_builder
             .with_vector_column(vector_column)
@@ -147,6 +182,143 @@ impl<'a> VectorSearchBuilder<'a> {
 
         debug_assert_eq!(results.len(), 1);
         Ok(results.remove(0))
+    }
+
+    /// Run the primary-key bucket-local vector search: plan the per-bucket splits,
+    /// build the real vindex ANN scorer and (outside FAST mode) the exact-fallback
+    /// readers, run the orchestrator, and convert the best-first candidates into a
+    /// `SearchResult`. Mirrors Java `PrimaryKeyVectorRead`.
+    async fn execute_primary_key_vector_search(
+        &self,
+        core: &CoreOptions<'_>,
+        pk_col: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> crate::Result<SearchResult> {
+        // Residual-filter guard: PK vector search accepts partition filters only.
+        // This builder exposes no data-predicate setter, so there is nothing to
+        // reject here; the guard mirrors Java `checkArgument(filter == null)` and,
+        // if a filter setter is ever added, it must error rather than be ignored.
+
+        // `primary_key_vector_distance_metric` returns a validated name; re-parse
+        // into the enum for the numeric semantics.
+        let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
+        let index_type = core.primary_key_vector_index_type(pk_col)?;
+        let field_id =
+            find_field_id_by_name(self.table.schema().fields(), pk_col).ok_or_else(|| {
+                crate::Error::DataInvalid {
+                    message: format!("PK-vector column '{pk_col}' not found in schema"),
+                    source: None,
+                }
+            })?;
+        let vector_field = self
+            .table
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| f.name() == pk_col)
+            .cloned()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("PK-vector column '{pk_col}' not found in schema"),
+                source: None,
+            })?;
+
+        let search_mode = core.global_index_search_mode()?;
+        let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
+
+        let plan = PkVectorScan::new(self.table, field_id, index_type)
+            .plan()
+            .await?;
+        if plan.splits.is_empty() {
+            return Ok(SearchResult::empty());
+        }
+
+        // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
+        // but projecting only the vector column with no predicates.
+        let reader = DataFileReader::new(
+            self.table.file_io().clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema().fields().to_vec(),
+            vec![vector_field.clone()],
+            Vec::new(),
+        );
+
+        // Real ANN scorer: preload each segment's bytes (keyed by resolved,
+        // globally unique path) and drive the vindex reader from memory.
+        let segment_bytes = preload_segment_bytes(self.table.file_io(), &plan.splits).await?;
+        // Fail loud on a config/segment metric mismatch before scoring, mirroring
+        // Java `PkVectorAnnSegmentSearcher.search`.
+        verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric)?;
+        let options = {
+            let mut o = self.table.schema().options().clone();
+            o.extend(self.options.clone());
+            o
+        };
+        let search_options = options.clone();
+        let field_name = pk_col.to_string();
+        let scorer: crate::vindex::pkvector::ann::Scorer =
+            Box::new(move |segment: &BucketAnnSegment, search: &VectorSearch| {
+                let data = segment_bytes
+                    .get(&segment.path)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "missing preloaded ANN bytes for segment".to_string(),
+                        source: None,
+                    })?
+                    .clone();
+                let io_meta = GlobalIndexIOMeta::new(
+                    segment.path.clone(),
+                    segment.file_size,
+                    segment.index_meta.clone(),
+                );
+                let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone());
+                reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+            });
+        let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
+
+        // Exact-fallback readers, keyed by (split_index, file_name). In FAST mode
+        // the kernel never invokes the factory, so skip the in-memory column read
+        // entirely.
+        let mut exact_readers: HashMap<(usize, String), Box<dyn PkVectorReader>> = HashMap::new();
+        if !skip_exact_fallback {
+            for (split_index, split) in plan.splits.iter().enumerate() {
+                let factory = DataFilePkVectorReaderFactory::new(
+                    reader.clone(),
+                    split.data_split.clone(),
+                    vector_field.clone(),
+                )?;
+                for active in &split.active_files {
+                    let r = factory.create(active).await?;
+                    exact_readers.insert((split_index, active.file_name.clone()), r);
+                }
+            }
+        }
+        let mut factory = |split_index: usize,
+                           _split: &PkVectorSearchSplit,
+                           file: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
+            exact_readers
+                .remove(&(split_index, file.file_name.clone()))
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!("no preloaded exact reader for {}", file.file_name),
+                    source: None,
+                })
+        };
+
+        let candidates = PkVectorOrchestrator::new(reader)
+            .search_candidates(
+                &plan.splits,
+                query_vector,
+                metric,
+                limit,
+                Some(&ann_searcher),
+                &mut factory,
+                &search_options,
+                skip_exact_fallback,
+            )
+            .await?;
+
+        candidates_to_search_result(&candidates, &plan.splits, metric)
     }
 }
 
@@ -517,6 +689,135 @@ async fn evaluate_batch_vector_search(
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+}
+
+/// Preload every ANN segment's bytes into a map keyed by the resolved (globally
+/// unique) segment path. The scorer closure reads from this map so the vindex
+/// reader is driven from memory without per-search IO.
+async fn preload_segment_bytes(
+    file_io: &FileIO,
+    splits: &[PkVectorSearchSplit],
+) -> crate::Result<HashMap<String, Vec<u8>>> {
+    let mut out = HashMap::new();
+    for split in splits {
+        for segment in &split.ann_segments {
+            if out.contains_key(&segment.path) {
+                continue;
+            }
+            let input = file_io.new_input(&segment.path)?;
+            let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
+                message: format!("failed to read ANN index file '{}': {e}", segment.path),
+                source: None,
+            })?;
+            out.insert(segment.path.clone(), bytes.to_vec());
+        }
+    }
+    Ok(out)
+}
+
+/// Fail loud when an ANN segment was trained with a metric other than the
+/// configured one, mirroring the search-time `checkArgument` in Java
+/// `PkVectorAnnSegmentSearcher.search`. Opens each distinct segment's preloaded
+/// bytes once and compares its trained metric against `configured`.
+fn verify_pk_vector_segment_metrics(
+    splits: &[PkVectorSearchSplit],
+    segment_bytes: &HashMap<String, Vec<u8>>,
+    configured: VectorSearchMetric,
+) -> crate::Result<()> {
+    let mut checked: HashSet<&str> = HashSet::new();
+    for split in splits {
+        for segment in &split.ann_segments {
+            if !checked.insert(segment.path.as_str()) {
+                continue;
+            }
+            let bytes =
+                segment_bytes
+                    .get(&segment.path)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!(
+                            "missing preloaded ANN bytes for segment '{}'",
+                            segment.path
+                        ),
+                        source: None,
+                    })?;
+            let reader = VIndexReader::open(Cursor::new(bytes.clone())).map_err(|e| {
+                crate::Error::DataInvalid {
+                    message: format!(
+                        "failed to open ANN index file '{}' for metric check: {e}",
+                        segment.path
+                    ),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+            let segment_metric = reader.metadata().metric;
+            if VectorSearchMetric::from_vindex(segment_metric) != configured {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "ANN segment metric {} does not match configured metric {}",
+                        segment_metric.as_str(),
+                        configured.as_str()
+                    ),
+                    source: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// candidate order (no re-sort). Each candidate's global row id is
+/// `first_row_id + row_position` of the data file it references; the score is
+/// derived from the raw distance via the metric. A candidate referencing a file
+/// absent from its split, or a file with no `first_row_id`, fails loud.
+fn candidates_to_search_result(
+    candidates: &[PkVectorCandidate],
+    splits: &[PkVectorSearchSplit],
+    metric: VectorSearchMetric,
+) -> crate::Result<SearchResult> {
+    let mut row_ids = Vec::with_capacity(candidates.len());
+    let mut scores = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let split = splits
+            .get(c.split_index)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("candidate split_index {} out of range", c.split_index),
+                source: None,
+            })?;
+        let file_meta = split
+            .data_split
+            .data_files()
+            .iter()
+            .find(|f| f.file_name == c.data_file_name)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "candidate references data file {} not present in its split",
+                    c.data_file_name
+                ),
+                source: None,
+            })?;
+        let first_row_id = file_meta
+            .first_row_id
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("data file {} has no first_row_id", c.data_file_name),
+                source: None,
+            })?;
+        let global =
+            first_row_id
+                .checked_add(c.row_position)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "global row id overflows i64".to_string(),
+                    source: None,
+                })?;
+        row_ids.push(
+            u64::try_from(global).map_err(|_| crate::Error::DataInvalid {
+                message: format!("negative global row id {global}"),
+                source: None,
+            })?,
+        );
+        scores.push(metric.distance_to_score(c.distance));
+    }
+    // Order preserved: best-first, as produced by the orchestrator.
+    Ok(SearchResult::new(row_ids, scores))
 }
 
 fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
@@ -1324,10 +1625,12 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
+    use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, DataType, FloatType, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry,
-        IntType, Schema, TableSchema,
+        ArrayType, BinaryRow, DataFileMeta, DataType, FloatType, GlobalIndexMeta, IndexFileMeta,
+        IndexManifestEntry, IntType, Schema, TableSchema,
     };
+    use crate::table::source::DataSplitBuilder;
     use crate::vindex::IVF_FLAT_IDENTIFIER;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     use arrow_array::ArrayRef;
@@ -1874,6 +2177,314 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "vector search must fail closed for a query-auth table"
         );
+    }
+
+    fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: 1,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 1,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id,
+            write_cols: None,
+        }
+    }
+
+    fn pk_search_split(bucket: i32, files: Vec<DataFileMeta>) -> PkVectorSearchSplit {
+        PkVectorSearchSplit {
+            data_split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(bucket)
+                .with_bucket_path(format!("memory:/t/bucket-{bucket}"))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .build()
+                .unwrap(),
+            ann_segments: Vec::new(),
+            active_files: Vec::new(),
+        }
+    }
+
+    fn pk_candidate(
+        split_index: usize,
+        bucket: i32,
+        file: &str,
+        pos: i64,
+        distance: f32,
+    ) -> PkVectorCandidate {
+        PkVectorCandidate {
+            split_index,
+            partition: BinaryRow::new(0),
+            bucket,
+            data_file_name: file.to_string(),
+            row_position: pos,
+            distance,
+        }
+    }
+
+    #[test]
+    fn candidates_to_search_result_global_row_id_and_best_first_order() {
+        // Two files in one split with different first_row_id. The helper is a pure
+        // order-preserving map: the orchestrator already established best-first
+        // order upstream, so the candidate INPUT order here is deliberately NOT in
+        // score order and NOT in (file, position) order. This proves the helper
+        // preserves the given sequence rather than sorting.
+        let splits = vec![pk_search_split(
+            0,
+            vec![
+                pk_data_file("file-a", 100, Some(1000)),
+                pk_data_file("file-b", 100, Some(5000)),
+            ],
+        )];
+        // Input sequence (NOT sorted by score, NOT sorted by file/position):
+        //   c0: file-b pos5 d=2.0  -> WORST distance, appears FIRST
+        //   c1: file-b pos1 d=1.0  -> tie with c2
+        //   c2: file-a pos2 d=1.0  -> tie with c1
+        // A score-based best-first re-sort would produce [c1, c2, c0] (worst last);
+        // a (file, position) re-sort would produce [c2 (file-a), c1, c0]. Both
+        // differ from the input order, so the exact assertion below discriminates.
+        let candidates = vec![
+            pk_candidate(0, 0, "file-b", 5, 2.0),
+            pk_candidate(0, 0, "file-b", 1, 1.0),
+            pk_candidate(0, 0, "file-a", 2, 1.0),
+        ];
+        let result = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
+            .expect("conversion succeeds");
+        // global_row_id = first_row_id + position; INPUT order preserved (not sorted).
+        assert_eq!(result.row_ids, vec![5005, 5001, 1002]);
+        assert_eq!(
+            result.scores,
+            vec![
+                VectorSearchMetric::L2.distance_to_score(2.0),
+                VectorSearchMetric::L2.distance_to_score(1.0),
+                VectorSearchMetric::L2.distance_to_score(1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_to_search_result_absent_first_row_id_fails_loud() {
+        let splits = vec![pk_search_split(0, vec![pk_data_file("file-a", 100, None)])];
+        let candidates = vec![pk_candidate(0, 0, "file-a", 0, 1.0)];
+        let err = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
+            .expect_err("absent first_row_id must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("first_row_id")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Build a real vindex IVF-flat segment trained with `metric`, returning the
+    /// serialized bytes. `nlist = 1` keeps training trivial and deterministic; the
+    /// only thing the metric check cares about is the persisted metadata metric.
+    fn build_vindex_segment_bytes(metric: &str) -> Vec<u8> {
+        use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+        use paimon_vindex_core::io::PosWriter;
+
+        const DIM: usize = 2;
+        let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let n = vectors.len() / DIM;
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let options = HashMap::from([
+            ("index.type".to_string(), "ivf_flat".to_string()),
+            ("dimension".to_string(), DIM.to_string()),
+            ("nlist".to_string(), "1".to_string()),
+            ("metric".to_string(), metric.to_string()),
+        ]);
+        let config = VectorIndexConfig::from_options(&options).unwrap();
+        let training = VectorIndexTrainer::train(config, &vectors, n).unwrap();
+        let mut writer = VectorIndexWriter::new(training);
+        writer.add_vectors(&ids, &vectors, n).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut output = PosWriter::new(&mut bytes);
+            writer.write(&mut output).unwrap();
+        }
+        bytes
+    }
+
+    /// A `PkVectorSearchSplit` carrying a single ANN segment addressed by `path`.
+    fn pk_split_with_segment(path: &str) -> PkVectorSearchSplit {
+        let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
+        let source_meta =
+            crate::spec::PkVectorSourceMeta::new(vec![crate::spec::PkVectorSourceFile::new(
+                "file-a".to_string(),
+                3,
+            )
+            .unwrap()])
+            .unwrap();
+        let mut segment = BucketAnnSegment::for_test(source_meta);
+        segment.path = path.to_string();
+        split.ann_segments = vec![segment];
+        split
+    }
+
+    #[test]
+    fn verify_pk_vector_segment_metrics_accepts_matching_metric() {
+        // Real IVF segment trained with L2; configured metric L2 => Ok.
+        let bytes = build_vindex_segment_bytes("l2");
+        let splits = vec![pk_split_with_segment("seg-l2")];
+        let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
+        verify_pk_vector_segment_metrics(&splits, &segment_bytes, VectorSearchMetric::L2)
+            .expect("matching metric must pass");
+    }
+
+    #[test]
+    fn verify_pk_vector_segment_metrics_rejects_mismatched_metric() {
+        // Real IVF segment trained with L2; configured metric Cosine => fail loud.
+        let bytes = build_vindex_segment_bytes("l2");
+        let splits = vec![pk_split_with_segment("seg-l2")];
+        let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
+        let err =
+            verify_pk_vector_segment_metrics(&splits, &segment_bytes, VectorSearchMetric::Cosine)
+                .expect_err("mismatched metric must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("does not match configured metric")
+                    && message.contains("l2")
+                    && message.contains("cosine")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn candidates_to_search_result_missing_file_fails_loud() {
+        let splits = vec![pk_search_split(
+            0,
+            vec![pk_data_file("known", 100, Some(0))],
+        )];
+        let candidates = vec![pk_candidate(0, 0, "unknown", 0, 1.0)];
+        let err = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
+            .expect_err("missing file must fail loud");
+        assert!(matches!(err, crate::Error::DataInvalid { .. }));
+    }
+
+    fn pk_vector_table(options: &[(&str, &str)]) -> Table {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            );
+        for (k, v) in options {
+            builder = builder.option(*k, *v);
+        }
+        let schema = builder.build().unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "pk_vector_test"),
+            "memory:/pk_vector_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn pk_branch_disabled_falls_through_to_de_path() {
+        // No pk-vector.index.columns: behaves exactly as the DE path. With no
+        // snapshot the DE path returns an empty result; the PK branch must not
+        // intercept it.
+        let table = pk_vector_table(&[]);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pk_branch_enabled_empty_plan_returns_empty() {
+        // pk-vector.index.columns set, but no snapshot -> empty plan -> empty result.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pk_branch_other_column_falls_through_to_de_path() {
+        // pk-vector index configured for "embedding", but the query targets a
+        // different column -> the PK branch must not intercept; DE path (no
+        // snapshot) yields empty. Discriminator: the PK column carries a
+        // DELIBERATELY INVALID distance metric, which the PK branch parses eagerly
+        // (`VectorSearchMetric::parse`) and would fail on. So a regression that
+        // dropped the `pk_col == vector_column` guard and ran the PK branch for
+        // "other" would surface as Err here, not Ok(empty) -- the assertion
+        // therefore proves the DE path ran, not merely that the result is empty.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            (
+                "fields.embedding.pk-vector.distance.metric",
+                "not-a-real-metric",
+            ),
+        ]);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("other")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pk_branch_multi_column_config_does_not_break_unrelated_de_query() {
+        // A malformed multi-column PK-vector config ("a,b") must not abort an
+        // unrelated DE vector query. The query targets a column NOT among the
+        // configured PK-vector columns, so membership resolution short-circuits
+        // before the exactly-one-column rule fires -- the query falls through to
+        // the DE path (no snapshot -> empty) instead of surfacing the "must name
+        // exactly one column" error.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "a,b"),
+            ("fields.a.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.a.pk-vector.distance.metric", "l2"),
+        ]);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("other")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_scored()
+            .await;
+        match result {
+            Ok(search) => assert!(search.is_empty()),
+            Err(err) => panic!(
+                "unrelated DE query must not error on a malformed multi-column PK config: {err}"
+            ),
+        }
     }
 
     fn make_lumina_entry(

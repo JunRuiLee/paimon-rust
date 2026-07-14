@@ -15,18 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Primary-key vector read orchestration: Rust equivalent of Java
-//! `PrimaryKeyVectorRead` + `PrimaryKeyVectorResult.splits()`.
+//! Primary-key vector read orchestration (Rust equivalent of Java
+//! `PrimaryKeyVectorRead` + `PrimaryKeyVectorResult.splits()`).
 //!
 //! Per-bucket search via `bucket_search`, cross-bucket global Top-K merge,
 //! grouping survivors by data file into `PkVectorIndexedSplit`s, and lazy
-//! materialization via `PkVectorIndexedSplitRead`. Inputs are per-bucket
-//! `PkVectorSearchSplit`s supplied by the caller.
-
-// The read path that drives this module lands in a later change, so under
-// clippy -D warnings the module reads as dead_code until then. Suppress at the
-// module boundary.
-#![allow(dead_code)]
+//! materialization via `PkVectorIndexedSplitRead`.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -53,8 +47,9 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-/// Per-bucket search input. Rust equivalent of Java `BucketVectorSearchSplit`.
-/// A `PrimaryKeyVectorScan` mirror constructs these from a snapshot/manifest plan.
+/// One bucket's search input. Rust equivalent of Java
+/// `BucketVectorSearchSplit`. Constructed from a snapshot/manifest plan by
+/// `PkVectorScan`.
 pub(crate) struct PkVectorSearchSplit {
     /// The bucket's combined data split (>= 1 data file); source of the
     /// partition/bucket/bucket_path/snapshot, the per-file `DataFileMeta`, and the
@@ -109,6 +104,9 @@ fn global_top_k(mut candidates: Vec<PkVectorCandidate>, limit: usize) -> Vec<PkV
 /// source bucket split, and build one `PkVectorIndexedSplit` per file. Groups are
 /// emitted in ascending group-key order (deterministic file/position output
 /// order). Mirrors Java `PrimaryKeyVectorResult.splits()`.
+// Part of the row-materialization path (`read`), which no production caller
+// drives yet; the wired search path returns candidates directly.
+#[allow(dead_code)]
 fn build_indexed_splits(
     survivors: Vec<PkVectorCandidate>,
     splits: &[PkVectorSearchSplit],
@@ -214,7 +212,8 @@ fn build_indexed_splits(
 /// Build one bucket's DV map: keys are the union of active-file names and all
 /// ANN-source file names, so an ANN-source file not in `active_files` still gets
 /// its DV. Uses one split-level factory. (Search-time DV; materialization loads
-/// its own DV again — an accepted redundancy.)
+/// its own DV again — an accepted redundancy between the search and
+/// materialization phases.)
 async fn build_bucket_dv_map(
     reader: &DataFileReader,
     split: &PkVectorSearchSplit,
@@ -322,9 +321,15 @@ impl PkVectorOrchestrator {
         Ok(global_top_k(candidates, limit))
     }
 
-    /// See spec §3. `async` because the eager search phase is genuine async IO
+    /// Run the eager per-bucket search phase, then return a stream that lazily
+    /// materializes the surviving rows. `async` because the eager search phase is
+    /// genuine async IO
     /// needing the borrowed `exact_reader_factory` / `ann_searcher`; the returned
     /// stream owns only the built splits + a reader clone (so it is `'static`).
+    ///
+    /// The wired vector search returns matched row-ids and scores via
+    /// `search_candidates`; no production caller drives row materialization yet.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read(
         &self,

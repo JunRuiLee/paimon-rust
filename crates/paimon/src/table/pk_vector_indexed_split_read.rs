@@ -15,21 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Primary-key vector indexed-split read-path contract (read-path subset of
-//! apache/paimon#8576).
+//! Primary-key vector indexed-split read-path contract.
 //!
 //! `PkVectorIndexedSplit` carries one data file + inclusive physical-position
 //! ranges + an optional aligned score array. `PkVectorIndexedSplitRead` validates
 //! the split, expands the ranges into an ascending position set and a
 //! `position -> score` map, and delegates to the sibling `PkVectorPositionRead`.
-//! It is a pure consumer: no bucket/ANN search, no cross-bucket orchestration, no
+//! It is a pure consumer: no bucket/ANN search, no cross-bucket merge, no
 //! serialization.
 
-// This module wires the position reader into the indexed read contract; the
-// sibling `pk_vector_orchestrator` adds cross-bucket orchestration on top. The
-// read path that drives that chain lands in a later change, so under clippy
-// -D warnings these items read as dead_code until then. Suppress at the module
-// boundary.
+// This materialization read path is exercised only by its own tests: the wired
+// vector search returns matched row-ids and scores directly, so no production
+// caller drives row materialization yet. Suppress dead_code at the module
+// boundary until a materializing caller exists.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

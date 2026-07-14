@@ -46,7 +46,6 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// `reader` is configured (via [`DataFileReader::with_read_type`]) to project
 /// only the vector column, so each read returns a single-column batch. Mirrors
 /// Java `PkVectorDataFileReader` (as a factory owning the projected reader).
-#[allow(dead_code)]
 pub(crate) struct DataFilePkVectorReaderFactory {
     reader: DataFileReader,
     data_split: DataSplit,
@@ -58,7 +57,6 @@ impl DataFilePkVectorReaderFactory {
     /// Configure `reader` to project the vector column only and capture the
     /// vector dimension from the schema field. The field must be a fixed-length
     /// `Vector` type; anything else is rejected as invalid.
-    #[allow(dead_code)]
     pub(crate) fn new(
         reader: DataFileReader,
         data_split: DataSplit,
@@ -85,7 +83,6 @@ impl DataFilePkVectorReaderFactory {
     /// sequential reader over it. `file` must name a data file present in this
     /// factory's split. The drained row count is checked against the file's
     /// `DataFileMeta.row_count`.
-    #[allow(dead_code)]
     pub(crate) async fn create(
         &self,
         file: &BucketActiveFile,
@@ -384,12 +381,19 @@ mod integration_tests {
         let file_path = format!("{bucket_path}/{file_name}");
         let output = file_io.new_output(&file_path).unwrap();
         let mut writer: Box<dyn FormatFileWriter> = Box::new(
-            ParquetFormatWriter::new(&output, arrow_schema.clone(), "zstd", 1)
-                .await
-                .unwrap(),
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                None,
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap(),
         );
         writer.write(&batch).await.unwrap();
-        let file_size = writer.close().await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
 
         let table_schema_id = 1;
         let data_split = DataSplitBuilder::new()
