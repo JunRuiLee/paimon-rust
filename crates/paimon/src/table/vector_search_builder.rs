@@ -149,6 +149,11 @@ impl<'a> VectorSearchBuilder<'a> {
     /// that does not resolve to the primary-key vector path (no PK-vector index,
     /// or a non-PK-vector column) also fails loud rather than silently ignoring
     /// the filter.
+    ///
+    /// The whole predicate is treated as a residual data filter applied per row;
+    /// this builder does not split off a partition sub-filter for scan-time
+    /// partition pruning. Partition columns are stored per row, so results stay
+    /// exact — only partition pushdown is forgone.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
         self
