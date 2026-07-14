@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::arrow::format::FilePredicates;
+use crate::arrow::residual::filter_record_batch_by_predicates;
 use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
@@ -38,6 +40,7 @@ use crate::table::pk_vector_position_read::{
 };
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
+use crate::table::source::DataSplit;
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
@@ -910,6 +913,87 @@ async fn evaluate_batch_vector_search(
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+}
+
+/// Compute, per data file in `split`, the set of physical row positions whose
+/// rows satisfy the residual predicate. Mirrors the row-collecting half of Java
+/// `PrimaryKeyVectorRead`'s `executeFilter`: because
+/// [`DataFileReader::read_single_file_stream`] rejects projecting `_ROW_ID`
+/// alongside a row-filtering predicate (the residual filter would drop rows
+/// before `_ROW_ID` is assigned positionally, desyncing it), the predicate is
+/// NOT pushed down. Instead `reader` projects the residual columns together with
+/// `_ROW_ID` and carries no pushdown predicate; the residual is applied here at
+/// the Arrow level, after `_ROW_ID` is materialized, and each surviving row's
+/// `_ROW_ID - first_row_id` is the file-local physical position.
+///
+/// Every data file in the split gets an entry, possibly empty. The bucket search
+/// treats an absent entry and an empty entry identically (the file contributes no
+/// candidates), so the empty entries only make the map cover every active file.
+///
+/// `reader` must project `_ROW_ID` and be predicate-free; `residual.file_fields`
+/// are the fields the residual leaf indices point into (resolved by name against
+/// each emitted batch). A data file without `first_row_id` fails loud, matching
+/// the position-read guard.
+// The vector search filter path will call this; until then it has no in-crate
+// caller outside tests.
+#[allow(dead_code)]
+async fn residual_positions_by_file(
+    reader: &DataFileReader,
+    split: &DataSplit,
+    residual: &FilePredicates,
+) -> crate::Result<HashMap<String, RoaringTreemap>> {
+    let scan_fields = reader.read_type().to_vec();
+    let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
+    for file_meta in split.data_files() {
+        let first_row_id = file_meta
+            .first_row_id
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "residual position read requires data file '{}' to have first_row_id",
+                    file_meta.file_name
+                ),
+                source: None,
+            })?;
+        let data_fields = reader.derive_data_fields(file_meta).await?;
+        let mut stream =
+            reader.read_single_file_stream(split, file_meta.clone(), data_fields, None, None)?;
+        // Register the file up front so a file whose rows all fail the residual
+        // still appears in the map (empty set).
+        let positions = out.entry(file_meta.file_name.clone()).or_default();
+        while let Some(batch) = stream.try_next().await? {
+            let filtered = filter_record_batch_by_predicates(batch, residual, &scan_fields)?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            let row_id_idx = filtered.schema().index_of(ROW_ID_FIELD_NAME).map_err(|_| {
+                crate::Error::DataInvalid {
+                    message: "residual position read batch is missing the _ROW_ID column"
+                        .to_string(),
+                    source: None,
+                }
+            })?;
+            let row_ids = filtered
+                .column(row_id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "residual position read _ROW_ID column is not Int64".to_string(),
+                    source: None,
+                })?;
+            for i in 0..row_ids.len() {
+                let position = row_ids.value(i) - first_row_id;
+                let position = u64::try_from(position).map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "residual position {position} is negative for data file '{}'",
+                        file_meta.file_name
+                    ),
+                    source: None,
+                })?;
+                positions.insert(position);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Preload every ANN segment's bytes into a map keyed by the resolved (globally
@@ -3114,5 +3198,268 @@ mod tests {
         let fields = builder.resolve_materialize_read_type().unwrap();
         let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id"]);
+    }
+}
+
+/// Tests for [`residual_positions_by_file`]: the residual predicate is applied at
+/// the Arrow level (no pushdown) against the predicate columns plus `_ROW_ID`,
+/// and each surviving row's `_ROW_ID` is converted back to a file-local physical
+/// position.
+#[cfg(test)]
+mod residual_positions_tests {
+    use super::*;
+    use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::FilePredicates;
+    use crate::io::FileIOBuilder;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{
+        BigIntType, BinaryRow, DataField, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
+        ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    };
+    use crate::table::data_file_reader::DataFileReader;
+    use crate::table::schema_manager::SchemaManager;
+    use crate::table::source::{DataSplit, DataSplitBuilder};
+    use arrow_array::{Int32Array, RecordBatch};
+    use bytes::Bytes;
+    use paimon_mosaic_core::spec::COMPRESSION_NONE;
+    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+    use std::io;
+    use std::sync::Arc;
+
+    struct MemOutputFile {
+        data: Vec<u8>,
+    }
+
+    impl OutputFile for MemOutputFile {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn pos(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    fn id_field() -> DataField {
+        DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn row_id_field() -> DataField {
+        DataField::new(
+            ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )
+    }
+
+    fn id_batch(ids: Vec<i32>) -> RecordBatch {
+        let schema = build_target_arrow_schema(&[id_field()]).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn write_mosaic(batch: &RecordBatch) -> Bytes {
+        let mut writer = MosaicWriter::new(
+            MemOutputFile { data: Vec::new() },
+            batch.schema().as_ref(),
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 2,
+                row_group_max_size: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(writer.output().data.to_vec())
+    }
+
+    fn data_file(
+        file_name: &str,
+        file_size: i64,
+        row_count: i64,
+        first_row_id: Option<i64>,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 1,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id,
+            write_cols: None,
+        }
+    }
+
+    /// Build a predicate-free reader (read_type = `id` + `_ROW_ID`) over a split
+    /// containing `files` (each `(name, ids, first_row_id)`), written as Mosaic
+    /// data files in the same bucket.
+    async fn build_reader_and_split(
+        table_path: &str,
+        files: &[(&str, Vec<i32>, i64)],
+    ) -> (DataFileReader, DataSplit) {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let mut metas = Vec::new();
+        for (name, ids, first_row_id) in files {
+            let data = write_mosaic(&id_batch(ids.clone()));
+            file_io
+                .new_output(&format!("{bucket_path}/{name}"))
+                .unwrap()
+                .write(data.clone())
+                .await
+                .unwrap();
+            metas.push(data_file(
+                name,
+                data.len() as i64,
+                ids.len() as i64,
+                Some(*first_row_id),
+            ));
+        }
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(metas)
+            .build()
+            .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            1,
+            vec![id_field()],
+            vec![id_field(), row_id_field()],
+            Vec::new(),
+        );
+        (reader, split)
+    }
+
+    /// `id > threshold`, with `file_fields` = `[id]` so the leaf index resolves.
+    fn residual_id_gt(threshold: i32) -> FilePredicates {
+        let pred = PredicateBuilder::new(&[id_field()])
+            .greater_than("id", Datum::Int(threshold))
+            .unwrap();
+        FilePredicates {
+            predicates: vec![pred],
+            file_fields: vec![id_field()],
+        }
+    }
+
+    fn sorted(t: &roaring::RoaringTreemap) -> Vec<u64> {
+        t.iter().collect()
+    }
+
+    #[tokio::test]
+    async fn test_residual_selects_matching_positions() {
+        // ids [1,2,3,4,5] at first_row_id 0; id > 2 -> ids 3,4,5 -> positions 2,3,4.
+        let (reader, split) = build_reader_and_split(
+            "memory:/rpf_basic",
+            &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        )
+        .await;
+        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(2))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_matches_none_yields_empty_entry() {
+        // id > 100 matches nothing; the file still gets a (present, empty) entry.
+        let (reader, split) =
+            build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)])
+                .await;
+        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(100))
+            .await
+            .unwrap();
+        assert!(map.contains_key("part-0.mosaic"));
+        assert!(map["part-0.mosaic"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_residual_matches_all_yields_full_set() {
+        let (reader, split) =
+            build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
+        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(0))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_positions_are_file_local_across_files() {
+        // Two files with distinct first_row_id; positions must be 0-based within
+        // each file, not global. id > 3 keeps ids 4,5 in both -> positions {3,4}.
+        let (reader, split) = build_reader_and_split(
+            "memory:/rpf_multi",
+            &[
+                ("part-0.mosaic", vec![1, 2, 3, 4, 5], 0),
+                ("part-1.mosaic", vec![1, 2, 3, 4, 5], 100),
+            ],
+        )
+        .await;
+        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(3))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
+        assert_eq!(sorted(&map["part-1.mosaic"]), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_missing_first_row_id_is_error() {
+        let (reader, split) = build_reader_and_split_no_first_row_id().await;
+        let err = residual_positions_by_file(&reader, &split, &residual_id_gt(0))
+            .await
+            .expect_err("missing first_row_id must error");
+        assert!(format!("{err:?}").contains("first_row_id"), "got: {err:?}");
+    }
+
+    async fn build_reader_and_split_no_first_row_id() -> (DataFileReader, DataSplit) {
+        let table_path = "memory:/rpf_nofrid";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let data = write_mosaic(&id_batch(vec![1, 2, 3]));
+        file_io
+            .new_output(&format!("{bucket_path}/part-0.mosaic"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file("part-0.mosaic", data.len() as i64, 3, None)])
+            .build()
+            .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            1,
+            vec![id_field()],
+            vec![id_field(), row_id_field()],
+            Vec::new(),
+        );
+        (reader, split)
     }
 }
