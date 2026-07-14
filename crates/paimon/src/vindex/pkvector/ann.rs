@@ -152,7 +152,8 @@ pub(crate) trait PkVectorAnnSearcher {
 /// with a segment's index bytes; tests inject a synthetic scorer. The adapter's
 /// own logic (live-row masking, ordinal mapping, deletion checks, ordering) is
 /// exercised independently of the scorer.
-type Scorer = Box<dyn Fn(&VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>>;
+pub(crate) type Scorer =
+    Box<dyn Fn(&BucketAnnSegment, &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>>>;
 
 /// Structural vindex-backed `PkVectorAnnSearcher`. Composes the pure helpers
 /// (`build_live_row_ids`, `map_ann_results`) around the scorer seam.
@@ -188,7 +189,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         {
             search = search.with_include_row_ids(live);
         }
-        let scored = match (self.scorer)(&search)? {
+        let scored = match (self.scorer)(segment, &search)? {
             Some(map) => map,
             None => return Ok(Vec::new()),
         };
@@ -360,7 +361,7 @@ mod tests {
         let scorer_has_filter = Rc::clone(&seen_has_filter);
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(move |search: &VectorSearch| {
+            Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
                 *scorer_limit.borrow_mut() = search.limit;
                 *scorer_has_filter.borrow_mut() = search.include_row_ids.is_some();
                 let mut scores = HashMap::new();
@@ -369,16 +370,14 @@ mod tests {
                 Ok(Some(scores))
             }),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![
-                    PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-                    PkVectorSourceFile::new("f1".into(), 5).unwrap(),
-                ])
-                .unwrap()
-            },
-        };
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(vec![
+                PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+                PkVectorSourceFile::new("f1".into(), 5).unwrap(),
+            ])
+            .unwrap()
+        });
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let results = searcher
@@ -406,15 +405,12 @@ mod tests {
     fn test_vindex_adapter_rejects_non_positive_limit() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                    .unwrap()
-            },
-        };
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()]).unwrap()
+        });
         let err = searcher
             .search(
                 &segment,
@@ -433,15 +429,12 @@ mod tests {
     fn test_vindex_adapter_empty_scorer_result_is_empty() {
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
-            Box::new(|_: &VectorSearch| Ok(None)),
+            Box::new(|_: &BucketAnnSegment, _: &VectorSearch| Ok(None)),
         );
-        let segment = BucketAnnSegment {
-            source_meta: {
-                use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-                PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                    .unwrap()
-            },
-        };
+        let segment = BucketAnnSegment::for_test({
+            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+            PkVectorSourceMeta::new(vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()]).unwrap()
+        });
         let results = searcher
             .search(
                 &segment,

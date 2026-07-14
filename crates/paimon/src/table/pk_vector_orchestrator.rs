@@ -292,6 +292,7 @@ impl PkVectorOrchestrator {
                 metric,
                 limit,
                 search_options,
+                false,
             )?;
             for PkVectorSearchResult {
                 data_file_name,
@@ -743,15 +744,15 @@ mod e2e_tests {
     }
 
     fn ann_segment(sources: &[(&str, i64)]) -> BucketAnnSegment {
-        BucketAnnSegment {
-            source_meta: PkVectorSourceMeta::new(
+        BucketAnnSegment::for_test(
+            PkVectorSourceMeta::new(
                 sources
                     .iter()
                     .map(|(n, r)| PkVectorSourceFile::new((*n).to_string(), *r).unwrap())
                     .collect(),
             )
             .unwrap(),
-        }
+        )
     }
 
     fn active(name: &str, rows: i64) -> BucketActiveFile {
