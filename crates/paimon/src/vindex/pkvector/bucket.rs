@@ -142,6 +142,13 @@ pub(crate) fn covered_source_files(
 ///
 /// `ann_searcher` may be `None` only when there are no ANN segments; segments
 /// present with `None` is an error.
+///
+/// `residual_ranges` (when `Some`) is a residual-predicate allow-list keyed by
+/// data-file name whose value is the set of physical row positions in that file
+/// that pass the predicate; only those rows may produce candidates. `None` applies
+/// no residual restriction (every row is allowed). A file absent from the map (or
+/// with an empty set) has no allowed rows and produces no candidates. Mirrors Java
+/// `rowRangesByFile`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bucket_search(
     ann_searcher: Option<&dyn PkVectorAnnSearcher>,
@@ -156,6 +163,7 @@ pub(crate) fn bucket_search(
     limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
+    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
     if limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
@@ -213,6 +221,7 @@ pub(crate) fn bucket_search(
             &active_source_files,
             deletion_vectors,
             search_options,
+            residual_ranges,
         )? {
             add_candidate(&mut heap, result, limit);
         }
@@ -223,13 +232,35 @@ pub(crate) fn bucket_search(
             if covered.contains(&file.file_name) {
                 continue;
             }
+            // Residual allow-list: when present, only rows whose physical position
+            // passes the predicate may produce candidates. A file with no entry (or
+            // an empty entry) has no allowed rows, so it is skipped without reading.
+            let residual_allowed: Option<&roaring::RoaringTreemap> = match residual_ranges {
+                Some(ranges) => match ranges.get(&file.file_name) {
+                    Some(allowed) if !allowed.is_empty() => Some(allowed),
+                    _ => continue,
+                },
+                None => None,
+            };
             let dv = deletion_vectors.get(&file.file_name).cloned();
             let is_excluded = move |position: i64| -> bool {
-                match &dv {
+                let dv_deleted = match &dv {
                     Some(dv) => u64::try_from(position)
                         .map(|p| dv.is_deleted(p))
                         .unwrap_or(false),
                     None => false,
+                };
+                if dv_deleted {
+                    return true;
+                }
+                match residual_allowed {
+                    // No residual restriction: the row is allowed.
+                    None => false,
+                    // Residual present: exclude positions outside the allow-list.
+                    Some(allowed) => match u64::try_from(position) {
+                        Ok(p) => !allowed.contains(p),
+                        Err(_) => true,
+                    },
                 }
             };
             let mut reader = exact_reader_factory(file)?;
@@ -291,6 +322,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
         ) -> crate::Result<Vec<PkVectorSearchResult>> {
             Ok(self.result.clone())
         }
@@ -311,6 +343,7 @@ mod tests {
             0,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("positive"));
@@ -351,6 +384,7 @@ mod tests {
             3,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         // Top-3 BEST_FIRST: (data-1,0), (data-1,1), (data-1,2) — the larger
@@ -439,6 +473,7 @@ mod tests {
             2,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -488,6 +523,7 @@ mod tests {
             2,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         // Candidates: data-2 pos0 {1,0} dist 1.0; data-1 pos1 {2,0} dist 4.0.
@@ -524,6 +560,7 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("duplicate") || err.to_string().contains("Duplicate"));
@@ -548,6 +585,7 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -586,6 +624,7 @@ mod tests {
             2,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -616,6 +655,7 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -641,6 +681,7 @@ mod tests {
             2,
             &HashMap::new(),
             true, // skip_exact_fallback
+            None,
         )
         .unwrap();
         assert!(results.is_empty());
@@ -661,6 +702,7 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("row count") || err.to_string().contains("-1"));
@@ -693,5 +735,163 @@ mod tests {
         let active = vec![active("data-1", 3)];
         let covered = covered_source_files(&[segment], &active);
         assert!(covered.is_empty());
+    }
+
+    fn treemap(positions: &[u64]) -> roaring::RoaringTreemap {
+        let mut t = roaring::RoaringTreemap::new();
+        for &p in positions {
+            t.insert(p);
+        }
+        t
+    }
+
+    #[test]
+    fn test_exact_residual_allow_list_restricts_positions() {
+        // No ANN. data-1 has 3 rows: pos0 {1,0} dist 1.0, pos1 {2,0} dist 4.0,
+        // pos2 {3,0} dist 9.0. residual allows only {0, 2} -> pos1 excluded even
+        // though it is not deletion-vector deleted.
+        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+            Ok(Box::new(ArrayReader::new(
+                2,
+                vec![
+                    Some(vec![1.0, 0.0]),
+                    Some(vec![2.0, 0.0]),
+                    Some(vec![3.0, 0.0]),
+                ],
+            )))
+        };
+        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        residual.insert("data-1".into(), treemap(&[0, 2]));
+        let results = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 3)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            5,
+            &HashMap::new(),
+            false,
+            Some(&residual),
+        )
+        .unwrap();
+        assert_eq!(
+            results,
+            vec![
+                PkVectorSearchResult {
+                    data_file_name: "data-1".into(),
+                    row_position: 0,
+                    distance: 1.0
+                },
+                PkVectorSearchResult {
+                    data_file_name: "data-1".into(),
+                    row_position: 2,
+                    distance: 9.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_exact_residual_file_absent_from_map_is_skipped_without_reading() {
+        // residual covers only data-1; data-2 has no entry -> no allowed rows, so
+        // data-2 is skipped entirely (its factory reader is never built).
+        let calls = RefCell::new(Vec::<String>::new());
+        let mut factory = |f: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+            calls.borrow_mut().push(f.file_name.clone());
+            Ok(Box::new(ArrayReader::new(
+                2,
+                vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
+            )))
+        };
+        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        residual.insert("data-1".into(), treemap(&[0, 1]));
+        let results = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            5,
+            &HashMap::new(),
+            false,
+            Some(&residual),
+        )
+        .unwrap();
+        // Only data-1 rows appear; data-2 was never read.
+        assert!(results.iter().all(|r| r.data_file_name == "data-1"));
+        assert_eq!(calls.borrow().as_slice(), &["data-1".to_string()]);
+    }
+
+    #[test]
+    fn test_exact_residual_empty_set_file_is_skipped_without_reading() {
+        // data-1 has an entry but it is empty -> no allowed rows, skipped without
+        // reading. Mirrors a file with no residual matches.
+        let calls = RefCell::new(0);
+        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+            *calls.borrow_mut() += 1;
+            unreachable!("data-1 has an empty allow set and must not be read")
+        };
+        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        residual.insert("data-1".into(), treemap(&[]));
+        let results = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 3)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            5,
+            &HashMap::new(),
+            false,
+            Some(&residual),
+        )
+        .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn test_exact_residual_intersects_with_deletion_vector() {
+        // residual allows {0, 1, 2} but the deletion vector deletes pos0; the
+        // surviving candidates are the residual-allowed AND not-deleted rows.
+        let mut factory = |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> {
+            Ok(Box::new(ArrayReader::new(
+                2,
+                vec![
+                    Some(vec![1.0, 0.0]),
+                    Some(vec![2.0, 0.0]),
+                    Some(vec![3.0, 0.0]),
+                ],
+            )))
+        };
+        let mut dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(0); // pos0 deleted
+        dvs.insert("data-1".into(), Arc::new(DeletionVector::from_bitmap(bm)));
+        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
+        residual.insert("data-1".into(), treemap(&[0, 1, 2]));
+        let results = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 3)],
+            &dvs,
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            5,
+            &HashMap::new(),
+            false,
+            Some(&residual),
+        )
+        .unwrap();
+        assert_eq!(
+            results.iter().map(|r| r.row_position).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

@@ -35,12 +35,21 @@ use crate::vector_search::VectorSearch;
 /// longer readable in this snapshot). Deletion vectors are applied only to active
 /// sources.
 ///
-/// Returns `None` only when every source file is active AND no deletion vector is
-/// relevant — nothing to mask. Otherwise returns the masked live ids.
+/// `residual_ranges` (when `Some`) restricts each source file to the physical row
+/// positions allowed by a residual predicate on the data columns: `key = file
+/// name`, `value = allowed physical positions`. A file with no entry (or an empty
+/// entry) has no allowed rows and contributes nothing. When `residual_ranges` is
+/// `Some`, a mask is always required (the residual can only narrow the live set),
+/// so the result is always `Some`. Mirrors Java `rowRangesByFile`.
+///
+/// Returns `None` only when there is no residual, every source file is active, AND
+/// no deletion vector is relevant — nothing to mask. Otherwise returns the masked
+/// live ids.
 pub(crate) fn build_live_row_ids(
     source_files: &[PkVectorSourceFile],
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
+    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
 ) -> crate::Result<Option<roaring::RoaringTreemap>> {
     let all_active = source_files
         .iter()
@@ -48,7 +57,7 @@ pub(crate) fn build_live_row_ids(
     let has_relevant_dv = source_files
         .iter()
         .any(|f| deletion_vectors.contains_key(f.file_name()));
-    if all_active && !has_relevant_dv {
+    if residual_ranges.is_none() && all_active && !has_relevant_dv {
         return Ok(None);
     }
 
@@ -63,7 +72,28 @@ pub(crate) fn build_live_row_ids(
             .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
         let active = active_source_files.contains(source_file.file_name());
         if active && row_count > 0 {
-            live.insert_range(file_offset..end);
+            match residual_ranges {
+                // No residual: the whole active file range is live.
+                None => {
+                    live.insert_range(file_offset..end);
+                }
+                // Residual present: only allowed physical positions of this file
+                // become live, mapped into global ordinal space (position +
+                // file_offset). A missing/empty entry allows no rows.
+                Some(ranges) => {
+                    if let Some(allowed) = ranges.get(source_file.file_name()) {
+                        for position in allowed.iter() {
+                            if position < row_count {
+                                let global =
+                                    file_offset.checked_add(position).ok_or_else(|| {
+                                        data_invalid("vector residual position overflows u64")
+                                    })?;
+                                live.insert(global);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if active {
             if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
@@ -143,6 +173,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
+        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     ) -> crate::Result<Vec<PkVectorSearchResult>>;
 }
 
@@ -185,6 +216,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
+        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
         if limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
@@ -192,8 +224,12 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         let source_files = segment.source_meta.source_files();
         let mut search = VectorSearch::new(query.to_vec(), limit, self.field_name.clone())?
             .with_options(search_options.clone());
-        if let Some(live) = build_live_row_ids(source_files, active_source_files, deletion_vectors)?
-        {
+        if let Some(live) = build_live_row_ids(
+            source_files,
+            active_source_files,
+            deletion_vectors,
+            residual_ranges,
+        )? {
             search = search.with_include_row_ids(live);
         }
         let scored = match (self.scorer)(segment, &search)? {
@@ -241,13 +277,15 @@ mod tests {
         let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
         let active = active_set(&["f0"]);
         // All active + empty map -> None.
-        assert!(build_live_row_ids(&files, &active, &HashMap::new())
+        assert!(build_live_row_ids(&files, &active, &HashMap::new(), None)
             .unwrap()
             .is_none());
         // All active + non-empty map but no matching file name -> None.
         let mut dvs = HashMap::new();
         dvs.insert("other".to_string(), dv(&[0]));
-        assert!(build_live_row_ids(&files, &active, &dvs).unwrap().is_none());
+        assert!(build_live_row_ids(&files, &active, &dvs, None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -258,7 +296,7 @@ mod tests {
             PkVectorSourceFile::new("f0".into(), 3).unwrap(),
             PkVectorSourceFile::new("f1".into(), 2).unwrap(),
         ];
-        let live = build_live_row_ids(&files, &active_set(&["f0"]), &HashMap::new())
+        let live = build_live_row_ids(&files, &active_set(&["f0"]), &HashMap::new(), None)
             .unwrap()
             .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1, 2]);
@@ -274,7 +312,7 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1])); // deletes global 1
         dvs.insert("f1".to_string(), dv(&[0])); // deletes global 3
-        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs)
+        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, None)
             .unwrap()
             .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2, 4]);
@@ -396,6 +434,7 @@ mod tests {
                 &active_set(&["f0", "f1"]),
                 &dvs,
                 &HashMap::new(),
+                None,
             )
             .unwrap();
         // Sorted BEST_FIRST by distance: (f1,0) dist 1.0 then (f0,0) dist 3.0.
@@ -427,6 +466,7 @@ mod tests {
                 &active_set(&["f0"]),
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("positive"));
@@ -451,8 +491,113 @@ mod tests {
                 &active_set(&["f0"]),
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    fn treemap(positions: &[u64]) -> roaring::RoaringTreemap {
+        let mut t = roaring::RoaringTreemap::new();
+        for &p in positions {
+            t.insert(p);
+        }
+        t
+    }
+
+    #[test]
+    fn test_build_live_row_ids_residual_intersects_with_active_and_dv() {
+        // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4). Both active.
+        // dv on f0 deletes pos1 (global 1). residual allows f0={0,1}, f1 has no
+        // entry (empty allow). Result: f0 keeps {0} (1 is residual-allowed but
+        // deleted, 2 not residual-allowed); f1 contributes nothing.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[1]));
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[0, 1]));
+        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, Some(&residual))
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0]);
+    }
+
+    #[test]
+    fn test_build_live_row_ids_residual_maps_positions_across_file_offsets() {
+        // f0 rows global 0,1,2; f1 rows global 3,4. residual allows f0={2}, f1={1}.
+        // f1 physical pos 1 -> global 3 + 1 = 4. Result {2, 4}. No DV.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[2]));
+        residual.insert("f1".to_string(), treemap(&[1]));
+        let live = build_live_row_ids(
+            &files,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            Some(&residual),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![2, 4]);
+    }
+
+    #[test]
+    fn test_build_live_row_ids_residual_some_returns_mask_even_when_all_active_no_dv() {
+        // All active, no DV: without residual this returns None. With a residual
+        // present, a mask is always required.
+        let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[0, 2]));
+        let live = build_live_row_ids(
+            &files,
+            &active_set(&["f0"]),
+            &HashMap::new(),
+            Some(&residual),
+        )
+        .unwrap()
+        .expect("residual present -> mask required");
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn test_vindex_adapter_sets_include_row_ids_to_residual_intersection() {
+        // Recording scorer captures the include_row_ids the adapter built. All
+        // active, no DV, residual f0={0,2} -> include_row_ids must equal {0,2}.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let seen_rows: Rc<RefCell<Option<Vec<u64>>>> = Rc::new(RefCell::new(None));
+        let scorer_rows = Rc::clone(&seen_rows);
+        let searcher = VindexAnnSearcher::new(
+            "embedding".to_string(),
+            Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
+                *scorer_rows.borrow_mut() = search
+                    .include_row_ids
+                    .as_ref()
+                    .map(|t| t.iter().collect::<Vec<u64>>());
+                Ok(None)
+            }),
+        );
+        let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[0, 2]));
+        searcher
+            .search(
+                &segment,
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                Some(&residual),
+            )
+            .unwrap();
+        assert_eq!(seen_rows.borrow().clone(), Some(vec![0, 2]));
     }
 }

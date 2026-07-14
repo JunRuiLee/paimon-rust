@@ -319,6 +319,7 @@ impl PkVectorOrchestrator {
                 limit,
                 search_options,
                 skip_exact_fallback,
+                None,
             )?;
             for PkVectorSearchResult {
                 data_file_name,
@@ -848,6 +849,7 @@ mod e2e_tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
         ) -> crate::Result<Vec<PkVectorSearchResult>> {
             Ok(self.hits.clone())
         }
