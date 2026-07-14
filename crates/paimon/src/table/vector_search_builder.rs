@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::arrow::format::FilePredicates;
-use crate::arrow::residual::filter_record_batch_by_predicates;
+use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
 use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
 use crate::spec::{
-    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
-    IndexManifestEntry, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
+    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
@@ -95,6 +95,7 @@ pub struct VectorSearchBuilder<'a> {
     limit: Option<usize>,
     options: HashMap<String, String>,
     projection: Option<Vec<String>>,
+    filter: Option<Predicate>,
 }
 
 pub struct BatchVectorSearchBuilder<'a> {
@@ -114,6 +115,7 @@ impl<'a> VectorSearchBuilder<'a> {
             limit: None,
             options: HashMap::new(),
             projection: None,
+            filter: None,
         }
     }
 
@@ -134,6 +136,18 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
+        self
+    }
+
+    /// Attach a residual scalar predicate applied *after* vector recall on the
+    /// primary-key vector path: each recalled candidate file is re-read and only
+    /// rows satisfying `filter` survive, folded into the search so best-first
+    /// order and Top-K still hold. Mirrors Java `PrimaryKeyVectorRead`'s
+    /// residual-filter support. Only the primary-key vector path consumes it, and
+    /// only when the table exposes physical rows directly (deletion vectors
+    /// enabled without merge-on-read); otherwise the query fails loud.
+    pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        self.filter = Some(filter);
         self
     }
 
@@ -287,11 +301,26 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        // Residual-filter guard: PK vector search accepts partition filters only.
-        // This builder exposes no data-predicate setter, so there is nothing to
-        // reject here; the guard mirrors Java `checkArgument(filter == null)` and,
-        // if a filter setter is ever added, it must error rather than be ignored.
-
+        // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
+        // predicate set via `with_filter` is applied post-recall by re-reading
+        // each candidate file's physical rows (see below). That physical-position
+        // filtering only agrees with the bucket search when the table exposes
+        // physical rows directly: deletion vectors enabled and merge-on-read
+        // disabled. Under merge-on-read (or without deletion vectors) a read
+        // merges multiple key versions, so a scalar filter could retain a stale
+        // version whose live version does not match — a silent wrong-read. Reject
+        // such queries rather than answer them incorrectly. No filter → nothing to
+        // guard, so the search-only and read paths are unaffected.
+        let physical_row_read =
+            core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
+        if self.filter.is_some() && !physical_row_read {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "primary-key vector pre-filter requires deletion vectors without merge-on-read"
+                        .to_string(),
+                source: None,
+            });
+        }
         // `primary_key_vector_distance_metric` returns a validated name; re-parse
         // into the enum for the numeric semantics.
         let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
@@ -404,6 +433,51 @@ impl<'a> VectorSearchBuilder<'a> {
                 })
         };
 
+        // Residual (post-recall) filtering: for each candidate file, re-read its
+        // physical rows and keep the positions whose rows satisfy the filter. The
+        // per-split allow-list is threaded into the bucket search so the residual
+        // folds into recall (best-first order and Top-K are preserved). Built only
+        // when a filter is set; otherwise `None` leaves the search unfiltered. The
+        // residual reader projects the predicate columns plus `_ROW_ID` (used to
+        // recover file-local physical positions) and carries no pushdown, matching
+        // `residual_positions_by_file`.
+        let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match &self.filter {
+            Some(filter) => {
+                let file_predicates = FilePredicates {
+                    predicates: vec![filter.clone()],
+                    file_fields: self.table.schema().fields().to_vec(),
+                };
+                let row_id_field = DataField::new(
+                    ROW_ID_FIELD_ID,
+                    ROW_ID_FIELD_NAME.to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                );
+                let residual_read_type =
+                    widen_scan_fields(std::slice::from_ref(&row_id_field), Some(&file_predicates));
+                let residual_reader = DataFileReader::new(
+                    self.table.file_io().clone(),
+                    self.table.schema_manager().clone(),
+                    self.table.schema().id(),
+                    self.table.schema().fields().to_vec(),
+                    residual_read_type,
+                    Vec::new(),
+                );
+                let mut per_split = Vec::with_capacity(plan.splits.len());
+                for split in &plan.splits {
+                    per_split.push(
+                        residual_positions_by_file(
+                            &residual_reader,
+                            &split.data_split,
+                            &file_predicates,
+                        )
+                        .await?,
+                    );
+                }
+                Some(per_split)
+            }
+            None => None,
+        };
+
         let candidates = PkVectorOrchestrator::new(reader)
             .search_candidates(
                 &plan.splits,
@@ -414,6 +488,7 @@ impl<'a> VectorSearchBuilder<'a> {
                 &mut factory,
                 &search_options,
                 skip_exact_fallback,
+                residual_by_split.as_deref(),
             )
             .await?;
 
@@ -934,9 +1009,6 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
 /// are the fields the residual leaf indices point into (resolved by name against
 /// each emitted batch). A data file without `first_row_id` fails loud, matching
 /// the position-read guard.
-// The vector search filter path will call this; until then it has no in-crate
-// caller outside tests.
-#[allow(dead_code)]
 async fn residual_positions_by_file(
     reader: &DataFileReader,
     split: &DataSplit,
@@ -2038,8 +2110,8 @@ mod tests {
     use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, BinaryRow, DataFileMeta, DataType, FloatType, GlobalIndexMeta, IndexFileMeta,
-        IndexManifestEntry, IntType, Schema, TableSchema,
+        ArrayType, BinaryRow, DataFileMeta, DataType, Datum, FloatType, GlobalIndexMeta,
+        IndexFileMeta, IndexManifestEntry, IntType, PredicateBuilder, Schema, TableSchema,
     };
     use crate::table::source::DataSplitBuilder;
     use crate::vindex::IVF_FLAT_IDENTIFIER;
@@ -2901,6 +2973,122 @@ mod tests {
                 "unrelated DE query must not error on a malformed multi-column PK config: {err}"
             ),
         }
+    }
+
+    /// `id > threshold` built against the table's user fields (leaf index resolves
+    /// against `table.schema().fields()`).
+    fn id_gt_filter(table: &Table, threshold: i32) -> Predicate {
+        PredicateBuilder::new(table.schema().fields())
+            .greater_than("id", Datum::Int(threshold))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_without_deletion_vectors_fails_loud() {
+        // A residual filter on a PK-vector table that does NOT enable deletion
+        // vectors must be rejected (merge-on-read semantics would make physical
+        // -position filtering unsound). Mirrors Java `PrimaryKeyVectorScan`.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("filter without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_filter_without_deletion_vectors_fails_loud() {
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("read filter without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_with_merge_on_read_fails_loud() {
+        // Deletion vectors enabled BUT merge-on-read on: still rejected, because a
+        // merge-on-read scan can surface stale key versions that a physical-row
+        // filter cannot reconcile.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("deletion-vectors.enabled", "true"),
+            ("deletion-vectors.merge-on-read", "true"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("merge-on-read filter must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_with_deletion_vectors_passes_guard() {
+        // Deletion vectors enabled, merge-on-read off (default): the residual guard
+        // passes. With no snapshot the plan is empty, so the (guarded) filter path
+        // simply yields an empty result rather than erroring — proving the guard
+        // admits a legal filtered query.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("deletion-vectors.enabled", "true"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .expect("guarded filter query must be admitted");
+        assert!(result.is_empty());
     }
 
     fn make_lumina_entry(
