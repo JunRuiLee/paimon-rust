@@ -17,6 +17,8 @@
 
 pub mod reader;
 
+pub mod pkvector;
+
 pub const IVF_FLAT_IDENTIFIER: &str = "ivf-flat";
 pub const IVF_PQ_IDENTIFIER: &str = "ivf-pq";
 pub const IVF_HNSW_FLAT_IDENTIFIER: &str = "ivf-hnsw-flat";

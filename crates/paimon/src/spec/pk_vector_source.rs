@@ -157,8 +157,8 @@ impl PkVectorSourceMeta {
 }
 
 /// Minimal big-endian reader mirroring the Java `DataInput` primitives the
-/// `_SOURCE_META` frame uses. Module-private by design (see the PR1 spec: no
-/// shared `common/` abstraction until a second consumer exists).
+/// `_SOURCE_META` frame uses. Module-private by design: no shared `common/`
+/// abstraction until a second consumer exists.
 struct DataInputCursor<'a> {
     bytes: &'a [u8],
     position: usize,

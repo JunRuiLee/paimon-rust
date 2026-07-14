@@ -23,6 +23,7 @@ pub struct VectorSearch {
     pub limit: usize,
     pub field_name: String,
     pub include_row_ids: Option<roaring::RoaringTreemap>,
+    pub options: HashMap<String, String>,
 }
 
 impl VectorSearch {
@@ -50,11 +51,17 @@ impl VectorSearch {
             limit,
             field_name,
             include_row_ids: None,
+            options: HashMap::new(),
         })
     }
 
     pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
         self.include_row_ids = Some(include_row_ids);
+        self
+    }
+
+    pub fn with_options(mut self, options: HashMap<String, String>) -> Self {
+        self.options = options;
         self
     }
 }
