@@ -67,17 +67,17 @@ pub(crate) struct PkVectorSearchSplit {
     pub active_files: Vec<BucketActiveFile>,
 }
 
-/// A `bucket_search` hit tagged with its source bucket. Rust equivalent of Java
-/// `PrimaryKeyVectorRead.Candidate`. `partition`/`bucket` are the cross-bucket
-/// merge dimensions a lone `PkVectorSearchResult` lacks; `split_index` is the
-/// re-association handle back to `splits[split_index].data_split`.
-struct Candidate {
-    split_index: usize,
-    partition: BinaryRow,
-    bucket: i32,
-    data_file_name: String,
-    row_position: i64,
-    distance: f32,
+/// A `bucket_search` hit tagged with its source bucket. `partition`/`bucket` are
+/// the cross-bucket merge dimensions a lone `PkVectorSearchResult` lacks;
+/// `split_index` is the re-association handle back to
+/// `splits[split_index].data_split`.
+pub(crate) struct PkVectorCandidate {
+    pub split_index: usize,
+    pub partition: BinaryRow,
+    pub bucket: i32,
+    pub data_file_name: String,
+    pub row_position: i64,
+    pub distance: f32,
 }
 
 /// 5-level BEST_FIRST (smallest = best) key. Level 1 orders distance with
@@ -85,7 +85,7 @@ struct Candidate {
 /// under inner product) sorts last rather than winning Top-1. Level 2 uses the
 /// partition's serialized bytes; Rust `Vec<u8>::cmp` is unsigned lexicographic
 /// then shorter-is-less, exactly the spec's contract (`[0x7f] < [0x80] < [0xff]`).
-fn candidate_cmp(a: &Candidate, b: &Candidate) -> Ordering {
+fn candidate_cmp(a: &PkVectorCandidate, b: &PkVectorCandidate) -> Ordering {
     java_float_compare(a.distance, b.distance)
         .then_with(|| {
             a.partition
@@ -98,7 +98,7 @@ fn candidate_cmp(a: &Candidate, b: &Candidate) -> Ordering {
 }
 
 /// Collect all candidates, order BEST_FIRST, keep the best `limit`.
-fn global_top_k(mut candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> {
+fn global_top_k(mut candidates: Vec<PkVectorCandidate>, limit: usize) -> Vec<PkVectorCandidate> {
     candidates.sort_by(candidate_cmp);
     candidates.truncate(limit);
     candidates
@@ -110,7 +110,7 @@ fn global_top_k(mut candidates: Vec<Candidate>, limit: usize) -> Vec<Candidate> 
 /// emitted in ascending group-key order (deterministic file/position output
 /// order). Mirrors Java `PrimaryKeyVectorResult.splits()`.
 fn build_indexed_splits(
-    survivors: Vec<Candidate>,
+    survivors: Vec<PkVectorCandidate>,
     splits: &[PkVectorSearchSplit],
     metric: VectorSearchMetric,
 ) -> crate::Result<Vec<PkVectorIndexedSplit>> {
@@ -253,8 +253,76 @@ impl PkVectorOrchestrator {
         Self { reader }
     }
 
-    /// Run the eager per-bucket search, then lazily materialize the surviving
-    /// rows. `async` because the eager search phase is genuine async IO
+    /// Run the eager per-bucket search + cross-bucket global Top-K and return the
+    /// best-first survivors (through the full 5-level tie-break, raw distance
+    /// preserved). The exact-reader factory is split-scoped: it receives the
+    /// current split index and split so a caller can build a reader keyed to the
+    /// specific split/file. `skip_exact_fallback` forwards to `bucket_search`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn search_candidates(
+        &self,
+        splits: &[PkVectorSearchSplit],
+        query: &[f32],
+        metric: VectorSearchMetric,
+        limit: usize,
+        ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+        exact_reader_factory: &mut dyn FnMut(
+            usize,
+            &PkVectorSearchSplit,
+            &BucketActiveFile,
+        ) -> crate::Result<Box<dyn PkVectorReader>>,
+        search_options: &HashMap<String, String>,
+        skip_exact_fallback: bool,
+    ) -> crate::Result<Vec<PkVectorCandidate>> {
+        // Eager input-shape validation (Java checkArgument parity).
+        if limit == 0 {
+            return Err(data_invalid("vector search limit must be positive"));
+        }
+        if query.is_empty() {
+            return Err(data_invalid("vector search query must not be empty"));
+        }
+
+        // Eager per-bucket search -> tagged candidates.
+        let mut candidates: Vec<PkVectorCandidate> = Vec::new();
+        for (split_index, split) in splits.iter().enumerate() {
+            let dvs = build_bucket_dv_map(&self.reader, split).await?;
+            // Wrap the split-scoped factory into bucket_search's per-file signature.
+            let mut bucket_factory =
+                |file: &BucketActiveFile| exact_reader_factory(split_index, split, file);
+            let results = bucket_search(
+                ann_searcher,
+                &split.ann_segments,
+                &split.active_files,
+                &dvs,
+                &mut bucket_factory,
+                query,
+                metric,
+                limit,
+                search_options,
+                skip_exact_fallback,
+            )?;
+            for PkVectorSearchResult {
+                data_file_name,
+                row_position,
+                distance,
+            } in results
+            {
+                candidates.push(PkVectorCandidate {
+                    split_index,
+                    partition: split.data_split.partition().clone(),
+                    bucket: split.data_split.bucket(),
+                    data_file_name,
+                    row_position,
+                    distance,
+                });
+            }
+        }
+
+        Ok(global_top_k(candidates, limit))
+    }
+
+    /// See spec §3. `async` because the eager search phase is genuine async IO
     /// needing the borrowed `exact_reader_factory` / `ann_searcher`; the returned
     /// stream owns only the built splits + a reader clone (so it is `'static`).
     #[allow(clippy::too_many_arguments)]
@@ -270,49 +338,22 @@ impl PkVectorOrchestrator {
         ) -> crate::Result<Box<dyn PkVectorReader>>,
         search_options: &HashMap<String, String>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // Eager input-shape validation (Java checkArgument parity).
-        if limit == 0 {
-            return Err(data_invalid("vector search limit must be positive"));
-        }
-        if query.is_empty() {
-            return Err(data_invalid("vector search query must not be empty"));
-        }
-
-        // Eager per-bucket search -> tagged candidates.
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for (split_index, split) in splits.iter().enumerate() {
-            let dvs = build_bucket_dv_map(&self.reader, split).await?;
-            let results = bucket_search(
-                ann_searcher,
-                &split.ann_segments,
-                &split.active_files,
-                &dvs,
-                exact_reader_factory,
+        // Wrap the per-file factory into the split-scoped shape search_candidates
+        // expects; the split index/split are unused on this back-compat path.
+        let mut wrapped =
+            |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| exact_reader_factory(f);
+        let survivors = self
+            .search_candidates(
+                splits,
                 query,
                 metric,
                 limit,
+                ann_searcher,
+                &mut wrapped,
                 search_options,
                 false,
-            )?;
-            for PkVectorSearchResult {
-                data_file_name,
-                row_position,
-                distance,
-            } in results
-            {
-                candidates.push(Candidate {
-                    split_index,
-                    partition: split.data_split.partition().clone(),
-                    bucket: split.data_split.bucket(),
-                    data_file_name,
-                    row_position,
-                    distance,
-                });
-            }
-        }
-
-        // Eager global merge + grouping + split construction.
-        let survivors = global_top_k(candidates, limit);
+            )
+            .await?;
         let indexed_splits = build_indexed_splits(survivors, splits, metric)?;
 
         // Lazy materialization: own the splits + a reader clone.
@@ -382,8 +423,14 @@ mod tests {
     }
 
     // Candidate carrying an empty (arity-0) partition, matching bucket_split's partition.
-    fn cand(split_index: usize, bucket: i32, file: &str, pos: i64, distance: f32) -> Candidate {
-        Candidate {
+    fn cand(
+        split_index: usize,
+        bucket: i32,
+        file: &str,
+        pos: i64,
+        distance: f32,
+    ) -> PkVectorCandidate {
+        PkVectorCandidate {
             split_index,
             partition: BinaryRow::new(0),
             bucket,
@@ -400,8 +447,8 @@ mod tests {
         file: &str,
         pos: i64,
         distance: f32,
-    ) -> Candidate {
-        Candidate {
+    ) -> PkVectorCandidate {
+        PkVectorCandidate {
             split_index,
             partition: BinaryRow::from_bytes(1, partition_bytes),
             bucket,
@@ -411,7 +458,7 @@ mod tests {
         }
     }
 
-    fn ids(c: &[Candidate]) -> Vec<(i32, String, i64)> {
+    fn ids(c: &[PkVectorCandidate]) -> Vec<(i32, String, i64)> {
         c.iter()
             .map(|c| (c.bucket, c.data_file_name.clone(), c.row_position))
             .collect()
@@ -1178,5 +1225,106 @@ mod e2e_tests {
             collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
             vec![l2_score(9.0), l2_score(1.0), l2_score(4.0)]
         );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_returns_best_first_survivors() {
+        // One bucket, exact-only, three rows; limit 2. Best-first by distance.
+        let table_path = "memory:/pkvo_candidates";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let meta = write_file(&file_io, &bucket_path, "c.mosaic", vec![1, 2, 3]).await;
+        let split = PkVectorSearchSplit {
+            data_split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![meta])
+                .build()
+                .unwrap(),
+            ann_segments: Vec::new(),
+            active_files: vec![active("c.mosaic", 3)],
+        };
+        // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           f: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
+            assert_eq!(f.file_name, "c.mosaic");
+            Ok(Box::new(ArrayReader::new(
+                2,
+                vec![
+                    Some(vec![3.0, 0.0]),
+                    Some(vec![1.0, 0.0]),
+                    Some(vec![2.0, 0.0]),
+                ],
+            )))
+        };
+        let opts = HashMap::new();
+        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &[split],
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                2,
+                None,
+                &mut factory,
+                &opts,
+                false,
+            )
+            .await
+            .unwrap();
+        // Best-first: pos1 (d=1), pos2 (d=4).
+        assert_eq!(
+            cands
+                .iter()
+                .map(|c| (c.row_position, c.distance))
+                .collect::<Vec<_>>(),
+            vec![(1, 1.0), (2, 4.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_fast_mode_skips_exact_factory() {
+        let table_path = "memory:/pkvo_fast";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let meta = write_file(&file_io, &bucket_path, "f.mosaic", vec![1, 2]).await;
+        let split = PkVectorSearchSplit {
+            data_split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![meta])
+                .build()
+                .unwrap(),
+            ann_segments: Vec::new(),
+            active_files: vec![active("f.mosaic", 2)],
+        };
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           _: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
+            unreachable!("fast mode must not read exact")
+        };
+        let opts = HashMap::new();
+        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &[split],
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                2,
+                None,
+                &mut factory,
+                &opts,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(cands.is_empty());
     }
 }
