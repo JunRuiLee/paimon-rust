@@ -145,7 +145,10 @@ impl<'a> VectorSearchBuilder<'a> {
     /// order and Top-K still hold. Mirrors Java `PrimaryKeyVectorRead`'s
     /// residual-filter support. Only the primary-key vector path consumes it, and
     /// only when the table exposes physical rows directly (deletion vectors
-    /// enabled without merge-on-read); otherwise the query fails loud.
+    /// enabled without merge-on-read); otherwise the query fails loud. A query
+    /// that does not resolve to the primary-key vector path (no PK-vector index,
+    /// or a non-PK-vector column) also fails loud rather than silently ignoring
+    /// the filter.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
         self.filter = Some(filter);
         self
@@ -206,6 +209,19 @@ impl<'a> VectorSearchBuilder<'a> {
                     .execute_primary_key_vector_search(&core, &pk_col, query_vector, limit)
                     .await;
             }
+        }
+
+        // The data-evolution (global-index) fall-through path cannot honor a
+        // residual filter — it never reads physical rows. Rather than silently
+        // drop the predicate and return unfiltered results, fail loud when a
+        // filter is set on a query that does not resolve to the primary-key
+        // vector path.
+        if self.filter.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "vector search filter is only supported on the primary-key vector path"
+                    .to_string(),
+                source: None,
+            });
         }
 
         let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
@@ -468,6 +484,7 @@ impl<'a> VectorSearchBuilder<'a> {
                         residual_positions_by_file(
                             &residual_reader,
                             &split.data_split,
+                            &split.active_files,
                             &file_predicates,
                         )
                         .await?,
@@ -1001,9 +1018,13 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
 /// the Arrow level, after `_ROW_ID` is materialized, and each surviving row's
 /// `_ROW_ID - first_row_id` is the file-local physical position.
 ///
-/// Every data file in the split gets an entry, possibly empty. The bucket search
-/// treats an absent entry and an empty entry identically (the file contributes no
-/// candidates), so the empty entries only make the map cover every active file.
+/// Every *active* data file in the split gets an entry, possibly empty. The
+/// bucket search treats an absent entry and an empty entry identically (the file
+/// contributes no candidates), so the empty entries only make the map cover every
+/// active file. Non-active files (e.g. level-0 files the bucket search excludes)
+/// are skipped entirely: they are never searched, so re-reading them would be
+/// wasted IO and their possibly-absent `first_row_id` must not fail an otherwise
+/// valid query.
 ///
 /// `reader` must project `_ROW_ID` and be predicate-free; `residual.file_fields`
 /// are the fields the residual leaf indices point into (resolved by name against
@@ -1012,11 +1033,19 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
 async fn residual_positions_by_file(
     reader: &DataFileReader,
     split: &DataSplit,
+    active_files: &[BucketActiveFile],
     residual: &FilePredicates,
 ) -> crate::Result<HashMap<String, RoaringTreemap>> {
     let scan_fields = reader.read_type().to_vec();
+    let active_names: HashSet<&str> = active_files.iter().map(|f| f.file_name.as_str()).collect();
     let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
     for file_meta in split.data_files() {
+        // Only files the bucket search actually recalls from need residual
+        // positions; skip everything else so a non-active file cannot trigger the
+        // `first_row_id` guard below or incur a wasted read.
+        if !active_names.contains(file_meta.file_name.as_str()) {
+            continue;
+        }
         let first_row_id = file_meta
             .first_row_id
             .ok_or_else(|| crate::Error::DataInvalid {
@@ -3037,6 +3066,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_scored_filter_on_non_pk_vector_path_fails_loud() {
+        // No PK-vector index configured, so `execute_scored` would fall through to
+        // the data-evolution path, which never consumes the filter. Silently
+        // returning unfiltered rows is a wrong-read; the query must fail loud
+        // instead.
+        let table = pk_vector_table(&[]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("filter on the non-PK-vector path must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supported on the primary-key vector path")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn pk_branch_filter_with_merge_on_read_fails_loud() {
         // Deletion vectors enabled BUT merge-on-read on: still rejected, because a
         // merge-on-read scan can surface stale key versions that a physical-row
@@ -3497,14 +3551,16 @@ mod residual_positions_tests {
 
     /// Build a predicate-free reader (read_type = `id` + `_ROW_ID`) over a split
     /// containing `files` (each `(name, ids, first_row_id)`), written as Mosaic
-    /// data files in the same bucket.
+    /// data files in the same bucket. The returned active-file list covers every
+    /// file (all files active).
     async fn build_reader_and_split(
         table_path: &str,
         files: &[(&str, Vec<i32>, i64)],
-    ) -> (DataFileReader, DataSplit) {
+    ) -> (DataFileReader, DataSplit, Vec<BucketActiveFile>) {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let bucket_path = format!("{table_path}/bucket-0");
         let mut metas = Vec::new();
+        let mut active_files = Vec::new();
         for (name, ids, first_row_id) in files {
             let data = write_mosaic(&id_batch(ids.clone()));
             file_io
@@ -3519,6 +3575,10 @@ mod residual_positions_tests {
                 ids.len() as i64,
                 Some(*first_row_id),
             ));
+            active_files.push(BucketActiveFile {
+                file_name: name.to_string(),
+                row_count: ids.len() as i64,
+            });
         }
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
@@ -3537,7 +3597,7 @@ mod residual_positions_tests {
             vec![id_field(), row_id_field()],
             Vec::new(),
         );
-        (reader, split)
+        (reader, split, active_files)
     }
 
     /// `id > threshold`, with `file_fields` = `[id]` so the leaf index resolves.
@@ -3558,12 +3618,12 @@ mod residual_positions_tests {
     #[tokio::test]
     async fn test_residual_selects_matching_positions() {
         // ids [1,2,3,4,5] at first_row_id 0; id > 2 -> ids 3,4,5 -> positions 2,3,4.
-        let (reader, split) = build_reader_and_split(
+        let (reader, split, active) = build_reader_and_split(
             "memory:/rpf_basic",
             &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
         )
         .await;
-        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(2))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
@@ -3572,10 +3632,10 @@ mod residual_positions_tests {
     #[tokio::test]
     async fn test_residual_matches_none_yields_empty_entry() {
         // id > 100 matches nothing; the file still gets a (present, empty) entry.
-        let (reader, split) =
+        let (reader, split, active) =
             build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)])
                 .await;
-        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(100))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(100))
             .await
             .unwrap();
         assert!(map.contains_key("part-0.mosaic"));
@@ -3584,9 +3644,9 @@ mod residual_positions_tests {
 
     #[tokio::test]
     async fn test_residual_matches_all_yields_full_set() {
-        let (reader, split) =
+        let (reader, split, active) =
             build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
-        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(0))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
@@ -3596,7 +3656,7 @@ mod residual_positions_tests {
     async fn test_residual_positions_are_file_local_across_files() {
         // Two files with distinct first_row_id; positions must be 0-based within
         // each file, not global. id > 3 keeps ids 4,5 in both -> positions {3,4}.
-        let (reader, split) = build_reader_and_split(
+        let (reader, split, active) = build_reader_and_split(
             "memory:/rpf_multi",
             &[
                 ("part-0.mosaic", vec![1, 2, 3, 4, 5], 0),
@@ -3604,7 +3664,7 @@ mod residual_positions_tests {
             ],
         )
         .await;
-        let map = residual_positions_by_file(&reader, &split, &residual_id_gt(3))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(3))
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
@@ -3612,15 +3672,62 @@ mod residual_positions_tests {
     }
 
     #[tokio::test]
+    async fn test_non_active_files_are_skipped() {
+        // Two files in the split, but only `part-0.mosaic` is active. The bucket
+        // search never recalls from `part-1.mosaic` (level-0 / non-active), so it
+        // must not appear in the residual map — and even though it lacks a
+        // `first_row_id`, the query still succeeds because non-active files are
+        // skipped before the guard.
+        let (reader, split, mut active) = build_reader_and_split(
+            "memory:/rpf_nonactive",
+            &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        )
+        .await;
+        // Append a non-active file (missing first_row_id) directly to the split's
+        // data files, but leave it out of the active list.
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = "memory:/rpf_nonactive/bucket-0";
+        let data = write_mosaic(&id_batch(vec![9, 9, 9]));
+        file_io
+            .new_output(&format!("{bucket_path}/part-1.mosaic"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let mut metas = split.data_files().to_vec();
+        metas.push(data_file("part-1.mosaic", data.len() as i64, 3, None));
+        // `active` already lists only part-0.mosaic; keep it that way.
+        let _ = &mut active;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path.to_string())
+            .with_total_buckets(1)
+            .with_data_files(metas)
+            .build()
+            .unwrap();
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+        assert!(
+            !map.contains_key("part-1.mosaic"),
+            "non-active file must be skipped"
+        );
+    }
+
+    #[tokio::test]
     async fn test_missing_first_row_id_is_error() {
-        let (reader, split) = build_reader_and_split_no_first_row_id().await;
-        let err = residual_positions_by_file(&reader, &split, &residual_id_gt(0))
+        let (reader, split, active) = build_reader_and_split_no_first_row_id().await;
+        let err = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
             .await
             .expect_err("missing first_row_id must error");
         assert!(format!("{err:?}").contains("first_row_id"), "got: {err:?}");
     }
 
-    async fn build_reader_and_split_no_first_row_id() -> (DataFileReader, DataSplit) {
+    async fn build_reader_and_split_no_first_row_id(
+    ) -> (DataFileReader, DataSplit, Vec<BucketActiveFile>) {
         let table_path = "memory:/rpf_nofrid";
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let bucket_path = format!("{table_path}/bucket-0");
@@ -3648,6 +3755,11 @@ mod residual_positions_tests {
             vec![id_field(), row_id_field()],
             Vec::new(),
         );
-        (reader, split)
+        // The lone file is active, so the `first_row_id` guard applies to it.
+        let active = vec![BucketActiveFile {
+            file_name: "part-0.mosaic".to_string(),
+            row_count: 3,
+        }];
+        (reader, split, active)
     }
 }
