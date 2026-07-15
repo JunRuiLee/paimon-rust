@@ -16,6 +16,23 @@
 // under the License.
 
 use super::data_invalid;
+use std::cmp::Ordering;
+
+/// Order two distances the way Java `Float.compare` does: every NaN sorts after
+/// all numeric values (so a NaN distance is always ranked worst, never best),
+/// while non-NaN values keep `total_cmp`'s IEEE total order (which also matches
+/// Java in ranking `-0.0` before `+0.0`). `f32::total_cmp` alone is unsuitable
+/// here because it orders a negative NaN before every finite value, which would
+/// let a NaN distance (e.g. from a non-finite stored vector under inner product)
+/// win Top-1.
+pub(crate) fn java_float_compare(a: f32, b: f32) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.total_cmp(&b),
+    }
+}
 
 /// Normalize a metric name: lowercase and `-` → `_`. NO trim (deliberately
 /// stricter than the build-side `vindex::normalize_metric`, to match Java
@@ -140,6 +157,51 @@ fn cosine_distance(similarity: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A negative NaN (sign bit set): `f32::total_cmp` would order this *before*
+    /// every finite value; `java_float_compare` must order it *after*.
+    const NEGATIVE_NAN: f32 = f32::from_bits(0xffc00000);
+
+    #[test]
+    fn java_float_compare_sorts_all_nan_after_finite() {
+        // Positive NaN after a finite value.
+        assert_eq!(java_float_compare(f32::NAN, 1.0), Ordering::Greater);
+        assert_eq!(java_float_compare(1.0, f32::NAN), Ordering::Less);
+        // Negative NaN also after a finite value (the total_cmp trap).
+        assert!(NEGATIVE_NAN.is_nan());
+        assert_eq!(java_float_compare(NEGATIVE_NAN, 1.0), Ordering::Greater);
+        assert_eq!(java_float_compare(1.0, NEGATIVE_NAN), Ordering::Less);
+        // NaN after +inf too.
+        assert_eq!(
+            java_float_compare(f32::NAN, f32::INFINITY),
+            Ordering::Greater
+        );
+        // Two NaNs compare equal.
+        assert_eq!(java_float_compare(f32::NAN, NEGATIVE_NAN), Ordering::Equal);
+    }
+
+    #[test]
+    fn java_float_compare_keeps_java_numeric_order() {
+        // Ascending finite order preserved.
+        assert_eq!(java_float_compare(1.0, 2.0), Ordering::Less);
+        assert_eq!(java_float_compare(2.0, 1.0), Ordering::Greater);
+        assert_eq!(java_float_compare(1.0, 1.0), Ordering::Equal);
+        // -0.0 sorts before +0.0, matching Java Float.compare.
+        assert_eq!(java_float_compare(-0.0, 0.0), Ordering::Less);
+        assert_eq!(java_float_compare(0.0, -0.0), Ordering::Greater);
+    }
+
+    #[test]
+    fn java_float_compare_ranks_negative_nan_worst_when_sorting() {
+        // A -NaN distance must never sort ahead of a finite one: sorting ascending
+        // (smallest = best) puts finite first, NaN last.
+        let mut xs = [NEGATIVE_NAN, 3.0, 1.0, 2.0];
+        xs.sort_by(|a, b| java_float_compare(*a, *b));
+        assert_eq!(xs[0], 1.0);
+        assert_eq!(xs[1], 2.0);
+        assert_eq!(xs[2], 3.0);
+        assert!(xs[3].is_nan());
+    }
 
     #[test]
     fn test_normalize_lowercases_and_replaces_hyphens_without_trimming() {

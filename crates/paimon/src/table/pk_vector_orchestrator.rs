@@ -42,7 +42,7 @@ use crate::table::source::{DataSplit, DataSplitBuilder, RowRange};
 use crate::table::ArrowRecordBatchStream;
 use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
 use crate::vindex::pkvector::bucket::{bucket_search, BucketActiveFile, BucketAnnSegment};
-use crate::vindex::pkvector::metric::VectorSearchMetric;
+use crate::vindex::pkvector::metric::{java_float_compare, VectorSearchMetric};
 use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::pkvector::result::PkVectorSearchResult;
 
@@ -80,12 +80,13 @@ struct Candidate {
     distance: f32,
 }
 
-/// 5-level BEST_FIRST (smallest = best) key. Level 2 uses the partition's
-/// serialized bytes; Rust `Vec<u8>::cmp` is unsigned lexicographic then
-/// shorter-is-less, exactly the spec's contract (`[0x7f] < [0x80] < [0xff]`).
+/// 5-level BEST_FIRST (smallest = best) key. Level 1 orders distance with
+/// `java_float_compare` so a NaN distance (e.g. from a non-finite stored vector
+/// under inner product) sorts last rather than winning Top-1. Level 2 uses the
+/// partition's serialized bytes; Rust `Vec<u8>::cmp` is unsigned lexicographic
+/// then shorter-is-less, exactly the spec's contract (`[0x7f] < [0x80] < [0xff]`).
 fn candidate_cmp(a: &Candidate, b: &Candidate) -> Ordering {
-    a.distance
-        .total_cmp(&b.distance)
+    java_float_compare(a.distance, b.distance)
         .then_with(|| {
             a.partition
                 .to_serialized_bytes()
