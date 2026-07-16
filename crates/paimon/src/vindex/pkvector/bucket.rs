@@ -434,6 +434,7 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);

@@ -569,14 +569,13 @@ mod tests {
     fn test_vindex_adapter_sets_include_row_ids_to_residual_intersection() {
         // Recording scorer captures the include_row_ids the adapter built. All
         // active, no DV, residual f0={0,2} -> include_row_ids must equal {0,2}.
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        let seen_rows: Rc<RefCell<Option<Vec<u64>>>> = Rc::new(RefCell::new(None));
-        let scorer_rows = Rc::clone(&seen_rows);
+        use std::sync::{Arc, Mutex};
+        let seen_rows: Arc<Mutex<Option<Vec<u64>>>> = Arc::new(Mutex::new(None));
+        let scorer_rows = Arc::clone(&seen_rows);
         let searcher = VindexAnnSearcher::new(
             "embedding".to_string(),
             Box::new(move |_segment: &BucketAnnSegment, search: &VectorSearch| {
-                *scorer_rows.borrow_mut() = search
+                *scorer_rows.lock().unwrap() = search
                     .include_row_ids
                     .as_ref()
                     .map(|t| t.iter().collect::<Vec<u64>>());
@@ -598,6 +597,6 @@ mod tests {
                 Some(&residual),
             )
             .unwrap();
-        assert_eq!(seen_rows.borrow().clone(), Some(vec![0, 2]));
+        assert_eq!(seen_rows.lock().unwrap().clone(), Some(vec![0, 2]));
     }
 }
