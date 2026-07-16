@@ -43,9 +43,11 @@ pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod multi_level_mor_tests;
 mod partition_filter;
+mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
+mod pk_vector_scan;
 mod postpone_file_writer;
 mod prepared_files;
 mod read_builder;

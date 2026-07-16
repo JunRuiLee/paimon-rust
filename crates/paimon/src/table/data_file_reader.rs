@@ -104,22 +104,21 @@ impl DataFileReader {
     // `pk_vector_indexed_split_read`, and `pk_vector_orchestrator` modules.
     /// Return a copy with a replaced read-type. Used by `pk_vector_position_read`
     /// to inject the internal `_ROW_ID` column for physical-position recovery.
-    #[allow(dead_code)]
     pub(super) fn with_read_type(mut self, read_type: Vec<DataField>) -> Self {
         self.read_type = read_type;
         self
     }
 
     /// The effective read-type (requested output fields) of this reader.
-    /// Exposed for the sibling `pk_vector_position_read` module.
-    #[allow(dead_code)]
+    /// Exposed for the sibling `pk_vector_position_read` module, which drives the
+    /// PK-vector materialization read path.
     pub(super) fn read_type(&self) -> &[DataField] {
         &self.read_type
     }
 
     /// True if any configured predicate can actually drop rows. A lone
     /// `Predicate::AlwaysTrue` keeps every row in order and is not row-filtering.
-    #[allow(dead_code)]
+    /// Consumed by `pk_vector_position_read` (materialization read path).
     pub(super) fn has_row_filtering_predicate(&self) -> bool {
         self.predicates
             .iter()
@@ -264,8 +263,9 @@ impl DataFileReader {
                 .iter()
                 .position(|f| f.id() == VALUE_KIND_FIELD_ID)
                 .ok_or_else(|| Error::DataInvalid {
-                    message: "DataFileReader::with_drop_deletes(true) requires _VALUE_KIND in read_type"
-                        .to_string(),
+                    message:
+                        "DataFileReader::with_drop_deletes(true) requires _VALUE_KIND in read_type"
+                            .to_string(),
                     source: None,
                 })?;
             let output_fields: Vec<arrow_schema::FieldRef> = target_schema

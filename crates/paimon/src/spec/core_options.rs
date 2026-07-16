@@ -54,8 +54,7 @@ const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
-const VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION: &str =
-    "versioned-partial-update.merge-mode";
+const VERSIONED_PARTIAL_UPDATE_MERGE_MODE_OPTION: &str = "versioned-partial-update.merge-mode";
 const VERSIONED_PARTIAL_UPDATE_IGNORE_MODE_ENABLED_OPTION: &str =
     "versioned-partial-update.ignore-mode.enabled";
 const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
@@ -70,8 +69,7 @@ const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 pub const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest-parallelism";
-pub const READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION: &str =
-    "read.sort-merge-buffer-soft-cap";
+pub const READ_SORT_MERGE_BUFFER_SOFT_CAP_OPTION: &str = "read.sort-merge-buffer-soft-cap";
 const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 /// Default rows per batch on the read path. Aligned with paimon-java's
@@ -104,6 +102,11 @@ const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 /// `docs/alluxio-via-libhdfs-impl-plan.md`. Catalog metadata (schema,
 /// snapshot, manifest) is never affected by this option.
 const ALLUXIO_CACHE_ENABLED_OPTION: &str = "alluxio.cache-enabled";
+const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
+/// Java `CoreOptions.GLOBAL_INDEX_SEARCH_MODE` option key. Controls how the
+/// vector-search kernel trades ANN-only speed against exact-fallback recall.
+/// Defaults to `FAST` when unset.
+const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 
 /// Merge engine for primary-key tables.
 ///
@@ -148,6 +151,22 @@ pub enum DvReadMode {
     /// L0 files breaks sort-merge" trap (mirror Java
     /// `KeyValueFileStoreScan.java:154-162@e8938f347`).
     Freshness,
+}
+
+/// Search mode for global/PK vector index queries. Mirrors Java
+/// `CoreOptions.GlobalIndexSearchMode` (`global-index.search-mode`, default
+/// `FAST`). `Fast` searches indexed data only (ANN-only, skipping the exact
+/// data-file fallback); `Full` and `Detail` additionally scan raw data to
+/// recover rows the index does not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalIndexSearchMode {
+    /// Only search indexed data (ANN-only). Default.
+    Fast,
+    /// Use snapshot next row id and coverage to detect gaps, scanning raw data
+    /// only where a gap exists.
+    Full,
+    /// Scan data files to find exact unindexed rows.
+    Detail,
 }
 
 /// Per-file merge-mode flag carried on `DataFileMeta._MERGE_MODE` for
@@ -559,8 +578,7 @@ impl<'a> CoreOptions<'a> {
     /// (`merge-engine=first-row`), or `forceLookup` (`force-lookup=true`)
     /// holds.
     pub fn need_lookup(&self) -> crate::Result<bool> {
-        let produce_changelog =
-            matches!(self.try_changelog_producer()?, ChangelogProducer::Lookup);
+        let produce_changelog = matches!(self.try_changelog_producer()?, ChangelogProducer::Lookup);
         let deletion_vector = self.deletion_vectors_enabled();
         let is_first_row = matches!(self.merge_engine()?, MergeEngine::FirstRow);
         let force_lookup = self.force_lookup();
@@ -855,6 +873,93 @@ impl<'a> CoreOptions<'a> {
             .get(BLOB_DESCRIPTOR_FIELD_OPTION)
             .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
             .unwrap_or_default()
+    }
+
+    /// True when the PK-vector index column option key is present (regardless of value).
+    pub fn primary_key_vector_index_enabled(&self) -> bool {
+        self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
+    }
+
+    /// The configured PK-vector index columns, split on ',' and trimmed. Errors when
+    /// the key is present but resolves to no non-blank column.
+    pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
+        let raw = self
+            .options
+            .get(PK_VECTOR_INDEX_COLUMNS_OPTION)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "pk-vector.index.columns is not set".to_string(),
+            })?;
+        let columns: Vec<String> = raw
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if columns.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "pk-vector.index.columns is set but names no column".to_string(),
+            });
+        }
+        Ok(columns)
+    }
+
+    /// The single PK-vector index column. The first release supports exactly one.
+    pub fn primary_key_vector_index_column(&self) -> crate::Result<String> {
+        let mut columns = self.primary_key_vector_index_columns()?;
+        if columns.len() != 1 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "pk-vector.index.columns must name exactly one column, got {}",
+                    columns.len()
+                ),
+            });
+        }
+        Ok(columns.remove(0))
+    }
+
+    /// The index type for a PK-vector column. Required — planning and the index reader
+    /// both need it, so an absent value is a hard error rather than a guessed default.
+    pub fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
+        self.options
+            .get(&format!("fields.{col}.pk-vector.index.type"))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!("fields.{col}.pk-vector.index.type is required but not set"),
+            })
+    }
+
+    /// The distance metric name for a PK-vector column, defaulting to inner_product.
+    /// Validated against the supported metrics; an unknown value is a hard error.
+    pub fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
+        let raw = self
+            .options
+            .get(&format!("fields.{col}.pk-vector.distance.metric"))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| "inner_product".to_string());
+        // Validate now (fail-loud) without exposing the crate-private metric enum.
+        crate::vindex::pkvector::metric::VectorSearchMetric::parse(&raw)?;
+        Ok(raw)
+    }
+
+    /// Search mode for global/PK vector index queries. Mirrors Java
+    /// `CoreOptions.globalIndexSearchMode()`: case-insensitive parse of
+    /// `global-index.search-mode`, defaulting to `Fast` when unset. An
+    /// unrecognized value is a hard error.
+    pub(crate) fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        match self.options.get(GLOBAL_INDEX_SEARCH_MODE_OPTION) {
+            None => Ok(GlobalIndexSearchMode::Fast),
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "fast" => Ok(GlobalIndexSearchMode::Fast),
+                "full" => Ok(GlobalIndexSearchMode::Full),
+                "detail" => Ok(GlobalIndexSearchMode::Detail),
+                other => Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Unsupported {GLOBAL_INDEX_SEARCH_MODE_OPTION} '{other}', \
+                         expected one of 'fast', 'full', 'detail'"
+                    ),
+                }),
+            },
+        }
     }
 }
 
@@ -1418,8 +1523,7 @@ mod tests {
 
     #[test]
     fn test_need_lookup_true_for_first_row_engine() {
-        let options =
-            HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "first-row".to_string())]);
+        let options = HashMap::from([(MERGE_ENGINE_OPTION.to_string(), "first-row".to_string())]);
         let core = CoreOptions::new(&options);
         assert!(core.need_lookup().unwrap());
     }
@@ -1472,20 +1576,14 @@ mod tests {
 
     #[test]
     fn test_parquet_page_index_case_insensitive_true() {
-        let opts = HashMap::from([(
-            PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(),
-            "TRUE".into(),
-        )]);
+        let opts = HashMap::from([(PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(), "TRUE".into())]);
         let core = CoreOptions::new(&opts);
         assert!(core.parquet_page_index_enabled());
     }
 
     #[test]
     fn test_parquet_page_index_unparseable_falls_back_to_default() {
-        let opts = HashMap::from([(
-            PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(),
-            "yes".into(),
-        )]);
+        let opts = HashMap::from([(PARQUET_PAGE_INDEX_ENABLED_OPTION.to_string(), "yes".into())]);
         let core = CoreOptions::new(&opts);
         // Unparseable values fall back to the default (true), not silently
         // flipping the toggle off.
@@ -1540,12 +1638,14 @@ mod tests {
     #[test]
     fn test_scan_manifest_parallelism_typical_values() {
         for v in [1usize, 8, 16, 64, 128, 1024] {
-            let opts = HashMap::from([(
-                SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
-                v.to_string(),
-            )]);
+            let opts =
+                HashMap::from([(SCAN_MANIFEST_PARALLELISM_OPTION.to_string(), v.to_string())]);
             let core = CoreOptions::new(&opts);
-            assert_eq!(core.scan_manifest_parallelism(), v, "value {v} not preserved");
+            assert_eq!(
+                core.scan_manifest_parallelism(),
+                v,
+                "value {v} not preserved"
+            );
         }
     }
 
@@ -1631,10 +1731,7 @@ mod tests {
         // Java options are stringly-typed and case-insensitive; mirror the
         // existing bool getters (row_tracking_enabled / deletion_vectors_enabled).
         for v in ["true", "TRUE", "True", "tRuE"] {
-            let opts = HashMap::from([(
-                ALLUXIO_CACHE_ENABLED_OPTION.to_string(),
-                v.to_string(),
-            )]);
+            let opts = HashMap::from([(ALLUXIO_CACHE_ENABLED_OPTION.to_string(), v.to_string())]);
             let core = CoreOptions::new(&opts);
             assert!(core.alluxio_cache_enabled(), "{v:?} should enable");
         }
@@ -1646,12 +1743,93 @@ mod tests {
         // including the explicit "false", garbage, or empty string. Matches
         // how `row_tracking_enabled` handles the same input shapes.
         for v in ["false", "FALSE", "0", "1", "yes", "", "  true  "] {
-            let opts = HashMap::from([(
-                ALLUXIO_CACHE_ENABLED_OPTION.to_string(),
-                v.to_string(),
-            )]);
+            let opts = HashMap::from([(ALLUXIO_CACHE_ENABLED_OPTION.to_string(), v.to_string())]);
             let core = CoreOptions::new(&opts);
             assert!(!core.alluxio_cache_enabled(), "{v:?} should stay disabled");
         }
+    }
+
+    #[test]
+    fn test_pk_vector_index_disabled_by_default() {
+        let opts = HashMap::new();
+        assert!(!CoreOptions::new(&opts).primary_key_vector_index_enabled());
+    }
+
+    #[test]
+    fn test_pk_vector_single_column_and_type_and_metric() {
+        let opts = HashMap::from([
+            (
+                "pk-vector.index.columns".to_string(),
+                " embedding ".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.index.type".to_string(),
+                "ivf-flat".to_string(),
+            ),
+            (
+                "fields.embedding.pk-vector.distance.metric".to_string(),
+                "Inner-Product".to_string(),
+            ),
+        ]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_vector_index_enabled());
+        assert_eq!(co.primary_key_vector_index_column().unwrap(), "embedding");
+        assert_eq!(
+            co.primary_key_vector_index_type("embedding").unwrap(),
+            "ivf-flat"
+        );
+        assert_eq!(
+            co.primary_key_vector_distance_metric("embedding").unwrap(),
+            "Inner-Product"
+        );
+    }
+
+    #[test]
+    fn test_pk_vector_metric_defaults_to_inner_product() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&opts)
+                .primary_key_vector_distance_metric("e")
+                .unwrap(),
+            "inner_product"
+        );
+    }
+
+    #[test]
+    fn test_pk_vector_unknown_metric_errors() {
+        let opts = HashMap::from([
+            ("pk-vector.index.columns".to_string(), "e".to_string()),
+            (
+                "fields.e.pk-vector.distance.metric".to_string(),
+                "manhattan".to_string(),
+            ),
+        ]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_distance_metric("e")
+            .is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_empty_columns_errors() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "  ,  ".to_string())]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_vector_index_enabled()); // key present
+        assert!(co.primary_key_vector_index_columns().is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_multiple_columns_unsupported() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "a,b".to_string())]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_index_column()
+            .is_err());
+    }
+
+    #[test]
+    fn test_pk_vector_index_type_absent_errors() {
+        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "e".to_string())]);
+        assert!(CoreOptions::new(&opts)
+            .primary_key_vector_index_type("e")
+            .is_err());
     }
 }
