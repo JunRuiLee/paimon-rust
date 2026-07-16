@@ -108,6 +108,35 @@ fn add_candidate(heap: &mut BinaryHeap<WorstFirst>, candidate: PkVectorSearchRes
     }
 }
 
+/// Active data files whose rows are already covered by an ANN segment's source
+/// metadata, matched by both file name AND row count. The bucket exact fallback
+/// skips these files, so a caller that preloads exact readers should preload
+/// only the *uncovered* active files (`active_files` minus this set) rather than
+/// reading every active file's vector column up front. A source naming an
+/// inactive file, or one whose row count disagrees with the active file, is not
+/// covered here; `bucket_search` rejects the row-count mismatch separately.
+pub(crate) fn covered_source_files(
+    ann_segments: &[BucketAnnSegment],
+    active_files: &[BucketActiveFile],
+) -> HashSet<String> {
+    let row_counts: HashMap<&str, i64> = active_files
+        .iter()
+        .map(|f| (f.file_name.as_str(), f.row_count))
+        .collect();
+    let mut covered = HashSet::new();
+    for segment in ann_segments {
+        for source in segment.source_meta.source_files() {
+            if row_counts
+                .get(source.file_name())
+                .is_some_and(|&rc| rc == source.row_count())
+            {
+                covered.insert(source.file_name().to_string());
+            }
+        }
+    }
+    covered
+}
+
 /// ANN + exact data-file fallback search for one snapshot bucket. Mirrors Java
 /// `org.apache.paimon.index.pkvector.PrimaryKeyVectorBucketSearch.search`.
 ///
@@ -154,26 +183,25 @@ pub(crate) fn bucket_search(
     let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
     let active_source_files: HashSet<String> =
         files_by_name.keys().map(|name| name.to_string()).collect();
-    let mut covered: HashSet<String> = HashSet::new();
+    // Active files whose rows an ANN segment already covers; the exact fallback
+    // skips them. Same rule the caller's exact-reader preload uses, so both agree
+    // on which files still need an exact reader.
+    let covered = covered_source_files(ann_segments, active_files);
 
     for segment in ann_segments {
+        // An active ANN source with a mismatched row count is corruption (the
+        // ordinal-to-position mapping would be wrong). An inactive source (no
+        // matching active file) is skipped: it was compacted away and its ordinal
+        // range is masked out of the ANN live-row bitmap. Mirrors Java master
+        // `PrimaryKeyVectorBucketSearch` (`file == null` -> continue).
         for source in segment.source_meta.source_files() {
-            // An ANN source that is no longer an active file (e.g. compacted away)
-            // is skipped, not rejected: its ordinal range is masked out of the ANN
-            // live-row bitmap and the remaining active sources are still searched.
-            // Mirrors Java master `PrimaryKeyVectorBucketSearch` (`file == null`
-            // -> continue). Active sources still require a row-count match.
-            match files_by_name.get(source.file_name()) {
-                Some(active) if active.row_count == source.row_count() => {
-                    covered.insert(source.file_name().to_string());
-                }
-                Some(_) => {
+            if let Some(active) = files_by_name.get(source.file_name()) {
+                if active.row_count != source.row_count() {
                     return Err(data_invalid(format!(
                         "ANN source {} does not match the active data file",
                         source.file_name()
                     )));
                 }
-                None => continue,
             }
         }
         let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
@@ -636,5 +664,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("row count") || err.to_string().contains("-1"));
+    }
+
+    #[test]
+    fn covered_source_files_matches_by_name_and_row_count() {
+        // "data-1" is an active ANN source with matching row count -> covered.
+        // "data-2" is active but its row count disagrees with the ANN source -> not
+        // covered (bucket_search rejects that separately). "data-3" is an active
+        // file with no ANN source -> not covered (it needs an exact reader).
+        let segment = BucketAnnSegment::for_test(meta(&[("data-1", 3), ("data-2", 9)]));
+        let active = vec![
+            active("data-1", 3),
+            active("data-2", 2),
+            active("data-3", 5),
+        ];
+        let covered = covered_source_files(&[segment], &active);
+        assert!(covered.contains("data-1"));
+        assert!(!covered.contains("data-2"));
+        assert!(!covered.contains("data-3"));
+        assert_eq!(covered.len(), 1);
+    }
+
+    #[test]
+    fn covered_source_files_ignores_inactive_source() {
+        // ANN source names a file that is not active (compacted away) -> not
+        // covered, and no active file needs it.
+        let segment = BucketAnnSegment::for_test(meta(&[("gone", 4)]));
+        let active = vec![active("data-1", 3)];
+        let covered = covered_source_files(&[segment], &active);
+        assert!(covered.is_empty());
     }
 }

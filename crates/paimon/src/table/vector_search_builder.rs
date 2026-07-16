@@ -43,7 +43,7 @@ use crate::table::{
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
-use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
+use crate::vindex::pkvector::bucket::{covered_source_files, BucketActiveFile, BucketAnnSegment};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::pkvector::reader::PkVectorReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
@@ -366,16 +366,23 @@ impl<'a> VectorSearchBuilder<'a> {
 
         // Exact-fallback readers, keyed by (split_index, file_name). In FAST mode
         // the kernel never invokes the factory, so skip the in-memory column read
-        // entirely.
+        // entirely. Otherwise preload only the *uncovered* active files: files an
+        // ANN segment already covers never reach the exact fallback, so reading
+        // their vector column here would be wasted IO/memory. Mirrors Java, which
+        // creates a `PkVectorReader` lazily only for uncovered files.
         let mut exact_readers: HashMap<(usize, String), Box<dyn PkVectorReader>> = HashMap::new();
         if !skip_exact_fallback {
             for (split_index, split) in plan.splits.iter().enumerate() {
+                let covered = covered_source_files(&split.ann_segments, &split.active_files);
                 let factory = DataFilePkVectorReaderFactory::new(
                     reader.clone(),
                     split.data_split.clone(),
                     vector_field.clone(),
                 )?;
                 for active in &split.active_files {
+                    if covered.contains(&active.file_name) {
+                        continue;
+                    }
                     let r = factory.create(active).await?;
                     exact_readers.insert((split_index, active.file_name.clone()), r);
                 }
