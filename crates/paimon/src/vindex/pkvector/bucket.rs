@@ -180,6 +180,33 @@ pub(crate) fn bucket_search(
         }
     }
 
+    // Validate ANN segments mirror Java PkVectorBucketIndexState constructor checks:
+    // (1) payload file uniqueness, (2) no source file covered by multiple segments.
+    let mut segments_by_path: HashMap<&str, usize> = HashMap::new();
+    let mut source_to_segment: HashMap<&str, &str> = HashMap::new();
+    for (idx, segment) in ann_segments.iter().enumerate() {
+        if segments_by_path
+            .insert(segment.path.as_str(), idx)
+            .is_some()
+        {
+            return Err(data_invalid(format!(
+                "ANN segment payload {} appears more than once",
+                segment.path
+            )));
+        }
+        for source in segment.source_meta.source_files() {
+            if let Some(&prior_segment_path) = source_to_segment.get(source.file_name()) {
+                return Err(data_invalid(format!(
+                    "source data file {} is covered by both ANN segments {} and {}",
+                    source.file_name(),
+                    prior_segment_path,
+                    segment.path
+                )));
+            }
+            source_to_segment.insert(source.file_name(), segment.path.as_str());
+        }
+    }
+
     let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
     let active_source_files: HashSet<String> =
         files_by_name.keys().map(|name| name.to_string()).collect();
@@ -644,6 +671,80 @@ mod tests {
         )
         .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_duplicate_ann_segment_path() {
+        let seg1 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2)]),
+            path: "duplicate-path".to_string(),
+            file_size: 100,
+            index_meta: vec![1, 2, 3],
+        };
+        let seg2 = BucketAnnSegment {
+            source_meta: meta(&[("data-2", 2)]),
+            path: "duplicate-path".to_string(),
+            file_size: 200,
+            index_meta: vec![4, 5, 6],
+        };
+        let ann = FakeAnnSearcher { result: vec![] };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let err = bucket_search(
+            Some(&ann),
+            &[seg1, seg2],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            1,
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate-path")
+                && err.to_string().contains("appears more than once")
+        );
+    }
+
+    #[test]
+    fn test_rejects_source_file_covered_by_multiple_segments() {
+        let seg1 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2)]),
+            path: "segment-1".to_string(),
+            file_size: 100,
+            index_meta: vec![1, 2, 3],
+        };
+        let seg2 = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2), ("data-2", 2)]),
+            path: "segment-2".to_string(),
+            file_size: 200,
+            index_meta: vec![4, 5, 6],
+        };
+        let ann = FakeAnnSearcher { result: vec![] };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let err = bucket_search(
+            Some(&ann),
+            &[seg1, seg2],
+            &[active("data-1", 2), active("data-2", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            1,
+            &HashMap::new(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("data-1")
+                && err.to_string().contains("covered by both")
+                && err.to_string().contains("segment-1")
+                && err.to_string().contains("segment-2")
+        );
     }
 
     #[test]
