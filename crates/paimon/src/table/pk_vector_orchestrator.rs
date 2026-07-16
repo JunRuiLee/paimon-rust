@@ -44,6 +44,25 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
+/// Validate a hit's physical row position against its data file, mirroring the
+/// bounds Java `PrimaryKeyVectorResult.splits()` enforces per candidate: the
+/// position must be non-negative, within the file's row count, and fit in an
+/// `i32`. A position outside this range means a corrupt ANN index or malformed
+/// source metadata resolved to a bogus ordinal; fail loud rather than emit a
+/// wrong row.
+pub(crate) fn validate_row_position(
+    file_name: &str,
+    row_position: i64,
+    row_count: i64,
+) -> crate::Result<()> {
+    if row_position < 0 || row_position >= row_count || row_position > i32::MAX as i64 {
+        return Err(data_invalid(format!(
+            "vector search hit position {row_position} out of range for {file_name} (row count {row_count})"
+        )));
+    }
+    Ok(())
+}
+
 /// One bucket's search input. Rust equivalent of Java
 /// `BucketVectorSearchSplit`. Constructed from a snapshot/manifest plan by
 /// `PkVectorScan`.
@@ -162,6 +181,11 @@ pub(crate) fn build_indexed_splits(
         let deletion_file = source
             .data_deletion_files()
             .and_then(|dfs| dfs.get(file_idx).cloned().flatten());
+
+        // Every hit's physical position must be in range for its data file.
+        for &(pos, _) in &hits {
+            validate_row_position(&file_name, pos, file_meta.row_count)?;
+        }
 
         // Coalesce ascending positions into inclusive ranges; scores aligned to
         // ascending-position order.
@@ -1304,5 +1328,18 @@ mod e2e_tests {
             .await
             .unwrap();
         assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn validate_row_position_bounds() {
+        // In range.
+        assert!(validate_row_position("f", 0, 3).is_ok());
+        assert!(validate_row_position("f", 2, 3).is_ok());
+        // Negative, at/over row count, and past i32::MAX all fail loud.
+        assert!(validate_row_position("f", -1, 3).is_err());
+        assert!(validate_row_position("f", 3, 3).is_err());
+        assert!(validate_row_position("f", i32::MAX as i64 + 1, i64::MAX).is_err());
+        let err = validate_row_position("data-1", 9, 3).unwrap_err();
+        assert!(err.to_string().contains("out of range") && err.to_string().contains("data-1"));
     }
 }

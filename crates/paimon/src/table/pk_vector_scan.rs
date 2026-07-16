@@ -166,15 +166,18 @@ impl<'a> PkVectorScan<'a> {
 
     pub(crate) async fn plan(&self) -> crate::Result<PkVectorScanPlan> {
         let snapshot_manager = self.table.snapshot_manager();
-        let snapshot = match snapshot_manager.get_latest_snapshot().await? {
-            Some(s) => s,
-            None => return Ok(PkVectorScanPlan { splits: Vec::new() }),
-        };
-        let snapshot_id = snapshot.id();
 
-        // Data splits (scan all files).
-        let builder = self.table.new_read_builder();
-        let data_splits = builder
+        // Data splits first, via the table's own scan resolution (which honors
+        // time travel / scan.snapshot-id). Deriving the snapshot from the scan's
+        // own output — rather than resolving `get_latest_snapshot()` separately —
+        // keeps the index manifest and the data splits on ONE snapshot, matching
+        // Java `PrimaryKeyVectorScan` (resolve one snapshot up front, read data and
+        // index from it). It also avoids a time-travel mismatch (data from the
+        // travelled snapshot, index from latest) and a TOCTOU where a concurrent
+        // commit lands between two independent resolutions.
+        let data_splits = self
+            .table
+            .new_read_builder()
             .new_scan()
             .with_scan_all_files()
             .plan()
@@ -182,14 +185,27 @@ impl<'a> PkVectorScan<'a> {
             .splits()
             .to_vec();
 
+        // No data files -> nothing to search.
+        let Some(first_split) = data_splits.first() else {
+            return Ok(PkVectorScanPlan { splits: Vec::new() });
+        };
+        let snapshot_id = first_split.snapshot_id();
+        let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
+
         // Index-manifest scan into filtered ANN payload tuples.
         let table_path = self.table.location().trim_end_matches('/');
         let mut entries = Vec::new();
         if let Some(name) = snapshot.index_manifest() {
             let path = snapshot_manager.manifest_path(name);
             for entry in IndexManifest::read(self.table.file_io(), &path).await? {
+                // The on-disk index manifest is combined to live ADD entries only.
+                // A non-ADD entry means a malformed manifest; fail loud rather than
+                // silently drop it (mirrors Java `checkArgument(kind == ADD)`).
                 if entry.kind != FileKind::Add {
-                    continue;
+                    return Err(data_invalid(format!(
+                        "index manifest entry {} is not active (kind {:?})",
+                        entry.index_file.file_name, entry.kind
+                    )));
                 }
                 if entry.index_file.index_type != self.index_type {
                     continue;

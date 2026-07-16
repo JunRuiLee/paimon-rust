@@ -30,7 +30,8 @@ use crate::table::global_index_scanner::{
 use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
 use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
 use crate::table::pk_vector_orchestrator::{
-    build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+    build_indexed_splits, validate_row_position, PkVectorCandidate, PkVectorOrchestrator,
+    PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
@@ -1021,6 +1022,7 @@ fn candidates_to_search_result(
                 message: format!("data file {} has no first_row_id", c.data_file_name),
                 source: None,
             })?;
+        validate_row_position(&c.data_file_name, c.row_position, file_meta.row_count)?;
         let global =
             first_row_id
                 .checked_add(c.row_position)
