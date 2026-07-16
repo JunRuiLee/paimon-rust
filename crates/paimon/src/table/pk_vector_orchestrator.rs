@@ -260,11 +260,12 @@ impl PkVectorOrchestrator {
         metric: VectorSearchMetric,
         limit: usize,
         ann_searcher: Option<&dyn PkVectorAnnSearcher>,
-        exact_reader_factory: &mut dyn FnMut(
+        exact_reader_factory: &mut (dyn FnMut(
             usize,
             &PkVectorSearchSplit,
             &BucketActiveFile,
-        ) -> crate::Result<Box<dyn PkVectorReader>>,
+        ) -> crate::Result<Box<dyn PkVectorReader>>
+                  + Send),
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
     ) -> crate::Result<Vec<PkVectorCandidate>> {
@@ -840,7 +841,8 @@ mod e2e_tests {
         metric: VectorSearchMetric,
         limit: usize,
         ann: Option<&dyn PkVectorAnnSearcher>,
-        factory: &mut dyn FnMut(&BucketActiveFile) -> crate::Result<Box<dyn PkVectorReader>>,
+        factory: &mut (dyn FnMut(&BucketActiveFile) -> crate::Result<Box<dyn PkVectorReader>>
+                  + Send),
         opts: &HashMap<String, String>,
     ) -> crate::Result<Vec<RecordBatch>> {
         let orch = PkVectorOrchestrator::new(reader.clone());
