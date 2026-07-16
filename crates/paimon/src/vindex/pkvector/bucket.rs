@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
 use super::exact::exact_search;
-use super::metric::VectorSearchMetric;
+use super::metric::{java_float_compare, VectorSearchMetric};
 use super::reader::PkVectorReader;
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
@@ -43,10 +43,10 @@ pub(crate) struct BucketActiveFile {
 }
 
 /// Total BEST_FIRST order over results: distance ASC, then data_file_name ASC,
-/// then row_position ASC. `total_cmp` keeps it NaN-safe and panic-free.
+/// then row_position ASC. `java_float_compare` sorts NaN distances last (never
+/// best), matching Java `Float.compare`, and is panic-free.
 fn best_first(a: &PkVectorSearchResult, b: &PkVectorSearchResult) -> Ordering {
-    a.distance
-        .total_cmp(&b.distance)
+    java_float_compare(a.distance, b.distance)
         .then_with(|| a.data_file_name.cmp(&b.data_file_name))
         .then_with(|| a.row_position.cmp(&b.row_position))
 }
@@ -312,6 +312,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("data-1", 0), ("data-1", 1), ("data-1", 2)]
         );
+    }
+
+    #[test]
+    fn nan_ann_hit_never_evicts_finite_candidate_from_top1() {
+        // The core failure mode from review: an ANN hit with a negative-NaN
+        // distance must not win the single bucket Top-1 slot over a finite hit.
+        // Under f32::total_cmp the -NaN would rank best and evict the finite
+        // candidate here in the bucket heap, before any cross-bucket merge.
+        let negative_nan = f32::from_bits(0xffc00000);
+        assert!(negative_nan.is_nan());
+        let segment = BucketAnnSegment {
+            source_meta: meta(&[("data-1", 2)]),
+        };
+        let ann = FakeAnnSearcher {
+            result: vec![
+                PkVectorSearchResult {
+                    data_file_name: "data-1".into(),
+                    row_position: 0,
+                    distance: negative_nan,
+                },
+                PkVectorSearchResult {
+                    data_file_name: "data-1".into(),
+                    row_position: 1,
+                    distance: -1.0,
+                },
+            ],
+        };
+        let mut factory =
+            |_: &BucketActiveFile| -> crate::Result<Box<dyn PkVectorReader>> { unreachable!() };
+        let results = bucket_search(
+            Some(&ann),
+            &[segment],
+            &[active("data-1", 2)],
+            &HashMap::new(),
+            &mut factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            1,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_position, 1);
+        assert_eq!(results[0].distance, -1.0);
     }
 
     #[test]

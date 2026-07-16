@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::bucket::BucketAnnSegment;
 use super::data_invalid;
-use super::metric::VectorSearchMetric;
+use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
 use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
@@ -119,8 +119,7 @@ pub(crate) fn map_ann_results(
         });
     }
     results.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
+        java_float_compare(a.distance, b.distance)
             .then_with(|| a.data_file_name.cmp(&b.data_file_name))
             .then_with(|| a.row_position.cmp(&b.row_position))
     });

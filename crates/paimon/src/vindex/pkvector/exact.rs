@@ -19,14 +19,15 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::data_invalid;
-use super::metric::VectorSearchMetric;
+use super::metric::{java_float_compare, VectorSearchMetric};
 use super::reader::PkVectorReader;
 use super::result::PkVectorSearchResult;
 
 /// A candidate wrapped so a max-heap keeps the WORST candidate on top:
 /// worst = largest distance, ties broken by largest row_position. Popping the
-/// top therefore evicts the least-wanted candidate. Uses `total_cmp` for a
-/// deterministic total order over f32 (NaN-safe, no panic).
+/// top therefore evicts the least-wanted candidate. Uses `java_float_compare`
+/// for a deterministic total order over f32 that ranks NaN distances as worst
+/// (largest), so a NaN is evicted before any finite candidate (no panic).
 struct WorstFirst(PkVectorSearchResult);
 
 impl PartialEq for WorstFirst {
@@ -42,9 +43,7 @@ impl PartialOrd for WorstFirst {
 }
 impl Ord for WorstFirst {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .distance
-            .total_cmp(&other.0.distance)
+        java_float_compare(self.0.distance, other.0.distance)
             .then_with(|| self.0.row_position.cmp(&other.0.row_position))
     }
 }
@@ -52,9 +51,7 @@ impl Ord for WorstFirst {
 /// True if `candidate` ranks strictly better (BEST_FIRST) than the current
 /// worst-on-heap `weakest`: smaller distance, ties broken by smaller position.
 fn is_better_than(candidate: &PkVectorSearchResult, weakest: &PkVectorSearchResult) -> bool {
-    candidate
-        .distance
-        .total_cmp(&weakest.distance)
+    java_float_compare(candidate.distance, weakest.distance)
         .then_with(|| candidate.row_position.cmp(&weakest.row_position))
         == Ordering::Less
 }
@@ -117,9 +114,7 @@ pub(crate) fn exact_search(
 
     let mut results: Vec<PkVectorSearchResult> = heap.into_iter().map(|w| w.0).collect();
     results.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.row_position.cmp(&b.row_position))
+        java_float_compare(a.distance, b.distance).then_with(|| a.row_position.cmp(&b.row_position))
     });
     Ok(results)
 }
@@ -154,6 +149,28 @@ mod tests {
             .unwrap();
             assert_eq!(results[0].distance, expected);
         }
+    }
+
+    #[test]
+    fn nan_distance_candidate_never_beats_finite_top1() {
+        // Row 0's stored vector contains NaN → its inner-product distance is a
+        // negative NaN (sign flipped by the metric's negation), which
+        // `f32::total_cmp` would rank as best (smallest) and select as Top-1.
+        // `java_float_compare` ranks NaN worst, so the finite row 1 wins the
+        // single Top-1 slot instead.
+        let mut reader = ArrayReader::new(2, vec![Some(vec![f32::NAN, 0.0]), Some(vec![1.0, 0.0])]);
+        let results = exact_search(
+            "data-file",
+            &mut reader,
+            &[1.0, 0.0],
+            VectorSearchMetric::InnerProduct,
+            1,
+            &no_exclusion(),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_position, 1);
+        assert_eq!(results[0].distance, -1.0);
     }
 
     #[test]
