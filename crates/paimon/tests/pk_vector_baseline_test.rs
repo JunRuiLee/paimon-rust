@@ -533,6 +533,10 @@ fn fixture_discriminating() -> ([f32; DIM], Vec<[f32; DIM]>) {
     (query, vectors)
 }
 
+// Gated off Windows: the fixture table location is a `file://` URL built from a
+// temp dir path, which `FileIO` cannot derive on Windows (see #397); the sibling
+// `rest_catalog_test` gates its identical `file://` tempdir tests the same way.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     let (query, vectors) = fixture_smoke();
@@ -604,6 +608,8 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
 /// [5, 1, 3], not in ascending physical position [1, 3, 5]. Also asserts the full
 /// row content (id + vector values) and the aligned `_PKEY_VECTOR_SCORE`, with no
 /// `_ROW_ID`/`_PKEY_VECTOR_POSITION` leaking.
+// Gated off Windows for the same `file://` tempdir reason as the test above.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn pk_vector_read_orders_rows_best_first_not_by_position() {
     let (query, vectors) = fixture_discriminating();
