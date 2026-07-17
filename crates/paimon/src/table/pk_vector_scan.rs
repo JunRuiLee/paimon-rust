@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::spec::{
     BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest, PkVectorSourceFile,
-    PkVectorSourceMeta,
+    PkVectorSourceMeta, Predicate,
 };
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
@@ -204,14 +204,21 @@ pub(crate) struct PkVectorScan<'a> {
     table: &'a Table,
     vector_field_id: i32,
     index_type: String,
+    filter: Option<Predicate>,
 }
 
 impl<'a> PkVectorScan<'a> {
-    pub(crate) fn new(table: &'a Table, vector_field_id: i32, index_type: String) -> Self {
+    pub(crate) fn new(
+        table: &'a Table,
+        vector_field_id: i32,
+        index_type: String,
+        filter: Option<Predicate>,
+    ) -> Self {
         Self {
             table,
             vector_field_id,
             index_type,
+            filter,
         }
     }
 
@@ -226,9 +233,17 @@ impl<'a> PkVectorScan<'a> {
         // index from it). It also avoids a time-travel mismatch (data from the
         // travelled snapshot, index from latest) and a TOCTOU where a concurrent
         // commit lands between two independent resolutions.
-        let data_splits = self
-            .table
-            .new_read_builder()
+        //
+        // The residual scalar filter, when set, is pushed into the read builder so
+        // scan planning drops files whose stats cannot match the predicate, mirroring
+        // Java `PrimaryKeyVectorScan` applying the filter at scan time. Files that
+        // survive are still residual-filtered per row downstream; this only avoids
+        // re-reading files the predicate already excludes.
+        let mut read_builder = self.table.new_read_builder();
+        if let Some(filter) = &self.filter {
+            read_builder.with_filter(filter.clone());
+        }
+        let data_splits = read_builder
             .new_scan()
             .with_scan_all_files()
             .plan()
@@ -612,5 +627,266 @@ mod tests {
         assert!(dvs[1].is_some());
         // Both files are COMPACT + level>0, so both appear as active files.
         assert_eq!(splits[0].active_files.len(), 2);
+    }
+
+    // ---- Real-table planning tests for filter push-down ----
+    //
+    // Gated off Windows: these fixtures build a table at a `file://` URL derived
+    // from a temp dir path, which `FileIO` cannot resolve on Windows (see #397).
+    #[cfg(not(windows))]
+    mod prune_pushdown_tests {
+        use super::*;
+        use crate::catalog::Identifier;
+        use crate::io::{FileIO, FileIOBuilder};
+        use crate::spec::stats::compute_column_stats;
+        use crate::spec::{
+            DataType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema, VectorType,
+        };
+        use crate::table::{CommitMessage, SchemaManager, Table, TableCommit, TableWrite};
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        /// Vector dimension for the pruning fixtures.
+        const PRUNE_DIM: usize = 4;
+        /// The primary-key vector column name.
+        const PRUNE_VECTOR_COLUMN: &str = "embedding";
+        /// vindex index type string; only used to route `PkVectorScan::new`, no index
+        /// segment is built for these tests.
+        const PRUNE_INDEX_TYPE: &str = "ivf-flat";
+        /// Number of rows written; `id`/`score` values live in `0..PRUNE_ROWS`.
+        const PRUNE_ROWS: i32 = 4;
+        /// A predicate literal guaranteed to fall outside the written `id`/`score`
+        /// range, so file stats cannot match it.
+        const OUT_OF_RANGE: i32 = 1_000_000;
+
+        /// Schema `(id INT PRIMARY KEY, score INT, embedding VECTOR<FLOAT>)`. When
+        /// `with_deletion_vectors`, enable deletion vectors (merge-on-read left at the
+        /// default `false`) so a non-PK scalar predicate also stats-prunes; otherwise a
+        /// plain PK table where only PK-column conjuncts prune.
+        fn prune_schema(with_deletion_vectors: bool) -> TableSchema {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("score", DataType::Int(IntType::new()))
+                .column(
+                    PRUNE_VECTOR_COLUMN,
+                    DataType::Vector(
+                        VectorType::try_new(
+                            true,
+                            PRUNE_DIM as u32,
+                            DataType::Float(FloatType::new()),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .primary_key(["id"])
+                .option("bucket".to_string(), "1".to_string());
+            if with_deletion_vectors {
+                builder =
+                    builder.option("deletion-vectors.enabled".to_string(), "true".to_string());
+            }
+            TableSchema::new(0, &builder.build().unwrap())
+        }
+
+        /// Arrow batch matching the schema: `id` and `score` both equal the physical
+        /// position (`0..n`), plus a `FixedSizeList<Float32>` vector column.
+        fn prune_data_batch(n: usize) -> RecordBatch {
+            let ids: Vec<i32> = (0..n as i32).collect();
+            let scores: Vec<i32> = (0..n as i32).collect();
+
+            let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+            let mut vector_builder =
+                FixedSizeListBuilder::new(Float32Builder::new(), PRUNE_DIM as i32)
+                    .with_field(element_field.clone());
+            for i in 0..n {
+                for d in 0..PRUNE_DIM {
+                    vector_builder.values().append_value((i + d) as f32);
+                }
+                vector_builder.append(true);
+            }
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("score", ArrowDataType::Int32, false),
+                ArrowField::new(
+                    PRUNE_VECTOR_COLUMN,
+                    ArrowDataType::FixedSizeList(element_field, PRUNE_DIM as i32),
+                    true,
+                ),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(ids)) as ArrayRef,
+                    Arc::new(Int32Array::from(scores)) as ArrayRef,
+                    Arc::new(vector_builder.finish()) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        }
+
+        async fn prune_open_table(file_io: &FileIO, location: &str) -> Table {
+            let schema = SchemaManager::new(file_io.clone(), location.to_string())
+                .latest()
+                .await
+                .expect("failed to list schemas")
+                .expect("table has no schema");
+            Table::new(
+                file_io.clone(),
+                Identifier::new("default", "pkvector_prune"),
+                location.to_string(),
+                (*schema).clone(),
+                None,
+            )
+        }
+
+        /// Build a real single-file primary-key table via the public write path, in a
+        /// fresh temp dir. Persists the schema and writes one data batch, then commits
+        /// the written data file with real `value_stats` for the `id`/`score` columns.
+        ///
+        /// The stats injection mirrors the meta-modification the baseline fixture uses
+        /// for `level`/`file_source`: the Rust key-value (primary-key) writer records
+        /// column stats in `key_stats` and leaves `value_stats` empty, but scan-time
+        /// file pruning reads `value_stats`. Java primary-key writers populate value
+        /// stats, so committing them here makes the file prunable exactly as it would be
+        /// in a table written by the Java engine. Returns the temp dir (kept alive by
+        /// the caller) and the opened table.
+        async fn build_pruning_test_table(
+            with_deletion_vectors: bool,
+        ) -> (tempfile::TempDir, Table) {
+            let tmp = tempfile::tempdir().expect("create temp dir");
+            let location = format!("file://{}", tmp.path().display());
+            let file_io = FileIOBuilder::new("file").build().unwrap();
+
+            for dir in ["schema", "snapshot", "manifest", "index"] {
+                file_io.mkdirs(&format!("{location}/{dir}")).await.unwrap();
+            }
+            let schema = prune_schema(with_deletion_vectors);
+            file_io
+                .new_output(&format!("{location}/schema/schema-{}", schema.id()))
+                .unwrap()
+                .write(bytes::Bytes::from(serde_json::to_vec(&schema).unwrap()))
+                .await
+                .unwrap();
+
+            let table = prune_open_table(&file_io, &location).await;
+
+            let batch = prune_data_batch(PRUNE_ROWS as usize);
+            let mut writer = TableWrite::new(&table, "pkvector-prune".to_string()).unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert_eq!(messages.len(), 1, "single bucket -> one write message");
+            let written = &messages[0];
+            assert_eq!(written.new_files.len(), 1, "single data file expected");
+            let base_meta = written.new_files[0].clone();
+            let bucket = written.bucket;
+            let partition = written.partition.clone();
+
+            // Real value stats over the `id` (col 0) and `score` (col 1) columns, so a
+            // predicate outside the written [0, PRUNE_ROWS) range can prune the file.
+            let int = DataType::Int(IntType::new());
+            let value_stats: BinaryTableStats =
+                compute_column_stats(&batch, &[0, 1], &[int.clone(), int]).unwrap();
+            let indexed_meta = DataFileMeta {
+                value_stats,
+                value_stats_cols: Some(vec!["id".to_string(), "score".to_string()]),
+                ..base_meta
+            };
+
+            let message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+            TableCommit::new(table.clone(), "pkvector-prune".to_string())
+                .commit(vec![message])
+                .await
+                .unwrap();
+
+            (tmp, table)
+        }
+
+        fn prune_vector_field_id(table: &Table) -> i32 {
+            table
+                .schema()
+                .fields()
+                .iter()
+                .find(|f| f.name() == PRUNE_VECTOR_COLUMN)
+                .expect("vector field present")
+                .id()
+        }
+
+        fn prune_equal(table: &Table, column: &str, value: i32) -> Predicate {
+            PredicateBuilder::new(table.schema().fields())
+                .equal(column, Datum::Int(value))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn plan_prunes_file_when_pk_predicate_excludes_it() {
+            // Real PK table, one data file with id in [0, PRUNE_ROWS). A predicate
+            // `id = OUT_OF_RANGE` cannot match the file's id stats, so the scan drops
+            // the file and plan() returns no splits. Control (no filter) returns one.
+            let (_tmp, table) = build_pruning_test_table(false).await;
+            let field_id = prune_vector_field_id(&table);
+
+            let unfiltered =
+                PkVectorScan::new(&table, field_id, PRUNE_INDEX_TYPE.to_string(), None)
+                    .plan()
+                    .await
+                    .unwrap();
+            assert_eq!(
+                unfiltered.splits.len(),
+                1,
+                "control: file present without a filter"
+            );
+
+            let out_of_range = prune_equal(&table, "id", OUT_OF_RANGE);
+            let filtered = PkVectorScan::new(
+                &table,
+                field_id,
+                PRUNE_INDEX_TYPE.to_string(),
+                Some(out_of_range),
+            )
+            .plan()
+            .await
+            .unwrap();
+            assert!(
+                filtered.splits.is_empty(),
+                "pk predicate stats-excludes the only file"
+            );
+        }
+
+        #[tokio::test]
+        async fn plan_prunes_file_on_non_pk_predicate_under_deletion_vectors() {
+            // Under deletion vectors (merge-on-read off), a non-PK column's stats also
+            // prune. A `score` predicate outside the written range drops the file.
+            let (_tmp, table) = build_pruning_test_table(true).await;
+            let field_id = prune_vector_field_id(&table);
+
+            // Control: without a filter the file is present.
+            let unfiltered =
+                PkVectorScan::new(&table, field_id, PRUNE_INDEX_TYPE.to_string(), None)
+                    .plan()
+                    .await
+                    .unwrap();
+            assert_eq!(
+                unfiltered.splits.len(),
+                1,
+                "control: file present without a filter"
+            );
+
+            let out_of_range = prune_equal(&table, "score", OUT_OF_RANGE);
+            let filtered = PkVectorScan::new(
+                &table,
+                field_id,
+                PRUNE_INDEX_TYPE.to_string(),
+                Some(out_of_range),
+            )
+            .plan()
+            .await
+            .unwrap();
+            assert!(
+                filtered.splits.is_empty(),
+                "non-pk predicate stats-excludes the file under deletion vectors"
+            );
+        }
     }
 }

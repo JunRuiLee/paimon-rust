@@ -26,6 +26,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use roaring::RoaringTreemap;
+
 use crate::deletion_vector::DeletionVector;
 use crate::spec::BinaryRow;
 use crate::table::data_file_reader::DataFileReader;
@@ -275,6 +277,13 @@ impl PkVectorOrchestrator {
     /// preserved). The exact-reader factory is split-scoped: it receives the
     /// current split index and split so a caller can build a reader keyed to the
     /// specific split/file. `skip_exact_fallback` forwards to `bucket_search`.
+    ///
+    /// `residual_by_split`, when present, carries one per-file allow-list of
+    /// physical row positions per split (indexed parallel to `splits`): only
+    /// positions listed for a file may survive that bucket's search. A file
+    /// absent from its split's map (or mapped to an empty set) contributes no
+    /// candidates. `None` applies no residual filtering. The slice must have the
+    /// same length as `splits`.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn search_candidates(
@@ -292,6 +301,7 @@ impl PkVectorOrchestrator {
                   + Send),
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
+        residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
     ) -> crate::Result<Vec<PkVectorCandidate>> {
         // Eager input-shape validation (Java checkArgument parity).
         if limit == 0 {
@@ -299,6 +309,13 @@ impl PkVectorOrchestrator {
         }
         if query.is_empty() {
             return Err(data_invalid("vector search query must not be empty"));
+        }
+        if let Some(per_split) = residual_by_split {
+            if per_split.len() != splits.len() {
+                return Err(data_invalid(
+                    "residual range map count does not match split count",
+                ));
+            }
         }
 
         // Eager per-bucket search -> tagged candidates.
@@ -308,6 +325,7 @@ impl PkVectorOrchestrator {
             // Wrap the split-scoped factory into bucket_search's per-file signature.
             let mut bucket_factory =
                 |file: &BucketActiveFile| exact_reader_factory(split_index, split, file);
+            let residual_ranges = residual_by_split.map(|per_split| &per_split[split_index]);
             let results = bucket_search(
                 ann_searcher,
                 &split.ann_segments,
@@ -319,6 +337,7 @@ impl PkVectorOrchestrator {
                 limit,
                 search_options,
                 skip_exact_fallback,
+                residual_ranges,
             )?;
             for PkVectorSearchResult {
                 data_file_name,
@@ -849,6 +868,7 @@ mod e2e_tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
         ) -> crate::Result<Vec<PkVectorSearchResult>> {
             Ok(self.hits.clone())
         }
@@ -875,7 +895,17 @@ mod e2e_tests {
         // expects; the split index/split are unused here.
         let mut wrapped = |_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| factory(f);
         let survivors = orch
-            .search_candidates(splits, query, metric, limit, ann, &mut wrapped, opts, false)
+            .search_candidates(
+                splits,
+                query,
+                metric,
+                limit,
+                ann,
+                &mut wrapped,
+                opts,
+                false,
+                None,
+            )
             .await?;
         let indexed_splits = build_indexed_splits(survivors, splits, metric)?;
         let mut out = Vec::new();
@@ -911,6 +941,7 @@ mod e2e_tests {
                 &mut factory,
                 &opts,
                 false,
+                None,
             )
             .await
             .map(|_| ())
@@ -940,6 +971,7 @@ mod e2e_tests {
                 &mut factory,
                 &opts,
                 false,
+                None,
             )
             .await
             .map(|_| ())
@@ -1276,6 +1308,7 @@ mod e2e_tests {
                 &mut factory,
                 &opts,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1286,6 +1319,130 @@ mod e2e_tests {
                 .map(|c| (c.row_position, c.distance))
                 .collect::<Vec<_>>(),
             vec![(1, 1.0), (2, 4.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_applies_residual_ranges() {
+        // Same single bucket / three rows as above, but a per-split residual map
+        // allows only physical positions {0, 2}. The best recalled hit (pos1,
+        // d=1) is filtered out; the survivors are the allowed positions in
+        // best-first order: pos2 (d=4) then pos0 (d=9). This proves the residual
+        // allow-list is threaded through to the bucket search rather than merely
+        // stored.
+        let table_path = "memory:/pkvo_residual";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let meta = write_file(&file_io, &bucket_path, "r.mosaic", vec![1, 2, 3]).await;
+        let split = PkVectorSearchSplit {
+            data_split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![meta])
+                .build()
+                .unwrap(),
+            ann_segments: Vec::new(),
+            active_files: vec![active("r.mosaic", 3)],
+        };
+        // pos0 {3,0} d=9, pos1 {1,0} d=1, pos2 {2,0} d=4.
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           f: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
+            assert_eq!(f.file_name, "r.mosaic");
+            Ok(Box::new(ArrayReader::new(
+                2,
+                vec![
+                    Some(vec![3.0, 0.0]),
+                    Some(vec![1.0, 0.0]),
+                    Some(vec![2.0, 0.0]),
+                ],
+            )))
+        };
+        // Allow only positions 0 and 2 for "r.mosaic"; pos1 (the best hit) is
+        // excluded by the residual.
+        let mut allowed = RoaringTreemap::new();
+        allowed.insert(0);
+        allowed.insert(2);
+        let residual_by_split = vec![HashMap::from([("r.mosaic".to_string(), allowed)])];
+        let opts = HashMap::new();
+        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &[split],
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                3,
+                None,
+                &mut factory,
+                &opts,
+                false,
+                Some(&residual_by_split),
+            )
+            .await
+            .unwrap();
+        // Best-first among allowed positions: pos2 (d=4) then pos0 (d=9).
+        assert_eq!(
+            cands
+                .iter()
+                .map(|c| (c.row_position, c.distance))
+                .collect::<Vec<_>>(),
+            vec![(2, 4.0), (0, 9.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_candidates_rejects_residual_length_mismatch() {
+        // A residual slice whose length differs from the split count is a caller
+        // bug (the map is indexed by split); it must fail loud rather than panic
+        // or silently misalign.
+        let table_path = "memory:/pkvo_residual_mismatch";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let meta = write_file(&file_io, &bucket_path, "m.mosaic", vec![1, 2]).await;
+        let split = PkVectorSearchSplit {
+            data_split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![meta])
+                .build()
+                .unwrap(),
+            ann_segments: Vec::new(),
+            active_files: vec![active("m.mosaic", 2)],
+        };
+        let mut factory = |_: usize,
+                           _: &PkVectorSearchSplit,
+                           _: &BucketActiveFile|
+         -> crate::Result<Box<dyn PkVectorReader>> {
+            unreachable!("length guard must fire before any bucket search")
+        };
+        // Two residual maps for a single split.
+        let residual_by_split: Vec<HashMap<String, RoaringTreemap>> =
+            vec![HashMap::new(), HashMap::new()];
+        let opts = HashMap::new();
+        let err = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+            .search_candidates(
+                &[split],
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                3,
+                None,
+                &mut factory,
+                &opts,
+                false,
+                Some(&residual_by_split),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("residual length mismatch must fail loud");
+        assert!(
+            format!("{err:?}").contains("does not match split count"),
+            "got: {err:?}"
         );
     }
 
@@ -1325,6 +1482,7 @@ mod e2e_tests {
                 &mut factory,
                 &opts,
                 true,
+                None,
             )
             .await
             .unwrap();

@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::arrow::format::FilePredicates;
+use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
 use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
 use crate::spec::{
-    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
-    IndexManifestEntry, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
+    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
@@ -38,6 +40,7 @@ use crate::table::pk_vector_position_read::{
 };
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
+use crate::table::source::DataSplit;
 use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
@@ -92,6 +95,7 @@ pub struct VectorSearchBuilder<'a> {
     limit: Option<usize>,
     options: HashMap<String, String>,
     projection: Option<Vec<String>>,
+    filter: Option<Predicate>,
 }
 
 pub struct BatchVectorSearchBuilder<'a> {
@@ -111,6 +115,7 @@ impl<'a> VectorSearchBuilder<'a> {
             limit: None,
             options: HashMap::new(),
             projection: None,
+            filter: None,
         }
     }
 
@@ -131,6 +136,26 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
         self.options = options;
+        self
+    }
+
+    /// Attach a residual scalar predicate applied *after* vector recall on the
+    /// primary-key vector path: each recalled candidate file is re-read and only
+    /// rows satisfying `filter` survive, folded into the search so best-first
+    /// order and Top-K still hold. Mirrors Java `PrimaryKeyVectorRead`'s
+    /// residual-filter support. Only the primary-key vector path consumes it, and
+    /// only when the table exposes physical rows directly (deletion vectors
+    /// enabled without merge-on-read); otherwise the query fails loud. A query
+    /// that does not resolve to the primary-key vector path (no PK-vector index,
+    /// or a non-PK-vector column) also fails loud rather than silently ignoring
+    /// the filter.
+    ///
+    /// The whole predicate is both pushed into the scan — where it prunes whole
+    /// data files by their column stats — and applied per row as a residual over
+    /// the surviving files, so results stay exact. Sub-file row-range narrowing is
+    /// not performed; a surviving file is re-read in full for the residual.
+    pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        self.filter = Some(filter);
         self
     }
 
@@ -189,6 +214,19 @@ impl<'a> VectorSearchBuilder<'a> {
                     .execute_primary_key_vector_search(&core, &pk_col, query_vector, limit)
                     .await;
             }
+        }
+
+        // The data-evolution (global-index) fall-through path cannot honor a
+        // residual filter — it never reads physical rows. Rather than silently
+        // drop the predicate and return unfiltered results, fail loud when a
+        // filter is set on a query that does not resolve to the primary-key
+        // vector path.
+        if self.filter.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "vector search filter is only supported on the primary-key vector path"
+                    .to_string(),
+                source: None,
+            });
         }
 
         let mut batch_builder = BatchVectorSearchBuilder::new(self.table);
@@ -284,11 +322,26 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        // Residual-filter guard: PK vector search accepts partition filters only.
-        // This builder exposes no data-predicate setter, so there is nothing to
-        // reject here; the guard mirrors Java `checkArgument(filter == null)` and,
-        // if a filter setter is ever added, it must error rather than be ignored.
-
+        // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
+        // predicate set via `with_filter` is applied post-recall by re-reading
+        // each candidate file's physical rows (see below). That physical-position
+        // filtering only agrees with the bucket search when the table exposes
+        // physical rows directly: deletion vectors enabled and merge-on-read
+        // disabled. Under merge-on-read (or without deletion vectors) a read
+        // merges multiple key versions, so a scalar filter could retain a stale
+        // version whose live version does not match — a silent wrong-read. Reject
+        // such queries rather than answer them incorrectly. No filter → nothing to
+        // guard, so the search-only and read paths are unaffected.
+        let physical_row_read =
+            core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
+        if self.filter.is_some() && !physical_row_read {
+            return Err(crate::Error::DataInvalid {
+                message:
+                    "primary-key vector pre-filter requires deletion vectors without merge-on-read"
+                        .to_string(),
+                source: None,
+            });
+        }
         // `primary_key_vector_distance_metric` returns a validated name; re-parse
         // into the enum for the numeric semantics.
         let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
@@ -315,7 +368,7 @@ impl<'a> VectorSearchBuilder<'a> {
         let search_mode = core.global_index_search_mode()?;
         let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
 
-        let plan = PkVectorScan::new(self.table, field_id, index_type)
+        let plan = PkVectorScan::new(self.table, field_id, index_type, self.filter.clone())
             .plan()
             .await?;
         if plan.splits.is_empty() {
@@ -365,12 +418,61 @@ impl<'a> VectorSearchBuilder<'a> {
             });
         let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
 
+        // Residual (post-recall) filtering: for each candidate file, re-read its
+        // physical rows and keep the positions whose rows satisfy the filter. The
+        // per-split allow-list is threaded into the bucket search so the residual
+        // folds into recall (best-first order and Top-K are preserved). Built only
+        // when a filter is set; otherwise `None` leaves the search unfiltered. The
+        // residual reader projects the predicate columns plus `_ROW_ID` (used to
+        // recover file-local physical positions) and carries no pushdown, matching
+        // `residual_positions_by_file`. Computed before the exact-reader preload so
+        // the preload can skip files the residual allow-list leaves empty.
+        let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match &self.filter {
+            Some(filter) => {
+                let file_predicates = FilePredicates {
+                    predicates: vec![filter.clone()],
+                    file_fields: self.table.schema().fields().to_vec(),
+                };
+                let row_id_field = DataField::new(
+                    ROW_ID_FIELD_ID,
+                    ROW_ID_FIELD_NAME.to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                );
+                let residual_read_type =
+                    widen_scan_fields(std::slice::from_ref(&row_id_field), Some(&file_predicates));
+                let residual_reader = DataFileReader::new(
+                    self.table.file_io().clone(),
+                    self.table.schema_manager().clone(),
+                    self.table.schema().id(),
+                    self.table.schema().fields().to_vec(),
+                    residual_read_type,
+                    Vec::new(),
+                );
+                let mut per_split = Vec::with_capacity(plan.splits.len());
+                for split in &plan.splits {
+                    per_split.push(
+                        residual_positions_by_file(
+                            &residual_reader,
+                            &split.data_split,
+                            &split.active_files,
+                            &file_predicates,
+                        )
+                        .await?,
+                    );
+                }
+                Some(per_split)
+            }
+            None => None,
+        };
+
         // Exact-fallback readers, keyed by (split_index, file_name). In FAST mode
         // the kernel never invokes the factory, so skip the in-memory column read
         // entirely. Otherwise preload only the *uncovered* active files: files an
         // ANN segment already covers never reach the exact fallback, so reading
         // their vector column here would be wasted IO/memory. Mirrors Java, which
-        // creates a `PkVectorReader` lazily only for uncovered files.
+        // creates a `PkVectorReader` lazily only for uncovered files. When a
+        // residual filter leaves a file's allow-list empty (or absent) the bucket
+        // search skips it, so its reader is not preloaded either.
         let mut exact_readers: HashMap<(usize, String), Box<dyn PkVectorReader>> = HashMap::new();
         if !skip_exact_fallback {
             for (split_index, split) in plan.splits.iter().enumerate() {
@@ -382,6 +484,13 @@ impl<'a> VectorSearchBuilder<'a> {
                 )?;
                 for active in &split.active_files {
                     if covered.contains(&active.file_name) {
+                        continue;
+                    }
+                    if !should_preload_exact_reader(
+                        residual_by_split.as_deref(),
+                        split_index,
+                        &active.file_name,
+                    ) {
                         continue;
                     }
                     let r = factory.create(active).await?;
@@ -411,6 +520,7 @@ impl<'a> VectorSearchBuilder<'a> {
                 &mut factory,
                 &search_options,
                 skip_exact_fallback,
+                residual_by_split.as_deref(),
             )
             .await?;
 
@@ -910,6 +1020,114 @@ async fn evaluate_batch_vector_search(
 
 fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
+}
+
+/// Whether the exact-fallback reader for `file_name` in split `split_index`
+/// should be preloaded. With a residual filter, a file absent from the split's
+/// allow-list or with an empty allow-list has no candidate rows, so the bucket
+/// search skips it and preloading its vector column would be wasted IO.
+fn should_preload_exact_reader(
+    residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
+    split_index: usize,
+    file_name: &str,
+) -> bool {
+    match residual_by_split {
+        None => true,
+        Some(per_split) => per_split
+            .get(split_index)
+            .and_then(|m| m.get(file_name))
+            .is_some_and(|allowed| !allowed.is_empty()),
+    }
+}
+
+/// Compute, per data file in `split`, the set of physical row positions whose
+/// rows satisfy the residual predicate. Mirrors the row-collecting half of Java
+/// `PrimaryKeyVectorRead`'s `executeFilter`: because
+/// [`DataFileReader::read_single_file_stream`] rejects projecting `_ROW_ID`
+/// alongside a row-filtering predicate (the residual filter would drop rows
+/// before `_ROW_ID` is assigned positionally, desyncing it), the predicate is
+/// NOT pushed down. Instead `reader` projects the residual columns together with
+/// `_ROW_ID` and carries no pushdown predicate; the residual is applied here at
+/// the Arrow level, after `_ROW_ID` is materialized, and each surviving row's
+/// `_ROW_ID - first_row_id` is the file-local physical position.
+///
+/// Every *active* data file in the split gets an entry, possibly empty. The
+/// bucket search treats an absent entry and an empty entry identically (the file
+/// contributes no candidates), so the empty entries only make the map cover every
+/// active file. Non-active files (e.g. level-0 files the bucket search excludes)
+/// are skipped entirely: they are never searched, so re-reading them would be
+/// wasted IO and their possibly-absent `first_row_id` must not fail an otherwise
+/// valid query.
+///
+/// `reader` must project `_ROW_ID` and be predicate-free; `residual.file_fields`
+/// are the fields the residual leaf indices point into (resolved by name against
+/// each emitted batch). A data file without `first_row_id` fails loud, matching
+/// the position-read guard.
+async fn residual_positions_by_file(
+    reader: &DataFileReader,
+    split: &DataSplit,
+    active_files: &[BucketActiveFile],
+    residual: &FilePredicates,
+) -> crate::Result<HashMap<String, RoaringTreemap>> {
+    let scan_fields = reader.read_type().to_vec();
+    let active_names: HashSet<&str> = active_files.iter().map(|f| f.file_name.as_str()).collect();
+    let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
+    for file_meta in split.data_files() {
+        // Only files the bucket search actually recalls from need residual
+        // positions; skip everything else so a non-active file cannot trigger the
+        // `first_row_id` guard below or incur a wasted read.
+        if !active_names.contains(file_meta.file_name.as_str()) {
+            continue;
+        }
+        let first_row_id = file_meta
+            .first_row_id
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "residual position read requires data file '{}' to have first_row_id",
+                    file_meta.file_name
+                ),
+                source: None,
+            })?;
+        let data_fields = reader.derive_data_fields(file_meta).await?;
+        let mut stream =
+            reader.read_single_file_stream(split, file_meta.clone(), data_fields, None, None)?;
+        // Register the file up front so a file whose rows all fail the residual
+        // still appears in the map (empty set).
+        let positions = out.entry(file_meta.file_name.clone()).or_default();
+        while let Some(batch) = stream.try_next().await? {
+            let filtered = filter_record_batch_by_predicates(batch, residual, &scan_fields)?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            let row_id_idx = filtered.schema().index_of(ROW_ID_FIELD_NAME).map_err(|_| {
+                crate::Error::DataInvalid {
+                    message: "residual position read batch is missing the _ROW_ID column"
+                        .to_string(),
+                    source: None,
+                }
+            })?;
+            let row_ids = filtered
+                .column(row_id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "residual position read _ROW_ID column is not Int64".to_string(),
+                    source: None,
+                })?;
+            for i in 0..row_ids.len() {
+                let position = row_ids.value(i) - first_row_id;
+                let position = u64::try_from(position).map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "residual position {position} is negative for data file '{}'",
+                        file_meta.file_name
+                    ),
+                    source: None,
+                })?;
+                positions.insert(position);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Preload every ANN segment's bytes into a map keyed by the resolved (globally
@@ -1954,8 +2172,8 @@ mod tests {
     use crate::lumina::{LEGACY_LUMINA_VECTOR_ANN_IDENTIFIER, LUMINA_IDENTIFIER};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, BinaryRow, DataFileMeta, DataType, FloatType, GlobalIndexMeta, IndexFileMeta,
-        IndexManifestEntry, IntType, Schema, TableSchema,
+        ArrayType, BinaryRow, DataFileMeta, DataType, Datum, FloatType, GlobalIndexMeta,
+        IndexFileMeta, IndexManifestEntry, IntType, PredicateBuilder, Schema, TableSchema,
     };
     use crate::table::source::DataSplitBuilder;
     use crate::vindex::IVF_FLAT_IDENTIFIER;
@@ -2012,6 +2230,26 @@ mod tests {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         assert_eq!(find_field_id_by_name(&fields, "embedding"), Some(2));
         assert_eq!(find_field_id_by_name(&fields, "nonexistent"), None);
+    }
+
+    #[test]
+    fn should_preload_skips_empty_or_absent_residual_files() {
+        use roaring::RoaringTreemap;
+        use std::collections::HashMap;
+        // No filter -> always preload.
+        assert!(should_preload_exact_reader(None, 0, "f0"));
+        // Filter present: file with a non-empty allow-list -> preload.
+        let mut m0: HashMap<String, RoaringTreemap> = HashMap::new();
+        m0.insert("f0".to_string(), RoaringTreemap::from_iter([0u64]));
+        let per_split = vec![m0];
+        assert!(should_preload_exact_reader(Some(&per_split), 0, "f0"));
+        // Filter present: file absent -> skip.
+        assert!(!should_preload_exact_reader(Some(&per_split), 0, "missing"));
+        // Filter present: file with empty allow-list -> skip.
+        let mut m1: HashMap<String, RoaringTreemap> = HashMap::new();
+        m1.insert("f1".to_string(), RoaringTreemap::new());
+        let per_split2 = vec![m1];
+        assert!(!should_preload_exact_reader(Some(&per_split2), 0, "f1"));
     }
 
     #[test]
@@ -2817,6 +3055,147 @@ mod tests {
         }
     }
 
+    /// `id > threshold` built against the table's user fields (leaf index resolves
+    /// against `table.schema().fields()`).
+    fn id_gt_filter(table: &Table, threshold: i32) -> Predicate {
+        PredicateBuilder::new(table.schema().fields())
+            .greater_than("id", Datum::Int(threshold))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_without_deletion_vectors_fails_loud() {
+        // A residual filter on a PK-vector table that does NOT enable deletion
+        // vectors must be rejected (merge-on-read semantics would make physical
+        // -position filtering unsound). Mirrors Java `PrimaryKeyVectorScan`.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("filter without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_filter_without_deletion_vectors_fails_loud() {
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("read filter without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_scored_filter_on_non_pk_vector_path_fails_loud() {
+        // No PK-vector index configured, so `execute_scored` would fall through to
+        // the data-evolution path, which never consumes the filter. Silently
+        // returning unfiltered rows is a wrong-read; the query must fail loud
+        // instead.
+        let table = pk_vector_table(&[]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("filter on the non-PK-vector path must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("only supported on the primary-key vector path")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_with_merge_on_read_fails_loud() {
+        // Deletion vectors enabled BUT merge-on-read on: still rejected, because a
+        // merge-on-read scan can surface stale key versions that a physical-row
+        // filter cannot reconcile.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("deletion-vectors.enabled", "true"),
+            ("deletion-vectors.merge-on-read", "true"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .map(|_| ())
+            .expect_err("merge-on-read filter must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_branch_filter_with_deletion_vectors_passes_guard() {
+        // Deletion vectors enabled, merge-on-read off (default): the residual guard
+        // passes. With no snapshot the plan is empty, so the (guarded) filter path
+        // simply yields an empty result rather than erroring — proving the guard
+        // admits a legal filtered query.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("deletion-vectors.enabled", "true"),
+        ]);
+        let filter = id_gt_filter(&table, 2);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_scored()
+            .await
+            .expect("guarded filter query must be admitted");
+        assert!(result.is_empty());
+    }
+
     fn make_lumina_entry(
         file_name: &str,
         index_type: &str,
@@ -3112,5 +3491,326 @@ mod tests {
         let fields = builder.resolve_materialize_read_type().unwrap();
         let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id"]);
+    }
+}
+
+/// Tests for [`residual_positions_by_file`]: the residual predicate is applied at
+/// the Arrow level (no pushdown) against the predicate columns plus `_ROW_ID`,
+/// and each surviving row's `_ROW_ID` is converted back to a file-local physical
+/// position.
+#[cfg(test)]
+mod residual_positions_tests {
+    use super::*;
+    use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::FilePredicates;
+    use crate::io::FileIOBuilder;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{
+        BigIntType, BinaryRow, DataField, DataFileMeta, DataType, Datum, IntType, PredicateBuilder,
+        ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    };
+    use crate::table::data_file_reader::DataFileReader;
+    use crate::table::schema_manager::SchemaManager;
+    use crate::table::source::{DataSplit, DataSplitBuilder};
+    use arrow_array::{Int32Array, RecordBatch};
+    use bytes::Bytes;
+    use paimon_mosaic_core::spec::COMPRESSION_NONE;
+    use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
+    use std::io;
+    use std::sync::Arc;
+
+    struct MemOutputFile {
+        data: Vec<u8>,
+    }
+
+    impl OutputFile for MemOutputFile {
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn pos(&self) -> u64 {
+            self.data.len() as u64
+        }
+    }
+
+    fn id_field() -> DataField {
+        DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn row_id_field() -> DataField {
+        DataField::new(
+            ROW_ID_FIELD_ID,
+            ROW_ID_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::new()),
+        )
+    }
+
+    fn id_batch(ids: Vec<i32>) -> RecordBatch {
+        let schema = build_target_arrow_schema(&[id_field()]).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn write_mosaic(batch: &RecordBatch) -> Bytes {
+        let mut writer = MosaicWriter::new(
+            MemOutputFile { data: Vec::new() },
+            batch.schema().as_ref(),
+            WriterOptions {
+                compression: COMPRESSION_NONE,
+                num_buckets: 2,
+                row_group_max_size: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(writer.output().data.to_vec())
+    }
+
+    fn data_file(
+        file_name: &str,
+        file_size: i64,
+        row_count: i64,
+        first_row_id: Option<i64>,
+    ) -> DataFileMeta {
+        DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::empty(),
+            value_stats: BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 1,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id,
+            write_cols: None,
+        }
+    }
+
+    /// Build a predicate-free reader (read_type = `id` + `_ROW_ID`) over a split
+    /// containing `files` (each `(name, ids, first_row_id)`), written as Mosaic
+    /// data files in the same bucket. The returned active-file list covers every
+    /// file (all files active).
+    async fn build_reader_and_split(
+        table_path: &str,
+        files: &[(&str, Vec<i32>, i64)],
+    ) -> (DataFileReader, DataSplit, Vec<BucketActiveFile>) {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let mut metas = Vec::new();
+        let mut active_files = Vec::new();
+        for (name, ids, first_row_id) in files {
+            let data = write_mosaic(&id_batch(ids.clone()));
+            file_io
+                .new_output(&format!("{bucket_path}/{name}"))
+                .unwrap()
+                .write(data.clone())
+                .await
+                .unwrap();
+            metas.push(data_file(
+                name,
+                data.len() as i64,
+                ids.len() as i64,
+                Some(*first_row_id),
+            ));
+            active_files.push(BucketActiveFile {
+                file_name: name.to_string(),
+                row_count: ids.len() as i64,
+            });
+        }
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(metas)
+            .build()
+            .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            1,
+            vec![id_field()],
+            vec![id_field(), row_id_field()],
+            Vec::new(),
+        );
+        (reader, split, active_files)
+    }
+
+    /// `id > threshold`, with `file_fields` = `[id]` so the leaf index resolves.
+    fn residual_id_gt(threshold: i32) -> FilePredicates {
+        let pred = PredicateBuilder::new(&[id_field()])
+            .greater_than("id", Datum::Int(threshold))
+            .unwrap();
+        FilePredicates {
+            predicates: vec![pred],
+            file_fields: vec![id_field()],
+        }
+    }
+
+    fn sorted(t: &roaring::RoaringTreemap) -> Vec<u64> {
+        t.iter().collect()
+    }
+
+    #[tokio::test]
+    async fn test_residual_selects_matching_positions() {
+        // ids [1,2,3,4,5] at first_row_id 0; id > 2 -> ids 3,4,5 -> positions 2,3,4.
+        let (reader, split, active) = build_reader_and_split(
+            "memory:/rpf_basic",
+            &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        )
+        .await;
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_matches_none_yields_empty_entry() {
+        // id > 100 matches nothing; the file still gets a (present, empty) entry.
+        let (reader, split, active) =
+            build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)])
+                .await;
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(100))
+            .await
+            .unwrap();
+        assert!(map.contains_key("part-0.mosaic"));
+        assert!(map["part-0.mosaic"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_residual_matches_all_yields_full_set() {
+        let (reader, split, active) =
+            build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_positions_are_file_local_across_files() {
+        // Two files with distinct first_row_id; positions must be 0-based within
+        // each file, not global. id > 3 keeps ids 4,5 in both -> positions {3,4}.
+        let (reader, split, active) = build_reader_and_split(
+            "memory:/rpf_multi",
+            &[
+                ("part-0.mosaic", vec![1, 2, 3, 4, 5], 0),
+                ("part-1.mosaic", vec![1, 2, 3, 4, 5], 100),
+            ],
+        )
+        .await;
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(3))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
+        assert_eq!(sorted(&map["part-1.mosaic"]), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_non_active_files_are_skipped() {
+        // Two files in the split, but only `part-0.mosaic` is active. The bucket
+        // search never recalls from `part-1.mosaic` (level-0 / non-active), so it
+        // must not appear in the residual map — and even though it lacks a
+        // `first_row_id`, the query still succeeds because non-active files are
+        // skipped before the guard.
+        let (reader, split, mut active) = build_reader_and_split(
+            "memory:/rpf_nonactive",
+            &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        )
+        .await;
+        // Append a non-active file (missing first_row_id) directly to the split's
+        // data files, but leave it out of the active list.
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = "memory:/rpf_nonactive/bucket-0";
+        let data = write_mosaic(&id_batch(vec![9, 9, 9]));
+        file_io
+            .new_output(&format!("{bucket_path}/part-1.mosaic"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let mut metas = split.data_files().to_vec();
+        metas.push(data_file("part-1.mosaic", data.len() as i64, 3, None));
+        // `active` already lists only part-0.mosaic; keep it that way.
+        let _ = &mut active;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path.to_string())
+            .with_total_buckets(1)
+            .with_data_files(metas)
+            .build()
+            .unwrap();
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
+            .await
+            .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+        assert!(
+            !map.contains_key("part-1.mosaic"),
+            "non-active file must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_first_row_id_is_error() {
+        let (reader, split, active) = build_reader_and_split_no_first_row_id().await;
+        let err = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
+            .await
+            .expect_err("missing first_row_id must error");
+        assert!(format!("{err:?}").contains("first_row_id"), "got: {err:?}");
+    }
+
+    async fn build_reader_and_split_no_first_row_id(
+    ) -> (DataFileReader, DataSplit, Vec<BucketActiveFile>) {
+        let table_path = "memory:/rpf_nofrid";
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let data = write_mosaic(&id_batch(vec![1, 2, 3]));
+        file_io
+            .new_output(&format!("{bucket_path}/part-0.mosaic"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file("part-0.mosaic", data.len() as i64, 3, None)])
+            .build()
+            .unwrap();
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            1,
+            vec![id_field()],
+            vec![id_field(), row_id_field()],
+            Vec::new(),
+        );
+        // The lone file is active, so the `first_row_id` guard applies to it.
+        let active = vec![BucketActiveFile {
+            file_name: "part-0.mosaic".to_string(),
+            row_count: 3,
+        }];
+        (reader, split, active)
     }
 }
