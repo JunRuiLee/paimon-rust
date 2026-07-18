@@ -58,6 +58,9 @@ use paimon::spec::{
     DataFileMeta, DataType, FloatType, GlobalIndexMeta, IndexFileMeta, IntType, Schema,
     TableSchema, VectorType,
 };
+// Used only by the residual end-to-end test, which is gated off Windows.
+#[cfg(not(windows))]
+use paimon::spec::{Datum, Predicate, PredicateBuilder};
 use paimon::table::{CommitMessage, SchemaManager, Table, TableCommit};
 use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
@@ -103,9 +106,19 @@ fn analytic_topk(query: &[f32], vectors: &[[f32; DIM]], k: usize) -> Vec<(u64, f
 /// Table options that route searches into the primary-key vector branch
 /// (`VectorSearchBuilder::execute_primary_key_vector_search`). Default search
 /// mode is FAST, so only the ANN segment is consulted (no exact fallback).
+///
+/// `deletion-vectors.enabled = true` (and merge-on-read left at its default
+/// `false`) is what makes the table expose physical rows directly, the
+/// precondition Java `PrimaryKeyVectorScan` requires before a residual data
+/// predicate (`with_filter`) may be applied post-recall. This fixture never
+/// actually deletes a row, so no deletion files are written; the option only
+/// satisfies the residual guard and does not otherwise change the write/read
+/// path (default `deduplicate` merge-engine, no deletion files -> no DV factory
+/// is built on read).
 fn table_options() -> Vec<(String, String)> {
     vec![
         ("bucket".to_string(), "1".to_string()),
+        ("deletion-vectors.enabled".to_string(), "true".to_string()),
         (
             "pk-vector.index.columns".to_string(),
             VECTOR_COLUMN.to_string(),
@@ -679,6 +692,232 @@ async fn pk_vector_read_orders_rows_best_first_not_by_position() {
             "_PKEY_VECTOR_POSITION must not leak into read output"
         );
         // Default projection keeps the user vector column.
+        assert!(
+            batch.schema().index_of(VECTOR_COLUMN).is_ok(),
+            "default projection must materialize the vector column"
+        );
+    }
+}
+
+/// Fixture #3 (residual): the unrestricted nearest neighbours sit at low ids
+/// (0, 1, 2), but the residual predicate `id >= 3` excludes exactly those, so
+/// the residual result set is disjoint from the unfiltered one. Among the rows
+/// the residual keeps (ids 3, 4, 5) the best-first order is [4, 5, 3], which is
+/// neither the ascending id order [3, 4, 5] nor a prefix of the unfiltered
+/// order — proving the residual genuinely reshapes the result.
+///
+///   query [10,0,0,0]
+///   pos0 [10,0,0,0] ->  0   (unfiltered nearest; excluded by id >= 3)
+///   pos1 [ 9,0,0,0] ->  1   (excluded)
+///   pos2 [ 8,0,0,0] ->  4   (excluded)
+///   pos3 [ 5,0,0,0] -> 25   (kept; farthest of the kept rows)
+///   pos4 [ 7,0,0,0] ->  9   (kept; nearest of the kept rows)
+///   pos5 [ 6,0,0,0] -> 16   (kept)
+/// Strict gaps 0 < 1 < 4 < 9 < 16 < 25 make every top-k order unique.
+///   unfiltered top-3 = [0, 1, 2]
+///   residual (id >= 3) top-3 = [4, 5, 3]
+#[cfg(not(windows))]
+fn fixture_residual() -> ([f32; DIM], Vec<[f32; DIM]>) {
+    let query = [10.0, 0.0, 0.0, 0.0];
+    let vectors = vec![
+        [10.0, 0.0, 0.0, 0.0], // pos 0 -> 0
+        [9.0, 0.0, 0.0, 0.0],  // pos 1 -> 1
+        [8.0, 0.0, 0.0, 0.0],  // pos 2 -> 4
+        [5.0, 0.0, 0.0, 0.0],  // pos 3 -> 25
+        [7.0, 0.0, 0.0, 0.0],  // pos 4 -> 9
+        [6.0, 0.0, 0.0, 0.0],  // pos 5 -> 16
+    ];
+    (query, vectors)
+}
+
+/// Run `execute_read()` with a residual `filter` attached via `with_filter` and
+/// flatten the stream into per-row `(id, score)` tuples in emission order
+/// (best-first), returning the collected batches too for schema / row-content
+/// assertions. Mirrors `read_id_and_scores` but exercises the residual path.
+#[cfg(not(windows))]
+async fn read_id_and_scores_filtered(
+    table: &Table,
+    query: Vec<f32>,
+    limit: usize,
+    filter: Predicate,
+) -> (Vec<i32>, Vec<f32>, Vec<RecordBatch>) {
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vector(query)
+        .with_limit(limit)
+        .with_filter(filter);
+    let batches = builder
+        .execute_read()
+        .await
+        .expect("primary-key vector residual read failed")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collecting residual read batches failed");
+
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            let idx = b.schema().index_of("id").unwrap();
+            b.column(idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    let scores: Vec<f32> = batches
+        .iter()
+        .flat_map(|b| {
+            let idx = b.schema().index_of("_PKEY_VECTOR_SCORE").unwrap();
+            b.column(idx)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    (ids, scores, batches)
+}
+
+/// End-to-end coverage of the residual data predicate (`with_filter`) on the
+/// public primary-key vector path. Mirrors Java `PrimaryKeyVectorRead`'s
+/// residual-filter support: the residual columns are re-read per candidate file,
+/// the surviving physical positions are folded into recall, and only rows
+/// satisfying the predicate remain — best-first and Top-K preserved.
+///
+/// The fixture is built so the residual actually changes the result set: the
+/// unfiltered top-3 is [0, 1, 2] while the residual (`id >= 3`) top-3 is
+/// [4, 5, 3]. The two sets are disjoint, so a residual that silently did nothing
+/// (or was ignored) would surface here.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn pk_vector_residual_filter_excludes_non_matching_rows() {
+    let (query, vectors) = fixture_residual();
+    let (_tmp, table) = build_table(&query, &vectors, 3).await;
+
+    // Ground truth: unrestricted top-3, and the top-3 restricted to ids >= 3
+    // (the residual only ranks rows whose id passes the predicate).
+    let unfiltered = analytic_topk(&query, &vectors, 3);
+    let unfiltered_ids: Vec<u64> = unfiltered.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        unfiltered_ids,
+        vec![0, 1, 2],
+        "fixture guard: unfiltered top-3 must be [0, 1, 2]"
+    );
+
+    let residual_threshold = 3;
+    let mut residual_ranked: Vec<(u64, f32)> = analytic_topk(&query, &vectors, vectors.len())
+        .into_iter()
+        .filter(|(id, _)| *id >= residual_threshold)
+        .collect();
+    residual_ranked.truncate(3);
+    let expected_ids: Vec<i32> = residual_ranked.iter().map(|(id, _)| *id as i32).collect();
+    let expected_scores: Vec<f32> = residual_ranked.iter().map(|(_, d)| l2_score(*d)).collect();
+    // The whole point of this fixture: residual result != unfiltered result, and
+    // best-first over the kept rows is not ascending id order.
+    assert_eq!(
+        expected_ids,
+        vec![4, 5, 3],
+        "fixture guard: residual (id >= 3) top-3 must be best-first [4, 5, 3]"
+    );
+
+    // Build the residual predicate on the data column `id` via the public
+    // PredicateBuilder, exactly as a caller would.
+    let residual = PredicateBuilder::new(table.schema().fields())
+        .greater_or_equal("id", Datum::Int(residual_threshold as i32))
+        .expect("build residual predicate on id");
+
+    // Search-only: unfiltered vs residual must differ, and every residual hit
+    // must satisfy the predicate (id >= 3), disjoint from the unfiltered set.
+    let unfiltered_result = table
+        .new_vector_search_builder()
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vector(query.to_vec())
+        .with_limit(3)
+        .execute_scored()
+        .await
+        .expect("unfiltered primary-key vector search failed");
+    assert_eq!(
+        unfiltered_result.row_ids, unfiltered_ids,
+        "unfiltered search must return [0, 1, 2]"
+    );
+
+    let residual_result = table
+        .new_vector_search_builder()
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vector(query.to_vec())
+        .with_limit(3)
+        .with_filter(residual.clone())
+        .execute_scored()
+        .await
+        .expect("residual primary-key vector search failed");
+    let residual_row_ids: Vec<u64> = expected_ids.iter().map(|&id| id as u64).collect();
+    assert_eq!(
+        residual_result.row_ids, residual_row_ids,
+        "residual search must return best-first [4, 5, 3]"
+    );
+    assert_ne!(
+        residual_result.row_ids, unfiltered_result.row_ids,
+        "residual must change the result set relative to no filter"
+    );
+    for &id in &residual_result.row_ids {
+        assert!(
+            id >= residual_threshold,
+            "residual search returned id {id} that fails the predicate id >= {residual_threshold}"
+        );
+    }
+
+    // Search-and-read with the residual: default projection materializes id +
+    // vector column, best-first, with an aligned `_PKEY_VECTOR_SCORE`.
+    let (ids, scores, batches) =
+        read_id_and_scores_filtered(&table, query.to_vec(), 3, residual).await;
+
+    assert_eq!(
+        ids, expected_ids,
+        "residual read must emit only kept rows, best-first [4, 5, 3]"
+    );
+    for &id in &ids {
+        assert!(
+            id >= residual_threshold as i32,
+            "residual read returned id {id} that fails the predicate id >= {residual_threshold}"
+        );
+    }
+
+    // Row content: the materialized vector for each emitted row equals the source
+    // vector at that physical position.
+    let got_vectors = collect_vectors(&batches);
+    assert_eq!(got_vectors.len(), 3, "three kept rows expected");
+    for (row_idx, (id, _)) in residual_ranked.iter().enumerate() {
+        assert_eq!(
+            got_vectors[row_idx],
+            vectors[*id as usize].to_vec(),
+            "materialized vector for row id {id} diverges from source data"
+        );
+    }
+
+    // Score alignment on the residual read path.
+    assert_eq!(scores.len(), 3);
+    for (got, want) in scores.iter().zip(&expected_scores) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "residual read score diverges: got {got}, want {want}"
+        );
+    }
+
+    // Hidden metadata columns must not leak, even on the residual path.
+    for batch in &batches {
+        assert!(
+            batch.schema().index_of("_ROW_ID").is_err(),
+            "_ROW_ID must not leak into residual read output"
+        );
+        assert!(
+            batch.schema().index_of("_PKEY_VECTOR_POSITION").is_err(),
+            "_PKEY_VECTOR_POSITION must not leak into residual read output"
+        );
         assert!(
             batch.schema().index_of(VECTOR_COLUMN).is_ok(),
             "default projection must materialize the vector column"

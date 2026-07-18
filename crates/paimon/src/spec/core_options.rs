@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_BITMAP64_OPTION: &str = "deletion-vectors.bitmap64";
 const DELETION_VECTORS_READ_MODE_OPTION: &str = "deletion-vectors.read-mode";
+const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
+pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
@@ -324,6 +326,28 @@ impl<'a> CoreOptions<'a> {
     pub fn deletion_vectors_bitmap64(&self) -> bool {
         self.options
             .get(DELETION_VECTORS_BITMAP64_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether `deletion-vectors.merge-on-read` is set (default `false`, matching
+    /// Java `CoreOptions.DELETION_VECTORS_MERGE_ON_READ`). When true, uncompacted
+    /// (level-0) data is made visible by merging on read; when false, deletion
+    /// vectors alone determine live rows over the compacted files.
+    pub fn deletion_vectors_merge_on_read(&self) -> bool {
+        self.options
+            .get(DELETION_VECTORS_MERGE_ON_READ_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether `query-auth.enabled` is set.
+    ///
+    /// When set, the server enforces a per-user row filter / column masking that this client
+    /// can't yet apply, so read paths fail closed (see `ensure_read_authorized`).
+    pub fn query_auth_enabled(&self) -> bool {
+        self.options
+            .get(QUERY_AUTH_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
