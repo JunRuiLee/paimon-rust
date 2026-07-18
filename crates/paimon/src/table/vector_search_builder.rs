@@ -32,8 +32,8 @@ use crate::table::global_index_scanner::{
 use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
 use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
 use crate::table::pk_vector_orchestrator::{
-    as_split_exact_reader_factory, build_indexed_splits, validate_row_position, PkVectorCandidate,
-    PkVectorOrchestrator, PkVectorSearchSplit,
+    as_split_exact_reader_factory, build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator,
+    PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
@@ -208,10 +208,10 @@ impl<'a> VectorSearchBuilder<'a> {
                 .ok()
                 .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
             if targets_pk_column {
-                let pk_col = core.primary_key_vector_index_column()?;
-                return self
-                    .execute_primary_key_vector_search(&core, &pk_col, query_vector, limit)
-                    .await;
+                return Err(crate::Error::DataInvalid {
+                    message: "primary-key vector search does not produce global row ids; use the materialized read (execute_read) instead".to_string(),
+                    source: None,
+                });
             }
         }
 
@@ -288,23 +288,6 @@ impl<'a> VectorSearchBuilder<'a> {
             message: "vector search read is only supported for primary-key vector indexes".into(),
             source: None,
         })
-    }
-
-    /// Run the primary-key bucket-local vector search: plan the per-bucket splits,
-    /// build the real vindex ANN scorer and (outside FAST mode) the exact-fallback
-    /// readers, run the orchestrator, and convert the best-first candidates into a
-    /// `SearchResult`. Mirrors Java `PrimaryKeyVectorRead`.
-    async fn execute_primary_key_vector_search(
-        &self,
-        core: &CoreOptions<'_>,
-        pk_col: &str,
-        query_vector: &[f32],
-        limit: usize,
-    ) -> crate::Result<SearchResult> {
-        let (candidates, plan, metric) = self
-            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
-            .await?;
-        candidates_to_search_result(&candidates, &plan.splits, metric)
     }
 
     /// Shared PK-vector search core for both the search-only and search-and-read
@@ -1165,62 +1148,6 @@ fn verify_pk_vector_segment_metrics(
         }
     }
     Ok(())
-}
-
-/// candidate order (no re-sort). Each candidate's global row id is
-/// `first_row_id + row_position` of the data file it references; the score is
-/// derived from the raw distance via the metric. A candidate referencing a file
-/// absent from its split, or a file with no `first_row_id`, fails loud.
-fn candidates_to_search_result(
-    candidates: &[PkVectorCandidate],
-    splits: &[PkVectorSearchSplit],
-    metric: VectorSearchMetric,
-) -> crate::Result<SearchResult> {
-    let mut row_ids = Vec::with_capacity(candidates.len());
-    let mut scores = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        let split = splits
-            .get(c.split_index)
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("candidate split_index {} out of range", c.split_index),
-                source: None,
-            })?;
-        let file_meta = split
-            .data_split
-            .data_files()
-            .iter()
-            .find(|f| f.file_name == c.data_file_name)
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "candidate references data file {} not present in its split",
-                    c.data_file_name
-                ),
-                source: None,
-            })?;
-        let first_row_id = file_meta
-            .first_row_id
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("data file {} has no first_row_id", c.data_file_name),
-                source: None,
-            })?;
-        validate_row_position(&c.data_file_name, c.row_position, file_meta.row_count)?;
-        let global =
-            first_row_id
-                .checked_add(c.row_position)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: "global row id overflows i64".to_string(),
-                    source: None,
-                })?;
-        row_ids.push(
-            u64::try_from(global).map_err(|_| crate::Error::DataInvalid {
-                message: format!("negative global row id {global}"),
-                source: None,
-            })?,
-        );
-        scores.push(metric.distance_to_score(c.distance));
-    }
-    // Order preserved: best-first, as produced by the orchestrator.
-    Ok(SearchResult::new(row_ids, scores))
 }
 
 /// One materialized row tagged with its best-first `rank` and its `(batch_index,
@@ -2733,75 +2660,6 @@ mod tests {
         }
     }
 
-    fn pk_candidate(
-        split_index: usize,
-        bucket: i32,
-        file: &str,
-        pos: i64,
-        distance: f32,
-    ) -> PkVectorCandidate {
-        PkVectorCandidate {
-            split_index,
-            partition: BinaryRow::new(0),
-            bucket,
-            data_file_name: file.to_string(),
-            row_position: pos,
-            distance,
-        }
-    }
-
-    #[test]
-    fn candidates_to_search_result_global_row_id_and_best_first_order() {
-        // Two files in one split with different first_row_id. The helper is a pure
-        // order-preserving map: the orchestrator already established best-first
-        // order upstream, so the candidate INPUT order here is deliberately NOT in
-        // score order and NOT in (file, position) order. This proves the helper
-        // preserves the given sequence rather than sorting.
-        let splits = vec![pk_search_split(
-            0,
-            vec![
-                pk_data_file("file-a", 100, Some(1000)),
-                pk_data_file("file-b", 100, Some(5000)),
-            ],
-        )];
-        // Input sequence (NOT sorted by score, NOT sorted by file/position):
-        //   c0: file-b pos5 d=2.0  -> WORST distance, appears FIRST
-        //   c1: file-b pos1 d=1.0  -> tie with c2
-        //   c2: file-a pos2 d=1.0  -> tie with c1
-        // A score-based best-first re-sort would produce [c1, c2, c0] (worst last);
-        // a (file, position) re-sort would produce [c2 (file-a), c1, c0]. Both
-        // differ from the input order, so the exact assertion below discriminates.
-        let candidates = vec![
-            pk_candidate(0, 0, "file-b", 5, 2.0),
-            pk_candidate(0, 0, "file-b", 1, 1.0),
-            pk_candidate(0, 0, "file-a", 2, 1.0),
-        ];
-        let result = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
-            .expect("conversion succeeds");
-        // global_row_id = first_row_id + position; INPUT order preserved (not sorted).
-        assert_eq!(result.row_ids, vec![5005, 5001, 1002]);
-        assert_eq!(
-            result.scores,
-            vec![
-                VectorSearchMetric::L2.distance_to_score(2.0),
-                VectorSearchMetric::L2.distance_to_score(1.0),
-                VectorSearchMetric::L2.distance_to_score(1.0),
-            ]
-        );
-    }
-
-    #[test]
-    fn candidates_to_search_result_absent_first_row_id_fails_loud() {
-        let splits = vec![pk_search_split(0, vec![pk_data_file("file-a", 100, None)])];
-        let candidates = vec![pk_candidate(0, 0, "file-a", 0, 1.0)];
-        let err = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
-            .expect_err("absent first_row_id must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("first_row_id")),
-            "unexpected error: {err:?}"
-        );
-    }
-
     /// Build a real vindex IVF-flat segment trained with `metric`, returning the
     /// serialized bytes. `nlist = 1` keeps training trivial and deterministic; the
     /// only thing the metric check cares about is the persisted metadata metric.
@@ -2873,18 +2731,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn candidates_to_search_result_missing_file_fails_loud() {
-        let splits = vec![pk_search_split(
-            0,
-            vec![pk_data_file("known", 100, Some(0))],
-        )];
-        let candidates = vec![pk_candidate(0, 0, "unknown", 0, 1.0)];
-        let err = candidates_to_search_result(&candidates, &splits, VectorSearchMetric::L2)
-            .expect_err("missing file must fail loud");
-        assert!(matches!(err, crate::Error::DataInvalid { .. }));
-    }
-
     fn pk_vector_table(options: &[(&str, &str)]) -> Table {
         let mut builder = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -2923,22 +2769,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_branch_enabled_empty_plan_returns_empty() {
-        // pk-vector.index.columns set, but no snapshot -> empty plan -> empty result.
+    async fn pk_branch_execute_scored_fails_loud() {
+        // On a PK-vector table `execute_scored` reports global row ids, which the
+        // PK path cannot produce (physical (file, position) coords, no global ids).
+        // It must fail loud rather than fabricate ids; callers use `execute_read`.
         let table = pk_vector_table(&[
             ("pk-vector.index.columns", "embedding"),
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
         ]);
-        let result = table
+        let err = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .execute_scored()
             .await
-            .unwrap();
-        assert!(result.is_empty());
+            .map(|_| ())
+            .expect_err("execute_scored on a PK-vector column must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("does not produce global row ids")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3007,34 +2860,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_branch_filter_without_deletion_vectors_fails_loud() {
-        // A residual filter on a PK-vector table that does NOT enable deletion
-        // vectors must be rejected (merge-on-read semantics would make physical
-        // -position filtering unsound). Mirrors Java `PrimaryKeyVectorScan`.
-        let table = pk_vector_table(&[
-            ("pk-vector.index.columns", "embedding"),
-            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
-            ("fields.embedding.pk-vector.distance.metric", "l2"),
-        ]);
-        let filter = id_gt_filter(&table, 2);
-        let err = table
-            .new_vector_search_builder()
-            .with_vector_column("embedding")
-            .with_query_vector(vec![1.0])
-            .with_limit(5)
-            .with_filter(filter)
-            .execute_scored()
-            .await
-            .map(|_| ())
-            .expect_err("filter without deletion vectors must fail loud");
-        assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("deletion vectors without merge-on-read")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn execute_read_filter_without_deletion_vectors_fails_loud() {
         let table = pk_vector_table(&[
             ("pk-vector.index.columns", "embedding"),
@@ -3085,7 +2910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_branch_filter_with_merge_on_read_fails_loud() {
+    async fn execute_read_filter_with_merge_on_read_fails_loud() {
         // Deletion vectors enabled BUT merge-on-read on: still rejected, because a
         // merge-on-read scan can surface stale key versions that a physical-row
         // filter cannot reconcile.
@@ -3103,7 +2928,7 @@ mod tests {
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .with_filter(filter)
-            .execute_scored()
+            .execute_read()
             .await
             .map(|_| ())
             .expect_err("merge-on-read filter must fail loud");
@@ -3115,10 +2940,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_branch_filter_with_deletion_vectors_passes_guard() {
+    async fn execute_read_filter_with_deletion_vectors_passes_guard() {
         // Deletion vectors enabled, merge-on-read off (default): the residual guard
         // passes. With no snapshot the plan is empty, so the (guarded) filter path
-        // simply yields an empty result rather than erroring — proving the guard
+        // simply yields an empty stream rather than erroring — proving the guard
         // admits a legal filtered query.
         let table = pk_vector_table(&[
             ("pk-vector.index.columns", "embedding"),
@@ -3127,16 +2952,16 @@ mod tests {
             ("deletion-vectors.enabled", "true"),
         ]);
         let filter = id_gt_filter(&table, 2);
-        let result = table
+        let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
             .with_query_vector(vec![1.0])
             .with_limit(5)
             .with_filter(filter)
-            .execute_scored()
+            .execute_read()
             .await
             .expect("guarded filter query must be admitted");
-        assert!(result.is_empty());
+        assert!(stream.try_next().await.unwrap().is_none());
     }
 
     fn make_lumina_entry(
