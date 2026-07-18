@@ -103,9 +103,10 @@ fn analytic_topk(query: &[f32], vectors: &[[f32; DIM]], k: usize) -> Vec<(u64, f
     scored
 }
 
-/// Table options that route searches into the primary-key vector branch
-/// (`VectorSearchBuilder::execute_primary_key_vector_search`). Default search
-/// mode is FAST, so only the ANN segment is consulted (no exact fallback).
+/// Table options that route searches into the primary-key vector branch (the
+/// `VectorSearchBuilder` detects a primary-key table with a PK-vector index and
+/// takes the bucket-local ANN path). Default search mode is FAST, so only the ANN
+/// segment is consulted (no exact fallback).
 ///
 /// `deletion-vectors.enabled = true` (and merge-on-read left at its default
 /// `false`) is what makes the table expose physical rows directly, the
@@ -583,31 +584,21 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     let expected_row_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
     let expected_scores: Vec<f32> = expected.iter().map(|(_, d)| l2_score(*d)).collect();
 
-    // Search path: execute_scored() -> row ids + scores.
-    let result = table
+    // A primary-key vector table exposes no global row ids, so the search-only
+    // `execute_scored()` path is unsupported and must fail loud, directing callers
+    // to the materialized `execute_read()` path exercised below.
+    let scored_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
         .execute_scored()
         .await
-        .expect("primary-key vector search failed");
-
-    assert_eq!(
-        result.row_ids, expected_row_ids,
-        "row ids diverge from the analytic expectation"
+        .expect_err("primary-key execute_scored must fail loud");
+    assert!(
+        format!("{scored_err:?}").contains("execute_read"),
+        "primary-key execute_scored should point at execute_read, got: {scored_err:?}"
     );
-    assert_eq!(
-        result.scores.len(),
-        expected_scores.len(),
-        "score count diverges from the analytic expectation"
-    );
-    for (got, want) in result.scores.iter().zip(&expected_scores) {
-        assert!(
-            (got - want).abs() < 1e-4,
-            "score diverges from the analytic expectation: got {got}, want {want}"
-        );
-    }
 
     // Search-and-read: execute_read() materializes the matching rows best-first
     // with a `_PKEY_VECTOR_SCORE` column, hiding `_ROW_ID`/`_PKEY_VECTOR_POSITION`.
@@ -932,22 +923,23 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         .greater_or_equal("id", Datum::Int(residual_threshold as i32))
         .expect("build residual predicate on id");
 
-    // Search-only: unfiltered vs residual must differ, and every residual hit
-    // must satisfy the predicate (id >= 3), disjoint from the unfiltered set.
-    let unfiltered_result = table
+    // A primary-key vector table exposes no global row ids, so `execute_scored()`
+    // is unsupported on this path — with or without a residual filter — and must
+    // fail loud, directing callers to the materialized `execute_read()` used below.
+    let unfiltered_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
         .execute_scored()
         .await
-        .expect("unfiltered primary-key vector search failed");
-    assert_eq!(
-        unfiltered_result.row_ids, unfiltered_ids,
-        "unfiltered search must return [0, 1, 2]"
+        .expect_err("primary-key execute_scored must fail loud");
+    assert!(
+        format!("{unfiltered_err:?}").contains("execute_read"),
+        "got: {unfiltered_err:?}"
     );
 
-    let residual_result = table
+    let residual_scored_err = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
@@ -955,22 +947,11 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         .with_filter(residual.clone())
         .execute_scored()
         .await
-        .expect("residual primary-key vector search failed");
-    let residual_row_ids: Vec<u64> = expected_ids.iter().map(|&id| id as u64).collect();
-    assert_eq!(
-        residual_result.row_ids, residual_row_ids,
-        "residual search must return best-first [4, 5, 3]"
+        .expect_err("primary-key execute_scored must fail loud with a residual too");
+    assert!(
+        format!("{residual_scored_err:?}").contains("execute_read"),
+        "got: {residual_scored_err:?}"
     );
-    assert_ne!(
-        residual_result.row_ids, unfiltered_result.row_ids,
-        "residual must change the result set relative to no filter"
-    );
-    for &id in &residual_result.row_ids {
-        assert!(
-            id >= residual_threshold,
-            "residual search returned id {id} that fails the predicate id >= {residual_threshold}"
-        );
-    }
 
     // Search-and-read with the residual: default projection materializes id +
     // vector column, best-first, with an aligned `_PKEY_VECTOR_SCORE`.

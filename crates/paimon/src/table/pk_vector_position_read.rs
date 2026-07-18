@@ -32,12 +32,10 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields, Schem
 use futures::StreamExt;
 
 use crate::deletion_vector::DeletionVector;
-use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
-};
+use crate::spec::{DataField, DataFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::source::DataSplit;
-use crate::table::{ArrowRecordBatchStream, RowRange};
+use crate::table::ArrowRecordBatchStream;
 
 pub(crate) const PKEY_VECTOR_POSITION_COLUMN: &str = "_PKEY_VECTOR_POSITION";
 pub(crate) const PKEY_VECTOR_SCORE_COLUMN: &str = "_PKEY_VECTOR_SCORE";
@@ -47,44 +45,6 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
         message: message.into(),
         source: None,
     }
-}
-
-/// Coalesce sorted, de-duplicated 0-based physical positions into contiguous
-/// global `RowRange`s (each bound offset by `first_row_id`). The read path
-/// converts these back to local ranges via `to_local_row_ranges(first_row_id)`,
-/// so this round-trips to exactly the requested physical positions.
-fn positions_to_global_ranges(
-    sorted_positions: &[i64],
-    first_row_id: i64,
-) -> crate::Result<Vec<RowRange>> {
-    let mut ranges = Vec::new();
-    let mut iter = sorted_positions.iter().copied();
-    let Some(first) = iter.next() else {
-        return Ok(ranges);
-    };
-    let mut push_range = |start: i64, end: i64| -> crate::Result<()> {
-        let from = start
-            .checked_add(first_row_id)
-            .ok_or_else(|| data_invalid("vector position offset overflows i64"))?;
-        let to = end
-            .checked_add(first_row_id)
-            .ok_or_else(|| data_invalid("vector position offset overflows i64"))?;
-        ranges.push(RowRange::new(from, to));
-        Ok(())
-    };
-    let mut start = first;
-    let mut end = first;
-    for pos in iter {
-        if end.checked_add(1) == Some(pos) {
-            end = pos;
-        } else {
-            push_range(start, end)?;
-            start = pos;
-            end = pos;
-        }
-    }
-    push_range(start, end)?;
-    Ok(ranges)
 }
 
 /// Reads selected physical rows of one data file, appending position (+ optional
@@ -168,81 +128,85 @@ impl<'a> PkVectorPositionRead<'a> {
             ));
         }
 
-        // (5) first_row_id guard
-        let first_row_id = file_meta.first_row_id.ok_or_else(|| {
-            data_invalid("PK vector position read requires a data file with first_row_id")
-        })?;
+        // Effective selection: the requested positions minus any the deletion
+        // vector marks deleted, ascending. `read_single_file_stream_local` folds
+        // the same DV into its row selection, so the reader returns exactly these
+        // rows in this order; the cursor below maps each returned batch back onto
+        // its slice of `effective` to recover file-LOCAL positions (no
+        // `first_row_id`, no `_ROW_ID` round-trip).
+        let effective: Vec<i64> = match dv.as_deref() {
+            Some(dv) => sorted
+                .iter()
+                .copied()
+                .filter(|&p| !dv.is_deleted(p as u64))
+                .collect(),
+            None => sorted.clone(),
+        };
 
-        // Build a reader whose read_type includes _ROW_ID so the lower-level read
-        // emits real global row-ids we can convert to physical positions. A
-        // caller-requested _ROW_ID was already rejected in (3), so it is always
-        // absent here and appended fresh.
-        let mut inner_read_type = self.reader.read_type().to_vec();
-        inner_read_type.push(DataField::new(
-            ROW_ID_FIELD_ID,
-            ROW_ID_FIELD_NAME.to_string(),
-            DataType::BigInt(BigIntType::new()),
-        ));
-        let inner_reader = self.reader.clone().with_read_type(inner_read_type);
-
-        let ranges = positions_to_global_ranges(&sorted, first_row_id)?;
-        let inner = inner_reader.read_single_file_stream(
-            split,
-            file_meta.clone(),
-            data_fields,
-            dv,
-            Some(ranges),
-        )?;
+        let inner =
+            self.reader
+                .read_single_file_stream_local(split, file_meta, data_fields, dv, sorted)?;
 
         let want_score_col = scores.is_some();
 
         let stream = async_stream::try_stream! {
             futures::pin_mut!(inner);
+            let mut cursor = 0usize;
             while let Some(batch) = inner.next().await {
                 let batch = batch?;
+                let n = batch.num_rows();
+                let end = cursor + n;
+                if end > effective.len() {
+                    let overflow: crate::Result<()> = Err(data_invalid(format!(
+                        "PK vector position read returned {end} rows but only {} positions were \
+                         selected",
+                        effective.len()
+                    )));
+                    overflow?;
+                }
                 let out = append_metadata_columns(
                     batch,
-                    first_row_id,
+                    &effective[cursor..end],
                     want_score_col,
                     scores.as_ref(),
                 )?;
+                cursor = end;
                 yield out;
+            }
+            if cursor != effective.len() {
+                let mismatch: crate::Result<()> = Err(data_invalid(format!(
+                    "PK vector position read returned {cursor} rows but {} positions were selected",
+                    effective.len()
+                )));
+                mismatch?;
             }
         };
         Ok(Box::pin(stream))
     }
 }
 
-/// Split `batch` (which contains a `_ROW_ID` column) into an output batch with
-/// `_ROW_ID` removed and `_PKEY_VECTOR_POSITION` (+ optional `_PKEY_VECTOR_SCORE`)
-/// appended. Positions are `_ROW_ID - first_row_id`; scores are looked up by the
-/// returned position. Returns the new batch.
+/// Append `_PKEY_VECTOR_POSITION` (and, when `want_score_col`, `_PKEY_VECTOR_SCORE`)
+/// to `batch`. `positions` are the file-LOCAL physical positions of the batch's
+/// rows, supplied by the caller's cursor into the effective (DV-filtered)
+/// selection, so they align 1:1 with the batch rows in order. Scores are looked
+/// up by position. The batch carries no `_ROW_ID` column, so every existing
+/// column is retained.
 fn append_metadata_columns(
     batch: RecordBatch,
-    first_row_id: i64,
+    positions: &[i64],
     want_score_col: bool,
     scores: Option<&BTreeMap<i64, f32>>,
 ) -> crate::Result<RecordBatch> {
+    debug_assert_eq!(
+        batch.num_rows(),
+        positions.len(),
+        "position slice must align with batch rows"
+    );
     let schema = batch.schema();
-    let row_id_idx = schema
-        .index_of(ROW_ID_FIELD_NAME)
-        .map_err(|_| data_invalid("internal: _ROW_ID column missing from position read"))?;
-    let row_ids = batch
-        .column(row_id_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| data_invalid("internal: _ROW_ID column is not Int64"))?;
 
-    let mut positions = Vec::with_capacity(row_ids.len());
-    let mut score_vals = if want_score_col {
-        Some(Vec::with_capacity(row_ids.len()))
-    } else {
-        None
-    };
-    for i in 0..row_ids.len() {
-        let position = row_ids.value(i) - first_row_id;
-        positions.push(position);
-        if let Some(sv) = score_vals.as_mut() {
+    let score_vals = if want_score_col {
+        let mut sv = Vec::with_capacity(positions.len());
+        for &position in positions {
             let score = scores
                 .and_then(|m| m.get(&position).copied())
                 .ok_or_else(|| {
@@ -252,24 +216,20 @@ fn append_metadata_columns(
                 })?;
             sv.push(score);
         }
-    }
+        Some(sv)
+    } else {
+        None
+    };
 
-    // Rebuild columns/fields excluding _ROW_ID, then append metadata columns.
-    let mut fields: Vec<ArrowField> = Vec::new();
-    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-    for (i, f) in schema.fields().iter().enumerate() {
-        if i == row_id_idx {
-            continue;
-        }
-        fields.push(f.as_ref().clone());
-        columns.push(batch.column(i).clone());
-    }
+    // Retain every existing column (no `_ROW_ID` to strip), then append metadata.
+    let mut fields: Vec<ArrowField> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut columns: Vec<Arc<dyn Array>> = batch.columns().to_vec();
     fields.push(ArrowField::new(
         PKEY_VECTOR_POSITION_COLUMN,
         ArrowDataType::Int64,
         false,
     ));
-    columns.push(Arc::new(Int64Array::from(positions)));
+    columns.push(Arc::new(Int64Array::from(positions.to_vec())));
     if let Some(sv) = score_vals {
         fields.push(ArrowField::new(
             PKEY_VECTOR_SCORE_COLUMN,
@@ -294,7 +254,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        DataFileMeta, DataType, Datum, IntType, PredicateBuilder, ROW_ID_FIELD_NAME,
+        BigIntType, DataFileMeta, DataType, Datum, IntType, PredicateBuilder, ROW_ID_FIELD_ID,
+        ROW_ID_FIELD_NAME,
     };
     use crate::table::data_file_reader::DataFileReader;
     use crate::table::schema_manager::SchemaManager;
@@ -964,44 +925,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_first_row_id_is_error() {
-        // first_row_id = None -> Err mentioning first_row_id. Positions must be
-        // valid so validation reaches the first_row_id guard.
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let schema_manager = SchemaManager::new(file_io.clone(), "memory:/pkvpr_frid".to_string());
-        let reader = DataFileReader::new(
-            file_io,
-            schema_manager,
-            1,
-            id_fields(),
-            id_fields(),
-            Vec::new(),
-        );
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(crate::spec::BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("memory:/pkvpr_frid/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![data_file("part-0.mosaic", 1, 5, 1, None)])
-            .build()
-            .unwrap();
-
-        let err = PkVectorPositionRead::new(&reader)
-            .read(
-                &split,
-                split.data_files()[0].clone(),
-                None,
-                None,
-                vec![0],
-                None,
-            )
-            .err()
-            .expect("missing first_row_id must be an error");
-        assert!(format!("{err:?}").contains("first_row_id"), "got: {err:?}");
-    }
-
-    #[tokio::test]
     async fn test_predicate_reader_is_rejected() {
         // A row-filtering predicate on the reader must be rejected.
         let file_io = FileIOBuilder::new("memory").build().unwrap();
@@ -1132,30 +1055,5 @@ mod tests {
             .err()
             .expect("requested _ROW_ID must be an error");
         assert!(format!("{err:?}").contains("_ROW_ID"), "got: {err:?}");
-    }
-
-    #[test]
-    fn test_positions_to_global_ranges_coalesces_and_offsets() {
-        // positions [0,1,2,4,5] with first_row_id 100 -> global ranges
-        // [100..=102] and [104..=105] (two coalesced ranges, offset by 100).
-        let ranges = positions_to_global_ranges(&[0, 1, 2, 4, 5], 100).unwrap();
-        assert_eq!(ranges.len(), 2);
-        assert_eq!((ranges[0].from(), ranges[0].to()), (100, 102));
-        assert_eq!((ranges[1].from(), ranges[1].to()), (104, 105));
-    }
-
-    #[test]
-    fn test_positions_to_global_ranges_single() {
-        let ranges = positions_to_global_ranges(&[3], 0).unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!((ranges[0].from(), ranges[0].to()), (3, 3));
-    }
-
-    #[test]
-    fn test_positions_to_global_ranges_overflow_is_error() {
-        // position 1 offset by i64::MAX overflows -> Err.
-        let err = positions_to_global_ranges(&[1], i64::MAX)
-            .expect_err("offset overflow must be an error");
-        assert!(format!("{err:?}").contains("overflows"), "got: {err:?}");
     }
 }

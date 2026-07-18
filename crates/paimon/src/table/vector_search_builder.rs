@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::arrow::format::FilePredicates;
-use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
+use crate::arrow::residual::{evaluate_predicates_mask, widen_scan_fields};
 use crate::io::FileIO;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
 use crate::lumina::{is_lumina_index_type, LuminaIndexMeta, LuminaVectorMetric};
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
-    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
+    IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
@@ -405,9 +405,10 @@ impl<'a> VectorSearchBuilder<'a> {
         // per-split allow-list is threaded into the bucket search so the residual
         // folds into recall (best-first order and Top-K are preserved). Built only
         // when a filter is set; otherwise `None` leaves the search unfiltered. The
-        // residual reader projects the predicate columns plus `_ROW_ID` (used to
-        // recover file-local physical positions) and carries no pushdown, matching
-        // `residual_positions_by_file`. A file the allow-list leaves empty is
+        // residual reader projects only the predicate columns and carries no
+        // pushdown; `residual_positions_by_file` recovers each surviving row's
+        // file-local physical position from its ordinal in the unfiltered scan (no
+        // `_ROW_ID`, no `first_row_id`). A file the allow-list leaves empty is
         // skipped by the bucket search without opening an exact reader.
         let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match &self.filter {
             Some(filter) => {
@@ -415,13 +416,7 @@ impl<'a> VectorSearchBuilder<'a> {
                     predicates: vec![filter.clone()],
                     file_fields: self.table.schema().fields().to_vec(),
                 };
-                let row_id_field = DataField::new(
-                    ROW_ID_FIELD_ID,
-                    ROW_ID_FIELD_NAME.to_string(),
-                    DataType::BigInt(BigIntType::new()),
-                );
-                let residual_read_type =
-                    widen_scan_fields(std::slice::from_ref(&row_id_field), Some(&file_predicates));
+                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
                 let residual_reader = DataFileReader::new(
                     self.table.file_io().clone(),
                     self.table.schema_manager().clone(),
@@ -986,29 +981,27 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
     VectorIndexBackend::from_index_type(&index_file.index_type).is_some()
 }
 
-/// Compute, per data file in `split`, the set of physical row positions whose
-/// rows satisfy the residual predicate. Mirrors the row-collecting half of Java
-/// `PrimaryKeyVectorRead`'s `executeFilter`: because
-/// [`DataFileReader::read_single_file_stream`] rejects projecting `_ROW_ID`
-/// alongside a row-filtering predicate (the residual filter would drop rows
-/// before `_ROW_ID` is assigned positionally, desyncing it), the predicate is
-/// NOT pushed down. Instead `reader` projects the residual columns together with
-/// `_ROW_ID` and carries no pushdown predicate; the residual is applied here at
-/// the Arrow level, after `_ROW_ID` is materialized, and each surviving row's
-/// `_ROW_ID - first_row_id` is the file-local physical position.
+/// Compute, per data file in `split`, the set of file-LOCAL physical row
+/// positions whose rows satisfy the residual predicate. Mirrors the
+/// row-collecting half of Java `PrimaryKeyVectorRead`'s `executeFilter`: the
+/// predicate is NOT pushed down (a pushed filter would drop rows before their
+/// position could be recovered). Instead `reader` projects only the residual
+/// columns and carries no pushdown predicate; every physical row is scanned in
+/// file order, the residual is evaluated here at the Arrow level, and each
+/// surviving row's file-local 0-based position is its running ordinal in the scan.
+/// This needs no `_ROW_ID` and no `first_row_id` — real primary-key tables never
+/// write one.
 ///
 /// Every *active* data file in the split gets an entry, possibly empty. The
 /// bucket search treats an absent entry and an empty entry identically (the file
 /// contributes no candidates), so the empty entries only make the map cover every
 /// active file. Non-active files (e.g. level-0 files the bucket search excludes)
 /// are skipped entirely: they are never searched, so re-reading them would be
-/// wasted IO and their possibly-absent `first_row_id` must not fail an otherwise
-/// valid query.
+/// wasted IO.
 ///
-/// `reader` must project `_ROW_ID` and be predicate-free; `residual.file_fields`
-/// are the fields the residual leaf indices point into (resolved by name against
-/// each emitted batch). A data file without `first_row_id` fails loud, matching
-/// the position-read guard.
+/// `reader` must be predicate-free and project the residual columns;
+/// `residual.file_fields` are the fields the residual leaf indices point into
+/// (resolved by name against each emitted batch).
 async fn residual_positions_by_file(
     reader: &DataFileReader,
     split: &DataSplit,
@@ -1020,57 +1013,46 @@ async fn residual_positions_by_file(
     let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
     for file_meta in split.data_files() {
         // Only files the bucket search actually recalls from need residual
-        // positions; skip everything else so a non-active file cannot trigger the
-        // `first_row_id` guard below or incur a wasted read.
+        // positions; skip everything else to avoid a wasted read.
         if !active_names.contains(file_meta.file_name.as_str()) {
             continue;
         }
-        let first_row_id = file_meta
-            .first_row_id
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "residual position read requires data file '{}' to have first_row_id",
-                    file_meta.file_name
-                ),
-                source: None,
-            })?;
         let data_fields = reader.derive_data_fields(file_meta).await?;
         let mut stream =
             reader.read_single_file_stream(split, file_meta.clone(), data_fields, None, None)?;
         // Register the file up front so a file whose rows all fail the residual
         // still appears in the map (empty set).
         let positions = out.entry(file_meta.file_name.clone()).or_default();
+        // The scan has no row selection and no DV, so rows arrive in physical file
+        // order with no gaps: each row's file-local 0-based position is its running
+        // ordinal `base + row_index`.
+        let mut base: u64 = 0;
         while let Some(batch) = stream.try_next().await? {
-            let filtered = filter_record_batch_by_predicates(batch, residual, &scan_fields)?;
-            if filtered.num_rows() == 0 {
-                continue;
-            }
-            let row_id_idx = filtered.schema().index_of(ROW_ID_FIELD_NAME).map_err(|_| {
-                crate::Error::DataInvalid {
-                    message: "residual position read batch is missing the _ROW_ID column"
-                        .to_string(),
-                    source: None,
+            let num_rows = batch.num_rows();
+            let mask = evaluate_predicates_mask(
+                &batch,
+                &residual.predicates,
+                &residual.file_fields,
+                &scan_fields,
+            )?;
+            match mask {
+                Some(mask) => {
+                    for row_index in 0..num_rows {
+                        // NULL follows the same NULL -> false convention the Arrow
+                        // filter kernel applies, so a null mask slot drops the row.
+                        if mask.is_valid(row_index) && mask.value(row_index) {
+                            positions.insert(base + row_index as u64);
+                        }
+                    }
                 }
-            })?;
-            let row_ids = filtered
-                .column(row_id_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: "residual position read _ROW_ID column is not Int64".to_string(),
-                    source: None,
-                })?;
-            for i in 0..row_ids.len() {
-                let position = row_ids.value(i) - first_row_id;
-                let position = u64::try_from(position).map_err(|_| crate::Error::DataInvalid {
-                    message: format!(
-                        "residual position {position} is negative for data file '{}'",
-                        file_meta.file_name
-                    ),
-                    source: None,
-                })?;
-                positions.insert(position);
+                // No predicate contributed a mask (identity) -> keep every row.
+                None => {
+                    for row_index in 0..num_rows {
+                        positions.insert(base + row_index as u64);
+                    }
+                }
             }
+            base += num_rows as u64;
         }
     }
     Ok(out)
@@ -3263,9 +3245,9 @@ mod tests {
 }
 
 /// Tests for [`residual_positions_by_file`]: the residual predicate is applied at
-/// the Arrow level (no pushdown) against the predicate columns plus `_ROW_ID`,
-/// and each surviving row's `_ROW_ID` is converted back to a file-local physical
-/// position.
+/// the Arrow level (no pushdown) against the predicate columns, and each surviving
+/// row's file-local physical position is recovered from its ordinal in the
+/// unfiltered scan (no `_ROW_ID`, no `first_row_id`).
 #[cfg(test)]
 mod residual_positions_tests {
     use super::*;
@@ -3537,12 +3519,15 @@ mod residual_positions_tests {
     }
 
     #[tokio::test]
-    async fn test_missing_first_row_id_is_error() {
+    async fn test_missing_first_row_id_recovers_local_positions() {
+        // Real primary-key data files carry no `first_row_id`. Positions are
+        // recovered from each row's ordinal in the scan, so the residual still
+        // works: ids [1,2,3] with id > 0 -> all match -> local positions [0,1,2].
         let (reader, split, active) = build_reader_and_split_no_first_row_id().await;
-        let err = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
             .await
-            .expect_err("missing first_row_id must error");
-        assert!(format!("{err:?}").contains("first_row_id"), "got: {err:?}");
+            .expect("missing first_row_id must not fail the residual read");
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
     }
 
     async fn build_reader_and_split_no_first_row_id(
@@ -3574,7 +3559,8 @@ mod residual_positions_tests {
             vec![id_field(), row_id_field()],
             Vec::new(),
         );
-        // The lone file is active, so the `first_row_id` guard applies to it.
+        // The lone file is active and carries no first_row_id, exercising the
+        // ordinal-based position recovery.
         let active = vec![BucketActiveFile {
             file_name: "part-0.mosaic".to_string(),
             row_count: 3,
