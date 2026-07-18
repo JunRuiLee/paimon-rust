@@ -431,10 +431,20 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         local_positions: Vec<i64>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // The PK-vector caller guarantees a predicate-free reader; a row-filtering
-        // predicate would drop rows and desync the local-position selection. This
-        // path never projects `_ROW_ID`, so the guard only asserts the invariant.
-        Self::reject_row_id_with_predicate(&self.read_type, &self.predicates)?;
+        // Local-position selection is only sound against a predicate-free reader: a
+        // row-filtering predicate drops arbitrary selected rows and desyncs the
+        // caller's position/score cursor. Guard the invariant here (not only at the
+        // PK-vector caller) so this `pub(super)` entry cannot be misused within the
+        // module. This path never projects `_ROW_ID`, so a `_ROW_ID`-only guard
+        // would be a no-op — check for any row-filtering predicate instead.
+        if self.has_row_filtering_predicate() {
+            return Err(crate::Error::DataInvalid {
+                message: "read_single_file_stream_local requires a predicate-free reader: a \
+                 row-filtering predicate would desync local-position selection"
+                    .to_string(),
+                source: None,
+            });
+        }
 
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
