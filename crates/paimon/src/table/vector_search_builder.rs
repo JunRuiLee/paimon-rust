@@ -196,12 +196,11 @@ impl<'a> VectorSearchBuilder<'a> {
         // targets a configured PK-vector column; otherwise fall through to the
         // data-evolution (DE) global-index path below.
         //
-        // Membership is resolved first via the non-erroring columns accessor so a
-        // malformed PK-vector config (e.g. more than one column, or a blank list)
-        // cannot abort an unrelated DE query. The exactly-one-column rule is
-        // enforced only once this query is known to target a PK-vector column,
-        // keeping fail-loud behavior for a genuinely-broken config on the path
-        // where erroring is correct.
+        // Membership is resolved via the non-erroring columns accessor so a
+        // malformed PK-vector config (e.g. a blank list) cannot abort an unrelated
+        // DE query. A query that does target the PK-vector column fails loud here:
+        // the PK path produces physical positions, not global row ids, so scored
+        // search is unsupported and callers must use `execute_read` instead.
         if core.primary_key_vector_index_enabled() {
             let targets_pk_column = core
                 .primary_key_vector_index_columns()
