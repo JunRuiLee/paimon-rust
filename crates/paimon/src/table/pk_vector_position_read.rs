@@ -454,8 +454,9 @@ mod tests {
     }
 
     /// Build a `DataFileReader` over an in-memory mosaic file plus the matching
-    /// `DataSplit`. `read_type`/`predicates` override the reader's projection and
-    /// filter; `deleted_rows`, when non-empty, writes a DV into the split.
+    /// `DataSplit`, pinning the data file's `first_row_id = Some(0)`.
+    /// `read_type`/`predicates` override the reader's projection and filter;
+    /// `deleted_rows`, when non-empty, writes a DV into the split.
     async fn build_reader_and_split(
         table_path: &str,
         data: &Bytes,
@@ -463,6 +464,32 @@ mod tests {
         read_type: Vec<DataField>,
         predicates: Vec<crate::spec::Predicate>,
         deleted_rows: &[u32],
+    ) -> (DataFileReader, DataSplit, Option<Arc<DeletionVector>>) {
+        build_reader_and_split_with_first_row_id(
+            table_path,
+            data,
+            row_count,
+            read_type,
+            predicates,
+            deleted_rows,
+            Some(0),
+        )
+        .await
+    }
+
+    /// As `build_reader_and_split`, but the caller controls the data file's
+    /// `first_row_id`. Real Java primary-key tables never write `first_row_id`
+    /// (row-tracking is forbidden for PK tables), so `None` is the shape the read
+    /// path must handle by keying off file-local physical positions.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_reader_and_split_with_first_row_id(
+        table_path: &str,
+        data: &Bytes,
+        row_count: i64,
+        read_type: Vec<DataField>,
+        predicates: Vec<crate::spec::Predicate>,
+        deleted_rows: &[u32],
+        first_row_id: Option<i64>,
     ) -> (DataFileReader, DataSplit, Option<Arc<DeletionVector>>) {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let bucket_path = format!("{table_path}/bucket-0");
@@ -486,7 +513,7 @@ mod tests {
                 data.len() as i64,
                 row_count,
                 schema_id,
-                Some(0),
+                first_row_id,
             )]);
         let mut dv = None;
         if !deleted_rows.is_empty() {
@@ -769,6 +796,65 @@ mod tests {
         assert_eq!(
             collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
             vec![0.9, 0.5, 0.1]
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_position_read_aligns_positions_across_dv_and_batches_without_first_row_id() {
+        // The Java primary-key shape: the data file carries NO first_row_id, rows
+        // span multiple row groups (batches), a DV deletes a NON-candidate
+        // position, and the candidates sit at non-contiguous local positions. The
+        // read must recover each row's FILE-LOCAL position (not a global row id),
+        // skip only the deleted row, and keep id/position/score aligned best-first.
+        //
+        // Three row groups [10,11] [12,13] [14,15] -> reader yields >1 batch.
+        // Candidates [1,3,4,5] with scores keyed by local position; DV deletes
+        // position 2 (a NON-candidate) -> it must not perturb the surviving rows.
+        // Expected surviving rows: ids [11,13,14,15], positions [1,3,4,5].
+        let data = write_mosaic_multi_group(&[
+            id_batch(vec![10, 11]),
+            id_batch(vec![12, 13]),
+            id_batch(vec![14, 15]),
+        ]);
+        let (reader, split, dv) = build_reader_and_split_with_first_row_id(
+            "memory:/pkvpr_local_dv_multibatch",
+            &data,
+            6,
+            id_fields(),
+            Vec::new(),
+            &[2],
+            None,
+        )
+        .await;
+
+        let scores = BTreeMap::from([(1, 0.9f32), (3, 0.5), (4, 0.3), (5, 0.1)]);
+        let batches = PkVectorPositionRead::new(&reader)
+            .read(
+                &split,
+                split.data_files()[0].clone(),
+                None,
+                dv,
+                vec![1, 3, 4, 5],
+                Some(scores),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(
+            batches.len() > 1,
+            "expected multiple batches, got {}",
+            batches.len()
+        );
+        assert_eq!(collect_i32(&batches, "id"), vec![11, 13, 14, 15]);
+        assert_eq!(
+            collect_i64(&batches, PKEY_VECTOR_POSITION_COLUMN),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(
+            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            vec![0.9, 0.5, 0.3, 0.1]
         );
     }
 

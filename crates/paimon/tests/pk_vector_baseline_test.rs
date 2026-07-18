@@ -325,6 +325,23 @@ async fn build_table(
     vectors: &[[f32; DIM]],
     k: usize,
 ) -> (tempfile::TempDir, Table) {
+    // Default fixture: `first_row_id = Some(0)`, so a global row id equals its
+    // physical position. Tests that must decouple the two use
+    // `build_table_with_first_row_id` directly.
+    build_table_with_first_row_id(query, vectors, k, Some(0)).await
+}
+
+/// As `build_table`, but pins the indexed data file's `first_row_id` to the
+/// caller's value. A non-zero (or absent) `first_row_id` breaks the "global row
+/// id == physical position" coincidence, so the read path must key candidate
+/// selection, position recovery, and score alignment off the file-local physical
+/// position rather than a global row id.
+async fn build_table_with_first_row_id(
+    query: &[f32],
+    vectors: &[[f32; DIM]],
+    k: usize,
+    first_row_id: Option<i64>,
+) -> (tempfile::TempDir, Table) {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let location = format!("file://{}", tmp.path().display());
     let file_io = FileIOBuilder::new("file").build().unwrap();
@@ -368,12 +385,14 @@ async fn build_table(
 
     // Constraint 1 (PrimaryKeyIndexSourcePolicy.shouldRead): only a compacted,
     // non-level-0 file backs the PK-vector index. Clone the real meta and set
-    // level > 0 + file_source == COMPACT (1). Pin first_row_id = 0 so the global
-    // row id equals the physical position.
+    // level > 0 + file_source == COMPACT (1). `first_row_id` is caller-controlled:
+    // real Java PK tables never write it (row-tracking is forbidden), so a correct
+    // read path must not depend on `first_row_id == 0` for physical-position
+    // recovery.
     let indexed_meta = DataFileMeta {
         level: 1,
         file_source: Some(1),
-        first_row_id: Some(0),
+        first_row_id,
         ..base_meta
     };
 
@@ -697,6 +716,88 @@ async fn pk_vector_read_orders_rows_best_first_not_by_position() {
             "default projection must materialize the vector column"
         );
     }
+}
+
+/// Shared body for the two physical-coordinate contract tests below. Builds the
+/// discriminating fixture with the caller's `first_row_id`, reads it back with the
+/// default projection, and asserts the materialized rows are the file-LOCAL
+/// best-first top-k (id column, vector content, aligned `_PKEY_VECTOR_SCORE`),
+/// invariant to `first_row_id`. The discriminating fixture makes best-first order
+/// [5, 1, 3] distinct from ascending physical position [1, 3, 5], so a
+/// position/global-id confusion cannot pass by coincidence.
+#[cfg(not(windows))]
+async fn assert_discriminating_local_read(first_row_id: Option<i64>) {
+    let (query, vectors) = fixture_discriminating();
+    let (_tmp, table) = build_table_with_first_row_id(&query, &vectors, 3, first_row_id).await;
+
+    let expected = analytic_topk(&query, &vectors, 3);
+    let expected_ids: Vec<i32> = expected.iter().map(|(id, _)| *id as i32).collect();
+    assert_eq!(
+        expected_ids,
+        vec![5, 1, 3],
+        "fixture must produce best-first order distinct from physical position order"
+    );
+    let expected_scores: Vec<f32> = expected.iter().map(|(_, d)| l2_score(*d)).collect();
+
+    // Default projection: id + vector column materialize. The read path must
+    // return the correct FILE-LOCAL rows regardless of `first_row_id`.
+    let (ids, scores, batches) = read_id_and_scores(&table, query.to_vec(), 3, None).await;
+
+    assert_eq!(
+        ids, expected_ids,
+        "materialized `id` column must be file-local best-first [5, 1, 3] and \
+         independent of the data file's first_row_id"
+    );
+
+    // Row content: each emitted row's vector equals the source vector at that
+    // file-local physical position (a global-id offset would fetch the wrong row).
+    let got_vectors = collect_vectors(&batches);
+    assert_eq!(got_vectors.len(), 3, "three rows expected");
+    for (row_idx, (id, _)) in expected.iter().enumerate() {
+        assert_eq!(
+            got_vectors[row_idx],
+            vectors[*id as usize].to_vec(),
+            "materialized vector for row id {id} diverges from source data"
+        );
+    }
+
+    // Score alignment must also key off the file-local position.
+    assert_eq!(scores.len(), 3);
+    for (got, want) in scores.iter().zip(&expected_scores) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "materialized score diverges: got {got}, want {want}"
+        );
+    }
+}
+
+/// Physical-coordinate contract: a primary-key vector read must select rows,
+/// recover positions, and align scores by the file-LOCAL physical position, and
+/// must NOT require the data file to carry a `first_row_id`. Real Java primary-key
+/// tables never write `first_row_id` (row-tracking is forbidden for PK tables), so
+/// this fixture pins the indexed data file's `first_row_id = None` — the same
+/// shape the committed Java fixture has, but over a Rust-built table with a
+/// discriminating dataset (best-first [5, 1, 3] != ascending position [1, 3, 5]).
+/// A read path that keys candidate selection or position recovery off a global row
+/// id (rather than the file-local physical position) cannot satisfy this.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn execute_read_without_first_row_id_selects_local_positions() {
+    assert_discriminating_local_read(None).await;
+}
+
+/// Regression pin for the same physical-coordinate contract with a present but
+/// deliberately NON-aligned `first_row_id = Some(100)`: recovering the file-local
+/// physical position must not be offset by `first_row_id`. This holds on the
+/// current code (the global-range round-trip is symmetric) and must keep holding
+/// after the read path switches to file-local coordinates, so a fix that reads
+/// local positions yet leaves a stray `first_row_id` offset would surface here.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn execute_read_ignores_nonzero_first_row_id() {
+    assert_discriminating_local_read(Some(100)).await;
 }
 
 /// Fixture #3 (residual): the unrestricted nearest neighbours sit at low ids
