@@ -15,15 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact sequential vector reader over one data file's vector column. Mirrors
-//! Java `org.apache.paimon.index.pkvector.PkVectorDataFileReader`.
+//! Streaming exact vector search over one data file's vector column. Mirrors
+//! Java `org.apache.paimon.index.pkvector.PkVectorDataFileReader` +
+//! `PkVectorExactSearcher`.
 //!
-//! The factory projects the single vector column, reads the whole file in
-//! physical order, and preloads it into memory as `Vec<Option<Vec<f32>>>`
-//! (a NULL row is `None`). Deletion vectors are deliberately NOT applied here:
-//! physical position must stay in lockstep with the segment ordinal so the
-//! bucket search can address rows by position. The returned reader then serves
-//! vectors from memory one physical row at a time.
+//! The factory projects the single vector column and, per uncovered file,
+//! streams the column one Arrow batch at a time — feeding each row into per-query
+//! bounded Top-K heaps and dropping the batch — so peak memory is one batch plus
+//! the heaps rather than the whole column. Deletion vectors and residual filters
+//! are deliberately NOT applied by the stream itself: physical position must stay
+//! in lockstep with the segment ordinal, so exclusion is folded in via the
+//! caller-supplied `is_excluded(position)` predicate. A NULL row is not scored but
+//! still advances the physical position.
+
+use std::collections::BinaryHeap;
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
 use futures::TryStreamExt;
@@ -32,7 +37,9 @@ use crate::spec::{DataField, DataType};
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::source::DataSplit;
 use crate::vindex::pkvector::bucket::BucketActiveFile;
-use crate::vindex::pkvector::reader::PkVectorReader;
+use crate::vindex::pkvector::exact::{drain_best_first, push_bounded, validate_query, WorstFirst};
+use crate::vindex::pkvector::metric::VectorSearchMetric;
+use crate::vindex::pkvector::result::PkVectorSearchResult;
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -41,7 +48,8 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-/// Builds an exact [`PkVectorReader`] over one data file's vector column.
+/// Runs a streaming exact [`PkVectorSearchResult`] search over one data file's
+/// vector column.
 ///
 /// `reader` is configured (via [`DataFileReader::with_read_type`]) to project
 /// only the vector column, so each read returns a single-column batch. Mirrors
@@ -79,14 +87,33 @@ impl DataFilePkVectorReaderFactory {
         })
     }
 
-    /// Preload the whole vector column of `file` into memory and return a
-    /// sequential reader over it. `file` must name a data file present in this
-    /// factory's split. The drained row count is checked against the file's
-    /// `DataFileMeta.row_count`.
-    pub(crate) async fn create(
+    /// Stream the vector column of `file` one Arrow batch at a time and return one
+    /// bounded, BEST_FIRST Top-K list per query (outer index aligned to `queries`).
+    /// `file` must name a data file present in this factory's split.
+    ///
+    /// All queries are validated (dimension + finite) BEFORE the file stream is
+    /// opened. Each surviving physical position (not NULL, not `is_excluded`) is
+    /// scored against every query into that query's bounded heap; a NULL row is
+    /// skipped but still advances the position so the position stays in lockstep
+    /// with `is_excluded`. The drained row count is checked against the file's
+    /// `DataFileMeta.row_count` (both truncation and overrun fail loud).
+    pub(crate) async fn search_file(
         &self,
         file: &BucketActiveFile,
-    ) -> crate::Result<Box<dyn PkVectorReader>> {
+        queries: &[&[f32]],
+        metric: VectorSearchMetric,
+        exact_limit: usize,
+        is_excluded: &(dyn Fn(i64) -> bool + Sync),
+    ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+        if exact_limit == 0 {
+            return Err(data_invalid("vector search limit must be positive"));
+        }
+        // Validate every query before opening the stream (validate-before-POLL);
+        // a malformed query fails loud before any file I/O.
+        for query in queries {
+            validate_query(query, self.dimension)?;
+        }
+
         let file_meta = self
             .data_split
             .data_files()
@@ -110,34 +137,58 @@ impl DataFilePkVectorReaderFactory {
             None,
         )?;
 
-        let mut vectors: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut heaps: Vec<BinaryHeap<WorstFirst>> = (0..queries.len())
+            .map(|_| BinaryHeap::with_capacity(exact_limit + 1))
+            .collect();
+        // One reused buffer per batch; a NULL row leaves it untouched (and is not
+        // scored). `position` is the monotonic physical row counter across batches.
+        let mut batch_vectors: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut position: i64 = 0;
         while let Some(batch) = stream.try_next().await? {
+            batch_vectors.clear();
             append_batch_vectors(
                 &batch,
                 self.vector_field.name(),
                 self.dimension,
-                &mut vectors,
+                &mut batch_vectors,
             )?;
+            for entry in &batch_vectors {
+                let pos = position;
+                position += 1;
+                if pos >= row_count {
+                    return Err(data_invalid(
+                        "data file produced more rows than DataFileMeta.row_count",
+                    ));
+                }
+                let Some(vector) = entry else {
+                    continue; // NULL row: not scored, position already advanced.
+                };
+                if is_excluded(pos) {
+                    continue;
+                }
+                for (query, heap) in queries.iter().zip(heaps.iter_mut()) {
+                    let candidate = PkVectorSearchResult {
+                        data_file_name: file.file_name.clone(),
+                        row_position: pos,
+                        distance: metric.compute_distance(query, vector),
+                    };
+                    push_bounded(heap, candidate, exact_limit);
+                }
+            }
         }
 
-        let drained = vectors.len() as i64;
-        if drained > row_count {
+        if position > row_count {
             return Err(data_invalid(
                 "data file produced more rows than DataFileMeta.row_count",
             ));
         }
-        if drained < row_count {
+        if position < row_count {
             return Err(data_invalid(
                 "data file ended before DataFileMeta.row_count",
             ));
         }
 
-        Ok(Box::new(DataFilePkVectorReader {
-            dimension: self.dimension,
-            row_count,
-            vectors,
-            position: 0,
-        }))
+        Ok(heaps.into_iter().map(drain_best_first).collect())
     }
 }
 
@@ -219,97 +270,6 @@ pub(crate) fn append_batch_vectors(
     Ok(())
 }
 
-/// In-memory sequential reader over one file's preloaded vector column. Each
-/// [`read_next_vector`](PkVectorReader::read_next_vector) advances exactly one
-/// physical row; a NULL row returns `false` but still advances the position.
-struct DataFilePkVectorReader {
-    dimension: usize,
-    row_count: i64,
-    /// Preloaded whole-file column in physical order; `None` = NULL row.
-    vectors: Vec<Option<Vec<f32>>>,
-    position: usize,
-}
-
-impl PkVectorReader for DataFilePkVectorReader {
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-
-    fn row_count(&self) -> i64 {
-        self.row_count
-    }
-
-    fn read_next_vector(&mut self, reuse: &mut [f32]) -> crate::Result<bool> {
-        if reuse.len() != self.dimension {
-            return Err(data_invalid(format!(
-                "reuse buffer length {} does not match vector dimension {}",
-                reuse.len(),
-                self.dimension
-            )));
-        }
-        if self.position as i64 >= self.row_count {
-            return Err(data_invalid("read past row count"));
-        }
-        let entry = &self.vectors[self.position];
-        self.position += 1;
-        match entry {
-            Some(vector) => {
-                reuse.copy_from_slice(vector);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn null_row_consumes_ordinal() {
-        let mut r = DataFilePkVectorReader {
-            dimension: 2,
-            row_count: 3,
-            vectors: vec![Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])],
-            position: 0,
-        };
-        let mut buf = [0.0f32; 2];
-        assert!(r.read_next_vector(&mut buf).unwrap());
-        assert_eq!(buf, [1.0, 2.0]);
-        assert!(!r.read_next_vector(&mut buf).unwrap()); // null: false, ordinal advanced
-        assert!(r.read_next_vector(&mut buf).unwrap());
-        assert_eq!(buf, [3.0, 4.0]);
-        assert_eq!(r.row_count(), 3);
-        assert_eq!(r.dimension(), 2);
-    }
-
-    #[test]
-    fn read_past_row_count_errors() {
-        let mut r = DataFilePkVectorReader {
-            dimension: 1,
-            row_count: 1,
-            vectors: vec![Some(vec![1.0])],
-            position: 0,
-        };
-        let mut buf = [0.0f32; 1];
-        assert!(r.read_next_vector(&mut buf).unwrap());
-        assert!(r.read_next_vector(&mut buf).is_err()); // past row_count
-    }
-
-    #[test]
-    fn reuse_len_mismatch_errors() {
-        let mut r = DataFilePkVectorReader {
-            dimension: 2,
-            row_count: 1,
-            vectors: vec![Some(vec![1.0, 2.0])],
-            position: 0,
-        };
-        let mut buf = [0.0f32; 1];
-        assert!(r.read_next_vector(&mut buf).is_err());
-    }
-}
-
 #[cfg(test)]
 mod integration_tests {
     use super::*;
@@ -384,12 +344,16 @@ mod integration_tests {
         );
     }
 
-    /// Write a FixedSizeList<Float32, 2> vector column
-    /// (`[1,2]`, NULL, `[3,4]`) as a parquet data file, build the factory over
-    /// its split, preload via `create`, and assert the whole-file sequential
-    /// read plus the "file not in split" error.
-    #[tokio::test]
-    async fn create_preloads_and_reads_whole_file() {
+    /// Build a FixedSizeList<Float32, 2> vector column from `rows` (`None` = NULL
+    /// row), write it as one parquet data file across `batches` write calls, and
+    /// return a factory over its split plus the file name. `stated_row_count` is
+    /// what the `DataFileMeta` claims (usually the true row count, but a test can
+    /// pass a wrong value to exercise the row-count guard).
+    async fn build_factory(
+        rows: &[Option<Vec<f32>>],
+        stated_row_count: i64,
+        table_path: &str,
+    ) -> (DataFilePkVectorReaderFactory, String) {
         let field = vector_field();
         let read_fields = vec![field.clone()];
         let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
@@ -397,20 +361,24 @@ mod integration_tests {
         let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
             ArrowField::new("element", ArrowDataType::Float32, true),
         ));
-        builder.values().append_value(1.0);
-        builder.values().append_value(2.0);
-        builder.append(true);
-        builder.values().append_value(0.0);
-        builder.values().append_value(0.0);
-        builder.append(false); // NULL vector row
-        builder.values().append_value(3.0);
-        builder.values().append_value(4.0);
-        builder.append(true);
+        for row in rows {
+            match row {
+                Some(v) => {
+                    builder.values().append_value(v[0]);
+                    builder.values().append_value(v[1]);
+                    builder.append(true);
+                }
+                None => {
+                    builder.values().append_value(0.0);
+                    builder.values().append_value(0.0);
+                    builder.append(false);
+                }
+            }
+        }
         let vec_array = builder.finish();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(vec_array)]).unwrap();
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/pk_vector_data_file_reader";
         let bucket_path = format!("{table_path}/bucket-0");
         let file_name = "part-0.parquet";
         let file_path = format!("{bucket_path}/{file_name}");
@@ -440,7 +408,7 @@ mod integration_tests {
             .with_data_files(vec![data_file(
                 file_name,
                 file_size as i64,
-                3,
+                stated_row_count,
                 table_schema_id,
             )])
             .build()
@@ -455,36 +423,162 @@ mod integration_tests {
             read_fields.clone(),
             Vec::new(),
         );
+        let factory = DataFilePkVectorReaderFactory::new(reader, data_split, field).unwrap();
+        (factory, file_name.to_string())
+    }
 
-        let factory =
-            DataFilePkVectorReaderFactory::new(reader, data_split, field.clone()).unwrap();
+    /// The streaming per-file search must produce candidates byte-identical to
+    /// the reference `exact_search` over an in-memory `ArrayReader` of the same
+    /// data, including a NULL row and a residual/DV exclusion.
+    #[tokio::test]
+    async fn search_file_matches_exact_search_reference() {
+        use crate::vindex::pkvector::exact::exact_search;
+        use crate::vindex::pkvector::reader::test_support::ArrayReader;
 
-        let present = BucketActiveFile {
-            file_name: file_name.to_string(),
+        let rows = vec![
+            Some(vec![3.0, 0.0]),
+            None,
+            Some(vec![1.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+        ];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_equiv").await;
+        let active = BucketActiveFile {
+            file_name: file_name.clone(),
+            row_count: rows.len() as i64,
+        };
+        // Exclude physical position 2 (residual/DV fold): mirrors the closure the
+        // bucket search passes in.
+        let is_excluded = |pos: i64| pos == 2;
+        let query = [0.0f32, 0.0];
+
+        let streamed = factory
+            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &is_excluded)
+            .await
+            .unwrap();
+
+        let mut ref_reader = ArrayReader::new(2, rows.clone());
+        let reference = exact_search(
+            &file_name,
+            &mut ref_reader,
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &is_excluded,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.len(), 1, "one query in, one result list out");
+        assert_eq!(streamed[0], reference);
+    }
+
+    /// Same streaming-vs-reference equivalence, but with more scorable rows than
+    /// `exact_limit` so the bounded heap's eviction branch is exercised on both
+    /// paths (the shared `push_bounded` must evict identically).
+    #[tokio::test]
+    async fn search_file_matches_exact_search_reference_with_eviction() {
+        use crate::vindex::pkvector::exact::exact_search;
+        use crate::vindex::pkvector::reader::test_support::ArrayReader;
+
+        // Five scorable rows, no NULL/exclusion; keep only the 2 closest to [0,0].
+        let rows = vec![
+            Some(vec![4.0, 0.0]),
+            Some(vec![1.0, 0.0]),
+            Some(vec![3.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+            Some(vec![5.0, 0.0]),
+        ];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_evict").await;
+        let active = BucketActiveFile {
+            file_name: file_name.clone(),
+            row_count: rows.len() as i64,
+        };
+        let query = [0.0f32, 0.0];
+
+        let streamed = factory
+            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &|_| false)
+            .await
+            .unwrap();
+
+        let mut ref_reader = ArrayReader::new(2, rows.clone());
+        let reference = exact_search(
+            &file_name,
+            &mut ref_reader,
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &|_| false,
+        )
+        .unwrap();
+
+        assert_eq!(streamed[0], reference);
+        // The two closest are positions 1 ([1,0]) then 3 ([2,0]), best-first.
+        assert_eq!(streamed[0].len(), 2, "bounded to exact_limit");
+        assert_eq!(streamed[0][0].row_position, 1);
+        assert_eq!(streamed[0][1].row_position, 3);
+    }
+
+    /// A `DataFileMeta.row_count` larger than the file's real row count means the
+    /// stream ends early; the search must fail loud rather than return a short
+    /// result.
+    #[tokio::test]
+    async fn search_file_fails_loud_on_row_count_truncation() {
+        let rows = vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])];
+        // Claim 3 rows but only write 2.
+        let (factory, file_name) = build_factory(&rows, 3, "memory:/pkvdfr_trunc").await;
+        let active = BucketActiveFile {
+            file_name,
             row_count: 3,
         };
-        let mut pk_reader = factory.create(&present).await.unwrap();
-        assert_eq!(pk_reader.dimension(), 2);
-        assert_eq!(pk_reader.row_count(), 3);
+        let query = [0.0f32, 0.0];
+        let err = factory
+            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &|_| false)
+            .await
+            .expect_err("row-count truncation must fail loud");
+        assert!(err.to_string().contains("ended before"), "got: {err}");
+    }
 
-        let mut buf = [0.0f32; 2];
-        assert!(pk_reader.read_next_vector(&mut buf).unwrap());
-        assert_eq!(buf, [1.0, 2.0]);
-        assert!(!pk_reader.read_next_vector(&mut buf).unwrap()); // NULL row
-        assert!(pk_reader.read_next_vector(&mut buf).unwrap());
-        assert_eq!(buf, [3.0, 4.0]);
-        assert!(pk_reader.read_next_vector(&mut buf).is_err()); // past row count
+    /// A malformed query (wrong dimension / non-finite element) fails loud, and a
+    /// file name absent from the split is rejected as invalid.
+    #[tokio::test]
+    async fn search_file_validates_query_and_rejects_absent_file() {
+        let rows = vec![Some(vec![1.0, 2.0]), None, Some(vec![3.0, 4.0])];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_validate").await;
+        let present = BucketActiveFile {
+            file_name: file_name.clone(),
+            row_count: rows.len() as i64,
+        };
 
-        // A file name absent from the split is rejected as invalid.
+        // Wrong dimension.
+        let bad_dim = [1.0f32];
+        let err = factory
+            .search_file(&present, &[&bad_dim], VectorSearchMetric::L2, 2, &|_| false)
+            .await
+            .expect_err("dimension mismatch must fail loud");
+        assert!(err.to_string().contains("dimension"), "got: {err}");
+
+        // Non-finite element.
+        let bad_finite = [f32::NAN, 0.0];
+        let err = factory
+            .search_file(&present, &[&bad_finite], VectorSearchMetric::L2, 2, &|_| {
+                false
+            })
+            .await
+            .expect_err("non-finite query must fail loud");
+        assert!(err.to_string().contains("finite"), "got: {err}");
+
+        // Absent file.
         let missing = BucketActiveFile {
             file_name: "absent.parquet".to_string(),
             row_count: 3,
         };
+        let query = [0.0f32, 0.0];
         let err = factory
-            .create(&missing)
+            .search_file(&missing, &[&query], VectorSearchMetric::L2, 2, &|_| false)
             .await
-            .err()
-            .expect("absent file must be rejected");
+            .expect_err("absent file must be rejected");
         assert!(matches!(err, crate::Error::DataInvalid { .. }));
     }
 }

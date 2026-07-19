@@ -34,8 +34,8 @@ use crate::table::pk_vector_data_file_reader::{
 };
 use crate::table::pk_vector_indexed_split_read::{expand_ranges, PkVectorIndexedSplitRead};
 use crate::table::pk_vector_orchestrator::{
-    as_split_exact_reader_factory, build_indexed_splits, merge_candidates,
-    OrchestratorSearchResult, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+    as_split_exact_file_search, build_indexed_splits, merge_candidates, OrchestratorSearchResult,
+    PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
@@ -49,7 +49,7 @@ use crate::table::{
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
-use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactReaderFuture};
+use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
@@ -577,18 +577,23 @@ impl<'a> VectorSearchBuilder<'a> {
             None => None,
         };
 
-        // Build the exact-fallback vector reader on demand: the kernel calls this
-        // only for a file it actually searches (uncovered by ANN, residual-allowed,
-        // and only when the search mode is not FAST). Everything the future needs is
+        // Build the exact-fallback search on demand: the kernel calls this only
+        // for a file it actually searches (uncovered by ANN, residual-allowed, and
+        // only when the search mode is not FAST). Everything the future needs is
         // cloned/owned up front so it borrows neither the split nor the file across
-        // the await.
+        // the await. The search streams the file's vector column one Arrow batch at
+        // a time into per-query bounded heaps (the caller passes a single query).
         let reader_for_factory = reader.clone();
         let vector_field_for_factory = vector_field.clone();
-        let mut factory = as_split_exact_reader_factory(
+        let factory = as_split_exact_file_search(
             move |_split_index: usize,
                   split: &PkVectorSearchSplit,
-                  file: &BucketActiveFile|
-                  -> ExactReaderFuture<'_> {
+                  file: &BucketActiveFile,
+                  queries: &[&[f32]],
+                  metric: VectorSearchMetric,
+                  exact_limit: usize,
+                  is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
                 let reader = reader_for_factory.clone();
                 let vector_field = vector_field_for_factory.clone();
                 let data_split = split.data_split.clone();
@@ -596,10 +601,15 @@ impl<'a> VectorSearchBuilder<'a> {
                     file_name: file.file_name.clone(),
                     row_count: file.row_count,
                 };
+                let owned_queries: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
                 Box::pin(async move {
                     let factory =
                         DataFilePkVectorReaderFactory::new(reader, data_split, vector_field)?;
-                    factory.create(&active).await
+                    let query_refs: Vec<&[f32]> =
+                        owned_queries.iter().map(|q| q.as_slice()).collect();
+                    factory
+                        .search_file(&active, &query_refs, metric, exact_limit, is_excluded)
+                        .await
                 })
             },
         );
@@ -612,7 +622,7 @@ impl<'a> VectorSearchBuilder<'a> {
                 limit,
                 indexed_limit,
                 Some(&ann_searcher),
-                &mut factory,
+                &factory,
                 &search_options,
                 skip_exact_fallback,
                 residual_by_split.as_deref(),

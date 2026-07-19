@@ -21,6 +21,10 @@
 /// `Send` so a boxed reader can be held across the `.await` points of the async
 /// search path (the returned future is spawned on a `Send` runtime by callers
 /// such as the DataFusion integration).
+///
+/// Retained as a test-only reference source for the exact search: production now
+/// streams the vector column one Arrow batch at a time in the table layer.
+#[cfg(test)]
 pub(crate) trait PkVectorReader: Send {
     fn dimension(&self) -> usize;
 
