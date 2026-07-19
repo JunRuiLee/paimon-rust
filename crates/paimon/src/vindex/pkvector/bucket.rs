@@ -142,6 +142,15 @@ pub(crate) fn covered_source_files(
     covered
 }
 
+/// Separately bounded approximate-index and exact-fallback candidates for one
+/// bucket. The approximate list may be over-fetched (for later exact reranking)
+/// while the exact-fallback list stays bounded to the caller's final limit.
+#[derive(Debug)]
+pub(crate) struct BucketSearchResult {
+    pub(crate) indexed: Vec<PkVectorSearchResult>,
+    pub(crate) exact: Vec<PkVectorSearchResult>,
+}
+
 /// ANN + exact data-file fallback search for one snapshot bucket. Mirrors Java
 /// `org.apache.paimon.index.pkvector.PrimaryKeyVectorBucketSearch.search`.
 ///
@@ -164,12 +173,16 @@ pub(crate) async fn bucket_search(
               + Send),
     query: &[f32],
     metric: VectorSearchMetric,
-    limit: usize,
+    indexed_limit: usize,
+    exact_limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
-) -> crate::Result<Vec<PkVectorSearchResult>> {
-    if limit == 0 {
+) -> crate::Result<BucketSearchResult> {
+    if indexed_limit == 0 {
+        return Err(data_invalid("vector search limit must be positive"));
+    }
+    if exact_limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
     }
 
@@ -219,7 +232,8 @@ pub(crate) async fn bucket_search(
         }
     }
 
-    let mut heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(limit + 1);
+    let mut indexed_heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(indexed_limit + 1);
+    let mut exact_heap: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(exact_limit + 1);
     let active_source_files: HashSet<String> =
         files_by_name.keys().map(|name| name.to_string()).collect();
     // Active files whose rows an ANN segment already covers; the exact fallback
@@ -247,13 +261,13 @@ pub(crate) async fn bucket_search(
             segment,
             query,
             metric,
-            limit,
+            indexed_limit,
             &active_source_files,
             deletion_vectors,
             search_options,
             residual_ranges,
         )? {
-            add_candidate(&mut heap, result, limit);
+            add_candidate(&mut indexed_heap, result, indexed_limit);
         }
     }
 
@@ -299,17 +313,19 @@ pub(crate) async fn bucket_search(
                 reader.as_mut(),
                 query,
                 metric,
-                limit,
+                exact_limit,
                 &is_excluded,
             )? {
-                add_candidate(&mut heap, result, limit);
+                add_candidate(&mut exact_heap, result, exact_limit);
             }
         }
     }
 
-    let mut results: Vec<PkVectorSearchResult> = heap.into_iter().map(|w| w.0).collect();
-    results.sort_by(best_first);
-    Ok(results)
+    let mut indexed: Vec<PkVectorSearchResult> = indexed_heap.into_iter().map(|w| w.0).collect();
+    indexed.sort_by(best_first);
+    let mut exact: Vec<PkVectorSearchResult> = exact_heap.into_iter().map(|w| w.0).collect();
+    exact.sort_by(best_first);
+    Ok(BucketSearchResult { indexed, exact })
 }
 
 #[cfg(test)]
@@ -370,6 +386,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dual_limit_bounds_indexed_and_exact_independently() {
+        // One ANN segment covering "ann.mosaic" (3 rows) and one uncovered exact
+        // file "exact.mosaic" (3 rows). indexed_limit = 3 lets all ANN hits through;
+        // exact_limit = 1 keeps only the single closest exact hit.
+        let segment = BucketAnnSegment::for_test(meta(&[("ann.mosaic", 3)]));
+        // Fake ANN searcher returns three hits at increasing distance.
+        let ann = FakeAnnSearcher {
+            result: vec![
+                PkVectorSearchResult {
+                    data_file_name: "ann.mosaic".into(),
+                    row_position: 0,
+                    distance: 0.1,
+                },
+                PkVectorSearchResult {
+                    data_file_name: "ann.mosaic".into(),
+                    row_position: 1,
+                    distance: 0.2,
+                },
+                PkVectorSearchResult {
+                    data_file_name: "ann.mosaic".into(),
+                    row_position: 2,
+                    distance: 0.3,
+                },
+            ],
+        };
+        // Exact file has three rows; query nearest is position 0.
+        let mut factory = as_factory(|_f: &BucketActiveFile| -> ExactReaderFuture<'_> {
+            let reader = ArrayReader::new(
+                2,
+                vec![
+                    Some(vec![1.0, 0.0]),
+                    Some(vec![9.0, 0.0]),
+                    Some(vec![8.0, 0.0]),
+                ],
+            );
+            Box::pin(async move { Ok(Box::new(reader) as Box<dyn PkVectorReader>) })
+        });
+        let active_files = vec![active("ann.mosaic", 3), active("exact.mosaic", 3)];
+        let dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
+        let opts = HashMap::new();
+
+        let out = bucket_search(
+            Some(&ann),
+            &[segment],
+            &active_files,
+            &dvs,
+            &mut factory,
+            &[1.0, 0.0],
+            VectorSearchMetric::L2,
+            3, // indexed_limit
+            1, // exact_limit
+            &opts,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            out.indexed.len(),
+            3,
+            "indexed heap keeps indexed_limit hits"
+        );
+        assert_eq!(out.exact.len(), 1, "exact heap bounded to exact_limit");
+        assert_eq!(out.exact[0].data_file_name, "exact.mosaic");
+        assert_eq!(out.exact[0].row_position, 0);
+    }
+
+    #[tokio::test]
     async fn test_rejects_non_positive_limit() {
         let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
             Box::pin(async { unreachable!() })
@@ -382,6 +467,7 @@ mod tests {
             &mut factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
+            0,
             0,
             &HashMap::new(),
             false,
@@ -417,7 +503,7 @@ mod tests {
         let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
             Box::pin(async { unreachable!() })
         });
-        let results = bucket_search(
+        let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 3)],
@@ -426,12 +512,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             3,
+            3,
             &HashMap::new(),
             false,
             None,
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(3);
         // Top-3 BEST_FIRST: (data-1,0), (data-1,1), (data-1,2) — the larger
         // data_file_name "data-2" entries are evicted despite equal distance.
         assert_eq!(
@@ -469,7 +560,7 @@ mod tests {
         let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
             Box::pin(async { unreachable!() })
         });
-        let results = bucket_search(
+        let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2)],
@@ -478,12 +569,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
+            1,
             &HashMap::new(),
             false,
             None,
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].row_position, 1);
         assert_eq!(results[0].distance, -1.0);
@@ -512,7 +608,7 @@ mod tests {
                 )) as Box<dyn PkVectorReader>)
             })
         });
-        let results = bucket_search(
+        let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2), active("data-2", 2)],
@@ -521,12 +617,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
+            2,
             &HashMap::new(),
             false,
             None,
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(2);
         assert_eq!(
             results,
             vec![
@@ -565,7 +666,7 @@ mod tests {
         bm.insert(0); // data-1 position 0 deleted
         dvs.insert("data-1".into(), Arc::new(DeletionVector::from_bitmap(bm)));
 
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 2), active("data-2", 2)],
@@ -573,6 +674,7 @@ mod tests {
             &mut factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
+            2,
             2,
             &HashMap::new(),
             false,
@@ -582,6 +684,10 @@ mod tests {
         .unwrap();
         // Candidates: data-2 pos0 {1,0} dist 1.0; data-1 pos1 {2,0} dist 4.0.
         // (data-1 pos0 deleted, data-2 pos1 null.)
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(2);
         assert_eq!(
             results,
             vec![
@@ -613,6 +719,7 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
+            1,
             &HashMap::new(),
             false,
             None,
@@ -639,6 +746,7 @@ mod tests {
             &mut factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
+            1,
             1,
             &HashMap::new(),
             false,
@@ -671,7 +779,7 @@ mod tests {
             calls.lock().unwrap().push(f.file_name.clone());
             Box::pin(async { unreachable!("only data-1 is active and it is ANN-covered") })
         });
-        let results = bucket_search(
+        let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2)],
@@ -680,12 +788,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
+            2,
             &HashMap::new(),
             false,
             None,
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(2);
         assert_eq!(
             results,
             vec![PkVectorSearchResult {
@@ -713,6 +826,7 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
+            1,
             &HashMap::new(),
             false,
             None,
@@ -732,7 +846,7 @@ mod tests {
         let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
             Box::pin(async { unreachable!() })
         });
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 2), active("data-2", 2)],
@@ -741,13 +855,15 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
+            2,
             &HashMap::new(),
             true, // skip_exact_fallback
             None,
         )
         .await
         .unwrap();
-        assert!(results.is_empty());
+        assert!(out.indexed.is_empty());
+        assert!(out.exact.is_empty());
     }
 
     #[tokio::test]
@@ -776,6 +892,7 @@ mod tests {
             &mut factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
+            1,
             1,
             &HashMap::new(),
             false,
@@ -816,6 +933,7 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
+            1,
             &HashMap::new(),
             false,
             None,
@@ -843,6 +961,7 @@ mod tests {
             &mut factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
+            1,
             1,
             &HashMap::new(),
             false,
@@ -909,7 +1028,7 @@ mod tests {
         });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 2]));
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 3)],
@@ -918,12 +1037,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
+            5,
             &HashMap::new(),
             false,
             Some(&residual),
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(5);
         assert_eq!(
             results,
             vec![
@@ -957,7 +1081,7 @@ mod tests {
         });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 1]));
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 2), active("data-2", 2)],
@@ -966,12 +1090,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
+            5,
             &HashMap::new(),
             false,
             Some(&residual),
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(5);
         // Only data-1 rows appear; data-2 was never read.
         assert!(results.iter().all(|r| r.data_file_name == "data-1"));
         assert_eq!(calls.lock().unwrap().as_slice(), &["data-1".to_string()]);
@@ -988,7 +1117,7 @@ mod tests {
         });
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[]));
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 3)],
@@ -997,13 +1126,15 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
+            5,
             &HashMap::new(),
             false,
             Some(&residual),
         )
         .await
         .unwrap();
-        assert!(results.is_empty());
+        assert!(out.indexed.is_empty());
+        assert!(out.exact.is_empty());
         assert_eq!(*calls.lock().unwrap(), 0);
     }
 
@@ -1029,7 +1160,7 @@ mod tests {
         dvs.insert("data-1".into(), Arc::new(DeletionVector::from_bitmap(bm)));
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 1, 2]));
-        let results = bucket_search(
+        let out = bucket_search(
             None,
             &[],
             &[active("data-1", 3)],
@@ -1038,12 +1169,17 @@ mod tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
+            5,
             &HashMap::new(),
             false,
             Some(&residual),
         )
         .await
         .unwrap();
+        let mut results = out.indexed.clone();
+        results.extend(out.exact.clone());
+        results.sort_by(best_first);
+        results.truncate(5);
         assert_eq!(
             results.iter().map(|r| r.row_position).collect::<Vec<_>>(),
             vec![1, 2]

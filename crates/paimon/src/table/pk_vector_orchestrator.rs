@@ -112,6 +112,7 @@ pub(crate) struct PkVectorSearchSplit {
 /// the cross-bucket merge dimensions a lone `PkVectorSearchResult` lacks;
 /// `split_index` is the re-association handle back to
 /// `splits[split_index].data_split`.
+#[derive(Clone)]
 pub(crate) struct PkVectorCandidate {
     pub split_index: usize,
     pub partition: BinaryRow,
@@ -119,6 +120,14 @@ pub(crate) struct PkVectorCandidate {
     pub data_file_name: String,
     pub row_position: i64,
     pub distance: f32,
+}
+
+/// Best-first indexed (approximate) and exact-fallback candidate lists, each
+/// already globally bounded. The indexed list may be over-fetched for a later
+/// exact rerank; the exact list is bounded to the caller's final limit.
+pub(crate) struct OrchestratorSearchResult {
+    pub(crate) indexed: Vec<PkVectorCandidate>,
+    pub(crate) exact: Vec<PkVectorCandidate>,
 }
 
 /// 5-level BEST_FIRST (smallest = best) key. Level 1 orders distance with
@@ -143,6 +152,20 @@ fn global_top_k(mut candidates: Vec<PkVectorCandidate>, limit: usize) -> Vec<PkV
     candidates.sort_by(candidate_cmp);
     candidates.truncate(limit);
     candidates
+}
+
+/// Merge already-bounded indexed and exact candidate lists into a single
+/// best-first list truncated to `limit`. The final global Top-K over the union
+/// is what guarantees the merged result is independent of how the two inputs
+/// were individually bounded.
+pub(crate) fn merge_candidates(
+    indexed: Vec<PkVectorCandidate>,
+    exact: Vec<PkVectorCandidate>,
+    limit: usize,
+) -> Vec<PkVectorCandidate> {
+    let mut all = indexed;
+    all.extend(exact);
+    global_top_k(all, limit)
 }
 
 /// Group Top-K survivors by `(partition, bucket, data_file_name)`, re-associate
@@ -197,7 +220,15 @@ pub(crate) fn build_indexed_splits(
         }
 
         // Re-associate the file to its DataFileMeta + aligned deletion file.
-        let source = &splits[split_index].data_split;
+        let source = &splits
+            .get(split_index)
+            .ok_or_else(|| {
+                data_invalid(format!(
+                    "vector search hit references split index {split_index} out of range (splits: {})",
+                    splits.len()
+                ))
+            })?
+            .data_split;
         let file_idx = source
             .data_files()
             .iter()
@@ -301,10 +332,13 @@ impl PkVectorOrchestrator {
     }
 
     /// Run the eager per-bucket search + cross-bucket global Top-K and return the
-    /// best-first survivors (through the full 5-level tie-break, raw distance
-    /// preserved). The exact-reader factory is split-scoped: it receives the
-    /// current split index and split so a caller can build a reader keyed to the
-    /// specific split/file. `skip_exact_fallback` forwards to `bucket_search`.
+    /// indexed (approximate) and exact-fallback survivors as two separate
+    /// best-first lists (each through the full 5-level tie-break, raw distance
+    /// preserved). The indexed list is bounded to `indexed_limit` (over-fetched
+    /// for a later exact rerank); the exact list is bounded to `limit`. The
+    /// exact-reader factory is split-scoped: it receives the current split index
+    /// and split so a caller can build a reader keyed to the specific split/file.
+    /// `skip_exact_fallback` forwards to `bucket_search`.
     ///
     /// `residual_by_split`, when present, carries one per-file allow-list of
     /// physical row positions per split (indexed parallel to `splits`): only
@@ -320,6 +354,7 @@ impl PkVectorOrchestrator {
         query: &[f32],
         metric: VectorSearchMetric,
         limit: usize,
+        indexed_limit: usize,
         ann_searcher: Option<&dyn PkVectorAnnSearcher>,
         exact_reader_factory: &mut (dyn for<'s, 'f> FnMut(
             usize,
@@ -330,10 +365,13 @@ impl PkVectorOrchestrator {
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
         residual_by_split: Option<&[HashMap<String, RoaringTreemap>]>,
-    ) -> crate::Result<Vec<PkVectorCandidate>> {
+    ) -> crate::Result<OrchestratorSearchResult> {
         // Eager input-shape validation (Java checkArgument parity).
         if limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
+        }
+        if indexed_limit == 0 {
+            return Err(data_invalid("vector indexed search limit must be positive"));
         }
         if query.is_empty() {
             return Err(data_invalid("vector search query must not be empty"));
@@ -346,8 +384,9 @@ impl PkVectorOrchestrator {
             }
         }
 
-        // Eager per-bucket search -> tagged candidates.
-        let mut candidates: Vec<PkVectorCandidate> = Vec::new();
+        // Eager per-bucket search -> tagged candidates, kept split by path.
+        let mut indexed_candidates: Vec<PkVectorCandidate> = Vec::new();
+        let mut exact_candidates: Vec<PkVectorCandidate> = Vec::new();
         for (split_index, split) in splits.iter().enumerate() {
             let dvs = build_bucket_dv_map(&self.reader, split).await?;
             // Wrap the split-scoped factory into bucket_search's per-file signature.
@@ -357,7 +396,7 @@ impl PkVectorOrchestrator {
                 exact_reader_factory(split_index, split, file)
             });
             let residual_ranges = residual_by_split.map(|per_split| &per_split[split_index]);
-            let results = bucket_search(
+            let result = bucket_search(
                 ann_searcher,
                 &split.ann_segments,
                 &split.active_files,
@@ -365,30 +404,33 @@ impl PkVectorOrchestrator {
                 &mut bucket_factory,
                 query,
                 metric,
+                indexed_limit,
                 limit,
                 search_options,
                 skip_exact_fallback,
                 residual_ranges,
             )
             .await?;
-            for PkVectorSearchResult {
+            let tag = |PkVectorSearchResult {
+                           data_file_name,
+                           row_position,
+                           distance,
+                       }: PkVectorSearchResult| PkVectorCandidate {
+                split_index,
+                partition: split.data_split.partition().clone(),
+                bucket: split.data_split.bucket(),
                 data_file_name,
                 row_position,
                 distance,
-            } in results
-            {
-                candidates.push(PkVectorCandidate {
-                    split_index,
-                    partition: split.data_split.partition().clone(),
-                    bucket: split.data_split.bucket(),
-                    data_file_name,
-                    row_position,
-                    distance,
-                });
-            }
+            };
+            indexed_candidates.extend(result.indexed.into_iter().map(&tag));
+            exact_candidates.extend(result.exact.into_iter().map(&tag));
         }
 
-        Ok(global_top_k(candidates, limit))
+        Ok(OrchestratorSearchResult {
+            indexed: global_top_k(indexed_candidates, indexed_limit),
+            exact: global_top_k(exact_candidates, limit),
+        })
     }
 }
 
@@ -548,6 +590,18 @@ mod tests {
     }
 
     #[test]
+    fn merge_candidates_takes_global_top_k_over_union() {
+        // indexed and exact each already bounded; the union's global Top-K must be
+        // independent of how each side was bounded.
+        let indexed = vec![cand(0, 0, "f", 0, 0.1), cand(0, 0, "f", 1, 0.4)];
+        let exact = vec![cand(0, 0, "g", 0, 0.2)];
+        let out = merge_candidates(indexed, exact, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].distance, 0.1);
+        assert_eq!(out[1].distance, 0.2); // 0.2 (exact) beats 0.4 (indexed)
+    }
+
+    #[test]
     fn builds_two_splits_with_ascending_position_ordered_scores() {
         // One bucket, two files. file-a hits at global order [pos=10, pos=2];
         // build must reorder to positions [2,10] with scores [score(2), score(10)].
@@ -626,6 +680,18 @@ mod tests {
             .map(|_| ())
             .expect_err("duplicate (file,pos) must error");
         assert!(format!("{err:?}").contains("duplicate"), "got: {err:?}");
+    }
+
+    #[test]
+    fn build_indexed_splits_fails_loud_on_out_of_range_split_index() {
+        // A malformed candidate whose split_index is beyond the splits slice must
+        // fail loud, not panic on a bare slice index.
+        let splits = vec![search_split(0, vec![data_file("f", 10)])];
+        let survivors = vec![cand(5, 0, "f", 0, 1.0)];
+        let err = build_indexed_splits(survivors, &splits, VectorSearchMetric::L2)
+            .map(|_| ())
+            .expect_err("out-of-range split index must error");
+        assert!(format!("{err:?}").contains("out of range"), "got: {err:?}");
     }
 
     #[test]
@@ -949,11 +1015,12 @@ mod e2e_tests {
         // expects; the split index/split are unused here.
         let mut wrapped =
             as_split_factory(|_: usize, _: &PkVectorSearchSplit, f: &BucketActiveFile| factory(f));
-        let survivors = orch
+        let result = orch
             .search_candidates(
                 splits,
                 query,
                 metric,
+                limit,
                 limit,
                 ann,
                 &mut wrapped,
@@ -962,6 +1029,9 @@ mod e2e_tests {
                 None,
             )
             .await?;
+        // Merge the two bounded lists into the best-first survivors the
+        // materialization path expects.
+        let survivors = merge_candidates(result.indexed, result.exact, limit);
         let indexed_splits = build_indexed_splits(survivors, splits, metric)?;
         let mut out = Vec::new();
         for indexed in indexed_splits {
@@ -991,6 +1061,7 @@ mod e2e_tests {
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
                 0,
+                0,
                 None,
                 &mut factory,
                 &opts,
@@ -1019,6 +1090,7 @@ mod e2e_tests {
                 &splits,
                 &[],
                 VectorSearchMetric::L2,
+                5,
                 5,
                 None,
                 &mut factory,
@@ -1360,11 +1432,12 @@ mod e2e_tests {
             },
         );
         let opts = HashMap::new();
-        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+        let result = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(
                 &[split],
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
+                2,
                 2,
                 None,
                 &mut factory,
@@ -1374,6 +1447,8 @@ mod e2e_tests {
             )
             .await
             .unwrap();
+        // Merge the two bounded lists into the best-first survivors.
+        let cands = merge_candidates(result.indexed, result.exact, 2);
         // Best-first: pos1 (d=1), pos2 (d=4).
         assert_eq!(
             cands
@@ -1432,11 +1507,12 @@ mod e2e_tests {
         allowed.insert(2);
         let residual_by_split = vec![HashMap::from([("r.mosaic".to_string(), allowed)])];
         let opts = HashMap::new();
-        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+        let result = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(
                 &[split],
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
+                3,
                 3,
                 None,
                 &mut factory,
@@ -1446,6 +1522,8 @@ mod e2e_tests {
             )
             .await
             .unwrap();
+        // Merge the two bounded lists into the best-first survivors.
+        let cands = merge_candidates(result.indexed, result.exact, 3);
         // Best-first among allowed positions: pos2 (d=4) then pos0 (d=9).
         assert_eq!(
             cands
@@ -1493,6 +1571,7 @@ mod e2e_tests {
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
                 3,
+                3,
                 None,
                 &mut factory,
                 &opts,
@@ -1533,11 +1612,12 @@ mod e2e_tests {
             },
         );
         let opts = HashMap::new();
-        let cands = PkVectorOrchestrator::new(make_reader(file_io, table_path))
+        let result = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(
                 &[split],
                 &[0.0, 0.0],
                 VectorSearchMetric::L2,
+                2,
                 2,
                 None,
                 &mut factory,
@@ -1547,7 +1627,8 @@ mod e2e_tests {
             )
             .await
             .unwrap();
-        assert!(cands.is_empty());
+        assert!(result.indexed.is_empty());
+        assert!(result.exact.is_empty());
     }
 
     #[test]

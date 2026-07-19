@@ -29,13 +29,17 @@ use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
-use crate::table::pk_vector_data_file_reader::DataFilePkVectorReaderFactory;
-use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
-use crate::table::pk_vector_orchestrator::{
-    as_split_exact_reader_factory, build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator,
-    PkVectorSearchSplit,
+use crate::table::pk_vector_data_file_reader::{
+    append_batch_vectors, DataFilePkVectorReaderFactory,
 };
-use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
+use crate::table::pk_vector_indexed_split_read::{expand_ranges, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_orchestrator::{
+    as_split_exact_reader_factory, build_indexed_splits, merge_candidates,
+    OrchestratorSearchResult, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+};
+use crate::table::pk_vector_position_read::{
+    PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
+};
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::source::DataSplit;
@@ -583,12 +587,29 @@ impl<'a> VectorSearchBuilder<'a> {
             },
         );
 
-        let candidates = PkVectorOrchestrator::new(reader)
+        // Resolve the refine factor from the query options first, then fall back to
+        // the table options; a positive factor over-fetches indexed (approximate)
+        // candidates so the exact rerank below has a wider pool to reorder. Factor 0
+        // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
+        // path. The two option maps are kept distinct (query options passed
+        // separately from table options) so a broad query key cannot be overridden
+        // by a more specific table key: query options take precedence as a whole.
+        // `search_options` above is the merged view used only to drive the ANN read.
+        let refine_factor = configured_refine_factor(
+            &self.options,
+            self.table.schema().options(),
+            pk_col,
+            &index_type,
+        )?;
+        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
+
+        let search: OrchestratorSearchResult = PkVectorOrchestrator::new(reader)
             .search_candidates(
                 &plan.splits,
                 query_vector,
                 metric,
                 limit,
+                indexed_limit,
                 Some(&ann_searcher),
                 &mut factory,
                 &search_options,
@@ -596,6 +617,38 @@ impl<'a> VectorSearchBuilder<'a> {
                 residual_by_split.as_deref(),
             )
             .await?;
+
+        // Exact rerank of the approximate candidates when a refine factor is set;
+        // exact-fallback candidates are already exact and are not reranked. With no
+        // refine factor this is a plain merge, byte-identical to the no-rerank path.
+        let indexed = if refine_factor > 0 && !search.indexed.is_empty() {
+            // Vector-only reader (project just the vector field); the position read
+            // appends _PKEY_VECTOR_POSITION itself and injects _ROW_ID internally.
+            let rerank_reader = DataFileReader::new(
+                self.table.file_io().clone(),
+                self.table.schema_manager().clone(),
+                self.table.schema().id(),
+                self.table.schema().fields().to_vec(),
+                vec![vector_field.clone()],
+                Vec::new(),
+            );
+            rerank_indexed_positional(
+                &rerank_reader,
+                search.indexed,
+                &plan.splits,
+                query_vector,
+                metric,
+                limit,
+                &vector_field,
+            )
+            .await?
+        } else {
+            search.indexed
+        };
+        // Merge the (possibly reranked) indexed list with the exact-fallback list
+        // back into one best-first list bounded to the caller's limit; the
+        // downstream materialization consumes a single ranked candidate list.
+        let candidates = merge_candidates(indexed, search.exact, limit);
 
         Ok((candidates, plan, metric))
     }
@@ -1277,6 +1330,168 @@ fn verify_pk_vector_segment_metrics(
         }
     }
     Ok(())
+}
+
+/// Rerank approximate (indexed) candidates by rereading ONLY their candidate
+/// positions and recomputing the exact distance, then keep the best `limit`.
+///
+/// Unlike a whole-column preload, this reuses [`PkVectorPositionRead`] to read
+/// just the selected physical rows of each hit file (positions -> row ranges ->
+/// local ranges), so a rerank over a large ANN-covered file touches only the
+/// candidate rows. Mirrors Java's IndexedSplit rerank.
+///
+/// Each returned row is matched back to its candidate by the
+/// `_PKEY_VECTOR_POSITION` column VALUE (never batch order). The recomputed
+/// distance is written into the ORIGINAL candidate so `split_index` /
+/// partition / bucket survive (`build_indexed_splits` does not carry
+/// `split_index`). A DV loaded exactly as [`PkVectorIndexedSplitRead::read`]
+/// does drops deleted positions, so a candidate at a deleted position returns no
+/// row and trips the leftover guard — a deleted candidate reaching rerank is a
+/// real inconsistency (the search path already DV-filters), so fail loud.
+#[allow(clippy::too_many_arguments)]
+async fn rerank_indexed_positional(
+    rerank_reader: &DataFileReader,
+    indexed: Vec<PkVectorCandidate>,
+    plan_splits: &[PkVectorSearchSplit],
+    query_vector: &[f32],
+    metric: VectorSearchMetric,
+    limit: usize,
+    vector_field: &DataField,
+) -> crate::Result<Vec<PkVectorCandidate>> {
+    // Original per-position candidates keyed by (split_index, file, position);
+    // the recomputed distance is written back into these so split_index and
+    // partition/bucket survive (build_indexed_splits does not carry split_index).
+    let mut by_key: HashMap<(usize, String, i64), PkVectorCandidate> = HashMap::new();
+    for c in &indexed {
+        if by_key
+            .insert(
+                (c.split_index, c.data_file_name.clone(), c.row_position),
+                c.clone(),
+            )
+            .is_some()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "duplicate primary-key vector candidate for reranking".to_string(),
+                source: None,
+            });
+        }
+    }
+
+    // Rebuild the split_index lookup by (partition bytes, bucket, file): the
+    // indexed split exposes partition/bucket/file but not split_index.
+    let mut split_index_of: HashMap<(Vec<u8>, i32, String), usize> = HashMap::new();
+    for (i, s) in plan_splits.iter().enumerate() {
+        let p = s.data_split.partition().to_serialized_bytes();
+        let b = s.data_split.bucket();
+        for f in s.data_split.data_files() {
+            split_index_of.insert((p.clone(), b, f.file_name.clone()), i);
+        }
+    }
+
+    // Every candidate must reference a (partition, bucket, file) that the plan
+    // actually carries. Checking up front — before build_indexed_splits, which
+    // indexes plan_splits by split_index — turns an absent file into a fail-loud
+    // error rather than an out-of-range panic, and keeps the per-split lookup
+    // below a self-consistent backstop.
+    for c in &indexed {
+        let key = (
+            c.partition.to_serialized_bytes(),
+            c.bucket,
+            c.data_file_name.clone(),
+        );
+        if !split_index_of.contains_key(&key) {
+            return Err(crate::Error::DataInvalid {
+                message: format!("rerank split for {} not found in plan", c.data_file_name),
+                source: None,
+            });
+        }
+    }
+
+    // Group the candidates into per-file indexed splits (position ranges + file
+    // meta), reusing the exact grouping/validation the materialization path uses.
+    let indexed_splits = build_indexed_splits(indexed, plan_splits, metric)?;
+
+    let dimension = query_vector.len();
+    let mut reranked: Vec<PkVectorCandidate> = Vec::new();
+    for split in indexed_splits {
+        let data_split = split.split.clone();
+        let file_meta = data_split.data_files()[0].clone();
+        let file_name = file_meta.file_name.clone();
+        let partition_bytes = data_split.partition().to_serialized_bytes();
+        let bucket = data_split.bucket();
+        let split_index = *split_index_of
+            .get(&(partition_bytes, bucket, file_name.clone()))
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("rerank split for {file_name} not found in plan"),
+                source: None,
+            })?;
+
+        // DV loaded exactly as PkVectorIndexedSplitRead::read does; skipping it
+        // would score deleted rows.
+        let dv_factory = rerank_reader.build_split_dv_factory(&data_split).await?;
+        let dv = DataFileReader::deletion_vector_for_file(dv_factory.as_ref(), &file_name);
+        let data_fields = rerank_reader.derive_data_fields(&file_meta).await?;
+
+        // Positions from the split's row_ranges (ascending); read only those.
+        let positions = expand_ranges(&split.row_ranges, file_meta.row_count)?;
+        let mut stream = PkVectorPositionRead::new(rerank_reader).read(
+            &data_split,
+            file_meta,
+            data_fields,
+            dv,
+            positions,
+            None, // no scores; rerank recomputes distance
+        )?;
+
+        while let Some(batch) = stream.try_next().await? {
+            let pos_idx = batch
+                .schema()
+                .index_of(PKEY_VECTOR_POSITION_COLUMN)
+                .map_err(|_| crate::Error::DataInvalid {
+                    message: format!("rerank batch missing {PKEY_VECTOR_POSITION_COLUMN} column"),
+                    source: None,
+                })?;
+            let pos_col = batch
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!("{PKEY_VECTOR_POSITION_COLUMN} column is not Int64"),
+                    source: None,
+                })?;
+            let mut vectors: Vec<Option<Vec<f32>>> = Vec::new();
+            append_batch_vectors(&batch, vector_field.name(), dimension, &mut vectors)?;
+            for (row, vector) in vectors.iter().enumerate() {
+                let position = pos_col.value(row);
+                let mut candidate = by_key
+                    .remove(&(split_index, file_name.clone(), position))
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("rerank read unexpected position {file_name}@{position}"),
+                        source: None,
+                    })?;
+                let vector = vector.as_ref().ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "primary-key vector candidate {file_name}@{position} contains a null vector"
+                    ),
+                    source: None,
+                })?;
+                candidate.distance = metric.compute_distance(query_vector, vector);
+                reranked.push(candidate);
+            }
+        }
+    }
+
+    if !by_key.is_empty() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "failed to read {} primary-key vector candidate(s) for reranking",
+                by_key.len()
+            ),
+            source: None,
+        });
+    }
+
+    Ok(merge_candidates(reranked, Vec::new(), limit))
 }
 
 /// One materialized row tagged with its best-first `rank` and its `(batch_index,
@@ -2963,6 +3178,633 @@ mod tests {
             ann_segments: Vec::new(),
             active_files: Vec::new(),
         }
+    }
+
+    fn pk_candidate(
+        split_index: usize,
+        bucket: i32,
+        file: &str,
+        pos: i64,
+        distance: f32,
+    ) -> PkVectorCandidate {
+        PkVectorCandidate {
+            split_index,
+            partition: BinaryRow::new(0),
+            bucket,
+            data_file_name: file.to_string(),
+            row_position: pos,
+            distance,
+        }
+    }
+
+    // Candidate with a fixed empty (arity-0) partition and bucket 0, keyed only by
+    // (split_index, file, position) — the dimensions the rerank core groups on.
+    fn cand_at(split_index: usize, file: &str, pos: i64, dist: f32) -> PkVectorCandidate {
+        pk_candidate(split_index, 0, file, pos, dist)
+    }
+
+    /// The single data-file name every rerank fixture writes.
+    const RERANK_FILE: &str = "part-0.parquet";
+
+    /// Serialize a Paimon deletion-vector blob covering `deleted_rows` and write it
+    /// at `path`, returning the matching `DeletionFile`. Byte layout mirrors the
+    /// position-read tests: `[length][magic][roaring bitmap][0]`.
+    async fn write_deletion_blob(
+        file_io: &FileIO,
+        path: &str,
+        deleted_rows: &[u32],
+    ) -> crate::table::source::DeletionFile {
+        use roaring::RoaringBitmap;
+
+        const MAGIC_NUMBER: i32 = 1581511376;
+        let mut bitmap = RoaringBitmap::new();
+        for row in deleted_rows {
+            bitmap.insert(*row);
+        }
+        let mut bitmap_bytes = Vec::new();
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+        let bitmap_length = 4 + bitmap_bytes.len() as i32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&bitmap_length.to_be_bytes());
+        blob.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
+        blob.extend_from_slice(&bitmap_bytes);
+        blob.extend_from_slice(&0i32.to_be_bytes());
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(bytes::Bytes::from(blob))
+            .await
+            .unwrap();
+        crate::table::source::DeletionFile::new(
+            path.to_string(),
+            0,
+            bitmap_length as i64,
+            Some(deleted_rows.len() as i64),
+        )
+    }
+
+    /// Write a single-file vector data file (`FixedSizeList<Float32>` of width
+    /// `dim`) holding `rows` (a `None` entry is a NULL vector row) as Parquet, and
+    /// return a vector-only `DataFileReader`, the enclosing `PkVectorSearchSplit`,
+    /// and the vector `DataField`. When `deleted_rows` is non-empty a deletion
+    /// vector covering those physical positions is attached to the split, so the
+    /// position read drops them exactly as `PkVectorIndexedSplitRead::read` does.
+    ///
+    /// This is the position-only analogue of the old `ArrayReader`: rerank now
+    /// re-reads real stored rows through `PkVectorPositionRead`, so the fixtures
+    /// exercise that path rather than an in-memory preloaded column.
+    async fn vector_rerank_fixture(
+        table_path: &str,
+        dim: u32,
+        rows: &[Option<Vec<f32>>],
+        deleted_rows: &[u32],
+    ) -> (DataFileReader, PkVectorSearchSplit, DataField) {
+        use crate::arrow::build_target_arrow_schema;
+        use crate::arrow::format::{FormatFileWriter, ParquetFormatWriter};
+        use crate::spec::VectorType;
+        use crate::table::schema_manager::SchemaManager;
+
+        let vector_type =
+            VectorType::try_new(true, dim, DataType::Float(FloatType::new())).unwrap();
+        let vector_field =
+            DataField::new(0, "embedding".to_string(), DataType::Vector(vector_type));
+        let read_fields = vec![vector_field.clone()];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim as i32).with_field(
+            Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+        );
+        for row in rows {
+            match row {
+                Some(values) => {
+                    for v in values {
+                        builder.values().append_value(*v);
+                    }
+                    builder.append(true);
+                }
+                None => {
+                    for _ in 0..dim {
+                        builder.values().append_value(0.0);
+                    }
+                    builder.append(false);
+                }
+            }
+        }
+        let vec_array = builder.finish();
+        let batch =
+            arrow_array::RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(vec_array)])
+                .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{RERANK_FILE}"))
+            .unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let schema_id = 1;
+        let file_meta = pk_data_file(RERANK_FILE, rows.len() as i64, Some(0));
+        let file_meta = DataFileMeta {
+            file_size: file_size as i64,
+            schema_id,
+            ..file_meta
+        };
+
+        let mut split_builder = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file_meta]);
+        if !deleted_rows.is_empty() {
+            let df =
+                write_deletion_blob(&file_io, &format!("{table_path}/index/dv-0"), deleted_rows)
+                    .await;
+            split_builder = split_builder.with_data_deletion_files(vec![Some(df)]);
+        }
+        let data_split = split_builder.build().unwrap();
+        let split = PkVectorSearchSplit {
+            data_split,
+            ann_segments: Vec::new(),
+            active_files: Vec::new(),
+        };
+
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            schema_id,
+            read_fields.clone(),
+            read_fields,
+            Vec::new(),
+        );
+        (reader, split, vector_field)
+    }
+
+    #[tokio::test]
+    async fn rerank_aligns_recomputed_distance_by_position_column() {
+        use crate::arrow::build_target_arrow_schema;
+        use crate::arrow::format::{FormatFileWriter, ParquetFormatWriter};
+        use crate::spec::VectorType;
+        use crate::table::schema_manager::SchemaManager;
+
+        // A vector data file with 4 physical rows: positions 0,1,3 hold vectors
+        // and position 2 (a NON-candidate) holds a NULL vector. Candidates sit at
+        // non-contiguous positions {1, 3}. The ANN-reported distances are
+        // deliberately reversed relative to the true stored vectors; after rerank
+        // each candidate must carry compute_distance(query, vec_at_its_position),
+        // proving alignment is by the _PKEY_VECTOR_POSITION column value, not batch
+        // order. Position 2's NULL is never read (it is not a candidate), so it
+        // cannot trip the null-vector guard.
+        let vector_type = VectorType::try_new(true, 2, DataType::Float(FloatType::new())).unwrap();
+        let vector_field =
+            DataField::new(0, "embedding".to_string(), DataType::Vector(vector_type));
+        let read_fields = vec![vector_field.clone()];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+
+        // pos0=[7,0], pos1=[1,0], pos2=NULL, pos3=[4,0].
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        for row in [
+            Some([7.0f32, 0.0]),
+            Some([1.0, 0.0]),
+            None,
+            Some([4.0, 0.0]),
+        ] {
+            match row {
+                Some([a, b]) => {
+                    builder.values().append_value(a);
+                    builder.values().append_value(b);
+                    builder.append(true);
+                }
+                None => {
+                    builder.values().append_value(0.0);
+                    builder.values().append_value(0.0);
+                    builder.append(false);
+                }
+            }
+        }
+        let vec_array = builder.finish();
+        let batch =
+            arrow_array::RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(vec_array)])
+                .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/rerank_positional";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.parquet";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let schema_id = 1;
+        let file_meta = pk_data_file(file_name, 4, Some(0));
+        let file_meta = DataFileMeta {
+            file_size: file_size as i64,
+            schema_id,
+            ..file_meta
+        };
+        let data_split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file_meta])
+            .build()
+            .unwrap();
+        let split = PkVectorSearchSplit {
+            data_split,
+            ann_segments: Vec::new(),
+            active_files: Vec::new(),
+        };
+
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let reader = DataFileReader::new(
+            file_io,
+            schema_manager,
+            schema_id,
+            read_fields.clone(),
+            read_fields.clone(),
+            Vec::new(),
+        );
+
+        let query = vec![1.0f32, 0.0];
+        // ANN-reported distances reversed vs. truth: pos1 reported worse (0.9) than
+        // pos3 (0.1), but the true L2 distances are pos1=0 and pos3=9.
+        let indexed = vec![cand_at(0, file_name, 1, 0.9), cand_at(0, file_name, 3, 0.1)];
+
+        let out = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &vector_field,
+        )
+        .await
+        .unwrap();
+
+        // Best-first after exact recompute: pos1 (d=0) then pos3 (d=9), each
+        // carrying the distance computed from its OWN position's stored vector.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].row_position, 1);
+        assert_eq!(out[0].distance, 0.0);
+        assert_eq!(out[1].row_position, 3);
+        assert_eq!(out[1].distance, 9.0);
+    }
+
+    #[tokio::test]
+    async fn rerank_recomputes_distance_and_reorders() {
+        // pos0=[9,0], pos1=[1,0]; query=[1,0]. The ANN-reported distances are
+        // reversed relative to the truth (pos0 reported best at 0.1, pos1 worst at
+        // 0.9), so an implementation that trusted the ANN order would emit pos0
+        // first. Exact L2 recompute yields pos0=64, pos1=0, so the output must
+        // reorder to pos1-then-pos0 with the recomputed distances.
+        let (reader, split, vector_field) = vector_rerank_fixture(
+            "memory:/rerank_reorder",
+            2,
+            &[Some(vec![9.0, 0.0]), Some(vec![1.0, 0.0])],
+            &[],
+        )
+        .await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![
+            cand_at(0, RERANK_FILE, 0, 0.1),
+            cand_at(0, RERANK_FILE, 1, 0.9),
+        ];
+
+        let out = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &vector_field,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].row_position, 1);
+        assert_eq!(out[0].distance, 0.0);
+        assert_eq!(out[1].row_position, 0);
+        assert_eq!(out[1].distance, 64.0);
+        // Order genuinely changed vs. the ANN-reported best-first (which was pos0).
+        assert!(out[0].distance < out[1].distance);
+    }
+
+    #[tokio::test]
+    async fn rerank_is_independent_of_fast_mode_reranks_indexed() {
+        // The rerank core takes only the indexed (fast-path) candidates and always
+        // recomputes their true distance; there is no fast/exact switch that can
+        // skip it. The single candidate carries a bogus ANN distance (0.42) but its
+        // stored vector equals the query, so the recomputed L2 distance is exactly
+        // 0.0 — proving the indexed candidate WAS reranked rather than passed
+        // through with its ANN distance.
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_indexed", 2, &[Some(vec![1.0, 0.0])], &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![cand_at(0, RERANK_FILE, 0, 0.42)];
+
+        let out = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            1,
+            &vector_field,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].row_position, 0);
+        assert_ne!(out[0].distance, 0.42);
+        assert_eq!(out[0].distance, 0.0);
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_null_vector() {
+        // A NULL vector stored AT a candidate position must fail loud rather than
+        // silently scoring it: the candidate genuinely has no vector to rerank on.
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_null", 2, &[None], &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![cand_at(0, RERANK_FILE, 0, 0.1)];
+
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            1,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("null vector at a candidate position must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("null vector")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_leftover_candidate() {
+        // pos1 is deleted by the deletion vector, so the position read returns no
+        // row for it. The search path already DV-filters, so a deleted candidate
+        // reaching rerank is a real inconsistency: the leftover guard must fail
+        // loud rather than silently dropping the candidate.
+        let (reader, split, vector_field) = vector_rerank_fixture(
+            "memory:/rerank_leftover",
+            2,
+            &[Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
+            &[1],
+        )
+        .await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![
+            cand_at(0, RERANK_FILE, 0, 0.1),
+            cand_at(0, RERANK_FILE, 1, 0.9),
+        ];
+
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("a candidate returning no row must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("failed to read")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_dimension_mismatch() {
+        // Stored vectors are 3-dimensional but the query is 2-dimensional. The
+        // vector extraction validates each stored row against the query dimension
+        // and fails loud, so the recompute never runs against mismatched vectors.
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_dim", 3, &[Some(vec![1.0, 0.0, 0.0])], &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![cand_at(0, RERANK_FILE, 0, 0.1)];
+
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            1,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("dimension mismatch must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("dimension")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_duplicate_candidate_position() {
+        // Two candidates addressing the same (split_index, file, position) is a
+        // programming error upstream: the dedup guard fires before any read.
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_dup", 2, &[Some(vec![1.0, 0.0])], &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![
+            cand_at(0, RERANK_FILE, 0, 0.1),
+            cand_at(0, RERANK_FILE, 0, 0.9),
+        ];
+
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("duplicate candidate position must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("duplicate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_unexpected_position() {
+        // Every position the read surfaces must resolve to a candidate keyed by
+        // (split_index, file, position). Here the plan carries two splits for the
+        // SAME (partition, bucket, file), so `split_index_of` resolves the file to
+        // the LAST plan index (1). The single candidate is tagged with split_index
+        // 0, so its by_key entry is (0, file, 0) while the read looks up
+        // (1, file, 0). The lookup misses and the unexpected-position guard fires
+        // rather than silently dropping the surfaced row.
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_unexpected", 2, &[Some(vec![1.0, 0.0])], &[])
+                .await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![cand_at(0, RERANK_FILE, 0, 0.1)];
+
+        // Two plan entries for the same file: split_index_of ends up mapping the
+        // file to plan index 1, not the candidate's split_index 0.
+        let dup = PkVectorSearchSplit {
+            data_split: split.data_split.clone(),
+            ann_segments: Vec::new(),
+            active_files: Vec::new(),
+        };
+        let plan = vec![dup, split];
+
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &plan,
+            &query,
+            VectorSearchMetric::L2,
+            1,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("a read position absent from the candidate map must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("unexpected position")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_fails_loud_on_file_not_in_plan() {
+        // A candidate references a (partition, bucket, file) that is absent from
+        // plan_splits. build_indexed_splits groups it into an indexed split, but the
+        // split_index_of lookup — built only from plan_splits — has no entry, so the
+        // kernel fails loud rather than reading an unplanned file.
+        let (reader, _split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_noplan", 2, &[Some(vec![1.0, 0.0])], &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![cand_at(0, RERANK_FILE, 0, 0.1)];
+
+        // Empty plan: the candidate's file resolves in no plan split.
+        let err = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[],
+            &query,
+            VectorSearchMetric::L2,
+            1,
+            &vector_field,
+        )
+        .await
+        .err()
+        .expect("a candidate file absent from the plan must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("not found in plan")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_reads_only_candidate_positions_not_whole_column() {
+        // A 6-row file where every NON-candidate position (0, 2, 4, 5) holds a NULL
+        // vector "poison" and only the two candidate positions (1, 3) hold real
+        // vectors. The rerank read is told to fetch only positions {1, 3}; every
+        // row it surfaces is looked up in the candidate map, and any position not in
+        // the map trips the "unexpected position" guard (a surfaced NULL row would
+        // additionally trip the null-vector guard). So if the read had surfaced any
+        // of the poison rows, rerank would fail. It succeeds and returns exactly the
+        // two candidates at positions {1, 3}, which proves the position selection
+        // reaching the read contained only the candidate positions (not the whole
+        // column).
+        let rows = &[
+            None,                 // pos0 poison (non-candidate)
+            Some(vec![1.0, 0.0]), // pos1 candidate
+            None,                 // pos2 poison (non-candidate)
+            Some(vec![3.0, 0.0]), // pos3 candidate
+            None,                 // pos4 poison (non-candidate)
+            None,                 // pos5 poison (non-candidate)
+        ];
+        let (reader, split, vector_field) =
+            vector_rerank_fixture("memory:/rerank_spy", 2, rows, &[]).await;
+        let query = vec![1.0f32, 0.0];
+        let indexed = vec![
+            cand_at(0, RERANK_FILE, 1, 0.9),
+            cand_at(0, RERANK_FILE, 3, 0.1),
+        ];
+
+        let out = rerank_indexed_positional(
+            &reader,
+            indexed,
+            &[split],
+            &query,
+            VectorSearchMetric::L2,
+            2,
+            &vector_field,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("only candidate positions are read, so the poison NULLs never decode: {e:?}")
+        });
+
+        assert_eq!(out.len(), 2, "exactly the candidate count of rows was read");
+        let mut positions: Vec<i64> = out.iter().map(|c| c.row_position).collect();
+        positions.sort_unstable();
+        assert_eq!(
+            positions,
+            vec![1, 3],
+            "only candidate positions reached the read"
+        );
+        // Recomputed distances confirm each surviving row is its own candidate's vector.
+        assert_eq!(out[0].row_position, 1);
+        assert_eq!(out[0].distance, 0.0);
+        assert_eq!(out[1].row_position, 3);
+        assert_eq!(out[1].distance, 4.0);
     }
 
     /// Build a real vindex IVF-flat segment trained with `metric`, returning the

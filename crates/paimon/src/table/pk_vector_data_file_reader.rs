@@ -145,7 +145,7 @@ impl DataFilePkVectorReaderFactory {
 /// `None`). The column must be a `FixedSizeList`/`List` of `Float32`; every
 /// non-null row's child slice must have exactly `dimension` elements. Mirrors
 /// the layout handling in `vector_search_builder`.
-fn append_batch_vectors(
+pub(crate) fn append_batch_vectors(
     batch: &arrow_array::RecordBatch,
     field_name: &str,
     dimension: usize,
@@ -206,6 +206,12 @@ fn append_batch_vectors(
         }
         let mut vector = Vec::with_capacity(dimension);
         for i in start..end {
+            if values.is_null(i) {
+                return Err(data_invalid(format!(
+                    "vector row {row} has a null element at index {}",
+                    i - start
+                )));
+            }
             vector.push(values.value(i));
         }
         out.push(Some(vector));
@@ -347,6 +353,35 @@ mod integration_tests {
             first_row_id: None,
             write_cols: None,
         }
+    }
+
+    /// A present (non-null) vector row whose child slice contains a NULL
+    /// element must fail loud rather than silently defaulting the element to
+    /// `0.0` and corrupting the distance.
+    #[test]
+    fn append_batch_vectors_fails_loud_on_null_element() {
+        let field = vector_field();
+        let read_fields = vec![field.clone()];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+
+        // Row is present, but element index 1 in its child slice is NULL: [1.0, null].
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        builder.values().append_value(1.0);
+        builder.values().append_null();
+        builder.append(true);
+        let vec_array = builder.finish();
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(vec_array)]).unwrap();
+
+        let mut out: Vec<Option<Vec<f32>>> = Vec::new();
+        let err = append_batch_vectors(&batch, field.name(), 2, &mut out)
+            .expect_err("null child element must fail loud");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null") && msg.contains("element"),
+            "got: {msg}"
+        );
     }
 
     /// Write a FixedSizeList<Float32, 2> vector column
