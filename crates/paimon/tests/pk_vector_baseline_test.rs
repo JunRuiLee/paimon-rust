@@ -1397,3 +1397,96 @@ async fn pk_vector_refine_factor_with_no_indexed_candidates_is_noop() {
         );
     }
 }
+
+/// An invalid refine factor must fail loud even when the table is empty: the
+/// factor is resolved before planning, so config validity does not depend on
+/// whether the table currently has searchable data. Regression for a resolution
+/// that ran only after the empty-plan early return. Covers both invalid forms
+/// the reviewer named (`0` and a non-integer) and both option sources (query and
+/// table), since the fix moved the resolution of both sources ahead of planning.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
+    // Persist only the schema (optionally with extra table options): no snapshot,
+    // so the PK-vector plan is empty.
+    async fn empty_table(file_io: &FileIO, location: &str, extra: &[(&str, &str)]) -> Table {
+        file_io.mkdirs(&format!("{location}/schema")).await.unwrap();
+        let schema = pk_vector_schema_with(extra);
+        file_io
+            .new_output(&format!("{location}/schema/schema-{}", schema.id()))
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&schema).unwrap()))
+            .await
+            .unwrap();
+        open_table(file_io, location).await
+    }
+
+    let refine_key = format!("fields.{VECTOR_COLUMN}.ivf.refine-factor");
+
+    // Case 1: non-integer via a QUERY option -> "Invalid ... Must be an integer".
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3)
+            .with_options(HashMap::from([(refine_key.clone(), "abc".to_string())]));
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a non-integer refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Invalid vector refine factor"),
+            "expected a non-integer refine-factor error, got: {err}"
+        );
+    }
+
+    // Case 2: explicit `0` via a QUERY option -> "must be positive" (0 means
+    // "omit"; it cannot be requested).
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3)
+            .with_options(HashMap::from([(refine_key.clone(), "0".to_string())]));
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a zero refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("must be positive"),
+            "expected a positive-refine-factor error, got: {err}"
+        );
+    }
+
+    // Case 3: non-integer via a TABLE option (the fix moved table-option
+    // resolution ahead of planning too).
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[(refine_key.as_str(), "abc")]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3);
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a non-integer table refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Invalid vector refine factor"),
+            "expected a non-integer refine-factor error, got: {err}"
+        );
+    }
+}

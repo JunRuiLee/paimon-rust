@@ -441,6 +441,23 @@ impl<'a> VectorSearchBuilder<'a> {
         let search_mode = core.global_index_search_mode()?;
         let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
 
+        // Resolve the refine factor from the query options first, then fall back to
+        // the table options; a positive factor over-fetches indexed (approximate)
+        // candidates so the exact rerank below has a wider pool to reorder. Factor 0
+        // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
+        // path. The two option maps are kept distinct (query options passed
+        // separately from table options) so a broad query key cannot be overridden
+        // by a more specific table key: query options take precedence as a whole.
+        // Resolved before planning so an invalid factor (e.g. a non-numeric value)
+        // fails loud regardless of whether the table currently has searchable data.
+        let refine_factor = configured_refine_factor(
+            &self.options,
+            self.table.schema().options(),
+            pk_col,
+            &index_type,
+        )?;
+        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
+
         let plan = PkVectorScan::new(
             self.table,
             field_id,
@@ -586,22 +603,6 @@ impl<'a> VectorSearchBuilder<'a> {
                 })
             },
         );
-
-        // Resolve the refine factor from the query options first, then fall back to
-        // the table options; a positive factor over-fetches indexed (approximate)
-        // candidates so the exact rerank below has a wider pool to reorder. Factor 0
-        // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
-        // path. The two option maps are kept distinct (query options passed
-        // separately from table options) so a broad query key cannot be overridden
-        // by a more specific table key: query options take precedence as a whole.
-        // `search_options` above is the merged view used only to drive the ANN read.
-        let refine_factor = configured_refine_factor(
-            &self.options,
-            self.table.schema().options(),
-            pk_col,
-            &index_type,
-        )?;
-        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
 
         let search: OrchestratorSearchResult = PkVectorOrchestrator::new(reader)
             .search_candidates(
