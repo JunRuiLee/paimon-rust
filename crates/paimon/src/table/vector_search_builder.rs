@@ -498,8 +498,18 @@ impl<'a> VectorSearchBuilder<'a> {
                     segment.file_size,
                     segment.index_meta.clone(),
                 );
-                let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone());
-                reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+                match backend {
+                    VectorIndexBackend::Lumina => {
+                        let mut reader =
+                            LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
+                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+                    }
+                    VectorIndexBackend::Vindex => {
+                        let mut reader =
+                            VindexVectorGlobalIndexReader::new(io_meta, options.clone());
+                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
+                    }
+                }
             });
         let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
 

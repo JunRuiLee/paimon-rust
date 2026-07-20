@@ -330,9 +330,9 @@ fn plan_from_inputs(
                 source_meta,
                 path,
                 file_size,
-                // Not consumed on the search path: the vindex reader loads its
-                // metadata from the index file bytes and ignores this field, so an
-                // absent value defaulting to an empty vec is acceptable.
+                // The Lumina reader consumes this as its serialized index
+                // metadata; the vindex reader ignores it and loads metadata from
+                // the segment file bytes. Absent value defaults to an empty vec.
                 index_meta: gim.index_meta.clone().unwrap_or_default(),
             });
     }
