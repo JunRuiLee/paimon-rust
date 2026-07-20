@@ -28,6 +28,7 @@ mod mem;
 mod result;
 mod table;
 mod types;
+mod vector_search;
 
 use std::cell::RefCell;
 use std::future::Future;

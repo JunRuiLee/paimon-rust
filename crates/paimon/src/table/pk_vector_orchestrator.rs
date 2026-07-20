@@ -662,9 +662,7 @@ mod e2e_tests {
         DataField, DataFileMeta, DataType, IntType, PkVectorSourceFile, PkVectorSourceMeta,
     };
     use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
-    use crate::table::pk_vector_position_read::{
-        PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
-    };
+    use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
     use crate::table::schema_manager::SchemaManager;
     use crate::table::source::DeletionFile;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
@@ -1103,7 +1101,7 @@ mod e2e_tests {
             vec![1, 0, 1]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![l2_score(0.25), l2_score(1.0), l2_score(4.0)]
         );
         for batch in &batches {
@@ -1195,7 +1193,7 @@ mod e2e_tests {
             vec![0, 0, 1]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![l2_score(1.0), l2_score(4.0), l2_score(9.0)]
         );
     }
@@ -1261,7 +1259,7 @@ mod e2e_tests {
             vec![0, 2, 3]
         );
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![l2_score(1.0), l2_score(9.0), l2_score(0.0)]
         );
     }
@@ -1324,7 +1322,7 @@ mod e2e_tests {
         );
         // Scores aligned to ascending position: d=9,1,4.
         assert_eq!(
-            collect_f32(&batches, PKEY_VECTOR_SCORE_COLUMN),
+            collect_f32(&batches, SEARCH_SCORE_COLUMN),
             vec![l2_score(9.0), l2_score(1.0), l2_score(4.0)]
         );
     }

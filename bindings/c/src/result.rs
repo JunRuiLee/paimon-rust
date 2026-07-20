@@ -77,3 +77,9 @@ pub struct paimon_result_next_batch {
     pub batch: paimon_arrow_batch,
     pub error: *mut paimon_error,
 }
+
+#[repr(C)]
+pub struct paimon_result_vector_search_builder {
+    pub builder: *mut paimon_vector_search_builder,
+    pub error: *mut paimon_error,
+}

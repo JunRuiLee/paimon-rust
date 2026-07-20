@@ -30,9 +30,7 @@ use crate::table::pk_vector_orchestrator::{
     as_split_exact_reader_factory, build_indexed_splits, PkVectorCandidate, PkVectorOrchestrator,
     PkVectorSearchSplit,
 };
-use crate::table::pk_vector_position_read::{
-    PKEY_VECTOR_POSITION_COLUMN, PKEY_VECTOR_SCORE_COLUMN,
-};
+use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::source::DataSplit;
@@ -597,7 +595,7 @@ impl<'a> VectorSearchBuilder<'a> {
             Some(names) => {
                 for name in names {
                     if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == PKEY_VECTOR_SCORE_COLUMN
+                        || name == SEARCH_SCORE_COLUMN
                         || name == ROW_ID_FIELD_NAME
                     {
                         return Err(crate::Error::DataInvalid {
@@ -1398,7 +1396,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
             ArrowField::new(PKEY_VECTOR_POSITION_COLUMN, ArrowDataType::Int64, false),
-            ArrowField::new(PKEY_VECTOR_SCORE_COLUMN, ArrowDataType::Float32, false),
+            ArrowField::new(SEARCH_SCORE_COLUMN, ArrowDataType::Float32, false),
         ]));
         let ids = Int32Array::from(rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>());
         let positions = Int64Array::from(rows.iter().map(|(_, pos, _)| *pos).collect::<Vec<_>>());
@@ -1460,7 +1458,7 @@ mod tests {
         assert_eq!(i32_col(out, "id"), vec![41, 42, 40]);
         // Score column preserved and aligned to the reordered rows.
         assert_eq!(
-            f32_col(out, PKEY_VECTOR_SCORE_COLUMN),
+            f32_col(out, SEARCH_SCORE_COLUMN),
             vec![l2_score(1.0), l2_score(4.0), l2_score(9.0)]
         );
         // Position column dropped; _ROW_ID never present.
@@ -1488,7 +1486,7 @@ mod tests {
         let out = reorder_and_strip_position(&batches, ranked).unwrap();
         assert_eq!(i32_col(&out[0], "id"), vec![20, 11, 10]);
         assert_eq!(
-            f32_col(&out[0], PKEY_VECTOR_SCORE_COLUMN),
+            f32_col(&out[0], SEARCH_SCORE_COLUMN),
             vec![l2_score(0.5), l2_score(1.0), l2_score(9.0)]
         );
     }
@@ -1576,7 +1574,7 @@ mod tests {
         for reserved in [
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
-            PKEY_VECTOR_SCORE_COLUMN,
+            SEARCH_SCORE_COLUMN,
         ] {
             let mut builder = table.new_vector_search_builder();
             builder
@@ -1610,7 +1608,7 @@ mod tests {
         for reserved in [
             ROW_ID_FIELD_NAME,
             PKEY_VECTOR_POSITION_COLUMN,
-            PKEY_VECTOR_SCORE_COLUMN,
+            SEARCH_SCORE_COLUMN,
         ] {
             let mut builder = table.new_vector_search_builder();
             builder

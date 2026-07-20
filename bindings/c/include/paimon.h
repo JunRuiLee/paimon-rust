@@ -205,6 +205,18 @@ typedef struct {
   uint32_t uint_val2;
 } paimon_datum;
 
+/**
+ * Opaque wrapper around a vector-search builder.
+ */
+typedef struct {
+  void *inner;
+} paimon_vector_search_builder;
+
+typedef struct {
+  paimon_vector_search_builder *builder;
+  paimon_error *error;
+} paimon_result_vector_search_builder;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -525,7 +537,8 @@ paimon_result_record_batch_reader paimon_table_read_to_arrow(const paimon_table_
  * Free a paimon_record_batch_reader.
  *
  * # Safety
- * Only call with a reader returned from `paimon_table_read_to_arrow`.
+ * Only call with a reader returned from `paimon_table_read_to_arrow` or
+ * `paimon_vector_search_builder_execute_read`.
  */
  void paimon_record_batch_reader_free(paimon_record_batch_reader *reader) ;
 
@@ -709,6 +722,109 @@ paimon_result_predicate paimon_predicate_is_not_in(const paimon_table *table,
  * Only call with bytes returned from paimon C functions.
  */
  void paimon_bytes_free(paimon_bytes bytes) ;
+
+/**
+ * Create a new vector-search builder from a Table.
+ *
+ * # Safety
+ * `table` must be a valid pointer from `paimon_catalog_get_table`, or null (returns error).
+ */
+
+paimon_result_vector_search_builder paimon_table_new_vector_search_builder(const paimon_table *table)
+;
+
+/**
+ * Set the target vector column for a vector-search builder.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error). `column` must be a valid C string.
+ */
+
+paimon_error *paimon_vector_search_builder_with_vector_column(paimon_vector_search_builder *b,
+                                                              const char *column)
+;
+
+/**
+ * Set the query vector for a vector-search builder.
+ *
+ * The `len` floats at `data` are copied into the builder; the caller retains
+ * ownership of `data`. An empty vector (`len == 0`) is rejected.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error). `data` must point to `len` `f32` values when `len > 0`.
+ */
+
+paimon_error *paimon_vector_search_builder_with_query_vector(paimon_vector_search_builder *b,
+                                                             const float *data,
+                                                             uintptr_t len)
+;
+
+/**
+ * Set the maximum number of results for a vector-search builder.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error).
+ */
+
+paimon_error *paimon_vector_search_builder_with_limit(paimon_vector_search_builder *b,
+                                                      uintptr_t limit)
+;
+
+/**
+ * Set scan/search options for a vector-search builder.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error). `options` must be a valid pointer to `len`
+ * `paimon_option` values, or null when `len` is 0.
+ */
+
+paimon_error *paimon_vector_search_builder_with_options(paimon_vector_search_builder *b,
+                                                        const paimon_option *options,
+                                                        uintptr_t len)
+;
+
+/**
+ * Set an optional scalar residual filter for a vector-search builder.
+ *
+ * The predicate is consumed (ownership transferred to the builder). Pass null
+ * to clear any previously set filter.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error). `predicate` must be a valid pointer from a
+ * `paimon_predicate_*` function, or null.
+ */
+
+paimon_error *paimon_vector_search_builder_with_filter(paimon_vector_search_builder *b,
+                                                       paimon_predicate *predicate)
+;
+
+/**
+ * Free a paimon_vector_search_builder.
+ *
+ * # Safety
+ * Only call with a builder returned from `paimon_table_new_vector_search_builder`.
+ */
+ void paimon_vector_search_builder_free(paimon_vector_search_builder *b) ;
+
+/**
+ * Execute the vector search and return a streaming Arrow reader over the
+ * materialized rows (projected user columns plus `__paimon_search_score`).
+ * Targets primary-key vector tables; a query that does not resolve to the
+ * primary-key vector path fails loud. Consume via
+ * `paimon_record_batch_reader_next` and free with `paimon_record_batch_reader_free`.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns an error result).
+ */
+
+paimon_result_record_batch_reader paimon_vector_search_builder_execute_read(paimon_vector_search_builder *b)
+;
 
 #ifdef __cplusplus
 }  // extern "C"
