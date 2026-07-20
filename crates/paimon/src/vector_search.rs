@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Clone)]
 pub struct VectorSearch {
     pub vector: Vec<f32>,
     pub limit: usize,
     pub field_name: String,
-    pub include_row_ids: Option<roaring::RoaringTreemap>,
     pub options: HashMap<String, String>,
+    pub include_row_ids: Option<roaring::RoaringTreemap>,
 }
 
 impl VectorSearch {
@@ -50,18 +51,18 @@ impl VectorSearch {
             vector,
             limit,
             field_name,
-            include_row_ids: None,
             options: HashMap::new(),
+            include_row_ids: None,
         })
-    }
-
-    pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
-        self.include_row_ids = Some(include_row_ids);
-        self
     }
 
     pub fn with_options(mut self, options: HashMap<String, String>) -> Self {
         self.options = options;
+        self
+    }
+
+    pub fn with_include_row_ids(mut self, include_row_ids: roaring::RoaringTreemap) -> Self {
+        self.include_row_ids = Some(include_row_ids);
         self
     }
 }
@@ -96,6 +97,46 @@ impl GlobalIndexIOMeta {
 pub struct SearchResult {
     pub row_ids: Vec<u64>,
     pub scores: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScoredRow {
+    row_id: u64,
+    score: f32,
+}
+
+impl Eq for ScoredRow {}
+
+impl PartialOrd for ScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.row_id.cmp(&other.row_id))
+    }
+}
+
+impl ScoredRow {
+    fn is_stronger_than(&self, other: &Self) -> bool {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.row_id.cmp(&self.row_id))
+            == Ordering::Greater
+    }
+}
+
+fn sort_scored_rows_by_rank(rows: &mut [ScoredRow]) {
+    rows.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.row_id.cmp(&b.row_id))
+    });
 }
 
 impl SearchResult {
@@ -159,19 +200,84 @@ impl SearchResult {
     }
 
     pub fn top_k(&self, k: usize) -> Self {
-        if self.row_ids.len() <= k {
-            return self.clone();
+        if k == 0 {
+            return Self::empty();
         }
-        let mut indices: Vec<usize> = (0..self.row_ids.len()).collect();
-        indices.sort_by(|&a, &b| {
-            self.scores[b]
-                .partial_cmp(&self.scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        indices.truncate(k);
-        let row_ids = indices.iter().map(|&i| self.row_ids[i]).collect();
-        let scores = indices.iter().map(|&i| self.scores[i]).collect();
+
+        let mut best_by_row_id = HashMap::with_capacity(self.row_ids.len());
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let entry = ScoredRow { row_id, score };
+            best_by_row_id
+                .entry(row_id)
+                .and_modify(|best| {
+                    if entry.is_stronger_than(best) {
+                        *best = entry;
+                    }
+                })
+                .or_insert(entry);
+        }
+
+        if best_by_row_id.len() <= k {
+            // Keep the original row order when no truncation is needed.
+            let rows = self
+                .row_ids
+                .iter()
+                .filter_map(|row_id| best_by_row_id.remove(row_id))
+                .collect();
+            return Self::from_scored_rows(rows);
+        }
+
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        for entry in best_by_row_id.into_values() {
+            if heap.len() < k {
+                heap.push(entry);
+            } else if heap
+                .peek()
+                .is_some_and(|weakest| entry.is_stronger_than(weakest))
+            {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+
+        let mut rows = heap.into_vec();
+        sort_scored_rows_by_rank(&mut rows);
+        Self::from_scored_rows(rows)
+    }
+
+    fn from_scored_rows(rows: Vec<ScoredRow>) -> Self {
+        let mut row_ids = Vec::with_capacity(rows.len());
+        let mut scores = Vec::with_capacity(rows.len());
+        for row in rows {
+            row_ids.push(row.row_id);
+            scores.push(row.score);
+        }
         Self { row_ids, scores }
+    }
+
+    pub(crate) fn without_deleted_row_ranges(
+        &self,
+        deleted_rows: Option<&crate::table::global_index_scanner::RowRangeIndex>,
+    ) -> crate::Result<Self> {
+        let Some(deleted_rows) = deleted_rows else {
+            return Ok(self.clone());
+        };
+
+        let mut row_ids = Vec::with_capacity(self.row_ids.len());
+        let mut scores = Vec::with_capacity(self.scores.len());
+        for (&row_id, &score) in self.row_ids.iter().zip(&self.scores) {
+            let row_id_i64 = i64::try_from(row_id).map_err(|_| crate::Error::DataInvalid {
+                message: format!(
+                    "Vector search row id {row_id} exceeds i64::MAX and cannot be checked against deletion vectors"
+                ),
+                source: None,
+            })?;
+            if !deleted_rows.intersects(row_id_i64, row_id_i64) {
+                row_ids.push(row_id);
+                scores.push(score);
+            }
+        }
+        Ok(Self { row_ids, scores })
     }
 
     pub fn to_row_ranges(&self) -> crate::Result<Vec<crate::table::RowRange>> {
@@ -230,6 +336,7 @@ mod tests {
         assert_eq!(cloned.vector, vector_search.vector);
         assert_eq!(cloned.limit, vector_search.limit);
         assert_eq!(cloned.field_name, vector_search.field_name);
+        assert_eq!(cloned.options, vector_search.options);
         assert_eq!(cloned.include_row_ids.as_ref(), Some(&include_row_ids));
     }
 
@@ -249,6 +356,61 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!(top.row_ids.contains(&2));
         assert!(top.row_ids.contains(&4));
+    }
+
+    #[test]
+    fn test_search_result_top_k_deduplicates_overlapping_rows() {
+        let indexed = SearchResult::new(vec![1], vec![0.9]);
+        let fallback = SearchResult::new(vec![1, 2], vec![0.8, 0.7]);
+
+        let merged = indexed.or(&fallback);
+        assert_eq!(merged.row_ids, vec![1, 1, 2]);
+        assert_eq!(merged.scores, vec![0.9, 0.8, 0.7]);
+
+        let top = merged.top_k(2);
+        assert_eq!(top.row_ids, vec![1, 2]);
+        assert_eq!(top.scores, vec![0.9, 0.7]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_keeps_highest_duplicate_score() {
+        let result = SearchResult::new(vec![1, 2, 1, 3], vec![0.5, 0.8, 0.9, 0.7]);
+
+        let top = result.top_k(2);
+        assert_eq!(top.row_ids, vec![1, 2]);
+        assert_eq!(top.scores, vec![0.9, 0.8]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_preserves_order_without_truncation() {
+        let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
+
+        let top = result.top_k(3);
+        assert_eq!(top.row_ids, result.row_ids);
+        assert_eq!(top.scores, result.scores);
+    }
+
+    #[test]
+    fn test_search_result_top_k_tie_breaks_by_smaller_row_id() {
+        let result = SearchResult::new(vec![30, 10, 20], vec![0.9, 0.9, 0.9]);
+        let top = result.top_k(2);
+        assert_eq!(top.row_ids, vec![10, 20]);
+        assert_eq!(top.scores, vec![0.9, 0.9]);
+    }
+
+    #[test]
+    fn test_search_result_filters_deleted_row_ranges() {
+        let result = SearchResult::new(vec![1, 2, 3, 4], vec![0.1, 0.9, 0.8, 0.2]);
+        let deleted = crate::table::global_index_scanner::RowRangeIndex::create(vec![
+            crate::table::RowRange::new(2, 3),
+        ]);
+
+        let filtered = result
+            .without_deleted_row_ranges(Some(&deleted))
+            .unwrap()
+            .top_k(10);
+        assert_eq!(filtered.row_ids, vec![1, 4]);
+        assert_eq!(filtered.scores, vec![0.1, 0.2]);
     }
 
     #[test]

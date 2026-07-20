@@ -487,7 +487,6 @@ impl RowRangeIndex {
     }
 
     /// Returns true if the index has any range that intersects `[start, end]`.
-    #[cfg(test)]
     pub fn intersects(&self, start: i64, end: i64) -> bool {
         let candidate = lower_bound(&self.ends, start);
         candidate < self.starts.len() && self.starts[candidate] <= end
