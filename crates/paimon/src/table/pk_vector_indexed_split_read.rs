@@ -61,7 +61,7 @@ pub(crate) struct PkVectorIndexedSplit {
 /// positions, validating bounds and ordering. Ranges must be non-empty, each
 /// within `[0, row_count)`, strictly ascending and non-overlapping (touching
 /// ranges allowed). Expansion is inclusive `from..=to`.
-fn expand_ranges(ranges: &[RowRange], row_count: i64) -> crate::Result<Vec<i64>> {
+pub(crate) fn expand_ranges(ranges: &[RowRange], row_count: i64) -> crate::Result<Vec<i64>> {
     if ranges.is_empty() {
         return Err(data_invalid("indexed split must select at least one row"));
     }

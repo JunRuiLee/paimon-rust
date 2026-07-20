@@ -1006,3 +1006,473 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         );
     }
 }
+
+// --- Exact-rerank coverage --------------------------------------------------
+//
+// The refine factor over-fetches approximate (ANN) candidates and reorders them
+// by exact distance re-read from the data file. The two tests below drive that
+// end-to-end through the public builder: one where the approximate order and the
+// exact order genuinely differ (so the reorder is observable), and one where the
+// search yields no indexed candidates (so the rerank must be skipped cleanly).
+
+/// The table-option `(key, value)` that requests exact rerank for the
+/// `embedding` PK-vector column. `fields.<col>.ivf.refine-factor` is one of the
+/// aliases the read path accepts for an `ivf-flat` index (the `ivf.` prefix,
+/// `refine-factor` suffix). kwai resolves the refine factor from table options
+/// (there is no query-side option), so tests bake it into the table schema.
+fn refine_factor_table_option(factor: usize) -> (String, String) {
+    (
+        format!("fields.{VECTOR_COLUMN}.ivf.refine-factor"),
+        factor.to_string(),
+    )
+}
+
+/// Primary-key schema `(id INT PRIMARY KEY, embedding VECTOR<FLOAT>)` with extra
+/// table options merged on top of [`table_options`]. Used to pin table-level
+/// options (e.g. `global-index.search-mode`) that the query-side `with_options`
+/// cannot influence.
+fn pk_vector_schema_with(extra: &[(&str, &str)]) -> TableSchema {
+    let mut builder = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            VECTOR_COLUMN,
+            DataType::Vector(
+                VectorType::try_new(true, DIM as u32, DataType::Float(FloatType::new())).unwrap(),
+            ),
+        )
+        .primary_key(["id"]);
+    for (k, v) in table_options() {
+        builder = builder.option(k, v);
+    }
+    for (k, v) in extra {
+        builder = builder.option(k.to_string(), v.to_string());
+    }
+    TableSchema::new(0, &builder.build().unwrap())
+}
+
+/// Persist `schema` and write one real data file over `data_vectors` in a fresh
+/// temp dir, returning the temp dir, the opened table, the `FileIO`, the table
+/// location, the written file's meta rewritten to satisfy the two PK-vector
+/// constraints (compacted, non-level-0, `first_row_id = 0`), and its
+/// bucket / partition.
+async fn write_schema_and_data(
+    schema: &TableSchema,
+    data_vectors: &[[f32; DIM]],
+) -> (
+    tempfile::TempDir,
+    Table,
+    FileIO,
+    String,
+    DataFileMeta,
+    Vec<u8>,
+    i32,
+) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let location = format!("file://{}", tmp.path().display());
+    let file_io = FileIOBuilder::new("file").build().unwrap();
+
+    for dir in ["schema", "snapshot", "manifest", "index"] {
+        file_io.mkdirs(&format!("{location}/{dir}")).await.unwrap();
+    }
+    file_io
+        .new_output(&format!("{location}/schema/schema-{}", schema.id()))
+        .unwrap()
+        .write(Bytes::from(serde_json::to_vec(schema).unwrap()))
+        .await
+        .unwrap();
+
+    let table = open_table(&file_io, &location).await;
+
+    let write_builder = table.new_write_builder();
+    let mut writer = write_builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&data_batch(data_vectors))
+        .await
+        .unwrap();
+    let write_messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(
+        write_messages.len(),
+        1,
+        "single bucket -> one write message"
+    );
+    let written = &write_messages[0];
+    assert_eq!(written.new_files.len(), 1, "single data file expected");
+    let base_meta = written.new_files[0].clone();
+
+    let bucket = written.bucket;
+    let partition = written.partition.clone();
+    let indexed_meta = DataFileMeta {
+        level: 1,
+        file_source: Some(1),
+        first_row_id: Some(0),
+        ..base_meta
+    };
+    (
+        tmp,
+        table,
+        file_io,
+        location,
+        indexed_meta,
+        partition,
+        bucket,
+    )
+}
+
+/// Build a table over the ANN-divergent rerank fixture: writes the true data
+/// file and commits an IVF-flat ANN segment encoding the perturbed order, with
+/// `extra` table options merged in. Returns the temp dir (kept alive by the
+/// caller) and the opened table. kwai resolves the refine factor from table
+/// options, so callers that want the exact rerank pass the refine-factor option
+/// in `extra`; callers that want the raw ANN order pass none.
+async fn setup_divergent_rerank_table(
+    query: &[f32],
+    index_vectors: &[[f32; DIM]],
+    data_vectors: &[[f32; DIM]],
+    k: usize,
+    extra: &[(&str, &str)],
+) -> (tempfile::TempDir, Table) {
+    let schema = pk_vector_schema_with(extra);
+    let (tmp, table, file_io, location, indexed_meta, partition, bucket) =
+        write_schema_and_data(&schema, data_vectors).await;
+    let data_file_name = indexed_meta.file_name.clone();
+    let row_count = indexed_meta.row_count;
+
+    let index_file_name = "vector-ivf-flat-pkvector-rerank.index".to_string();
+    let index_file_size =
+        write_ann_segment(&file_io, &location, &index_file_name, index_vectors).await;
+    {
+        let bytes = file_io
+            .new_input(&format!("{location}/index/{index_file_name}"))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        // The segment recalls the perturbed order, not the true-data order.
+        assert_segment_reads_back(&bytes, query, &analytic_topk(query, index_vectors, k));
+    }
+
+    let vector_field_id = schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == VECTOR_COLUMN)
+        .expect("vector field present")
+        .id();
+    let index_file = IndexFileMeta {
+        index_type: INDEX_TYPE.to_string(),
+        file_name: index_file_name,
+        file_size: i32::try_from(index_file_size).unwrap(),
+        row_count: i32::try_from(row_count).unwrap(),
+        deletion_vectors_ranges: None,
+        global_index_meta: Some(GlobalIndexMeta {
+            row_range_start: 0,
+            row_range_end: row_count - 1,
+            index_field_id: vector_field_id,
+            extra_field_ids: None,
+            source_meta: Some(source_meta_bytes(
+                indexed_meta.level,
+                &[(&data_file_name, row_count)],
+            )),
+            index_meta: None,
+        }),
+    };
+    let mut message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+    message.new_index_files = vec![index_file];
+    TableCommit::new(table.clone(), "pkvector-rerank".to_string())
+        .commit(vec![message])
+        .await
+        .unwrap();
+    (tmp, table)
+}
+
+/// Fixture where the ANN-approximate order and the exact-distance order are
+/// disjoint. The data file holds `data_vectors` (the truth the rerank re-reads),
+/// while the ANN segment is built over `index_vectors` (a perturbed copy), so the
+/// approximate recall order differs from the exact order over the true data.
+///
+///   query [10,0,0,0]
+///   position | index_vectors (ANN sees)         | data_vectors (truth)
+///   ---------+----------------------------------+---------------------------
+///   0        | [0,0,0,0]  -> 100                 | [9,0,0,0] ->   1  (exact 1st)
+///   1        | [0,0,1,0]  -> 101                 | [8,0,0,0] ->   4  (exact 2nd)
+///   2        | [0,0,2,0]  -> 104                 | [7,0,0,0] ->   9  (exact 3rd)
+///   3        | [9,0,0,0]  ->   1  (ANN 3rd)      | [0,0,0,0] -> 100
+///   4        | [9.5,0,0,0]->   0.25 (ANN 2nd)    | [0,5,0,0] -> 125
+///   5        | [10,0,0,0] ->   0  (ANN 1st)      | [0,0,6,0] -> 136
+///
+/// ANN top-3 = [5, 4, 3]; exact top-3 = [0, 1, 2]. The two are disjoint, so if the
+/// rerank never ran (gate broken or factor unset) the output would be [5, 4, 3].
+fn fixture_rerank_divergent() -> ([f32; DIM], Vec<[f32; DIM]>, Vec<[f32; DIM]>) {
+    let query = [10.0, 0.0, 0.0, 0.0];
+    let index_vectors = vec![
+        [0.0, 0.0, 0.0, 0.0],  // pos 0
+        [0.0, 0.0, 1.0, 0.0],  // pos 1
+        [0.0, 0.0, 2.0, 0.0],  // pos 2
+        [9.0, 0.0, 0.0, 0.0],  // pos 3
+        [9.5, 0.0, 0.0, 0.0],  // pos 4
+        [10.0, 0.0, 0.0, 0.0], // pos 5
+    ];
+    let data_vectors = vec![
+        [9.0, 0.0, 0.0, 0.0], // pos 0
+        [8.0, 0.0, 0.0, 0.0], // pos 1
+        [7.0, 0.0, 0.0, 0.0], // pos 2
+        [0.0, 0.0, 0.0, 0.0], // pos 3
+        [0.0, 5.0, 0.0, 0.0], // pos 4
+        [0.0, 0.0, 6.0, 0.0], // pos 5
+    ];
+    (query, index_vectors, data_vectors)
+}
+
+/// refine_factor > 0 reorders the emitted rows to the exact-distance ground truth:
+/// the ANN-approximate order (built over a perturbed copy of the vectors) differs
+/// from the exact order over the true data, and the rerank corrects it.
+///
+/// The fixture builds the ANN segment over `index_vectors` while the data file
+/// holds `data_vectors`, so the approximate recall order [5, 4, 3] is disjoint
+/// from the exact order [0, 1, 2]. With `refine-factor = 2` the search over-fetches
+/// `limit * 2 = 6` candidates (the whole bucket), then re-reads each candidate's
+/// true vector and reorders by exact distance. The emitted rows must be the exact
+/// top-3 [0, 1, 2] with scores computed from the true distances.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn pk_vector_refine_factor_matches_exact_ground_truth() {
+    let (query, index_vectors, data_vectors) = fixture_rerank_divergent();
+    let k = 3;
+
+    // Ground truths: the ANN recall order (exact over the perturbed index vectors,
+    // since nlist = 1 is exhaustive) and the exact order over the true data.
+    let ann_order: Vec<i32> = analytic_topk(&query, &index_vectors, k)
+        .iter()
+        .map(|(id, _)| *id as i32)
+        .collect();
+    let exact = analytic_topk(&query, &data_vectors, k);
+    let exact_ids: Vec<i32> = exact.iter().map(|(id, _)| *id as i32).collect();
+    let exact_scores: Vec<f32> = exact.iter().map(|(_, d)| l2_score(*d)).collect();
+    assert_eq!(ann_order, vec![5, 4, 3], "fixture guard: ANN order");
+    assert_eq!(exact_ids, vec![0, 1, 2], "fixture guard: exact order");
+    assert_ne!(
+        ann_order, exact_ids,
+        "fixture is only discriminating if ANN order differs from exact order"
+    );
+
+    // Build a table whose ANN segment encodes the perturbed order while the data
+    // file holds the true vectors, and confirm the segment really recalls the
+    // perturbed order before the read path runs.
+    // Build a table whose ANN segment encodes the perturbed order while the data
+    // file holds the true vectors. kwai resolves the refine factor from table
+    // options (no query-side option), so the raw-ANN and exact-rerank cases use
+    // two tables built over the identical fixture, differing only in whether the
+    // refine-factor table option is set.
+
+    // No refine factor: raw ANN recall order [5, 4, 3] (the rerank never runs), so
+    // any reordering below is attributable to the refine factor and not to the
+    // fixture happening to agree.
+    let (_tmp_ann, table_ann) =
+        setup_divergent_rerank_table(&query, &index_vectors, &data_vectors, k, &[]).await;
+    let (unset_ids, _unset_scores, _unset_batches) =
+        read_id_and_scores(&table_ann, query.to_vec(), k, None).await;
+    assert_eq!(
+        unset_ids, ann_order,
+        "without a refine factor the rows must stay in raw ANN order [5, 4, 3]"
+    );
+
+    // With the refine factor set in table options, the emitted rows are the EXACT
+    // top-3 [0, 1, 2], not the approximate order [5, 4, 3]: the rerank reordered
+    // them.
+    let (refine_key, refine_value) = refine_factor_table_option(2);
+    let (_tmp_refine, table_refine) = setup_divergent_rerank_table(
+        &query,
+        &index_vectors,
+        &data_vectors,
+        k,
+        &[(refine_key.as_str(), refine_value.as_str())],
+    )
+    .await;
+    let (ids, scores, batches) = read_id_and_scores(&table_refine, query.to_vec(), k, None).await;
+    assert_eq!(
+        ids, exact_ids,
+        "refine factor must reorder rows to exact top-3 [0, 1, 2], not ANN order [5, 4, 3]"
+    );
+
+    // Row content: each emitted row's vector equals the TRUE data vector at that
+    // physical position (the rerank read the data file, not the ANN segment).
+    let got_vectors = collect_vectors(&batches);
+    assert_eq!(got_vectors.len(), k, "three rows expected");
+    for (row_idx, (id, _)) in exact.iter().enumerate() {
+        assert_eq!(
+            got_vectors[row_idx],
+            data_vectors[*id as usize].to_vec(),
+            "materialized vector for row id {id} diverges from true data"
+        );
+    }
+
+    // Scores are computed from the recomputed exact distances over the true data.
+    assert_eq!(scores.len(), k);
+    for (got, want) in scores.iter().zip(&exact_scores) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "reranked score diverges: got {got}, want {want}"
+        );
+    }
+}
+
+/// Gating: with a positive refine factor set but a search that yields ZERO
+/// indexed (ANN) candidates, the exact rerank must be skipped — no error, no
+/// spurious position read — and the exact-fallback rows come through unchanged.
+///
+/// The table carries a compacted, non-level-0 data file but NO ANN index segment,
+/// and `global-index.search-mode = full` enables the exact data-file fallback. The
+/// search therefore produces exact-fallback candidates while `search.indexed` is
+/// empty, which is exactly the `refine_factor > 0 && !search.indexed.is_empty()`
+/// gate's short-circuit path. The emitted rows must be the exact top-3 the fallback
+/// found, identical to what a refine-unset run would emit.
+// Gated off Windows for the same `file://` tempdir reason as the tests above.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn pk_vector_refine_factor_with_no_indexed_candidates_is_noop() {
+    // Reuse the discriminating fixture's true-data layout so best-first order
+    // [5, 1, 3] is distinct from ascending position, proving the exact fallback
+    // ranked correctly rather than emitting rows in file order.
+    let (query, data_vectors) = fixture_discriminating();
+    let k = 3;
+    let exact = analytic_topk(&query, &data_vectors, k);
+    let exact_ids: Vec<i32> = exact.iter().map(|(id, _)| *id as i32).collect();
+    let exact_scores: Vec<f32> = exact.iter().map(|(_, d)| l2_score(*d)).collect();
+    assert_eq!(exact_ids, vec![5, 1, 3], "fixture guard: exact order");
+
+    // FULL search mode enables the exact data-file fallback; no ANN segment is
+    // committed, so the ANN candidate list stays empty. A positive refine factor
+    // is set in table options (kwai resolves it from there), but with no indexed
+    // candidates the rerank is gated off.
+    let (refine_key, refine_value) = refine_factor_table_option(2);
+    let schema = pk_vector_schema_with(&[
+        ("global-index.search-mode", "full"),
+        (refine_key.as_str(), refine_value.as_str()),
+    ]);
+    let (_tmp, table, _file_io, _location, indexed_meta, partition, bucket) =
+        write_schema_and_data(&schema, &data_vectors).await;
+
+    // Commit the data file WITHOUT any index segment: the plan has a searchable
+    // bucket but zero ANN segments -> zero indexed candidates.
+    let message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+    TableCommit::new(table.clone(), "pkvector-rerank-noop".to_string())
+        .commit(vec![message])
+        .await
+        .unwrap();
+
+    // With no indexed candidates the rerank is gated off: execute_read must not
+    // error, and returns the exact-fallback rows.
+    let (ids, scores, batches) = read_id_and_scores(&table, query.to_vec(), k, None).await;
+    assert_eq!(
+        ids, exact_ids,
+        "with no indexed candidates the exact-fallback rows must pass through unchanged"
+    );
+
+    let got_vectors = collect_vectors(&batches);
+    assert_eq!(got_vectors.len(), k, "three rows expected");
+    for (row_idx, (id, _)) in exact.iter().enumerate() {
+        assert_eq!(
+            got_vectors[row_idx],
+            data_vectors[*id as usize].to_vec(),
+            "materialized vector for row id {id} diverges from true data"
+        );
+    }
+    assert_eq!(scores.len(), k);
+    for (got, want) in scores.iter().zip(&exact_scores) {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "exact-fallback score diverges: got {got}, want {want}"
+        );
+    }
+}
+
+/// An invalid refine factor must fail loud even when the table is empty: the
+/// factor is resolved before planning, so config validity does not depend on
+/// whether the table currently has searchable data. Regression for a resolution
+/// that ran only after the empty-plan early return. Covers both invalid forms
+/// the reviewer named (`0` and a non-integer); kwai resolves the refine factor
+/// from table options, so all cases pin it there.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
+    // Persist only the schema (optionally with extra table options): no snapshot,
+    // so the PK-vector plan is empty.
+    async fn empty_table(file_io: &FileIO, location: &str, extra: &[(&str, &str)]) -> Table {
+        file_io.mkdirs(&format!("{location}/schema")).await.unwrap();
+        let schema = pk_vector_schema_with(extra);
+        file_io
+            .new_output(&format!("{location}/schema/schema-{}", schema.id()))
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&schema).unwrap()))
+            .await
+            .unwrap();
+        open_table(file_io, location).await
+    }
+
+    let refine_key = format!("fields.{VECTOR_COLUMN}.ivf.refine-factor");
+
+    // Case 1: non-integer table option -> "Invalid ... Must be an integer".
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[(refine_key.as_str(), "abc")]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3);
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a non-integer refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Invalid vector refine factor"),
+            "expected a non-integer refine-factor error, got: {err}"
+        );
+    }
+
+    // Case 2: explicit `0` table option -> "must be positive" (0 means "omit"; it
+    // cannot be requested).
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[(refine_key.as_str(), "0")]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3);
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a zero refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("must be positive"),
+            "expected a positive-refine-factor error, got: {err}"
+        );
+    }
+
+    // Case 3: non-integer via a TABLE option built into the schema (resolution
+    // runs ahead of planning).
+    {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let location = format!("file://{}", tmp.path().display());
+        let file_io = FileIOBuilder::new("file").build().unwrap();
+        let table = empty_table(&file_io, &location, &[(refine_key.as_str(), "abc")]).await;
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(vec![0.0f32; DIM])
+            .with_limit(3);
+        let err = match builder.execute_read().await {
+            Ok(_) => panic!("a non-integer table refine factor must fail loud on an empty table"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("Invalid vector refine factor"),
+            "expected a non-integer refine-factor error, got: {err}"
+        );
+    }
+}
