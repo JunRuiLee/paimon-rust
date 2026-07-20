@@ -437,12 +437,28 @@ impl<'a> VectorSearchBuilder<'a> {
         let search_mode = core.global_index_search_mode()?;
         let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
 
-        let plan = PkVectorScan::new(self.table, field_id, index_type, self.filter.clone())
-            .plan()
-            .await?;
+        let plan = PkVectorScan::new(
+            self.table,
+            field_id,
+            index_type.clone(),
+            self.filter.clone(),
+        )
+        .plan()
+        .await?;
         if plan.splits.is_empty() {
             return Ok((Vec::new(), plan, metric));
         }
+
+        // Resolve the vector index backend from the single configured index type.
+        // Java enforces one index type per PK table and Rust filters segments to
+        // it, so one backend serves every segment. Computed after the empty-plan
+        // return so an empty table never errors on an unrecognized type.
+        let backend = VectorIndexBackend::from_index_type(&index_type).ok_or_else(|| {
+            crate::Error::DataInvalid {
+                message: format!("unsupported PK vector index backend/type: '{index_type}'"),
+                source: None,
+            }
+        })?;
 
         // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
         // but projecting only the vector column with no predicates.
@@ -460,7 +476,7 @@ impl<'a> VectorSearchBuilder<'a> {
         let segment_bytes = preload_segment_bytes(self.table.file_io(), &plan.splits).await?;
         // Fail loud on a config/segment metric mismatch before scoring, mirroring
         // Java `PkVectorAnnSegmentSearcher.search`.
-        verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric)?;
+        verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric, backend)?;
         let options = {
             let mut o = self.table.schema().options().clone();
             o.extend(self.options.clone());
@@ -1200,6 +1216,7 @@ fn verify_pk_vector_segment_metrics(
     splits: &[PkVectorSearchSplit],
     segment_bytes: &HashMap<String, Vec<u8>>,
     configured: VectorSearchMetric,
+    backend: VectorIndexBackend,
 ) -> crate::Result<()> {
     let mut checked: HashSet<&str> = HashSet::new();
     for split in splits {
@@ -1207,27 +1224,37 @@ fn verify_pk_vector_segment_metrics(
             if !checked.insert(segment.path.as_str()) {
                 continue;
             }
-            let bytes =
-                segment_bytes
-                    .get(&segment.path)
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: format!(
-                            "missing preloaded ANN bytes for segment '{}'",
-                            segment.path
-                        ),
-                        source: None,
-                    })?;
-            let reader = VIndexReader::open(Cursor::new(bytes.clone())).map_err(|e| {
-                crate::Error::DataInvalid {
-                    message: format!(
-                        "failed to open ANN index file '{}' for metric check: {e}",
-                        segment.path
-                    ),
-                    source: Some(Box::new(e)),
+            let segment_metric = match backend {
+                VectorIndexBackend::Lumina => {
+                    // Lumina records its metric in the serialized index metadata
+                    // (`index_meta`), not in the segment file bytes.
+                    let lumina_metric =
+                        LuminaIndexMeta::deserialize(&segment.index_meta)?.metric()?;
+                    VectorSearchMetric::from_lumina(lumina_metric)
                 }
-            })?;
-            let segment_metric = reader.metadata().metric;
-            if VectorSearchMetric::from_vindex(segment_metric) != configured {
+                VectorIndexBackend::Vindex => {
+                    let bytes = segment_bytes.get(&segment.path).ok_or_else(|| {
+                        crate::Error::DataInvalid {
+                            message: format!(
+                                "missing preloaded ANN bytes for segment '{}'",
+                                segment.path
+                            ),
+                            source: None,
+                        }
+                    })?;
+                    let reader = VIndexReader::open(Cursor::new(bytes.clone())).map_err(|e| {
+                        crate::Error::DataInvalid {
+                            message: format!(
+                                "failed to open ANN index file '{}' for metric check: {e}",
+                                segment.path
+                            ),
+                            source: Some(Box::new(e)),
+                        }
+                    })?;
+                    VectorSearchMetric::from_vindex(reader.metadata().metric)
+                }
+            };
+            if segment_metric != configured {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
                         "ANN segment metric {} does not match configured metric {}",
@@ -2971,14 +2998,94 @@ mod tests {
         split
     }
 
+    fn pk_split_with_lumina_segment(path: &str, metric: &str) -> PkVectorSearchSplit {
+        let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
+        let source_meta = crate::spec::PkVectorSourceMeta::new(
+            1,
+            vec![crate::spec::PkVectorSourceFile::new("file-a".to_string(), 3).unwrap()],
+        )
+        .unwrap();
+        let mut segment = BucketAnnSegment::for_test(source_meta);
+        segment.path = path.to_string();
+        // Lumina stores its metric in the serialized index metadata blob, not in
+        // the segment file bytes. `deserialize` requires both keys present.
+        let meta = crate::lumina::LuminaIndexMeta::new(HashMap::from([
+            ("index.dimension".to_string(), "2".to_string()),
+            ("distance.metric".to_string(), metric.to_string()),
+        ]));
+        segment.index_meta = meta.serialize().unwrap();
+        split.ann_segments = vec![segment];
+        split
+    }
+
+    #[test]
+    fn verify_pk_vector_segment_metrics_accepts_matching_lumina_metric() {
+        // Lumina segment metadata says cosine; configured cosine => Ok. No segment
+        // file bytes are needed on the Lumina path.
+        let splits = vec![pk_split_with_lumina_segment("seg-lumina", "cosine")];
+        let segment_bytes = HashMap::new();
+        verify_pk_vector_segment_metrics(
+            &splits,
+            &segment_bytes,
+            VectorSearchMetric::Cosine,
+            VectorIndexBackend::Lumina,
+        )
+        .expect("matching lumina metric must pass");
+    }
+
+    #[test]
+    fn verify_pk_vector_segment_metrics_rejects_mismatched_lumina_metric() {
+        // Lumina segment metadata says l2; configured inner_product => fail loud,
+        // naming both metrics.
+        let splits = vec![pk_split_with_lumina_segment("seg-lumina", "l2")];
+        let segment_bytes = HashMap::new();
+        let err = verify_pk_vector_segment_metrics(
+            &splits,
+            &segment_bytes,
+            VectorSearchMetric::InnerProduct,
+            VectorIndexBackend::Lumina,
+        )
+        .expect_err("mismatched lumina metric must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("does not match configured metric")
+                    && message.contains("l2")
+                    && message.contains("inner_product")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_index_type_classifies_lumina_and_vindex() {
+        assert_eq!(
+            VectorIndexBackend::from_index_type("lumina"),
+            Some(VectorIndexBackend::Lumina)
+        );
+        assert_eq!(
+            VectorIndexBackend::from_index_type("lumina-vector-ann"),
+            Some(VectorIndexBackend::Lumina)
+        );
+        assert_eq!(
+            VectorIndexBackend::from_index_type("ivf-flat"),
+            Some(VectorIndexBackend::Vindex)
+        );
+        // `diskann` is Lumina's internal index type, not a top-level index type.
+        assert_eq!(VectorIndexBackend::from_index_type("diskann"), None);
+    }
+
     #[test]
     fn verify_pk_vector_segment_metrics_accepts_matching_metric() {
         // Real IVF segment trained with L2; configured metric L2 => Ok.
         let bytes = build_vindex_segment_bytes("l2");
         let splits = vec![pk_split_with_segment("seg-l2")];
         let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
-        verify_pk_vector_segment_metrics(&splits, &segment_bytes, VectorSearchMetric::L2)
-            .expect("matching metric must pass");
+        verify_pk_vector_segment_metrics(
+            &splits,
+            &segment_bytes,
+            VectorSearchMetric::L2,
+            VectorIndexBackend::Vindex,
+        )
+        .expect("matching metric must pass");
     }
 
     #[test]
@@ -2987,9 +3094,13 @@ mod tests {
         let bytes = build_vindex_segment_bytes("l2");
         let splits = vec![pk_split_with_segment("seg-l2")];
         let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
-        let err =
-            verify_pk_vector_segment_metrics(&splits, &segment_bytes, VectorSearchMetric::Cosine)
-                .expect_err("mismatched metric must fail loud");
+        let err = verify_pk_vector_segment_metrics(
+            &splits,
+            &segment_bytes,
+            VectorSearchMetric::Cosine,
+            VectorIndexBackend::Vindex,
+        )
+        .expect_err("mismatched metric must fail loud");
         assert!(
             matches!(err, crate::Error::DataInvalid { ref message, .. }
                 if message.contains("does not match configured metric")
