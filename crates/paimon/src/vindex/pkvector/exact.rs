@@ -19,7 +19,10 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::data_invalid;
-use super::metric::{java_float_compare, VectorSearchMetric};
+use super::metric::java_float_compare;
+#[cfg(test)]
+use super::metric::VectorSearchMetric;
+#[cfg(test)]
 use super::reader::PkVectorReader;
 use super::result::PkVectorSearchResult;
 
@@ -28,7 +31,10 @@ use super::result::PkVectorSearchResult;
 /// top therefore evicts the least-wanted candidate. Uses `java_float_compare`
 /// for a deterministic total order over f32 that ranks NaN distances as worst
 /// (largest), so a NaN is evicted before any finite candidate (no panic).
-struct WorstFirst(PkVectorSearchResult);
+///
+/// Ordered by distance then row position only (a single data file, so the file
+/// name is constant across all its candidates).
+pub(crate) struct WorstFirst(PkVectorSearchResult);
 
 impl PartialEq for WorstFirst {
     fn eq(&self, other: &Self) -> bool {
@@ -50,15 +56,74 @@ impl Ord for WorstFirst {
 
 /// True if `candidate` ranks strictly better (BEST_FIRST) than the current
 /// worst-on-heap `weakest`: smaller distance, ties broken by smaller position.
-fn is_better_than(candidate: &PkVectorSearchResult, weakest: &PkVectorSearchResult) -> bool {
+pub(crate) fn is_better_than(
+    candidate: &PkVectorSearchResult,
+    weakest: &PkVectorSearchResult,
+) -> bool {
     java_float_compare(candidate.distance, weakest.distance)
         .then_with(|| candidate.row_position.cmp(&weakest.row_position))
         == Ordering::Less
 }
 
+/// Add `candidate` to a bounded (size `limit`) BEST_FIRST Top-K max-heap over one
+/// file's candidates: push if under capacity, else replace the current worst iff
+/// the candidate beats it. `O(log limit)` per call. The single shared push step
+/// so the whole-file `exact_search` and the streaming per-file search cannot
+/// drift in how they bound their heaps.
+pub(crate) fn push_bounded(
+    heap: &mut BinaryHeap<WorstFirst>,
+    candidate: PkVectorSearchResult,
+    limit: usize,
+) {
+    if heap.len() < limit {
+        heap.push(WorstFirst(candidate));
+    } else if heap
+        .peek()
+        .is_some_and(|worst| is_better_than(&candidate, &worst.0))
+    {
+        heap.pop();
+        heap.push(WorstFirst(candidate));
+    }
+}
+
+/// Drain a bounded Top-K heap into a BEST_FIRST-sorted result list: distance
+/// ASC, then row_position ASC (single file, so data_file_name is constant).
+pub(crate) fn drain_best_first(heap: BinaryHeap<WorstFirst>) -> Vec<PkVectorSearchResult> {
+    let mut results: Vec<PkVectorSearchResult> = heap.into_iter().map(|w| w.0).collect();
+    results.sort_by(|a, b| {
+        java_float_compare(a.distance, b.distance).then_with(|| a.row_position.cmp(&b.row_position))
+    });
+    results
+}
+
+/// Validate one query vector against the index dimension: length must match and
+/// every element must be finite. Shared by the whole-file `exact_search` and the
+/// table-layer streaming per-file search so both reject the same malformed
+/// queries with the same messages (before any read is performed).
+pub(crate) fn validate_query(query: &[f32], dimension: usize) -> crate::Result<()> {
+    if query.len() != dimension {
+        return Err(data_invalid(format!(
+            "query vector dimension does not match: index expects {}, got {}",
+            dimension,
+            query.len()
+        )));
+    }
+    if let Some(i) = query.iter().position(|v| !v.is_finite()) {
+        return Err(data_invalid(format!(
+            "query vector element at position {i} must be finite"
+        )));
+    }
+    Ok(())
+}
+
 /// Exact Top-K over one sequential physical-row vector source. Mirrors Java
 /// `PkVectorExactSearcher.search`. Results are sorted BEST_FIRST: distance ASC,
 /// then row_position ASC (single file, so data_file_name is constant).
+///
+/// No longer the production read path (the table layer streams the vector column
+/// one Arrow batch at a time via the per-file search closure); kept as a tested
+/// reference the streaming search must stay byte-identical to.
+#[cfg(test)]
 pub(crate) fn exact_search(
     data_file_name: &str,
     reader: &mut dyn PkVectorReader,
@@ -67,20 +132,9 @@ pub(crate) fn exact_search(
     limit: usize,
     is_excluded: &dyn Fn(i64) -> bool,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
-    if query.len() != reader.dimension() {
-        return Err(data_invalid(format!(
-            "query vector dimension does not match: index expects {}, got {}",
-            reader.dimension(),
-            query.len()
-        )));
-    }
+    validate_query(query, reader.dimension())?;
     if limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
-    }
-    if let Some(i) = query.iter().position(|v| !v.is_finite()) {
-        return Err(data_invalid(format!(
-            "query vector element at position {i} must be finite"
-        )));
     }
     let row_count = reader.row_count();
     if row_count < 0 {
@@ -101,22 +155,10 @@ pub(crate) fn exact_search(
             row_position: position,
             distance: metric.compute_distance(query, &reuse),
         };
-        if heap.len() < limit {
-            heap.push(WorstFirst(candidate));
-        } else if heap
-            .peek()
-            .is_some_and(|worst| is_better_than(&candidate, &worst.0))
-        {
-            heap.pop();
-            heap.push(WorstFirst(candidate));
-        }
+        push_bounded(&mut heap, candidate, limit);
     }
 
-    let mut results: Vec<PkVectorSearchResult> = heap.into_iter().map(|w| w.0).collect();
-    results.sort_by(|a, b| {
-        java_float_compare(a.distance, b.distance).then_with(|| a.row_position.cmp(&b.row_position))
-    });
-    Ok(results)
+    Ok(drain_best_first(heap))
 }
 
 #[cfg(test)]

@@ -23,16 +23,19 @@ use futures::future::BoxFuture;
 
 use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
-use super::exact::exact_search;
 use super::metric::{java_float_compare, VectorSearchMetric};
-use super::reader::PkVectorReader;
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
 use crate::spec::PkVectorSourceMeta;
 
-/// Future returned by the exact-fallback reader factory: builds the sequential
-/// vector reader for one data file on demand.
-pub(crate) type ExactReaderFuture<'a> = BoxFuture<'a, crate::Result<Box<dyn PkVectorReader>>>;
+/// Search one uncovered data file for its per-query exact Top-K. Returns one
+/// bounded, BEST_FIRST list per query (outer index aligns to the `queries` slice
+/// passed to the closure). The table-layer implementation streams the file's
+/// vector column one Arrow batch at a time, so peak memory is one batch plus the
+/// bounded heaps, not the whole column. `is_excluded(position)` folds residual +
+/// deletion-vector exclusion (built by `bucket_search`, which owns those inputs).
+pub(crate) type ExactFileSearchFuture<'a> =
+    BoxFuture<'a, crate::Result<Vec<Vec<PkVectorSearchResult>>>>;
 
 /// One ANN segment to be searched by the bucket kernel. `source_meta` resolves
 /// segment ordinals back to physical `(data file, position)` and drives live-row
@@ -164,13 +167,21 @@ pub(crate) struct BucketSearchResult {
 /// with an empty set) has no allowed rows and produces no candidates. Mirrors Java
 /// `rowRangesByFile`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(crate) async fn bucket_search(
     ann_searcher: Option<&dyn PkVectorAnnSearcher>,
     ann_segments: &[BucketAnnSegment],
     active_files: &[BucketActiveFile],
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    exact_reader_factory: &mut (dyn for<'a> FnMut(&'a BucketActiveFile) -> ExactReaderFuture<'a>
-              + Send),
+    exact_file_search: &(dyn for<'a> Fn(
+        &'a BucketActiveFile,
+        &'a [&'a [f32]],
+        VectorSearchMetric,
+        usize,
+        &'a (dyn Fn(i64) -> bool + Sync),
+    ) -> ExactFileSearchFuture<'a>
+          + Send
+          + Sync),
     query: &[f32],
     metric: VectorSearchMetric,
     indexed_limit: usize,
@@ -184,6 +195,15 @@ pub(crate) async fn bucket_search(
     }
     if exact_limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
+    }
+    // Validate-before-OPEN: a non-finite query element fails loud before any
+    // exact-file search closure is invoked (so before any file stream is opened).
+    // The per-file closure additionally validates the query dimension before it
+    // polls its stream (validate-before-POLL).
+    if let Some(i) = query.iter().position(|v| !v.is_finite()) {
+        return Err(data_invalid(format!(
+            "query vector element at position {i} must be finite"
+        )));
     }
 
     let mut files_by_name: HashMap<&str, &BucketActiveFile> = HashMap::new();
@@ -307,15 +327,22 @@ pub(crate) async fn bucket_search(
                     },
                 }
             };
-            let mut reader = exact_reader_factory(file).await?;
-            for result in exact_search(
-                &file.file_name,
-                reader.as_mut(),
-                query,
+            // Search this one file for its per-query exact Top-K. The caller passes
+            // a single-query slice and reads the sole returned list.
+            let queries: [&[f32]; 1] = [query];
+            let per_query = exact_file_search(
+                file,
+                &queries,
                 metric,
                 exact_limit,
-                &is_excluded,
-            )? {
+                &is_excluded as &(dyn Fn(i64) -> bool + Sync),
+            )
+            .await?;
+            let results = per_query
+                .into_iter()
+                .next()
+                .ok_or_else(|| data_invalid("exact file search returned no per-query results"))?;
+            for result in results {
                 add_candidate(&mut exact_heap, result, exact_limit);
             }
         }
@@ -333,6 +360,7 @@ mod tests {
     use super::*;
     use crate::spec::PkVectorSourceFile;
     use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
+    use crate::vindex::pkvector::exact::exact_search;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
     use roaring::RoaringBitmap;
 
@@ -354,15 +382,91 @@ mod tests {
         }
     }
 
-    /// Coerce a closure into the higher-ranked exact-reader factory shape so its
-    /// returned future borrows for exactly the argument's lifetime. Closure return
+    /// Coerce a closure into the higher-ranked per-file exact-search shape so its
+    /// returned future borrows for exactly the argument lifetime. Closure return
     /// types cannot express this borrow through inference alone, so the bound is
-    /// supplied here.
-    fn as_factory<F>(f: F) -> F
+    /// supplied here. The closure is `Fn + Send + Sync` (called concurrently by
+    /// the parallel search), not `FnMut`.
+    fn as_search<F>(f: F) -> F
     where
-        F: for<'a> FnMut(&'a BucketActiveFile) -> ExactReaderFuture<'a> + Send,
+        F: for<'a> Fn(
+                &'a BucketActiveFile,
+                &'a [&'a [f32]],
+                VectorSearchMetric,
+                usize,
+                &'a (dyn Fn(i64) -> bool + Sync),
+            ) -> ExactFileSearchFuture<'a>
+            + Send
+            + Sync,
     {
         f
+    }
+
+    /// Build a per-file exact-search closure that runs the reference `exact_search`
+    /// over an in-memory `ArrayReader` of `vectors`, returning one per-query list.
+    /// The caller wires a single query, so the returned outer `Vec` has one element.
+    #[allow(clippy::type_complexity)]
+    fn array_search(
+        vectors: Vec<Option<Vec<f32>>>,
+    ) -> impl for<'a> Fn(
+        &'a BucketActiveFile,
+        &'a [&'a [f32]],
+        VectorSearchMetric,
+        usize,
+        &'a (dyn Fn(i64) -> bool + Sync),
+    ) -> ExactFileSearchFuture<'a>
+           + Send
+           + Sync {
+        let vectors = Arc::new(vectors);
+        as_search(
+            move |file: &BucketActiveFile,
+                  queries: &[&[f32]],
+                  metric: VectorSearchMetric,
+                  exact_limit: usize,
+                  is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let dimension = vectors
+                    .first()
+                    .and_then(|v| v.as_ref())
+                    .map_or(0, |v| v.len());
+                let owned: Vec<Option<Vec<f32>>> = (*vectors).clone();
+                let file_name = file.file_name.clone();
+                let query: Vec<f32> = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader = ArrayReader::new(dimension, owned);
+                    let results = exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?;
+                    Ok(vec![results])
+                })
+            },
+        )
+    }
+
+    /// A per-file exact-search closure that must never be invoked.
+    #[allow(clippy::type_complexity)]
+    fn unreachable_search() -> impl for<'a> Fn(
+        &'a BucketActiveFile,
+        &'a [&'a [f32]],
+        VectorSearchMetric,
+        usize,
+        &'a (dyn Fn(i64) -> bool + Sync),
+    ) -> ExactFileSearchFuture<'a>
+           + Send
+           + Sync {
+        as_search(
+            |_: &BucketActiveFile,
+             _: &[&[f32]],
+             _: VectorSearchMetric,
+             _: usize,
+             _: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> { Box::pin(async { unreachable!() }) },
+        )
     }
 
     /// Fake ANN searcher returning preset results and recording calls.
@@ -412,17 +516,11 @@ mod tests {
             ],
         };
         // Exact file has three rows; query nearest is position 0.
-        let mut factory = as_factory(|_f: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            let reader = ArrayReader::new(
-                2,
-                vec![
-                    Some(vec![1.0, 0.0]),
-                    Some(vec![9.0, 0.0]),
-                    Some(vec![8.0, 0.0]),
-                ],
-            );
-            Box::pin(async move { Ok(Box::new(reader) as Box<dyn PkVectorReader>) })
-        });
+        let factory = array_search(vec![
+            Some(vec![1.0, 0.0]),
+            Some(vec![9.0, 0.0]),
+            Some(vec![8.0, 0.0]),
+        ]);
         let active_files = vec![active("ann.mosaic", 3), active("exact.mosaic", 3)];
         let dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
         let opts = HashMap::new();
@@ -432,7 +530,7 @@ mod tests {
             &[segment],
             &active_files,
             &dvs,
-            &mut factory,
+            &factory,
             &[1.0, 0.0],
             VectorSearchMetric::L2,
             3, // indexed_limit
@@ -456,15 +554,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejects_non_positive_limit() {
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             None,
             &[],
             &[],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             0,
@@ -500,15 +596,13 @@ mod tests {
                 hit("data-1", 1),
             ],
         };
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 3)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             3,
@@ -557,15 +651,13 @@ mod tests {
                 },
             ],
         };
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -598,22 +690,37 @@ mod tests {
             }],
         };
         let calls = std::sync::Mutex::new(Vec::<String>::new());
-        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            calls.lock().unwrap().push(f.file_name.clone());
-            // data-2 vectors: pos0 {1,0} dist 1.0, pos1 {3,0} dist 9.0
-            Box::pin(async {
-                Ok(Box::new(ArrayReader::new(
-                    2,
-                    vec![Some(vec![1.0, 0.0]), Some(vec![3.0, 0.0])],
-                )) as Box<dyn PkVectorReader>)
-            })
-        });
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                calls.lock().unwrap().push(file.file_name.clone());
+                // data-2 vectors: pos0 {1,0} dist 1.0, pos1 {3,0} dist 9.0
+                let file_name = file.file_name.clone();
+                let query = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader =
+                        ArrayReader::new(2, vec![Some(vec![1.0, 0.0]), Some(vec![3.0, 0.0])]);
+                    Ok(vec![exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?])
+                })
+            },
+        );
         let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
@@ -650,17 +757,34 @@ mod tests {
     async fn test_exact_fallback_merges_files_and_applies_deletion_vectors() {
         // No ANN. data-1 pos0 {0,0} deleted; remaining candidates merge across files.
         let calls = std::sync::Mutex::new(0usize);
-        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            *calls.lock().unwrap() += 1;
-            let vectors = match f.file_name.as_str() {
-                "data-1" => vec![Some(vec![0.0, 0.0]), Some(vec![2.0, 0.0])],
-                "data-2" => vec![Some(vec![1.0, 0.0]), None],
-                _ => unreachable!(),
-            };
-            Box::pin(async move {
-                Ok(Box::new(ArrayReader::new(2, vectors)) as Box<dyn PkVectorReader>)
-            })
-        });
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                *calls.lock().unwrap() += 1;
+                let vectors = match file.file_name.as_str() {
+                    "data-1" => vec![Some(vec![0.0, 0.0]), Some(vec![2.0, 0.0])],
+                    "data-2" => vec![Some(vec![1.0, 0.0]), None],
+                    _ => unreachable!(),
+                };
+                let file_name = file.file_name.clone();
+                let query = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader = ArrayReader::new(2, vectors);
+                    Ok(vec![exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?])
+                })
+            },
+        );
         let mut dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // data-1 position 0 deleted
@@ -671,7 +795,7 @@ mod tests {
             &[],
             &[active("data-1", 2), active("data-2", 2)],
             &dvs,
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
@@ -707,15 +831,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejects_duplicate_active_file_name() {
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             None,
             &[],
             &[active("dup", 1), active("dup", 1)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -735,15 +857,13 @@ mod tests {
         // Segment references data-1 with 2 rows, but the active file has 3 rows.
         // An active source with a mismatched row count is still a hard error.
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 3)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -775,16 +895,23 @@ mod tests {
             }],
         };
         let calls = std::sync::Mutex::new(Vec::<String>::new());
-        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            calls.lock().unwrap().push(f.file_name.clone());
-            Box::pin(async { unreachable!("only data-1 is active and it is ANN-covered") })
-        });
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             _: &[&[f32]],
+             _: VectorSearchMetric,
+             _: usize,
+             _: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                calls.lock().unwrap().push(file.file_name.clone());
+                Box::pin(async { unreachable!("only data-1 is active and it is ANN-covered") })
+            },
+        );
         let out = bucket_search(
             Some(&ann),
             &[segment],
             &[active("data-1", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
@@ -814,15 +941,13 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_segments_without_ann_searcher() {
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             None,
             &[segment],
             &[active("data-1", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -843,15 +968,13 @@ mod tests {
     async fn test_skip_exact_fallback_does_not_call_factory() {
         // No ANN segments, two active files. With skip_exact_fallback = true the
         // factory must never be called and the result is empty.
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let out = bucket_search(
             None,
             &[],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             2,
@@ -881,15 +1004,13 @@ mod tests {
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             Some(&ann),
             &[seg1, seg2],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -921,15 +1042,13 @@ mod tests {
             index_meta: vec![4, 5, 6],
         };
         let ann = FakeAnnSearcher { result: vec![] };
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             Some(&ann),
             &[seg1, seg2],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -950,15 +1069,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_negative_active_row_count_rejected() {
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async { unreachable!() })
-        });
+        let factory = unreachable_search();
         let err = bucket_search(
             None,
             &[],
             &[active("data-1", -1)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             1,
@@ -1014,18 +1131,11 @@ mod tests {
         // No ANN. data-1 has 3 rows: pos0 {1,0} dist 1.0, pos1 {2,0} dist 4.0,
         // pos2 {3,0} dist 9.0. residual allows only {0, 2} -> pos1 excluded even
         // though it is not deletion-vector deleted.
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async {
-                Ok(Box::new(ArrayReader::new(
-                    2,
-                    vec![
-                        Some(vec![1.0, 0.0]),
-                        Some(vec![2.0, 0.0]),
-                        Some(vec![3.0, 0.0]),
-                    ],
-                )) as Box<dyn PkVectorReader>)
-            })
-        });
+        let factory = array_search(vec![
+            Some(vec![1.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+            Some(vec![3.0, 0.0]),
+        ]);
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 2]));
         let out = bucket_search(
@@ -1033,7 +1143,7 @@ mod tests {
             &[],
             &[active("data-1", 3)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
@@ -1070,15 +1180,30 @@ mod tests {
         // residual covers only data-1; data-2 has no entry -> no allowed rows, so
         // data-2 is skipped entirely (its factory reader is never built).
         let calls = std::sync::Mutex::new(Vec::<String>::new());
-        let mut factory = as_factory(|f: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            calls.lock().unwrap().push(f.file_name.clone());
-            Box::pin(async {
-                Ok(Box::new(ArrayReader::new(
-                    2,
-                    vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])],
-                )) as Box<dyn PkVectorReader>)
-            })
-        });
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                calls.lock().unwrap().push(file.file_name.clone());
+                let file_name = file.file_name.clone();
+                let query = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader =
+                        ArrayReader::new(2, vec![Some(vec![1.0, 0.0]), Some(vec![2.0, 0.0])]);
+                    Ok(vec![exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?])
+                })
+            },
+        );
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[0, 1]));
         let out = bucket_search(
@@ -1086,7 +1211,7 @@ mod tests {
             &[],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
@@ -1111,10 +1236,19 @@ mod tests {
         // data-1 has an entry but it is empty -> no allowed rows, skipped without
         // reading. Mirrors a file with no residual matches.
         let calls = std::sync::Mutex::new(0usize);
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            *calls.lock().unwrap() += 1;
-            Box::pin(async { unreachable!("data-1 has an empty allow set and must not be read") })
-        });
+        let factory = as_search(
+            |_: &BucketActiveFile,
+             _: &[&[f32]],
+             _: VectorSearchMetric,
+             _: usize,
+             _: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                *calls.lock().unwrap() += 1;
+                Box::pin(async {
+                    unreachable!("data-1 has an empty allow set and must not be read")
+                })
+            },
+        );
         let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
         residual.insert("data-1".into(), treemap(&[]));
         let out = bucket_search(
@@ -1122,7 +1256,7 @@ mod tests {
             &[],
             &[active("data-1", 3)],
             &HashMap::new(),
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
@@ -1142,18 +1276,11 @@ mod tests {
     async fn test_exact_residual_intersects_with_deletion_vector() {
         // residual allows {0, 1, 2} but the deletion vector deletes pos0; the
         // surviving candidates are the residual-allowed AND not-deleted rows.
-        let mut factory = as_factory(|_: &BucketActiveFile| -> ExactReaderFuture<'_> {
-            Box::pin(async {
-                Ok(Box::new(ArrayReader::new(
-                    2,
-                    vec![
-                        Some(vec![1.0, 0.0]),
-                        Some(vec![2.0, 0.0]),
-                        Some(vec![3.0, 0.0]),
-                    ],
-                )) as Box<dyn PkVectorReader>)
-            })
-        });
+        let factory = array_search(vec![
+            Some(vec![1.0, 0.0]),
+            Some(vec![2.0, 0.0]),
+            Some(vec![3.0, 0.0]),
+        ]);
         let mut dvs: HashMap<String, Arc<DeletionVector>> = HashMap::new();
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // pos0 deleted
@@ -1165,7 +1292,7 @@ mod tests {
             &[],
             &[active("data-1", 3)],
             &dvs,
-            &mut factory,
+            &factory,
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             5,
@@ -1183,6 +1310,46 @@ mod tests {
         assert_eq!(
             results.iter().map(|r| r.row_position).collect::<Vec<_>>(),
             vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_finite_query_fails_before_opening_any_file() {
+        // A non-finite query element must fail loud before the exact-file search
+        // closure is ever invoked (validate-before-OPEN). The recording closure
+        // flips a flag if called; the flag must stay false.
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let factory = as_search(
+            |_: &BucketActiveFile,
+             _: &[&[f32]],
+             _: VectorSearchMetric,
+             _: usize,
+             _: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { unreachable!("closure must not run for a malformed query") })
+            },
+        );
+        let err = bucket_search(
+            None,
+            &[],
+            &[active("data-1", 2)],
+            &HashMap::new(),
+            &factory,
+            &[f32::NAN, 0.0],
+            VectorSearchMetric::L2,
+            2,
+            2,
+            &HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("finite"), "got: {err}");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "the exact-file search closure must not be invoked for a malformed query"
         );
     }
 }
