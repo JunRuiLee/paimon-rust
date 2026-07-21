@@ -20,7 +20,9 @@ use crate::arrow::format::create_format_reader;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, Predicate, RowKind, VALUE_KIND_FIELD_ID};
+use crate::spec::{
+    DataField, DataFileMeta, Predicate, RowKind, ROW_ID_FIELD_NAME, VALUE_KIND_FIELD_ID,
+};
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
@@ -299,7 +301,14 @@ impl DataFileReader {
                 None => (df.clone(), None),
             }
         } else {
-            (read_type.clone(), None)
+            (
+                read_type
+                    .iter()
+                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                    .cloned()
+                    .collect(),
+                None,
+            )
         };
 
         // Remap predicates from table-level to file-level indices.
@@ -339,6 +348,23 @@ impl DataFileReader {
                 local_ranges.as_deref(),
             );
 
+            // Synthesize `_ROW_ID` positionally when it is a requested output
+            // field. `_ROW_ID` is not a physical file column, so it was excluded
+            // from `projected_read_fields`; the values are derived from the row
+            // selection (post-DV/post-range) so they stay in lockstep with the
+            // rows the format reader actually emits. When a row selection is
+            // active the ids follow the selected global ids; otherwise they run
+            // sequentially from `first_row_id`. Consumed by
+            // `pk_vector_position_read` for physical-position recovery.
+            let selected_row_ids = match (file_meta.first_row_id, row_selection.as_ref()) {
+                (Some(first_row_id), Some(ranges)) => {
+                    Some(expand_local_selected_row_ids(first_row_id, ranges))
+                }
+                _ => None,
+            };
+            let mut row_id_cursor = file_meta.first_row_id.unwrap_or(0);
+            let mut row_id_offset = 0usize;
+
             let mut batch_stream = format_reader.read_batch_stream(
                 Box::new(file_reader),
                 file_meta.file_size as u64,
@@ -356,6 +382,17 @@ impl DataFileReader {
                 // Build output columns using index mapping (field-ID-based) or by name.
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(target_schema.fields().len());
                 for (i, target_field) in target_schema.fields().iter().enumerate() {
+                    if target_field.name() == ROW_ID_FIELD_NAME {
+                        columns.push(row_id_column_for_batch(
+                            file_meta.first_row_id,
+                            num_rows,
+                            &mut row_id_cursor,
+                            selected_row_ids.as_deref(),
+                            &mut row_id_offset,
+                        )?);
+                        continue;
+                    }
+
                     let source_col = if let Some(ref idx_map) = index_mapping {
                         let data_idx = idx_map[i];
                         if data_idx == NULL_FIELD_INDEX {
@@ -591,6 +628,60 @@ pub(super) fn expand_selected_row_ids(
         }
     }
     ids
+}
+
+/// Expand row_ranges into local selected global row ids: for each (post-DV,
+/// post-range) 0-based local range, emit `first_row_id + local_id`. The result
+/// is in physical-read order and is consumed batch-by-batch by
+/// `row_id_column_for_batch` to synthesize the `_ROW_ID` column.
+fn expand_local_selected_row_ids(first_row_id: i64, local_ranges: &[RowRange]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for range in local_ranges {
+        for local_id in range.from()..=range.to() {
+            ids.push(first_row_id + local_id);
+        }
+    }
+    ids
+}
+
+/// Produce the `_ROW_ID` column for one emitted batch. With a row selection the
+/// ids are sliced from `selected_row_ids` (advancing `row_id_offset`); without
+/// one they run sequentially from `row_id_cursor`. When the file has no
+/// `first_row_id` a null column is returned. Mirrors the community read path so
+/// `_ROW_ID - first_row_id` recovers the physical position downstream.
+fn row_id_column_for_batch(
+    first_row_id: Option<i64>,
+    num_rows: usize,
+    row_id_cursor: &mut i64,
+    selected_row_ids: Option<&[i64]>,
+    row_id_offset: &mut usize,
+) -> crate::Result<Arc<dyn arrow_array::Array>> {
+    if first_row_id.is_none() {
+        return Ok(Arc::new(Int64Array::new_null(num_rows)));
+    }
+
+    if let Some(selected_row_ids) = selected_row_ids {
+        let end = *row_id_offset + num_rows;
+        if end > selected_row_ids.len() {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Row ID offset out of bounds: need {}..{} but selected_row_ids has {} entries",
+                    *row_id_offset,
+                    end,
+                    selected_row_ids.len()
+                ),
+                source: None,
+            });
+        }
+        let batch_ids = &selected_row_ids[*row_id_offset..end];
+        *row_id_offset = end;
+        return Ok(Arc::new(Int64Array::from(batch_ids.to_vec())));
+    }
+
+    let start = *row_id_cursor;
+    let end = start + num_rows as i64;
+    *row_id_cursor = end;
+    Ok(Arc::new(Int64Array::from((start..end).collect::<Vec<_>>())))
 }
 
 pub(super) fn attach_row_id(
