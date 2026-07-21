@@ -824,8 +824,17 @@ mod tests {
                 .unwrap()
         }
 
+        // Ignored on kwai: this fixture (PK table, NO deletion vectors, default
+        // Deduplicate engine, L0 file) is not a valid PK-vector residual-filter
+        // scenario per Java — `PrimaryKeyVectorScan` only allows a scalar filter
+        // when deletion vectors are enabled and merge-on-read is off, and such PK
+        // tables must enable DV. kwai's `should_apply_value_stats_to_entry` C4
+        // guard therefore correctly keeps L0 stats from pruning here (preserving
+        // sort-merge inputs). The DV-backed sibling test
+        // `plan_prunes_file_on_non_pk_predicate_under_deletion_vectors` is the
+        // valid pruning coverage and passes.
         #[tokio::test]
-        #[ignore = "kwai: PK-L0-Deduplicate stats-prune blocked by C4-correctness guard in should_apply_value_stats_to_entry"]
+        #[ignore = "kwai: no-DV Deduplicate residual PK-vector prefilter is invalid per Java; C4 guard keeps L0 stats from pruning"]
         async fn plan_prunes_file_when_pk_predicate_excludes_it() {
             // Real PK table, one data file with id in [0, PRUNE_ROWS). A predicate
             // `id = OUT_OF_RANGE` cannot match the file's id stats, so the scan drops
