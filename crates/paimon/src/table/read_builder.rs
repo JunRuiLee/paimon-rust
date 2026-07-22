@@ -120,7 +120,7 @@ pub struct ReadBuilder<'a> {
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
     /// Whether column-name matching (projection and predicate column
-    /// resolution) is case-sensitive. Defaults to `true` (exact match).
+    /// resolution) is case-sensitive. Defaults to `false` (kwai: case-insensitive).
     case_sensitive: bool,
 }
 
@@ -132,7 +132,9 @@ impl<'a> ReadBuilder<'a> {
             filter: NormalizedFilter::default(),
             limit: None,
             row_ranges: None,
-            case_sensitive: true,
+            // kwai default: case-INSENSITIVE column matching (ASCII case-fold).
+            // Use `with_case_sensitive(true)` to restore exact-case matching.
+            case_sensitive: false,
         }
     }
 
@@ -150,9 +152,9 @@ impl<'a> ReadBuilder<'a> {
     }
 
     /// Set whether column-name matching (projection and predicate column
-    /// resolution) is case-sensitive. Defaults to `true` (exact match). When set
-    /// to `false`, names are matched by ASCII case-folding and an ambiguous
-    /// (case-colliding) request errors. This mirrors the per-read case
+    /// resolution) is case-sensitive. Defaults to `false` (kwai: case-insensitive
+    /// ASCII case-folding; an ambiguous case-colliding request errors). Pass
+    /// `true` for exact-case matching. This mirrors the per-read case
     /// sensitivity engines like Spark drive from `spark.sql.caseSensitive`,
     /// rather than being a table property.
     ///
@@ -496,12 +498,24 @@ mod tests {
     }
 
     #[test]
-    fn test_read_builder_default_case_sensitive_rejects_wrong_case() {
-        // Default (case-sensitive=true): a wrong-case projection must not resolve.
-        // Resolution is deferred, so the error surfaces at new_read().
+    fn test_read_builder_default_case_insensitive_resolves_wrong_case() {
+        // kwai default (case-insensitive): a wrong-case projection resolves to the
+        // canonical schema field name. Resolution is deferred to new_read().
         let table = mixed_case_table();
         let mut builder = ReadBuilder::new(&table);
         builder.with_projection(&["NAME"]);
+        let read = builder.new_read().unwrap();
+        assert_eq!(read.read_type().len(), 1);
+        assert_eq!(read.read_type()[0].name(), "Name");
+    }
+
+    #[test]
+    fn test_read_builder_explicit_case_sensitive_rejects_wrong_case() {
+        // Explicit with_case_sensitive(true): a wrong-case projection must not
+        // resolve; the error surfaces at new_read() (resolution is deferred).
+        let table = mixed_case_table();
+        let mut builder = ReadBuilder::new(&table);
+        builder.with_case_sensitive(true).with_projection(&["NAME"]);
         let err = builder.new_read().unwrap_err();
         assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
     }
@@ -546,22 +560,25 @@ mod tests {
     }
 
     #[test]
-    fn test_default_case_sensitive_wrong_case_errors_at_new_read() {
-        // Default (no with_case_sensitive) + wrong-case projection errors at read.
+    fn test_default_case_insensitive_wrong_case_resolves_at_new_read() {
+        // kwai default (no with_case_sensitive) + wrong-case projection resolves
+        // to the canonical name at read build time.
         let table = mixed_case_table();
         let mut builder = ReadBuilder::new(&table);
         builder.with_projection(&["name"]);
-        let err = builder.new_read().unwrap_err();
-        assert!(matches!(err, crate::Error::ColumnNotExist { .. }));
+        let read = builder.new_read().unwrap();
+        assert_eq!(read.read_type()[0].name(), "Name");
     }
 
     #[test]
     fn test_new_scan_defers_projection_error_to_new_read() {
         // Contract: new_scan is infallible — it does not resolve the projection,
-        // while the same resolution surfaces the error from new_read.
+        // while the same resolution surfaces the error from new_read. Use a
+        // genuinely-unknown column so it fails to resolve under any case
+        // sensitivity (default is now case-insensitive).
         let table = mixed_case_table();
         let mut builder = ReadBuilder::new(&table);
-        builder.with_projection(&["name"]); // case-only match, default sensitive
+        builder.with_projection(&["definitely_absent"]);
         let _scan = builder.new_scan(); // must not panic / must succeed
         let err = builder.new_read().unwrap_err();
         assert!(matches!(err, crate::Error::ColumnNotExist { .. }));

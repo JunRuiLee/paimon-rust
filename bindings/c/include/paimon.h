@@ -411,13 +411,12 @@ paimon_error *paimon_read_builder_with_projection(paimon_read_builder *rb,
 
 /**
  * Set whether column-name matching for **projection** is case-sensitive for
- * this ReadBuilder. Defaults to `true` (exact match). When `false`, projected
- * column names are matched by ASCII case-folding and an ambiguous
- * (case-colliding) request errors.
+ * this ReadBuilder. Defaults to `false` (case-insensitive: ASCII case-fold, an
+ * ambiguous case-colliding request errors). Pass `true` for exact-case match.
  *
  * This does **not** affect predicate resolution: a predicate is resolved when
  * it is constructed, so its case sensitivity is chosen by which constructor
- * you call — `paimon_predicate_*` (case-sensitive) or the additive
+ * you call — `paimon_predicate_*` (case-insensitive by default) or the additive
  * `paimon_predicate_*_with_case_sensitive` variant — independently of this
  * setting.
  *
@@ -575,9 +574,9 @@ paimon_result_record_batch_reader paimon_table_read_to_arrow(const paimon_table_
  void paimon_arrow_batch_free(paimon_arrow_batch batch) ;
 
 /**
- * Create an equality predicate: `column = datum` (case-sensitive column match).
+ * Create an equality predicate: `column = datum` (case-insensitive column match).
  *
- * For case-insensitive column matching use
+ * For explicit case-sensitive column matching use
  * `paimon_predicate_equal_with_case_sensitive`.
  *
  * # Safety
@@ -603,7 +602,7 @@ paimon_result_predicate paimon_predicate_equal_with_case_sensitive(const paimon_
 ;
 
 /**
- * Create a not-equal predicate: `column != datum` (case-sensitive column match).
+ * Create a not-equal predicate: `column != datum` (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -628,7 +627,7 @@ paimon_result_predicate paimon_predicate_not_equal_with_case_sensitive(const pai
 ;
 
 /**
- * Create a less-than predicate: `column < datum` (case-sensitive column match).
+ * Create a less-than predicate: `column < datum` (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -653,7 +652,7 @@ paimon_result_predicate paimon_predicate_less_than_with_case_sensitive(const pai
 ;
 
 /**
- * Create a less-or-equal predicate: `column <= datum` (case-sensitive column match).
+ * Create a less-or-equal predicate: `column <= datum` (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -678,7 +677,7 @@ paimon_result_predicate paimon_predicate_less_or_equal_with_case_sensitive(const
 ;
 
 /**
- * Create a greater-than predicate: `column > datum` (case-sensitive column match).
+ * Create a greater-than predicate: `column > datum` (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -703,7 +702,7 @@ paimon_result_predicate paimon_predicate_greater_than_with_case_sensitive(const 
 ;
 
 /**
- * Create a greater-or-equal predicate: `column >= datum` (case-sensitive column match).
+ * Create a greater-or-equal predicate: `column >= datum` (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -728,7 +727,7 @@ paimon_result_predicate paimon_predicate_greater_or_equal_with_case_sensitive(co
 ;
 
 /**
- * Create an IS NULL predicate (case-sensitive column match).
+ * Create an IS NULL predicate (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -748,7 +747,7 @@ paimon_result_predicate paimon_predicate_is_null_with_case_sensitive(const paimo
 ;
 
 /**
- * Create an IS NOT NULL predicate (case-sensitive column match).
+ * Create an IS NOT NULL predicate (case-insensitive column match).
  *
  * # Safety
  * `table` and `column` must be valid pointers.
@@ -771,7 +770,7 @@ paimon_result_predicate paimon_predicate_is_not_null_with_case_sensitive(const p
 ;
 
 /**
- * Create an IN predicate: `column IN (datum1, datum2, ...)` (case-sensitive column match).
+ * Create an IN predicate: `column IN (datum1, datum2, ...)` (case-insensitive column match).
  *
  * # Safety
  * `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.
@@ -798,7 +797,7 @@ paimon_result_predicate paimon_predicate_is_in_with_case_sensitive(const paimon_
 ;
 
 /**
- * Create a NOT IN predicate: `column NOT IN (datum1, datum2, ...)` (case-sensitive column match).
+ * Create a NOT IN predicate: `column NOT IN (datum1, datum2, ...)` (case-insensitive column match).
  *
  * # Safety
  * `table`, `column`, and `datums` must be valid pointers. `datums_len` must be the length.

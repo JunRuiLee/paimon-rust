@@ -591,10 +591,12 @@ pub struct PredicateBuilder {
 }
 
 impl PredicateBuilder {
-    /// Create a new builder from schema fields, matching column names
-    /// case-sensitively. Infallible.
+    /// Create a builder that resolves column names case-INSENSITIVELY (ASCII
+    /// case-fold; kwai default). An ambiguous (case-colliding) schema errors at
+    /// resolution. Use [`new_with_case_sensitive`](Self::new_with_case_sensitive)
+    /// with `true` for exact-case matching. Infallible.
     pub fn new(fields: &[DataField]) -> Self {
-        Self::new_with_case_sensitive(fields, true)
+        Self::new_with_case_sensitive(fields, false)
     }
 
     /// Create a builder with explicit case sensitivity. When `case_sensitive`
@@ -1297,8 +1299,20 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_case_sensitive_default_rejects_wrong_case() {
+    fn test_builder_default_case_insensitive_accepts_wrong_case() {
+        // kwai default (case-insensitive): a wrong-case column resolves and the
+        // leaf stores the canonical schema name.
         let pb = PredicateBuilder::new(&test_fields());
+        match pb.equal("ID", Datum::Int(1)).unwrap() {
+            Predicate::Leaf { column, .. } => assert_eq!(column, "id"),
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_explicit_case_sensitive_rejects_wrong_case() {
+        // Explicit case-sensitive builder must reject a wrong-case column.
+        let pb = PredicateBuilder::new_with_case_sensitive(&test_fields(), true);
         assert!(pb.equal("ID", Datum::Int(1)).is_err());
     }
 
