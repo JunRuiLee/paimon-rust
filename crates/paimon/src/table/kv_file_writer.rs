@@ -33,7 +33,6 @@ use crate::spec::{
     extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions, DataFileMeta,
     DataType, MergeEngine, PartialUpdateConfig, RowKind, COMMIT_SNAPSHOT_ID_PENDING,
     EMPTY_SERIALIZED_ROW, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
-
 };
 use crate::table::prepared_files::PreparedFiles;
 use crate::Result;

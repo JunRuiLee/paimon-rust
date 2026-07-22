@@ -247,15 +247,12 @@ impl MergeFunction for VersionedPartialUpdateMergeFunction {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        let batch =
-            RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
-                Error::UnexpectedError {
-                    message: format!(
-                        "Failed to build versioned-partial-update materialized row: {e}"
-                    ),
-                    source: Some(Box::new(e)),
-                }
-            })?;
+        let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build versioned-partial-update materialized row: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?;
 
         Ok(MergeResult::MaterializedRow(batch))
     }
@@ -290,13 +287,14 @@ fn merge_mv_column(
     }
 
     let map_col = struct_arr.column(2);
-    let map_arr = map_col
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| Error::UnexpectedError {
-            message: "versioned-partial-update MV column field 2 is not MapArray".to_string(),
-            source: None,
-        })?;
+    let map_arr =
+        map_col
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| Error::UnexpectedError {
+                message: "versioned-partial-update MV column field 2 is not MapArray".to_string(),
+                source: None,
+            })?;
 
     if !map_arr.is_null(row_idx) {
         // MAP path: iterate this row's entries via offsets, since
@@ -319,7 +317,12 @@ fn merge_mv_column(
             if key_str.is_null(j) {
                 continue;
             }
-            merge_version_entry(state, key_str.value(j).to_string(), value_col.slice(j, 1), mode);
+            merge_version_entry(
+                state,
+                key_str.value(j).to_string(),
+                value_col.slice(j, 1),
+                mode,
+            );
         }
         return Ok(());
     }
@@ -416,9 +419,17 @@ fn build_mv_output(
         vec![key_array, value_concat],
         None, // entries struct itself is non-null
     );
-    let offsets =
-        OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, state.len() as i32]));
-    let map_arr = MapArray::new(entries_field.clone(), offsets, entries_struct, None, *sorted);
+    let offsets = OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+        0i32,
+        state.len() as i32,
+    ]));
+    let map_arr = MapArray::new(
+        entries_field.clone(),
+        offsets,
+        entries_struct,
+        None,
+        *sorted,
+    );
 
     let mv_struct = StructArray::new(
         struct_fields.clone(),
@@ -512,8 +523,22 @@ mod tests {
         let schema = pk_val_schema();
         let buf = build_buf(&schema, &[(1, Some(10)), (1, Some(20))]);
         let rows = vec![
-            row(0, 0, /*snap*/ 1, /*seq*/ 1, RowKind::Insert, VersionedMergeMode::Upsert),
-            row(1, 0, /*snap*/ 1, /*seq*/ 2, RowKind::Insert, VersionedMergeMode::Upsert),
+            row(
+                0,
+                0,
+                /*snap*/ 1,
+                /*seq*/ 1,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
+            row(
+                1,
+                0,
+                /*snap*/ 1,
+                /*seq*/ 2,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
         ];
         let out = run_merge(
             VersionedPartialUpdateMergeFunction::new(&HashMap::new()).unwrap(),
@@ -595,8 +620,22 @@ mod tests {
         // First row has SNAPSHOT=2 (newer); second has SNAPSHOT=1 (older).
         // Without internal sort, the latter would "win" with UPSERT.
         let rows = vec![
-            row(0, 0, /*snap*/ 2, 1, RowKind::Insert, VersionedMergeMode::Upsert),
-            row(1, 0, /*snap*/ 1, 5, RowKind::Insert, VersionedMergeMode::Upsert),
+            row(
+                0,
+                0,
+                /*snap*/ 2,
+                1,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
+            row(
+                1,
+                0,
+                /*snap*/ 1,
+                5,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
         ];
         let out = run_merge(
             VersionedPartialUpdateMergeFunction::new(&HashMap::new()).unwrap(),
@@ -648,11 +687,9 @@ mod tests {
             .map(|(pk, val)| {
                 let pk_arr = Int32Array::from(vec![*pk]);
                 let val_arr = Int32Array::from(vec![*val]);
-                let batch = RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(pk_arr), Arc::new(val_arr)],
-                )
-                .unwrap();
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(pk_arr), Arc::new(val_arr)])
+                        .unwrap();
                 BufferedBatch::Source(batch)
             })
             .collect()
@@ -736,8 +773,22 @@ mod tests {
         let buf = build_buf(&schema, &[(1, Some(10)), (1, Some(99))]);
         // (snap=1, seq=10, val=10) then (snap=2, seq=10, val=99). Snap=2 wins.
         let rows = vec![
-            row(0, 0, /*snap*/ 1, /*seq*/ 10, RowKind::Insert, VersionedMergeMode::Upsert),
-            row(1, 0, /*snap*/ 2, /*seq*/ 10, RowKind::Insert, VersionedMergeMode::Upsert),
+            row(
+                0,
+                0,
+                /*snap*/ 1,
+                /*seq*/ 10,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
+            row(
+                1,
+                0,
+                /*snap*/ 2,
+                /*seq*/ 10,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
         ];
         let out = run_merge(
             VersionedPartialUpdateMergeFunction::new(&HashMap::new()).unwrap(),
@@ -758,8 +809,22 @@ mod tests {
         let buf = build_buf(&schema, &[(1, Some(10)), (1, Some(99))]);
         // (snap=1, seq=20, val=10) then (snap=2, seq=10, val=99). Snap=2 wins.
         let rows = vec![
-            row(0, 0, /*snap*/ 1, /*seq*/ 20, RowKind::Insert, VersionedMergeMode::Upsert),
-            row(1, 0, /*snap*/ 2, /*seq*/ 10, RowKind::Insert, VersionedMergeMode::Upsert),
+            row(
+                0,
+                0,
+                /*snap*/ 1,
+                /*seq*/ 20,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
+            row(
+                1,
+                0,
+                /*snap*/ 2,
+                /*seq*/ 10,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
         ];
         let out = run_merge(
             VersionedPartialUpdateMergeFunction::new(&HashMap::new()).unwrap(),
@@ -784,10 +849,31 @@ mod tests {
         let buf = build_buf(&schema, &[(1, Some(10)), (1, Some(20)), (1, None)]);
         let rows = vec![
             // L1 row at older snapshot.
-            row(0, 0, /*snap*/ 1, /*seq*/ 5, RowKind::Insert, VersionedMergeMode::Upsert),
+            row(
+                0,
+                0,
+                /*snap*/ 1,
+                /*seq*/ 5,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
             // L0 row at newer snapshot, then its DELETE.
-            row(1, 0, /*snap*/ 2, /*seq*/ 10, RowKind::Insert, VersionedMergeMode::Upsert),
-            row(2, 0, /*snap*/ 2, /*seq*/ 11, RowKind::Delete, VersionedMergeMode::Upsert),
+            row(
+                1,
+                0,
+                /*snap*/ 2,
+                /*seq*/ 10,
+                RowKind::Insert,
+                VersionedMergeMode::Upsert,
+            ),
+            row(
+                2,
+                0,
+                /*snap*/ 2,
+                /*seq*/ 11,
+                RowKind::Delete,
+                VersionedMergeMode::Upsert,
+            ),
         ];
         let result = run_merge_raw(
             VersionedPartialUpdateMergeFunction::new(&HashMap::new()).unwrap(),
@@ -865,8 +951,7 @@ mod tests {
             unreachable!()
         };
 
-        let lv_arr: ArrayRef =
-            Arc::new(StringArray::from(vec![latest_version.map(String::from)]));
+        let lv_arr: ArrayRef = Arc::new(StringArray::from(vec![latest_version.map(String::from)]));
         let val_arr: ArrayRef = Arc::new(StringArray::from(vec![latest_value.map(String::from)]));
 
         let map_arr: ArrayRef = match entries {
@@ -878,8 +963,7 @@ mod tests {
                     Arc::new(StringArray::from(Vec::<Option<String>>::new()));
                 let entries_struct =
                     StructArray::new(entry_fields.clone(), vec![empty_keys, empty_vals], None);
-                let offsets =
-                    OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 0i32]));
+                let offsets = OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 0i32]));
                 let nulls = NullBuffer::from(vec![false]);
                 Arc::new(MapArray::new(
                     entries_field.clone(),
@@ -917,8 +1001,7 @@ mod tests {
             vec![lv_arr, val_arr, map_arr],
             None,
         ));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![pk_arr, mv_struct]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![pk_arr, mv_struct]).unwrap();
         BufferedBatch::Source(batch)
     }
 
@@ -1036,7 +1119,10 @@ mod tests {
         let (lv, val, pairs) = extract_mv(&out, 1);
         assert_eq!(lv, "v1");
         assert_eq!(val.as_deref(), Some("original"));
-        assert_eq!(pairs, vec![("v1".to_string(), Some("original".to_string()))]);
+        assert_eq!(
+            pairs,
+            vec![("v1".to_string(), Some("original".to_string()))]
+        );
     }
 
     /// Java parity: `testUpsertExistingKeyUpdatesLatestByLexicographicOrder`

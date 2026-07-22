@@ -19,9 +19,9 @@ use crate::arrow::format::FilePredicates;
 use crate::arrow::residual::{evaluate_predicates_mask, widen_scan_fields};
 use crate::lumina::is_lumina_index_type;
 use crate::lumina::reader::LuminaVectorGlobalIndexReader;
-use crate::lumina::LuminaIndexMeta;
+use crate::lumina::{LuminaIndexMeta, LuminaVectorIndexOptions};
 use crate::spec::{
-    CoreOptions, DataField, FileKind, GlobalIndexSearchMode, IndexManifest, Predicate,
+    CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexManifest, Predicate,
     ROW_ID_FIELD_NAME,
 };
 use crate::table::data_file_reader::DataFileReader;
@@ -43,11 +43,12 @@ use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
-use crate::vindex::is_vindex_index_type;
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
+use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
+use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_select::interleave::interleave_record_batch;
 use futures::{stream, TryStreamExt};
@@ -88,6 +89,16 @@ pub struct VectorSearchBuilder<'a> {
     vector_column: Option<String>,
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
+    projection: Option<Vec<String>>,
+    filter: Option<Predicate>,
+}
+
+pub struct BatchVectorSearchBuilder<'a> {
+    table: &'a Table,
+    vector_column: Option<String>,
+    query_vectors: Option<Vec<Vec<f32>>>,
+    limit: Option<usize>,
+    options: HashMap<String, String>,
     projection: Option<Vec<String>>,
     filter: Option<Predicate>,
 }
@@ -294,13 +305,10 @@ impl<'a> VectorSearchBuilder<'a> {
         })
     }
 
-    /// Shared PK-vector search core for both the search-only and search-and-read
-    /// paths: plan the per-bucket splits, verify the configured metric against each
-    /// ANN segment, build the real vindex ANN scorer and (outside FAST mode) the
-    /// exact-fallback readers, and run the orchestrator. Returns the best-first
-    /// candidates together with the plan and resolved metric so the caller can
-    /// either serialize them to a `SearchResult` or materialize their rows. An
-    /// empty plan yields empty candidates.
+    /// Single-query wrapper over
+    /// [`plan_and_search_pk_candidates_batch`]: plan once, search the one query,
+    /// and return its candidate list. Output is byte-identical to the batch-of-one
+    /// path.
     async fn plan_and_search_pk_candidates(
         &self,
         core: &CoreOptions<'_>,
@@ -308,282 +316,23 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
-        // predicate set via `with_filter` is applied post-recall by re-reading
-        // each candidate file's physical rows (see below). That physical-position
-        // filtering only agrees with the bucket search when the table exposes
-        // physical rows directly: deletion vectors enabled and merge-on-read
-        // disabled. Under merge-on-read (or without deletion vectors) a read
-        // merges multiple key versions, so a scalar filter could retain a stale
-        // version whose live version does not match — a silent wrong-read. Reject
-        // such queries rather than answer them incorrectly. No filter → nothing to
-        // guard, so the search-only and read paths are unaffected.
-        let physical_row_read =
-            core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
-        if self.filter.is_some() && !physical_row_read {
-            return Err(crate::Error::DataInvalid {
-                message:
-                    "primary-key vector pre-filter requires deletion vectors without merge-on-read"
-                        .to_string(),
-                source: None,
-            });
-        }
-        // `primary_key_vector_distance_metric` returns a validated name; re-parse
-        // into the enum for the numeric semantics.
-        let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
-        let index_type = core.primary_key_vector_index_type(pk_col)?;
-        let field_id =
-            find_field_id_by_name(self.table.schema().fields(), pk_col).ok_or_else(|| {
-                crate::Error::DataInvalid {
-                    message: format!("PK-vector column '{pk_col}' not found in schema"),
-                    source: None,
-                }
-            })?;
-        let vector_field = self
-            .table
-            .schema()
-            .fields()
-            .iter()
-            .find(|f| f.name() == pk_col)
-            .cloned()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!("PK-vector column '{pk_col}' not found in schema"),
-                source: None,
-            })?;
-
-        let search_mode = core.global_index_search_mode()?;
-        let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
-
-        // Resolve the refine factor from the query options first, then fall back to
-        // the table options; a positive factor over-fetches indexed (approximate)
-        // candidates so the exact rerank below has a wider pool to reorder. Factor 0
-        // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
-        // path. The two option maps are kept distinct (query options passed
-        // separately from table options) so a broad query key cannot be overridden
-        // by a more specific table key: query options take precedence as a whole.
-        // Resolved before planning so an invalid factor (e.g. a non-numeric value)
-        // fails loud regardless of whether the table currently has searchable data.
-        // kwai's builder carries no per-search options override, so both the query
-        // and table option maps are the table options; a positive refine factor is
-        // resolved from those directly.
-        let refine_factor = configured_refine_factor(
-            self.table.schema().options(),
-            self.table.schema().options(),
-            pk_col,
-            &index_type,
-        )?;
-        let indexed_limit = indexed_search_limit(limit, refine_factor)?;
-
-        let plan = PkVectorScan::new(
+        // kwai's single-query builder carries no query-side options; the batch core
+        // reads all config (dimension, refine-factor, ANN options) from the table
+        // options itself, so pass an empty query-options map (passing the table
+        // options here would wrongly feed them to the vindex option validator).
+        let query_options = HashMap::new();
+        let (mut candidates, plan, metric) = plan_and_search_pk_candidates_batch(
             self.table,
-            field_id,
-            index_type.clone(),
-            self.filter.clone(),
+            &query_options,
+            self.filter.as_ref(),
+            core,
+            pk_col,
+            &[query_vector],
+            limit,
         )
-        .plan()
         .await?;
-        if plan.splits.is_empty() {
-            return Ok((Vec::new(), plan, metric));
-        }
-
-        // Resolve the vector index backend from the single configured index type.
-        // Java enforces one index type per PK table and Rust filters segments to
-        // it, so one backend serves every segment. Computed after the empty-plan
-        // return so an empty table never errors on an unrecognized type.
-        let backend = VectorIndexBackend::from_index_type(&index_type).ok_or_else(|| {
-            crate::Error::DataInvalid {
-                message: format!("unsupported PK vector index backend/type: '{index_type}'"),
-                source: None,
-            }
-        })?;
-
-        // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
-        // but projecting only the vector column with no predicates.
-        let reader = DataFileReader::new(
-            self.table.file_io().clone(),
-            self.table.schema_manager().clone(),
-            self.table.schema().id(),
-            self.table.schema().fields().to_vec(),
-            vec![vector_field.clone()],
-            Vec::new(),
-            core.read_batch_size(),
-            core.parquet_page_index_enabled(),
-            core.parquet_bloom_filter_enabled(),
-        );
-
-        // Real ANN scorer: preload each segment's bytes (keyed by resolved,
-        // globally unique path) and drive the vindex reader from memory.
-        let segment_bytes = preload_segment_bytes(self.table.file_io(), &plan.splits).await?;
-        // Fail loud on a config/segment metric mismatch before scoring, mirroring
-        // Java `PkVectorAnnSegmentSearcher.search`.
-        verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric, backend)?;
-        // kwai's builder carries no per-search options override, so the ANN reader
-        // is driven with the table options directly.
-        let options = self.table.schema().options().clone();
-        let search_options = options.clone();
-        let field_name = pk_col.to_string();
-        let scorer: crate::vindex::pkvector::ann::Scorer =
-            Box::new(move |segment: &BucketAnnSegment, search: &VectorSearch| {
-                let data = segment_bytes
-                    .get(&segment.path)
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: "missing preloaded ANN bytes for segment".to_string(),
-                        source: None,
-                    })?
-                    .clone();
-                let io_meta = GlobalIndexIOMeta::new(
-                    segment.path.clone(),
-                    segment.file_size,
-                    segment.index_meta.clone(),
-                );
-                match backend {
-                    VectorIndexBackend::Lumina => {
-                        let mut reader =
-                            LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
-                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
-                    }
-                    VectorIndexBackend::Vindex => {
-                        let mut reader =
-                            VindexVectorGlobalIndexReader::new(io_meta, options.clone());
-                        reader.visit_vector_search(search, |_| Ok(Cursor::new(data)))
-                    }
-                }
-            });
-        let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
-
-        // Residual (post-recall) filtering: for each candidate file, re-read its
-        // physical rows and keep the positions whose rows satisfy the filter. The
-        // per-split allow-list is threaded into the bucket search so the residual
-        // folds into recall (best-first order and Top-K are preserved). Built only
-        // when a filter is set; otherwise `None` leaves the search unfiltered. The
-        // residual reader projects only the predicate columns and carries no
-        // pushdown; `residual_positions_by_file` recovers each surviving row's
-        // file-local physical position from its ordinal in the unfiltered scan (no
-        // `_ROW_ID`, no `first_row_id`). A file the allow-list leaves empty is
-        // skipped by the bucket search without opening an exact reader.
-        let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match &self.filter {
-            Some(filter) => {
-                let file_predicates = FilePredicates {
-                    predicates: vec![filter.clone()],
-                    file_fields: self.table.schema().fields().to_vec(),
-                };
-                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
-                let residual_reader = DataFileReader::new(
-                    self.table.file_io().clone(),
-                    self.table.schema_manager().clone(),
-                    self.table.schema().id(),
-                    self.table.schema().fields().to_vec(),
-                    residual_read_type,
-                    Vec::new(),
-                    core.read_batch_size(),
-                    core.parquet_page_index_enabled(),
-                    core.parquet_bloom_filter_enabled(),
-                );
-                let mut per_split = Vec::with_capacity(plan.splits.len());
-                for split in &plan.splits {
-                    per_split.push(
-                        residual_positions_by_file(
-                            &residual_reader,
-                            &split.data_split,
-                            &split.active_files,
-                            &file_predicates,
-                        )
-                        .await?,
-                    );
-                }
-                Some(per_split)
-            }
-            None => None,
-        };
-
-        // Build the exact-fallback search on demand: the kernel calls this only
-        // for a file it actually searches (uncovered by ANN, residual-allowed, and
-        // only when the search mode is not FAST). Everything the future needs is
-        // cloned/owned up front so it borrows neither the split nor the file across
-        // the await. The search streams the file's vector column one Arrow batch at
-        // a time into per-query bounded heaps (the caller passes a single query).
-        let reader_for_factory = reader.clone();
-        let vector_field_for_factory = vector_field.clone();
-        let factory = as_split_exact_file_search(
-            move |_split_index: usize,
-                  split: &PkVectorSearchSplit,
-                  file: &BucketActiveFile,
-                  queries: &[&[f32]],
-                  metric: VectorSearchMetric,
-                  exact_limit: usize,
-                  is_excluded: &(dyn Fn(i64) -> bool + Sync)|
-                  -> ExactFileSearchFuture<'_> {
-                let reader = reader_for_factory.clone();
-                let vector_field = vector_field_for_factory.clone();
-                let data_split = split.data_split.clone();
-                let active = BucketActiveFile {
-                    file_name: file.file_name.clone(),
-                    row_count: file.row_count,
-                };
-                let owned_queries: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
-                Box::pin(async move {
-                    let factory =
-                        DataFilePkVectorReaderFactory::new(reader, data_split, vector_field)?;
-                    let query_refs: Vec<&[f32]> =
-                        owned_queries.iter().map(|q| q.as_slice()).collect();
-                    factory
-                        .search_file(&active, &query_refs, metric, exact_limit, is_excluded)
-                        .await
-                })
-            },
-        );
-
-        let search: OrchestratorSearchResult = PkVectorOrchestrator::new(reader)
-            .search_candidates(
-                &plan.splits,
-                query_vector,
-                metric,
-                limit,
-                indexed_limit,
-                Some(&ann_searcher),
-                &factory,
-                &search_options,
-                skip_exact_fallback,
-                residual_by_split.as_deref(),
-            )
-            .await?;
-
-        // Exact rerank of the approximate candidates when a refine factor is set;
-        // exact-fallback candidates are already exact and are not reranked. With no
-        // refine factor this is a plain merge, byte-identical to the no-rerank path.
-        let indexed = if refine_factor > 0 && !search.indexed.is_empty() {
-            // Vector-only reader (project just the vector field); the position read
-            // appends _PKEY_VECTOR_POSITION itself and injects _ROW_ID internally.
-            let rerank_reader = DataFileReader::new(
-                self.table.file_io().clone(),
-                self.table.schema_manager().clone(),
-                self.table.schema().id(),
-                self.table.schema().fields().to_vec(),
-                vec![vector_field.clone()],
-                Vec::new(),
-                core.read_batch_size(),
-                core.parquet_page_index_enabled(),
-                core.parquet_bloom_filter_enabled(),
-            );
-            rerank_indexed_positional(
-                &rerank_reader,
-                search.indexed,
-                &plan.splits,
-                query_vector,
-                metric,
-                limit,
-                &vector_field,
-            )
-            .await?
-        } else {
-            search.indexed
-        };
-        // Merge the (possibly reranked) indexed list with the exact-fallback list
-        // back into one best-first list bounded to the caller's limit; the
-        // downstream materialization consumes a single ranked candidate list.
-        let candidates = merge_candidates(indexed, search.exact, limit);
-
-        Ok((candidates, plan, metric))
+        debug_assert_eq!(candidates.len(), 1);
+        Ok((candidates.remove(0), plan, metric))
     }
 
     /// Materialize the best-first PK-vector search hits into Arrow rows. Mirrors
@@ -613,10 +362,6 @@ impl<'a> VectorSearchBuilder<'a> {
         // Default (no `with_projection`) is every user table column.
         let read_type = self.resolve_materialize_read_type()?;
 
-        if candidates.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-
         // A separate, predicate-free materialization reader projecting the user
         // columns (the search reader projects only the vector column). Mirrors
         // `table_read.rs::new_data_file_reader` with an empty predicate list.
@@ -631,6 +376,25 @@ impl<'a> VectorSearchBuilder<'a> {
             core.parquet_page_index_enabled(),
             core.parquet_bloom_filter_enabled(),
         );
+
+        Self::materialize_candidates(candidates, &plan, metric, &materialize_reader).await
+    }
+
+    /// Materialize one best-first candidate list into an Arrow stream, best-first,
+    /// with a `__paimon_search_score` column and `_PKEY_VECTOR_POSITION` stripped.
+    /// An empty candidate list yields an empty stream (never skipped) so a batch
+    /// caller preserves per-query arity. `materialize_reader` must project the
+    /// output columns (predicate-free). Both the single-query and batch read paths
+    /// use this so their materialization is identical.
+    async fn materialize_candidates(
+        candidates: Vec<PkVectorCandidate>,
+        plan: &PkVectorScanPlan,
+        metric: VectorSearchMetric,
+        materialize_reader: &DataFileReader,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        if candidates.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
 
         // Rank each candidate by its best-first position, then reduce the physical
         // materialization order back to best-first. The orchestrator emits rows in
@@ -691,10 +455,7 @@ impl<'a> VectorSearchBuilder<'a> {
             None => self.table.schema().fields().to_vec(),
             Some(names) => {
                 for name in names {
-                    if name == PKEY_VECTOR_POSITION_COLUMN
-                        || name == SEARCH_SCORE_COLUMN
-                        || name == ROW_ID_FIELD_NAME
-                    {
+                    if is_reserved_read_column(name) {
                         return Err(crate::Error::DataInvalid {
                             message: format!(
                                 "vector search read projection must not request reserved column '{name}'"
@@ -724,6 +485,671 @@ impl<'a> VectorSearchBuilder<'a> {
                 resolved
             }
         };
+        // The default projection returns every user column, so a user column
+        // whose name collides with an injected metadata column must be rejected
+        // on the resolved field list too — not only when explicitly requested.
+        ensure_no_reserved_read_columns(&fields)?;
+        Ok(fields)
+    }
+}
+
+/// Names a read injects as metadata columns — `__paimon_search_score`,
+/// `_PKEY_VECTOR_POSITION`, and `_ROW_ID` — that a materialized read type must
+/// not reuse for a user column.
+fn is_reserved_read_column(name: &str) -> bool {
+    name == PKEY_VECTOR_POSITION_COLUMN || name == SEARCH_SCORE_COLUMN || name == ROW_ID_FIELD_NAME
+}
+
+/// Reject a materialized read type whose resolved fields contain a reserved
+/// metadata column name. Applied to the RESOLVED field list so the default
+/// (all user columns) projection is covered, not only an explicit one.
+fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Result<()> {
+    for field in fields {
+        if is_reserved_read_column(field.name()) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "vector search read projection must not include reserved column '{}'",
+                    field.name()
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Batch PK-vector search core shared by the single and batch builders: plan ONE
+/// per-bucket split set, segment preload, ANN scorer, exact-fallback search
+/// closure, and residual allow-list (all query-independent), then run
+/// `search_candidates_batch` ONCE so N queries share the opened readers. Per
+/// query, the approximate candidates are exact-reranked (when a refine factor is
+/// set) and merged with the exact fallback into one best-first list bounded to
+/// `limit`. Returns one candidate list per query (outer index aligned to
+/// `queries`), together with the shared plan and resolved metric so the caller can
+/// materialize each query's rows. An empty plan yields one empty candidate list
+/// per query.
+///
+/// The residual allow-list depends only on `filter` and the plan, NOT the query
+/// vector, so it is computed once and the SAME slice is shared across all queries.
+/// Rerank stays per-query (each query reranks its own indexed list).
+#[allow(clippy::too_many_arguments)]
+async fn plan_and_search_pk_candidates_batch(
+    table: &Table,
+    query_options: &HashMap<String, String>,
+    filter: Option<&Predicate>,
+    core: &CoreOptions<'_>,
+    pk_col: &str,
+    queries: &[&[f32]],
+    limit: usize,
+) -> crate::Result<(
+    Vec<Vec<PkVectorCandidate>>,
+    PkVectorScanPlan,
+    VectorSearchMetric,
+)> {
+    // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
+    // predicate set via `with_filter` is applied post-recall by re-reading each
+    // candidate file's physical rows (see below). That physical-position filtering
+    // only agrees with the bucket search when the table exposes physical rows
+    // directly: deletion vectors enabled and merge-on-read disabled. Under
+    // merge-on-read (or without deletion vectors) a read merges multiple key
+    // versions, so a scalar filter could retain a stale version whose live version
+    // does not match — a silent wrong-read. Reject such queries rather than answer
+    // them incorrectly. No filter → nothing to guard, so the search-only and read
+    // paths are unaffected.
+    let physical_row_read =
+        core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
+    if filter.is_some() && !physical_row_read {
+        return Err(crate::Error::DataInvalid {
+            message:
+                "primary-key vector pre-filter requires deletion vectors without merge-on-read"
+                    .to_string(),
+            source: None,
+        });
+    }
+    // `primary_key_vector_distance_metric` returns a validated name; re-parse into
+    // the enum for the numeric semantics.
+    let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
+    let index_type = core.primary_key_vector_index_type(pk_col)?;
+    let field_id = find_field_id_by_name(table.schema().fields(), pk_col).ok_or_else(|| {
+        crate::Error::DataInvalid {
+            message: format!("PK-vector column '{pk_col}' not found in schema"),
+            source: None,
+        }
+    })?;
+    let vector_field = table
+        .schema()
+        .fields()
+        .iter()
+        .find(|f| f.name() == pk_col)
+        .cloned()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("PK-vector column '{pk_col}' not found in schema"),
+            source: None,
+        })?;
+
+    let search_mode = core.global_index_search_mode()?;
+    let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
+
+    // A non-positive limit is invalid regardless of the plan; reject it before
+    // planning so an empty plan cannot mask it with empty results.
+    if limit == 0 {
+        return Err(crate::Error::DataInvalid {
+            message: "vector search limit must be positive".to_string(),
+            source: None,
+        });
+    }
+
+    // Resolve the refine factor from the query options first, then fall back to
+    // the table options; a positive factor over-fetches indexed (approximate)
+    // candidates so the exact rerank below has a wider pool to reorder. Factor 0
+    // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
+    // path. The two option maps are kept distinct (query options passed
+    // separately from table options) so a broad query key cannot be overridden
+    // by a more specific table key: query options take precedence as a whole.
+    // Resolved before planning so an invalid factor (e.g. a non-numeric value)
+    // fails loud regardless of whether the table currently has searchable data.
+    let refine_factor =
+        configured_refine_factor(query_options, table.schema().options(), pk_col, &index_type)?;
+    let indexed_limit = indexed_search_limit(limit, refine_factor)?;
+
+    // Validate every query against the vector column's dimension (and finiteness)
+    // before planning or any read, so a malformed query fails loud even when the
+    // plan turns out empty. VECTOR<FLOAT> carries the dimension in its type;
+    // ARRAY<FLOAT> gets the index dimension from the same vindex option resolver
+    // used by index reads. Both valid PK-vector column shapes must reject NaN/Inf
+    // up front, not only after a non-empty plan opens readers.
+    if let Some(dimension) = pk_vector_query_dimension(
+        table.schema().options(),
+        query_options,
+        &index_type,
+        &vector_field,
+    )? {
+        for query in queries {
+            validate_query(query, dimension)?;
+        }
+    }
+
+    let plan = PkVectorScan::new(table, field_id, index_type.clone(), filter.cloned())
+        .plan()
+        .await?;
+    if plan.splits.is_empty() {
+        return Ok((vec![Vec::new(); queries.len()], plan, metric));
+    }
+
+    // Resolve the vector index backend from the single configured index type.
+    // Java enforces one index type per PK table and Rust filters segments to it,
+    // so one backend serves every segment. Computed after the empty-plan return so
+    // an empty table never errors on an unrecognized type.
+    let backend = VectorIndexBackend::from_index_type(&index_type).ok_or_else(|| {
+        crate::Error::DataInvalid {
+            message: format!("unsupported PK vector index backend/type: '{index_type}'"),
+            source: None,
+        }
+    })?;
+
+    // Production data-file reader, mirroring `table_read.rs::new_data_file_reader`
+    // but projecting only the vector column with no predicates.
+    let reader = DataFileReader::new(
+        table.file_io().clone(),
+        table.schema_manager().clone(),
+        table.schema().id(),
+        table.schema().fields().to_vec(),
+        vec![vector_field.clone()],
+        Vec::new(),
+        core.read_batch_size(),
+        core.parquet_page_index_enabled(),
+        core.parquet_bloom_filter_enabled(),
+    );
+
+    // Real ANN scorer: preload each segment's bytes (keyed by resolved, globally
+    // unique path) and drive the vindex reader from memory. The reader is opened
+    // once per segment and every query in the batch is searched against it,
+    // mirroring the shared-reader batch search.
+    let segment_bytes = preload_segment_bytes(table.file_io(), &plan.splits).await?;
+    // Fail loud on a config/segment metric mismatch before scoring, mirroring Java
+    // `PkVectorAnnSegmentSearcher.search`.
+    verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric, backend)?;
+    let options = {
+        let mut o = table.schema().options().clone();
+        o.extend(query_options.clone());
+        o
+    };
+    let search_options = options.clone();
+    let field_name = pk_col.to_string();
+    let scorer: crate::vindex::pkvector::ann::BatchScorer = Box::new(
+        move |segment: &BucketAnnSegment, searches: &[VectorSearch]| {
+            let data = segment_bytes
+                .get(&segment.path)
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "missing preloaded ANN bytes for segment".to_string(),
+                    source: None,
+                })?
+                .clone();
+            let io_meta = GlobalIndexIOMeta::new(
+                segment.path.clone(),
+                segment.file_size,
+                segment.index_meta.clone(),
+            );
+            match backend {
+                VectorIndexBackend::Lumina => {
+                    let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
+                    reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
+                }
+                VectorIndexBackend::Vindex => {
+                    let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone());
+                    reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
+                }
+            }
+        },
+    );
+    let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
+
+    // Residual (post-recall) filtering: for each candidate file, re-read its
+    // physical rows and keep the positions whose rows satisfy the filter. The
+    // per-split allow-list is threaded into the bucket search so the residual folds
+    // into recall (best-first order and Top-K are preserved). Built only when a
+    // filter is set; otherwise `None` leaves the search unfiltered. The residual
+    // depends only on the filter and the plan, not the query vector, so it is
+    // computed once here and shared across every query in the batch. The residual
+    // reader projects only the predicate columns and carries no pushdown;
+    // `residual_positions_by_file` recovers each surviving row's file-local
+    // physical position from its ordinal in the unfiltered scan (no `_ROW_ID`, no
+    // `first_row_id`). A file the allow-list leaves empty is skipped by the bucket
+    // search without opening an exact reader.
+    let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match filter {
+        Some(filter) => {
+            let file_predicates = FilePredicates {
+                predicates: vec![filter.clone()],
+                file_fields: table.schema().fields().to_vec(),
+            };
+            let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
+            let residual_reader = DataFileReader::new(
+                table.file_io().clone(),
+                table.schema_manager().clone(),
+                table.schema().id(),
+                table.schema().fields().to_vec(),
+                residual_read_type,
+                Vec::new(),
+                core.read_batch_size(),
+                core.parquet_page_index_enabled(),
+                core.parquet_bloom_filter_enabled(),
+            );
+            let mut per_split = Vec::with_capacity(plan.splits.len());
+            for split in &plan.splits {
+                per_split.push(
+                    residual_positions_by_file(
+                        &residual_reader,
+                        &split.data_split,
+                        &split.active_files,
+                        &file_predicates,
+                    )
+                    .await?,
+                );
+            }
+            Some(per_split)
+        }
+        None => None,
+    };
+
+    // Build the exact-fallback search on demand: the kernel calls this only for a
+    // file it actually searches (uncovered by ANN, residual-allowed, and only when
+    // the search mode is not FAST). Everything the future needs is cloned/owned up
+    // front so it borrows neither the split nor the file across the await. The
+    // search streams the file's vector column one Arrow batch at a time into
+    // per-query bounded heaps (all queries share one stream).
+    let reader_for_factory = reader.clone();
+    let vector_field_for_factory = vector_field.clone();
+    let factory = as_split_exact_file_search(
+        move |_split_index: usize,
+              split: &PkVectorSearchSplit,
+              file: &BucketActiveFile,
+              queries: &[&[f32]],
+              metric: VectorSearchMetric,
+              exact_limit: usize,
+              is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+              -> ExactFileSearchFuture<'_> {
+            let reader = reader_for_factory.clone();
+            let vector_field = vector_field_for_factory.clone();
+            let data_split = split.data_split.clone();
+            let active = BucketActiveFile {
+                file_name: file.file_name.clone(),
+                row_count: file.row_count,
+            };
+            let owned_queries: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
+            Box::pin(async move {
+                let factory = DataFilePkVectorReaderFactory::new(reader, data_split, vector_field)?;
+                let query_refs: Vec<&[f32]> = owned_queries.iter().map(|q| q.as_slice()).collect();
+                factory
+                    .search_file(&active, &query_refs, metric, exact_limit, is_excluded)
+                    .await
+            })
+        },
+    );
+
+    // Resolve the refine factor from the query options first, then fall back to the
+    // table options; a positive factor over-fetches indexed (approximate)
+    // candidates so the exact rerank below has a wider pool to reorder. Factor 0
+    // (unset) leaves `indexed_limit == limit`, byte-identical to the no-rerank
+    // path. The two option maps are kept distinct (query options passed separately
+    // from table options) so a broad query key cannot be overridden by a more
+    // specific table key: query options take precedence as a whole. `search_options`
+    // above is the merged view used only to drive the ANN read.
+
+    let searches: Vec<OrchestratorSearchResult> = PkVectorOrchestrator::new(reader)
+        .search_candidates_batch(
+            &plan.splits,
+            queries,
+            metric,
+            limit,
+            indexed_limit,
+            Some(&ann_searcher),
+            &factory,
+            &search_options,
+            skip_exact_fallback,
+            residual_by_split.as_deref(),
+        )
+        .await?;
+
+    // Per query: exact rerank of the approximate candidates when a refine factor is
+    // set (exact-fallback candidates are already exact and are not reranked), then
+    // merge the (possibly reranked) indexed list with the exact list into one
+    // best-first list bounded to the caller's limit. With no refine factor the
+    // rerank is a plain merge, byte-identical to the no-rerank path. Each query
+    // reranks its OWN indexed candidates.
+    let mut per_query_candidates = Vec::with_capacity(searches.len());
+    for (query_index, search) in searches.into_iter().enumerate() {
+        let query_vector = queries[query_index];
+        let indexed = if refine_factor > 0 && !search.indexed.is_empty() {
+            // Vector-only reader (project just the vector field); the position read
+            // appends _PKEY_VECTOR_POSITION itself and injects _ROW_ID internally.
+            let rerank_reader = DataFileReader::new(
+                table.file_io().clone(),
+                table.schema_manager().clone(),
+                table.schema().id(),
+                table.schema().fields().to_vec(),
+                vec![vector_field.clone()],
+                Vec::new(),
+                core.read_batch_size(),
+                core.parquet_page_index_enabled(),
+                core.parquet_bloom_filter_enabled(),
+            );
+            rerank_indexed_positional(
+                &rerank_reader,
+                search.indexed,
+                &plan.splits,
+                query_vector,
+                metric,
+                limit,
+                &vector_field,
+            )
+            .await?
+        } else {
+            search.indexed
+        };
+        per_query_candidates.push(merge_candidates(indexed, search.exact, limit));
+    }
+
+    Ok((per_query_candidates, plan, metric))
+}
+
+impl<'a> BatchVectorSearchBuilder<'a> {
+    pub(crate) fn new(table: &'a Table) -> Self {
+        Self {
+            table,
+            vector_column: None,
+            query_vectors: None,
+            limit: None,
+            options: HashMap::new(),
+            projection: None,
+            filter: None,
+        }
+    }
+
+    pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
+        self.vector_column = Some(name.to_string());
+        self
+    }
+
+    pub fn with_query_vectors(&mut self, vectors: Vec<Vec<f32>>) -> &mut Self {
+        self.query_vectors = Some(vectors);
+        self
+    }
+
+    pub fn with_limit(&mut self, limit: usize) -> &mut Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
+        self
+    }
+
+    /// Attach a residual scalar predicate applied *after* vector recall on the
+    /// primary-key vector path, shared across every query in the batch. Mirrors
+    /// the single [`VectorSearchBuilder::with_filter`]: only the primary-key
+    /// vector path (via [`execute_read`](Self::execute_read)) consumes it, and only
+    /// when the table exposes physical rows directly (deletion vectors without
+    /// merge-on-read); otherwise the query fails loud.
+    pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Restrict the columns materialized by [`execute_read`](Self::execute_read) to
+    /// `cols` (plus the always-appended `__paimon_search_score`). Without this call
+    /// `execute_read` materializes every user table column. Only affects
+    /// `execute_read`; `execute` ignores it.
+    pub fn with_projection(&mut self, cols: &[&str]) -> &mut Self {
+        self.projection = Some(cols.iter().map(|c| c.to_string()).collect());
+        self
+    }
+
+    pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        // Fail closed: like `execute_read` and the single-query builder, this
+        // returns data-derived row ids/scores outside `TableScan`/`TableRead`,
+        // so it must refuse a `query-auth.enabled` table before any fast path
+        // (an empty snapshot would otherwise return empty results and bypass it).
+        let core = CoreOptions::new(self.table.schema().options());
+        if core.query_auth_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "vector search does not support query-auth.enabled tables".to_string(),
+            });
+        };
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        if vector_column.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Vector column must be set via with_vector_column()".to_string(),
+            });
+        }
+
+        let query_vectors =
+            self.query_vectors
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vectors must be set via with_query_vectors()".to_string(),
+                })?;
+        if query_vectors.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Query vectors must be set via with_query_vectors()".to_string(),
+            });
+        }
+
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+        if limit == 0 || limit > i32::MAX as usize {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Limit must be between 1 and {}, got: {limit}", i32::MAX),
+            });
+        }
+
+        // A primary-key vector table exposes no global row ids, so scored batch
+        // search is unsupported: `execute()` returns `SearchResult`s (global row
+        // ids). Fail loud and direct callers to the materialized batch
+        // `execute_read`, mirroring the single-query builder's PK guard. Membership
+        // is resolved via the non-erroring columns accessor so a malformed
+        // PK-vector config cannot abort an unrelated DE query.
+        if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+            if targets_pk_column {
+                return Err(crate::Error::DataInvalid {
+                    message: "primary-key vector search does not produce global row ids; use the materialized read (execute_read) instead".to_string(),
+                    source: None,
+                });
+            }
+        }
+
+        // The data-evolution (global-index) fall-through path cannot honor a
+        // residual filter — it never reads physical rows. Rather than silently
+        // drop the predicate and return unfiltered results, fail loud when a
+        // filter is set on a batch that does not resolve to the primary-key
+        // vector path, mirroring the single-query builder.
+        if self.filter.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "vector search filter is only supported on the primary-key vector path"
+                    .to_string(),
+                source: None,
+            });
+        }
+
+        // kwai's batch builder supports primary-key vector columns only (Decision 3).
+        // The data-evolution (global-index) path would require helpers kwai lacks
+        // (deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
+        // unindexed_ranges_for_global_index_entries). Rather than silently fall back
+        // or loop the single-query DE path (an unreviewed shim), fail loud and direct
+        // callers to the single-query builder for DE queries.
+        Err(crate::Error::Unsupported {
+            message: "batch vector search supports primary-key vector columns only; for data-evolution (global-index) queries, use the single-query vector search builder instead".to_string(),
+        })
+    }
+
+    /// Run a batch of vector searches and materialize each query's matching rows as
+    /// a best-first Arrow stream. Supported only for the primary-key vector path
+    /// (which alone can materialize physical rows). The returned `Vec` is aligned
+    /// strictly to the input query order and its length always equals the query
+    /// count — a query with no hits yields an empty stream, never a missing entry.
+    /// If ANY query errors (e.g. a malformed vector) the whole call fails loud with
+    /// no partial `Vec` of streams. Output columns are the projected user table
+    /// columns (all user columns by default, or those set via
+    /// [`with_projection`](Self::with_projection)) plus `__paimon_search_score`;
+    /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
+    ///
+    /// A data-evolution (global-index) table fails loud: its batch search returns
+    /// scored global row-ids, not materialized rows, so callers use
+    /// [`execute`](Self::execute) instead.
+    pub async fn execute_read(&self) -> crate::Result<Vec<ArrowRecordBatchStream>> {
+        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        let core = CoreOptions::new(self.table.schema().options());
+        if core.query_auth_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "vector search does not support query-auth.enabled tables".to_string(),
+            });
+        };
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let query_vectors =
+            self.query_vectors
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vectors must be set via with_query_vectors()".to_string(),
+                })?;
+        if query_vectors.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Query vectors must be set via with_query_vectors()".to_string(),
+            });
+        }
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        // Only the primary-key vector path can materialize rows. The data-evolution
+        // (global-index) path returns data-derived row-ids, not table rows, so a
+        // batch read against it (or a non-PK-vector column) fails loud, directing
+        // callers to `execute()`.
+        let targets_pk_column = core.primary_key_vector_index_enabled()
+            && core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+        if !targets_pk_column {
+            return Err(crate::Error::DataInvalid {
+                message: "batch vector read is only supported on the primary-key vector path; data-evolution batch search returns scored row ids, use execute() instead".to_string(),
+                source: None,
+            });
+        }
+
+        let pk_col = core.primary_key_vector_index_column()?;
+        let query_refs: Vec<&[f32]> = query_vectors.iter().map(|q| q.as_slice()).collect();
+
+        // Resolve the materialization read-type up front so an invalid projection
+        // (unknown column, or a reserved metadata / row-id name) fails loud
+        // unconditionally, before any read — a whole-call failure, not a partial
+        // Vec.
+        let read_type = self.resolve_materialize_read_type()?;
+
+        // One shared plan / segment preload / residual across all N queries; the
+        // per-query candidate lists come back in strict input order. Any query
+        // error (or a shared-plan error) propagates here, so no partial Vec is
+        // returned.
+        let (per_query_candidates, plan, metric) = plan_and_search_pk_candidates_batch(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &pk_col,
+            &query_refs,
+            limit,
+        )
+        .await?;
+
+        let materialize_reader = DataFileReader::new(
+            self.table.file_io().clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema().fields().to_vec(),
+            read_type,
+            Vec::new(),
+            core.read_batch_size(),
+            core.parquet_page_index_enabled(),
+            core.parquet_bloom_filter_enabled(),
+        );
+
+        // Materialize each query's candidates into its own stream, preserving
+        // arity: an empty candidate list yields an empty stream. Build every stream
+        // before returning so a materialization error fails the whole call with no
+        // partial Vec.
+        let mut streams = Vec::with_capacity(per_query_candidates.len());
+        for candidates in per_query_candidates {
+            streams.push(
+                VectorSearchBuilder::materialize_candidates(
+                    candidates,
+                    &plan,
+                    metric,
+                    &materialize_reader,
+                )
+                .await?,
+            );
+        }
+        Ok(streams)
+    }
+
+    /// Resolve the projected fields for the materialization read-type. Default
+    /// (no projection set) is all user table fields; otherwise the requested names
+    /// resolved via `resolve_projected_fields`. Rejects reserved metadata names and
+    /// `_ROW_ID` so a user cannot request a hidden column. Mirrors the single
+    /// builder's resolver.
+    fn resolve_materialize_read_type(&self) -> crate::Result<Vec<DataField>> {
+        let fields = match &self.projection {
+            None => self.table.schema().fields().to_vec(),
+            Some(names) => {
+                for name in names {
+                    if is_reserved_read_column(name) {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "vector search read projection must not request reserved column '{name}'"
+                            ),
+                            source: None,
+                        });
+                    }
+                }
+                let full_name = self.table.identifier().full_name();
+                let field_map: HashMap<&str, &DataField> = self
+                    .table
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (f.name(), f))
+                    .collect();
+                let mut resolved = Vec::new();
+                for name in names {
+                    let field = field_map.get(name.as_str()).ok_or_else(|| {
+                        crate::Error::ColumnNotExist {
+                            full_name: full_name.clone(),
+                            column: name.clone(),
+                        }
+                    })?;
+                    resolved.push((*field).clone());
+                }
+                resolved
+            }
+        };
+        // The default projection returns every user column, so a user column
+        // whose name collides with an injected metadata column must be rejected
+        // on the resolved field list too — not only when explicitly requested.
+        ensure_no_reserved_read_columns(&fields)?;
         Ok(fields)
     }
 }
@@ -982,114 +1408,45 @@ fn verify_pk_vector_segment_metrics(
     Ok(())
 }
 
-/// Over-fetch the indexed (approximate) candidate pool so the exact rerank has a
-/// wider set to reorder. A refine factor of 0 (unset) leaves the limit unchanged
-/// (byte-identical to the no-rerank path); a positive factor multiplies it,
-/// failing loud on overflow.
-fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
-    if refine_factor == 0 {
-        return Ok(limit);
-    }
-    let search_limit =
-        limit
-            .checked_mul(refine_factor)
-            .ok_or_else(|| crate::Error::ConfigInvalid {
-                message: format!(
-                    "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
-                ),
-            })?;
-    if search_limit > i32::MAX as usize {
-        return Err(crate::Error::ConfigInvalid {
-            message: format!(
-                "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
-            ),
-        });
-    }
-    Ok(search_limit)
-}
-
-fn normalize_metric(metric: &str) -> String {
-    metric.to_ascii_lowercase().replace('-', "_")
-}
-
-/// Option-key prefixes probed (in order) for the refine-factor setting of a given
-/// field/index type: `fields.<field>.<index_type>.`, its normalized variant, an
-/// `ivf.` collapse, then the bare field/global scope.
-fn indexed_type_prefixes(field_name: &str, index_type: &str) -> Vec<String> {
-    let mut prefixes = Vec::new();
-    add_refine_prefixes(&mut prefixes, &format!("fields.{field_name}."), index_type);
-    add_refine_prefixes(&mut prefixes, "", index_type);
-    prefixes
-}
-
-fn add_refine_prefixes(prefixes: &mut Vec<String>, base: &str, index_type: &str) {
-    if !index_type.is_empty() {
-        prefixes.push(format!("{base}{index_type}."));
-        let normalized = normalize_metric(index_type);
-        if normalized != index_type {
-            prefixes.push(format!("{base}{normalized}."));
-        }
-        if normalized.starts_with("ivf") {
-            prefixes.push(format!("{base}ivf."));
-        }
-    }
-    prefixes.push(base.to_string());
-}
-
-/// Resolve the configured refine factor, preferring the query options over the
-/// table options; returns 0 when unset. An invalid (non-numeric or zero) value
-/// fails loud.
-fn configured_refine_factor(
-    search_options: &HashMap<String, String>,
+fn pk_vector_query_dimension(
     table_options: &HashMap<String, String>,
-    field_name: &str,
+    query_options: &HashMap<String, String>,
     index_type: &str,
-) -> crate::Result<usize> {
-    if let Some(value) =
-        configured_refine_factor_from_options(search_options, field_name, index_type)
-    {
-        return parse_refine_factor(&value);
-    }
-    if let Some(value) =
-        configured_refine_factor_from_options(table_options, field_name, index_type)
-    {
-        return parse_refine_factor(&value);
-    }
-    Ok(0)
-}
-
-fn configured_refine_factor_from_options(
-    options: &HashMap<String, String>,
-    field_name: &str,
-    index_type: &str,
-) -> Option<String> {
-    for prefix in indexed_type_prefixes(field_name, index_type) {
-        for suffix in [
-            "refine_factor",
-            "refine-factor",
-            "rerank_factor",
-            "rerank-factor",
-        ] {
-            if let Some(value) = options.get(&(prefix.clone() + suffix)) {
-                return Some(value.trim().to_string());
+    vector_field: &DataField,
+) -> crate::Result<Option<usize>> {
+    match vector_field.data_type() {
+        DataType::Vector(vector_type)
+            if matches!(vector_type.element_type(), DataType::Float(_)) =>
+        {
+            Ok(Some(vector_type.length() as usize))
+        }
+        DataType::Array(array_type) if matches!(array_type.element_type(), DataType::Float(_)) => {
+            // Resolve the dimension per the configured backend. An `ARRAY<FLOAT>`
+            // column carries no dimension in its type, so it comes from options —
+            // but the option shape differs by backend. Lumina is not a vindex
+            // index type, so routing it through `VindexVectorIndexOptions` would
+            // reject it as unsupported before planning (even on an empty table).
+            if is_lumina_index_type(index_type) {
+                // Lumina reads `lumina.index.dimension` (default 128) from the
+                // merged table+query options, matching `resolve_lumina_options`.
+                let mut merged = table_options.clone();
+                merged.extend(query_options.clone());
+                let dimension = LuminaVectorIndexOptions::new(&merged)?.dimension;
+                Ok(Some(dimension as usize))
+            } else {
+                Ok(Some(
+                    VindexVectorIndexOptions::new(
+                        table_options,
+                        query_options,
+                        index_type,
+                        vector_field,
+                    )?
+                    .dimension(),
+                ))
             }
         }
+        _ => Ok(None),
     }
-    None
-}
-
-fn parse_refine_factor(value: &str) -> crate::Result<usize> {
-    let factor = value
-        .parse::<usize>()
-        .map_err(|_| crate::Error::ConfigInvalid {
-            message: format!("Invalid vector refine factor: {value}. Must be an integer."),
-        })?;
-    if factor == 0 {
-        return Err(crate::Error::ConfigInvalid {
-            message: format!("Vector refine factor must be positive, got: {value}"),
-        });
-    }
-    Ok(factor)
 }
 
 /// Rerank approximate (indexed) candidates by rereading ONLY their candidate
@@ -1359,6 +1716,112 @@ fn reorder_and_strip_position(
     Ok(vec![projected])
 }
 
+fn indexed_search_limit(limit: usize, refine_factor: usize) -> crate::Result<usize> {
+    if refine_factor == 0 {
+        return Ok(limit);
+    }
+    let search_limit =
+        limit
+            .checked_mul(refine_factor)
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
+                ),
+            })?;
+    if search_limit > i32::MAX as usize {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Vector search limit overflow: limit={limit}, refine factor={refine_factor}"
+            ),
+        });
+    }
+    Ok(search_limit)
+}
+
+fn normalize_metric(metric: &str) -> String {
+    metric.to_ascii_lowercase().replace('-', "_")
+}
+
+/// Option-key prefixes probed (in order) for the refine-factor setting of a given
+/// field/index type: `fields.<field>.<index_type>.`, its normalized variant, an
+/// `ivf.` collapse, then the bare field/global scope.
+fn indexed_type_prefixes(field_name: &str, index_type: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    add_refine_prefixes(&mut prefixes, &format!("fields.{field_name}."), index_type);
+    add_refine_prefixes(&mut prefixes, "", index_type);
+    prefixes
+}
+
+fn add_refine_prefixes(prefixes: &mut Vec<String>, base: &str, index_type: &str) {
+    if !index_type.is_empty() {
+        prefixes.push(format!("{base}{index_type}."));
+        let normalized = normalize_metric(index_type);
+        if normalized != index_type {
+            prefixes.push(format!("{base}{normalized}."));
+        }
+        if normalized.starts_with("ivf") {
+            prefixes.push(format!("{base}ivf."));
+        }
+    }
+    prefixes.push(base.to_string());
+}
+
+/// Resolve the configured refine factor, preferring the query options over the
+/// table options; returns 0 when unset. An invalid (non-numeric or zero) value
+/// fails loud.
+fn configured_refine_factor(
+    search_options: &HashMap<String, String>,
+    table_options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: &str,
+) -> crate::Result<usize> {
+    if let Some(value) =
+        configured_refine_factor_from_options(search_options, field_name, index_type)
+    {
+        return parse_refine_factor(&value);
+    }
+    if let Some(value) =
+        configured_refine_factor_from_options(table_options, field_name, index_type)
+    {
+        return parse_refine_factor(&value);
+    }
+    Ok(0)
+}
+
+fn configured_refine_factor_from_options(
+    options: &HashMap<String, String>,
+    field_name: &str,
+    index_type: &str,
+) -> Option<String> {
+    for prefix in indexed_type_prefixes(field_name, index_type) {
+        for suffix in [
+            "refine_factor",
+            "refine-factor",
+            "rerank_factor",
+            "rerank-factor",
+        ] {
+            if let Some(value) = options.get(&(prefix.clone() + suffix)) {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_refine_factor(value: &str) -> crate::Result<usize> {
+    let factor = value
+        .parse::<usize>()
+        .map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("Invalid vector refine factor: {value}. Must be an integer."),
+        })?;
+    if factor == 0 {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("Vector refine factor must be positive, got: {value}"),
+        });
+    }
+    Ok(factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1385,11 +1848,151 @@ mod tests {
         DataField::new(id, name.to_string(), DataType::Int(IntType::default()))
     }
 
+    fn vector_test_table() -> Table {
+        use std::collections::HashMap;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .build()
+            .unwrap();
+        let mut options = HashMap::new();
+        options.insert(
+            "fields.embedding.pk-vector.index.type".to_string(),
+            "ivf-flat".to_string(),
+        );
+        options.insert(
+            "fields.embedding.pk-vector.distance.metric".to_string(),
+            "l2".to_string(),
+        );
+        options.insert(
+            "pk-vector.index.columns".to_string(),
+            "embedding".to_string(),
+        );
+        let table_schema = TableSchema::new(0, &schema).copy_with_options(options);
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "vector_test"),
+            "memory:/vector_test".to_string(),
+            table_schema,
+            None,
+        )
+    }
+
     #[test]
     fn test_find_field_id_by_name() {
         let fields = vec![make_field(1, "id"), make_field(2, "embedding")];
         assert_eq!(find_field_id_by_name(&fields, "embedding"), Some(2));
         assert_eq!(find_field_id_by_name(&fields, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_configured_refine_factor_precedence_and_aliases() {
+        let table_options = HashMap::from([(
+            "fields.embedding.ivf.refine-factor".to_string(),
+            "3".to_string(),
+        )]);
+        let search_options = HashMap::from([(
+            "fields.embedding.ivf_flat.rerank_factor".to_string(),
+            "2".to_string(),
+        )]);
+        assert_eq!(
+            configured_refine_factor(
+                &search_options,
+                &table_options,
+                "embedding",
+                IVF_FLAT_IDENTIFIER,
+            )
+            .unwrap(),
+            2
+        );
+
+        assert_eq!(
+            configured_refine_factor(
+                &HashMap::new(),
+                &table_options,
+                "embedding",
+                IVF_FLAT_IDENTIFIER,
+            )
+            .unwrap(),
+            3
+        );
+
+        let global_options = HashMap::from([("rerank-factor".to_string(), "4".to_string())]);
+        assert_eq!(
+            configured_refine_factor(
+                &HashMap::new(),
+                &global_options,
+                "embedding",
+                LUMINA_IDENTIFIER,
+            )
+            .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn test_configured_refine_factor_rejects_invalid_values() {
+        let zero_options = HashMap::from([("refine_factor".to_string(), "0".to_string())]);
+        let err = configured_refine_factor(
+            &zero_options,
+            &HashMap::new(),
+            "embedding",
+            LUMINA_IDENTIFIER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+
+        let invalid_options = HashMap::from([("refine_factor".to_string(), "abc".to_string())]);
+        let err = configured_refine_factor(
+            &invalid_options,
+            &HashMap::new(),
+            "embedding",
+            LUMINA_IDENTIFIER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Must be an integer"));
+
+        assert!(indexed_search_limit(i32::MAX as usize, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_requires_vectors() {
+        let table = vector_test_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(Vec::new())
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Query vectors must be set via with_query_vectors()"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_vector_search_rejects_zero_limit() {
+        let table = vector_test_table();
+        let err = table
+            .new_batch_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vectors(vec![vec![1.0]])
+            .with_limit(0)
+            .execute()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Limit must be between 1"),
+            "unexpected error: {err}"
+        );
     }
 
     fn pk_data_file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
@@ -2117,7 +2720,6 @@ mod tests {
         split
     }
 
-    #[test]
     fn verify_pk_vector_segment_metrics_accepts_matching_lumina_metric() {
         // Lumina segment metadata says cosine; configured cosine => Ok. No segment
         // file bytes are needed on the Lumina path.
@@ -2132,7 +2734,6 @@ mod tests {
         .expect("matching lumina metric must pass");
     }
 
-    #[test]
     fn verify_pk_vector_segment_metrics_rejects_mismatched_lumina_metric() {
         // Lumina segment metadata says l2; configured inner_product => fail loud,
         // naming both metrics.
@@ -2154,7 +2755,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn from_index_type_classifies_lumina_and_vindex() {
         assert_eq!(
             VectorIndexBackend::from_index_type("lumina"),
@@ -2172,7 +2772,6 @@ mod tests {
         assert_eq!(VectorIndexBackend::from_index_type("diskann"), None);
     }
 
-    #[test]
     fn verify_pk_vector_segment_metrics_accepts_matching_metric() {
         // Real IVF segment trained with L2; configured metric L2 => Ok.
         let bytes = build_vindex_segment_bytes("l2");
@@ -2187,7 +2786,6 @@ mod tests {
         .expect("matching metric must pass");
     }
 
-    #[test]
     fn verify_pk_vector_segment_metrics_rejects_mismatched_metric() {
         // Real IVF segment trained with L2; configured metric Cosine => fail loud.
         let bytes = build_vindex_segment_bytes("l2");
@@ -2428,12 +3026,15 @@ mod tests {
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
             ("deletion-vectors.enabled", "true"),
+            // Pin the index dimension so the query vector below matches it; the
+            // up-front dimension guard runs before this test's residual guard.
+            ("fields.embedding.dimension", "4"),
         ]);
         let filter = id_gt_filter(&table, 2);
         let mut stream = table
             .new_vector_search_builder()
             .with_vector_column("embedding")
-            .with_query_vector(vec![1.0])
+            .with_query_vector(vec![1.0; 4])
             .with_limit(5)
             .with_filter(filter)
             .execute_read()
@@ -2637,9 +3238,72 @@ mod tests {
             .map(|_| ())
             .expect_err("non-PK column read must fail loud");
         assert!(
-            matches!(err, crate::Error::DataInvalid { ref message, .. }
-                if message.contains("only supported for primary-key")),
-            "unexpected error: {err:?}"
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("only supported for primary-key")),
+            "non-PK column read must fail loud, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_scalar_column_fails_loud() {
+        // A scalar (non-vector) column targeted by a vector read must fail loud,
+        // not return an empty data-evolution stream.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("id") // scalar Int column
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("scalar vector column must fail loud on execute_read"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("only supported for primary-key")),
+            "scalar column read must fail loud, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_read_non_float_vector_column_fails_loud() {
+        // An ARRAY<INT> column is not a searchable vector column (the index/search
+        // operates on FLOAT elements). It must fail loud rather than fall through
+        // to the DE path and return an empty stream.
+        use crate::spec::{ArrayType, IntType, Schema, TableSchema};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "de_non_float_vector"),
+            "memory:/de_non_float_vector".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let err = match table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0])
+            .with_limit(5)
+            .execute_read()
+            .await
+        {
+            Ok(_) => panic!("ARRAY<INT> vector column must fail loud on execute_read"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, crate::Error::DataInvalid { message, .. } if message.contains("only supported for primary-key")),
+            "non-float vector column read must fail loud, got: {err}"
         );
     }
 
@@ -2654,6 +3318,10 @@ mod tests {
             ("pk-vector.index.columns", "embedding"),
             ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
             ("fields.embedding.pk-vector.distance.metric", "l2"),
+            // Pin the index dimension so the query vector below matches it; the
+            // up-front dimension guard runs before this test's reserved-projection
+            // guard, so a mismatched query would mask the error under test.
+            ("fields.embedding.dimension", "4"),
         ]);
         for reserved in [
             ROW_ID_FIELD_NAME,
@@ -2663,7 +3331,7 @@ mod tests {
             let mut builder = table.new_vector_search_builder();
             builder
                 .with_vector_column("embedding")
-                .with_query_vector(vec![1.0])
+                .with_query_vector(vec![1.0; 4])
                 .with_limit(5)
                 .with_projection(&["id", reserved]);
             let err = builder
@@ -2677,6 +3345,37 @@ mod tests {
                 "unexpected error for {reserved}: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_read_empty_plan_lumina_array_float_is_admitted() {
+        // A Lumina PK-vector `ARRAY<FLOAT>` column is a valid configuration, but
+        // batch query dimension validation routed every `ARRAY<FLOAT>` column
+        // through the vindex resolver, which rejects `lumina` as an unsupported
+        // index type before planning — failing even an empty table. The
+        // dimension must be resolved per the configured backend, so a
+        // well-formed Lumina query is admitted and (with no snapshot) yields an
+        // empty stream rather than an "Unsupported vindex index type" error.
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            (
+                "fields.embedding.pk-vector.index.type",
+                crate::lumina::LUMINA_IDENTIFIER,
+            ),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("lumina.index.dimension", "4"),
+        ]);
+        let mut stream = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .execute_read()
+            .await
+            .expect(
+                "Lumina ARRAY<FLOAT> query must be admitted, not rejected as unsupported vindex",
+            );
+        assert!(stream.try_next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2723,6 +3422,60 @@ mod tests {
         let fields = builder.resolve_materialize_read_type().unwrap();
         let names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
         assert_eq!(names, vec!["id", "embedding"]);
+    }
+
+    /// A PK-vector table whose user schema carries an extra column named
+    /// `reserved`, used to prove reserved metadata names are rejected even when
+    /// they arrive via the default (all-columns) projection.
+    fn pk_vector_table_with_extra_column(reserved: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .column(reserved, DataType::Int(IntType::new()))
+            .option("pk-vector.index.columns", "embedding")
+            .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
+            .option("fields.embedding.pk-vector.distance.metric", "l2")
+            .build()
+            .unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "reserved_col_test"),
+            "memory:/reserved_col_test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[test]
+    fn resolve_materialize_read_type_default_rejects_reserved_user_column() {
+        // The default (all-columns) projection must reject a user column whose
+        // name collides with an injected metadata column, not only columns named
+        // in an explicit projection. Otherwise it silently passes on an empty
+        // result and collides with the metadata columns the read attaches.
+        let table = pk_vector_table_with_extra_column(SEARCH_SCORE_COLUMN);
+        let builder = table.new_vector_search_builder();
+        let err = builder.resolve_materialize_read_type().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("reserved column")),
+            "single-query default projection must reject reserved user column, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn batch_resolve_materialize_read_type_default_rejects_reserved_user_column() {
+        // Same guard on the batch resolver.
+        let table = pk_vector_table_with_extra_column(PKEY_VECTOR_POSITION_COLUMN);
+        let builder = table.new_batch_vector_search_builder();
+        let err = builder.resolve_materialize_read_type().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("reserved column")),
+            "batch default projection must reject reserved user column, got: {err:?}"
+        );
     }
 
     #[test]

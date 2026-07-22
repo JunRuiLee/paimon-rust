@@ -44,12 +44,12 @@
 //! returns `Error::Unsupported` rather than silently dropping data.
 
 use crate::spec::be_io::{BeReader, BeWriter};
+use crate::spec::BinaryRow;
+use crate::spec::DataFileMeta;
 use crate::spec::{
     data_file_meta_from_serialized_bytes_versioned, data_file_meta_to_serialized_bytes,
     DataFileMetaWireVersion,
 };
-use crate::spec::BinaryRow;
-use crate::spec::DataFileMeta;
 use crate::table::source::{DataSplit, DeletionFile, Plan};
 
 /// `paimon::DataSplitImpl::MAGIC` from `paimon-cpp/.../data_split_impl.h`.
@@ -286,8 +286,7 @@ fn read_data_file_list(
         let mut buf = Vec::with_capacity(4 + body.len());
         buf.extend_from_slice(&size.to_be_bytes());
         buf.extend_from_slice(body);
-        let (meta, consumed) =
-            data_file_meta_from_serialized_bytes_versioned(&buf, wire_version)?;
+        let (meta, consumed) = data_file_meta_from_serialized_bytes_versioned(&buf, wire_version)?;
         debug_assert_eq!(consumed, buf.len());
         // Suppress unused-arity-constant warning when DEBUG_ASSERTIONS is off.
         let _ = DATA_FILE_META_V8_ARITY;
@@ -326,9 +325,7 @@ fn write_deletion_file_list(
     Ok(())
 }
 
-fn read_deletion_file_list(
-    r: &mut BeReader,
-) -> crate::Result<Option<Vec<Option<DeletionFile>>>> {
+fn read_deletion_file_list(r: &mut BeReader) -> crate::Result<Option<Vec<Option<DeletionFile>>>> {
     let has = r.read_i8()?;
     if has == 0 {
         return Ok(None);
@@ -462,12 +459,7 @@ mod tests {
 
     #[test]
     fn rust_round_trip_with_deletion_files() {
-        let dv = DeletionFile::new(
-            "FILE:/tmp/external/index-1".into(),
-            1,
-            22,
-            Some(1),
-        );
+        let dv = DeletionFile::new("FILE:/tmp/external/index-1".into(), 1, 22, Some(1));
         let split = DataSplit::builder()
             .with_snapshot(4)
             .with_partition(make_partition_row())
@@ -607,12 +599,10 @@ mod tests {
         //   before_files i32 (=0)
         //   before_dv flag i8 (=0)
         let mut pos = 20;
-        let part_total =
-            i32::from_be_bytes(serialized[pos..pos + 4].try_into().unwrap()) as usize;
+        let part_total = i32::from_be_bytes(serialized[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4 + part_total;
         pos += 4; // bucket
-        let bp_len =
-            i16::from_be_bytes(serialized[pos..pos + 2].try_into().unwrap()) as usize;
+        let bp_len = i16::from_be_bytes(serialized[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2 + bp_len;
         pos += 1 + 4; // total_buckets flag + value
         pos += 4; // before_files count
@@ -633,13 +623,11 @@ mod tests {
     // ---------------------------------------------------------------
 
     fn read_fixture(name: &str) -> Vec<u8> {
-        let path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata/data_splits")
-                .join(name);
-        std::fs::read(&path).unwrap_or_else(|e| {
-            panic!("failed to read fixture {}: {e}", path.display())
-        })
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/data_splits")
+            .join(name);
+        std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()))
     }
 
     /// Fixture: `pk_dv_index_in_data_with_external/data_split-02`
@@ -661,7 +649,10 @@ mod tests {
 
         assert_eq!(split.data_files().len(), 1);
         let df = &split.data_files()[0];
-        assert_eq!(df.file_name, "data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc");
+        assert_eq!(
+            df.file_name,
+            "data-72b62a5f-d698-4db5-b51a-04c0dc027702-0.orc"
+        );
         assert_eq!(df.file_size, 961);
         assert_eq!(df.row_count, 5);
         assert_eq!(df.min_sequence_number, 0);
@@ -728,11 +719,17 @@ mod tests {
         assert_eq!(split.data_files().len(), 1);
 
         let df = &split.data_files()[0];
-        assert_eq!(df.file_name, "data-aa87291d-2a90-4846-b106-1bb4c76d74db-0.orc");
+        assert_eq!(
+            df.file_name,
+            "data-aa87291d-2a90-4846-b106-1bb4c76d74db-0.orc"
+        );
         assert_eq!(df.file_size, 961);
         assert_eq!(df.row_count, 5);
         assert!(df.external_path.is_none(), "fixture has no external_path");
-        assert_eq!(df.creation_time.unwrap().timestamp_millis(), 1_757_349_273_246);
+        assert_eq!(
+            df.creation_time.unwrap().timestamp_millis(),
+            1_757_349_273_246
+        );
 
         let dvs = split.data_deletion_files().expect("has deletion list");
         let dv = dvs[0].as_ref().unwrap();
@@ -844,7 +841,9 @@ mod tests {
         }
 
         // before_files i32 count, then n × (i32 size + body)
-        let consume_list = |bytes: &mut [u8], pos: &mut usize, mutate: &mut dyn FnMut(&mut [u8])| {
+        let consume_list = |bytes: &mut [u8],
+                            pos: &mut usize,
+                            mutate: &mut dyn FnMut(&mut [u8])| {
             let n = i32::from_be_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
             *pos += 4;
             for _ in 0..n {
@@ -866,7 +865,8 @@ mod tests {
                 let entry_flag = bytes[pos];
                 pos += 1;
                 if entry_flag != 0 {
-                    let p_len = i16::from_be_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+                    let p_len =
+                        i16::from_be_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
                     pos += 2 + p_len + 8 + 8 + 8;
                 }
             }

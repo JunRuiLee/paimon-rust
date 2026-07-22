@@ -2222,11 +2222,11 @@ mod tests {
         let result = SortMergeReaderBuilder::new(
             vec![s0, s1],
             schema,
-            vec![0],   // key: pk
-            1,         // seq index
-            2,         // value_kind index
-            vec![3],   // user sequence field: seq1
-            vec![4],   // value index
+            vec![0], // key: pk
+            1,       // seq index
+            2,       // value_kind index
+            vec![3], // user sequence field: seq1
+            vec![4], // value index
             output_schema,
             Box::new(DeduplicateMergeFunction),
         )

@@ -117,7 +117,11 @@ fn id_value_kind_batch(ids: Vec<i32>, values: Vec<i32>, kinds: Vec<i8>) -> Recor
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", ArrowDataType::Int32, false),
         ArrowField::new("value", ArrowDataType::Int32, false),
-        ArrowField::new(crate::spec::VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+        ArrowField::new(
+            crate::spec::VALUE_KIND_FIELD_NAME,
+            ArrowDataType::Int8,
+            false,
+        ),
     ]));
     RecordBatch::try_new(
         schema,
@@ -225,7 +229,11 @@ async fn test_dedup_cross_level_overlap_newer_wins() {
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     assert_eq!(plan.splits().len(), 1, "overlapping files share one split");
     assert_eq!(plan.splits()[0].data_files().len(), 2);
-    assert_eq!(plan_levels(plan.splits()), vec![0, 1], "split spans L0 and L1");
+    assert_eq!(
+        plan_levels(plan.splits()),
+        vec![0, 1],
+        "split spans L0 and L1"
+    );
 
     assert_eq!(read_id_value(&table).await, vec![(1, 99)]);
 }
@@ -243,7 +251,11 @@ async fn test_dedup_cross_level_tombstone_suppresses_older_row() {
     commit_batch_at_level(&table, id_value_kind_batch(vec![1], vec![10], vec![0]), 1).await;
     commit_batch_at_level(&table, id_value_kind_batch(vec![1], vec![0], vec![3]), 0).await;
 
-    assert_eq!(read_id_value(&table).await, vec![], "tombstone wins, row gone");
+    assert_eq!(
+        read_id_value(&table).await,
+        vec![],
+        "tombstone wins, row gone"
+    );
 }
 
 /// A newer INSERT at L0 must resurrect a key that was deleted at the older L1.
@@ -421,7 +433,11 @@ async fn test_dedup_cross_level_filter_semantics() {
     let gt = read_with(builder.greater_than("value", Datum::Int(50)).unwrap()).await;
     assert_eq!(gt, vec![(1, 99)]);
     let lt = read_with(builder.less_than("value", Datum::Int(50)).unwrap()).await;
-    assert_eq!(lt, vec![(1, 99)], "non-PK filter is residual; stale 10 never leaks");
+    assert_eq!(
+        lt,
+        vec![(1, 99)],
+        "non-PK filter is residual; stale 10 never leaks"
+    );
 
     // PK predicates ARE honored and must not break the cross-level merge:
     // id=1 keeps the merged winner, id=2 prunes everything.

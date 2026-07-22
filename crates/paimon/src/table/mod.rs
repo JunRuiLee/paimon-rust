@@ -99,6 +99,7 @@ pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
+pub use vector_search_builder::BatchVectorSearchBuilder;
 pub use vector_search_builder::VectorSearchBuilder;
 pub use write_builder::WriteBuilder;
 
@@ -194,6 +195,10 @@ impl Table {
 
     pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
         VectorSearchBuilder::new(self)
+    }
+
+    pub fn new_batch_vector_search_builder(&self) -> BatchVectorSearchBuilder<'_> {
+        BatchVectorSearchBuilder::new(self)
     }
 
     pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {

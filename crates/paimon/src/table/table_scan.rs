@@ -1003,10 +1003,7 @@ mod tests {
         live.sort();
         assert_eq!(
             live,
-            vec![
-                ("f.parquet".to_string(), 5),
-                ("g.parquet".to_string(), 0)
-            ],
+            vec![("f.parquet".to_string(), 5), ("g.parquet".to_string(), 0)],
             "upgraded file (f@L5) must survive; only f@L0 is cancelled by the DELETE"
         );
     }
