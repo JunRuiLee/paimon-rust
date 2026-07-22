@@ -20,6 +20,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
@@ -117,6 +119,64 @@ fn add_candidate(heap: &mut BinaryHeap<WorstFirst>, candidate: PkVectorSearchRes
     }
 }
 
+/// Extract the sole per-query list from a single-query exact-file search result,
+/// failing loud if the closure returned no lists.
+fn single_query_result(
+    per_query: Vec<Vec<PkVectorSearchResult>>,
+) -> crate::Result<Vec<PkVectorSearchResult>> {
+    per_query
+        .into_iter()
+        .next()
+        .ok_or_else(|| data_invalid("exact file search returned no per-query results"))
+}
+
+/// Verify a multi-query exact-file search returned exactly one list per query,
+/// failing loud on an arity mismatch.
+fn validate_per_query_len(
+    per_query: Vec<Vec<PkVectorSearchResult>>,
+    expected: usize,
+) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+    if per_query.len() != expected {
+        return Err(data_invalid(format!(
+            "exact file search returned {} result lists for {} queries",
+            per_query.len(),
+            expected
+        )));
+    }
+    Ok(per_query)
+}
+
+/// Build the per-position exclusion predicate for one uncovered exact file: a
+/// physical position is excluded if the deletion vector marks it deleted, or
+/// (when a residual allow-list is present) if it is not in the allow-list. Folds
+/// the residual ∩ DV exclusion the exact search applies per row. The returned
+/// closure borrows the allow-list for its lifetime.
+fn position_excluder(
+    dv: Option<Arc<DeletionVector>>,
+    residual_allowed: Option<&roaring::RoaringTreemap>,
+) -> impl Fn(i64) -> bool + Sync + '_ {
+    move |position: i64| -> bool {
+        let dv_deleted = match &dv {
+            Some(dv) => u64::try_from(position)
+                .map(|p| dv.is_deleted(p))
+                .unwrap_or(false),
+            None => false,
+        };
+        if dv_deleted {
+            return true;
+        }
+        match residual_allowed {
+            // No residual restriction: the row is allowed.
+            None => false,
+            // Residual present: exclude positions outside the allow-list.
+            Some(allowed) => match u64::try_from(position) {
+                Ok(p) => !allowed.contains(p),
+                Err(_) => true,
+            },
+        }
+    }
+}
+
 /// Active data files whose rows are already covered by an ANN segment's source
 /// metadata, matched by both file name AND row count. The bucket exact fallback
 /// skips these files (an ANN segment already covers their rows), so they never
@@ -143,6 +203,37 @@ pub(crate) fn covered_source_files(
         }
     }
     covered
+}
+
+/// Acquire one slot from the shared global-index search concurrency budget, if a
+/// budget is set. The returned guard holds the slot until it is dropped, so the
+/// caller must keep it alive for the duration of the leaf exact-file I/O it gates.
+///
+/// A `None` budget means the leaf runs ungated (no cap) — the function does not
+/// require any particular `concurrency` value; the orchestrator simply passes
+/// `None` on the strictly sequential `concurrency <= 1` path (which needs no
+/// gating). A `Some` budget is a single [`Semaphore`] shared across every bucket
+/// and every exact file of one search, so total in-flight exact-file I/O is capped
+/// at N regardless of how many buckets and files fan out — mirroring Java's single
+/// shared `GlobalIndexReadThreadPool`. Only leaf exact-file work acquires a permit;
+/// bucket orchestration never holds one, so it cannot starve leaf work (the async
+/// analogue of Java's "start from the caller" note in
+/// `PrimaryKeyVectorRead.searchBuckets`).
+async fn acquire_search_permit(
+    budget: &Option<Arc<Semaphore>>,
+) -> crate::Result<Option<OwnedSemaphorePermit>> {
+    match budget {
+        Some(semaphore) => {
+            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
+                crate::Error::UnexpectedError {
+                    message: "global-index search concurrency budget was closed".to_string(),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+            Ok(Some(permit))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Separately bounded approximate-index and exact-fallback candidates for one
@@ -189,6 +280,8 @@ pub(crate) async fn bucket_search(
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    concurrency: usize,
+    search_budget: Option<Arc<Semaphore>>,
 ) -> crate::Result<BucketSearchResult> {
     if indexed_limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
@@ -260,6 +353,9 @@ pub(crate) async fn bucket_search(
     // skips them, so the lazy exact-reader factory is never invoked for those files.
     let covered = covered_source_files(ann_segments, active_files);
 
+    // The ANN searcher is synchronous CPU work (no `.await`), so iterating segments
+    // sequentially is intentional: fanning it out would need `spawn_blocking`. Only
+    // the exact-fallback file reads below (which are async I/O) are parallelized.
     for segment in ann_segments {
         // An active ANN source with a mismatched row count is corruption (the
         // ordinal-to-position mapping would be wrong). An inactive source (no
@@ -292,6 +388,11 @@ pub(crate) async fn bucket_search(
     }
 
     if !skip_exact_fallback {
+        // Collect the eligible uncovered files (active-file order preserved) with
+        // their per-position exclusion predicate. A file with no residual-allowed
+        // rows is skipped without reading.
+        #[allow(clippy::type_complexity)]
+        let mut tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
         for file in active_files {
             if covered.contains(&file.file_name) {
                 continue;
@@ -307,41 +408,44 @@ pub(crate) async fn bucket_search(
                 None => None,
             };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            let is_excluded = move |position: i64| -> bool {
-                let dv_deleted = match &dv {
-                    Some(dv) => u64::try_from(position)
-                        .map(|p| dv.is_deleted(p))
-                        .unwrap_or(false),
-                    None => false,
-                };
-                if dv_deleted {
-                    return true;
+            tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+        }
+
+        // Search each uncovered file for its exact Top-K. The caller passes a
+        // single-query slice and each search returns one per-query list. The
+        // per-file results feed the bounded heap, which is order-independent, so
+        // the merge does not depend on which file finished first. `concurrency == 1`
+        // takes a plain sequential loop so the file visit order is strictly
+        // deterministic; larger values fan the file searches out with
+        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
+        // so total in-flight exact-file I/O across all buckets is capped at N.
+        let queries: [&[f32]; 1] = [query];
+        let per_file: Vec<Vec<PkVectorSearchResult>> = if concurrency <= 1 {
+            let mut out = Vec::with_capacity(tasks.len());
+            for (file, is_excluded) in &tasks {
+                let per_query =
+                    exact_file_search(file, &queries, metric, exact_limit, is_excluded.as_ref())
+                        .await?;
+                out.push(single_query_result(per_query)?);
+            }
+            out
+        } else {
+            stream::iter(tasks.iter().map(|(file, is_excluded)| {
+                let queries = &queries;
+                let budget = search_budget.clone();
+                async move {
+                    let _permit = acquire_search_permit(&budget).await?;
+                    let per_query =
+                        exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
+                            .await?;
+                    single_query_result(per_query)
                 }
-                match residual_allowed {
-                    // No residual restriction: the row is allowed.
-                    None => false,
-                    // Residual present: exclude positions outside the allow-list.
-                    Some(allowed) => match u64::try_from(position) {
-                        Ok(p) => !allowed.contains(p),
-                        Err(_) => true,
-                    },
-                }
-            };
-            // Search this one file for its per-query exact Top-K. The caller passes
-            // a single-query slice and reads the sole returned list.
-            let queries: [&[f32]; 1] = [query];
-            let per_query = exact_file_search(
-                file,
-                &queries,
-                metric,
-                exact_limit,
-                &is_excluded as &(dyn Fn(i64) -> bool + Sync),
-            )
-            .await?;
-            let results = per_query
-                .into_iter()
-                .next()
-                .ok_or_else(|| data_invalid("exact file search returned no per-query results"))?;
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?
+        };
+        for results in per_file {
             for result in results {
                 add_candidate(&mut exact_heap, result, exact_limit);
             }
@@ -389,6 +493,8 @@ pub(crate) async fn bucket_search_batch(
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    concurrency: usize,
+    search_budget: Option<Arc<Semaphore>>,
 ) -> crate::Result<Vec<BucketSearchResult>> {
     if queries.is_empty() {
         return Err(data_invalid("vector search requires at least one query"));
@@ -410,6 +516,8 @@ pub(crate) async fn bucket_search_batch(
             search_options,
             skip_exact_fallback,
             residual_ranges,
+            concurrency,
+            search_budget,
         )
         .await?;
         return Ok(vec![single]);
@@ -489,6 +597,9 @@ pub(crate) async fn bucket_search_batch(
         files_by_name.keys().map(|name| name.to_string()).collect();
     let covered = covered_source_files(ann_segments, active_files);
 
+    // The ANN searcher is synchronous CPU work (no `.await`), so iterating segments
+    // sequentially is intentional: fanning it out would need `spawn_blocking`. Only
+    // the exact-fallback file reads below (which are async I/O) are parallelized.
     for segment in ann_segments {
         for source in segment.source_meta.source_files() {
             if let Some(active) = files_by_name.get(source.file_name()) {
@@ -528,6 +639,11 @@ pub(crate) async fn bucket_search_batch(
     }
 
     if !skip_exact_fallback {
+        // Eligible uncovered files (active-file order preserved) with their
+        // per-position exclusion predicate; a file with no residual-allowed rows is
+        // skipped without reading.
+        #[allow(clippy::type_complexity)]
+        let mut tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
         for file in active_files {
             if covered.contains(&file.file_name) {
                 continue;
@@ -540,40 +656,41 @@ pub(crate) async fn bucket_search_batch(
                 None => None,
             };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            let is_excluded = move |position: i64| -> bool {
-                let dv_deleted = match &dv {
-                    Some(dv) => u64::try_from(position)
-                        .map(|p| dv.is_deleted(p))
-                        .unwrap_or(false),
-                    None => false,
-                };
-                if dv_deleted {
-                    return true;
-                }
-                match residual_allowed {
-                    None => false,
-                    Some(allowed) => match u64::try_from(position) {
-                        Ok(p) => !allowed.contains(p),
-                        Err(_) => true,
-                    },
-                }
-            };
-            // One shared stream per file scores every query into its own heap.
-            let per_query = exact_file_search(
-                file,
-                queries,
-                metric,
-                exact_limit,
-                &is_excluded as &(dyn Fn(i64) -> bool + Sync),
-            )
-            .await?;
-            if per_query.len() != queries.len() {
-                return Err(data_invalid(format!(
-                    "exact file search returned {} result lists for {} queries",
-                    per_query.len(),
-                    queries.len()
-                )));
+            tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+        }
+
+        // One shared stream per file scores every query into its own per-query
+        // list. The per-file lists feed per-query bounded heaps (order-independent),
+        // so the fan-in does not depend on which file finished first: collect every
+        // file's per-query result, then merge. `concurrency == 1` uses a strictly
+        // sequential loop; larger values fan the file searches out with
+        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
+        // so total in-flight exact-file I/O across all buckets is capped at N.
+        let per_file: Vec<Vec<Vec<PkVectorSearchResult>>> = if concurrency <= 1 {
+            let mut out = Vec::with_capacity(tasks.len());
+            for (file, is_excluded) in &tasks {
+                let per_query =
+                    exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
+                        .await?;
+                out.push(validate_per_query_len(per_query, queries.len())?);
             }
+            out
+        } else {
+            stream::iter(tasks.iter().map(|(file, is_excluded)| {
+                let budget = search_budget.clone();
+                async move {
+                    let _permit = acquire_search_permit(&budget).await?;
+                    let per_query =
+                        exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
+                            .await?;
+                    validate_per_query_len(per_query, queries.len())
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?
+        };
+        for per_query in per_file {
             for (results, heap) in per_query.into_iter().zip(exact_heaps.iter_mut()) {
                 for result in results {
                     add_candidate(heap, result, exact_limit);
@@ -777,6 +894,8 @@ mod tests {
             &opts,
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -806,6 +925,8 @@ mod tests {
             0,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -848,6 +969,8 @@ mod tests {
             3,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -903,6 +1026,8 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -966,6 +1091,8 @@ mod tests {
             2,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1042,6 +1169,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1084,6 +1213,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1109,6 +1240,8 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1158,6 +1291,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1194,6 +1329,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1220,6 +1357,8 @@ mod tests {
             2,
             &HashMap::new(),
             true, // skip_exact_fallback
+            None,
+            1,
             None,
         )
         .await
@@ -1256,6 +1395,8 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1295,6 +1436,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1321,6 +1464,8 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1390,6 +1535,8 @@ mod tests {
             &HashMap::new(),
             false,
             Some(&residual),
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1458,6 +1605,8 @@ mod tests {
             &HashMap::new(),
             false,
             Some(&residual),
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1503,6 +1652,8 @@ mod tests {
             &HashMap::new(),
             false,
             Some(&residual),
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1539,6 +1690,8 @@ mod tests {
             &HashMap::new(),
             false,
             Some(&residual),
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1581,6 +1734,8 @@ mod tests {
             2,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1684,6 +1839,8 @@ mod tests {
                 &opts,
                 false,
                 None,
+                1,
+                None,
             )
             .await
             .unwrap()
@@ -1707,6 +1864,8 @@ mod tests {
             2,
             &opts,
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1741,6 +1900,8 @@ mod tests {
             1,
             &HashMap::new(),
             false,
+            None,
+            1,
             None,
         )
         .await
@@ -1800,6 +1961,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -1842,6 +2005,8 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            1,
+            None,
         )
         .await
         .unwrap_err();
@@ -1849,6 +2014,170 @@ mod tests {
         assert!(
             !called.load(std::sync::atomic::Ordering::SeqCst),
             "the exact-file search closure must not be invoked for a malformed batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_file_search_order_is_sequential_at_concurrency_one() {
+        // At concurrency == 1 the per-exact-file loop must visit uncovered files in
+        // strict active-file (submission) order. A recording closure captures the
+        // visit order; it must match the active-file order deterministically.
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let factory = as_search(
+            |file: &BucketActiveFile,
+             queries: &[&[f32]],
+             metric: VectorSearchMetric,
+             exact_limit: usize,
+             is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+             -> ExactFileSearchFuture<'_> {
+                calls.lock().unwrap().push(file.file_name.clone());
+                let file_name = file.file_name.clone();
+                let query = queries[0].to_vec();
+                Box::pin(async move {
+                    let mut reader = ArrayReader::new(2, vec![Some(vec![1.0, 0.0])]);
+                    Ok(vec![exact_search(
+                        &file_name,
+                        &mut reader,
+                        &query,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                    )?])
+                })
+            },
+        );
+        let out = bucket_search(
+            None,
+            &[],
+            &[
+                active("data-a", 1),
+                active("data-b", 1),
+                active("data-c", 1),
+                active("data-d", 1),
+            ],
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exact.len(), 4);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                "data-a".to_string(),
+                "data-b".to_string(),
+                "data-c".to_string(),
+                "data-d".to_string(),
+            ],
+            "concurrency == 1 must visit files in strict active-file order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_exact_files_tie_and_nan_rank_deterministically_out_of_order() {
+        // Two uncovered files whose candidates share a distance (a tie decided by
+        // the BEST_FIRST file/position tie-break) plus a NaN-distance candidate that
+        // must sort LAST. The futures complete OUT OF ORDER: the alphabetically
+        // first file (data-a) yields more times before returning, so under
+        // buffer_unordered(concurrency > 1) data-b completes first. The bounded-heap
+        // merge is order-independent, so the final best-first ranking must still be
+        // the deterministic BEST_FIRST order (identical to a serial run).
+        let negative_nan = f32::from_bits(0xffc00000);
+        assert!(negative_nan.is_nan());
+        let factory = as_search(
+            move |file: &BucketActiveFile,
+                  queries: &[&[f32]],
+                  _metric: VectorSearchMetric,
+                  exact_limit: usize,
+                  _is_excluded: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let name = file.file_name.clone();
+                // data-a is submitted first but yields more, so it finishes last.
+                let yields = if name == "data-a" { 8 } else { 0 };
+                let _ = (queries, exact_limit);
+                Box::pin(async move {
+                    for _ in 0..yields {
+                        tokio::task::yield_now().await;
+                    }
+                    // Each file returns two candidates: one tied distance 1.0 and one
+                    // NaN distance that must never outrank a finite candidate.
+                    let results = vec![
+                        PkVectorSearchResult {
+                            data_file_name: name.clone(),
+                            row_position: 0,
+                            distance: 1.0,
+                        },
+                        PkVectorSearchResult {
+                            data_file_name: name.clone(),
+                            row_position: 1,
+                            distance: negative_nan,
+                        },
+                    ];
+                    Ok(vec![results])
+                })
+            },
+        );
+
+        let run = |concurrency: usize| {
+            let factory = &factory;
+            async move {
+                let out = bucket_search(
+                    None,
+                    &[],
+                    &[active("data-a", 2), active("data-b", 2)],
+                    &HashMap::new(),
+                    factory,
+                    &[0.0, 0.0],
+                    VectorSearchMetric::L2,
+                    8,
+                    8,
+                    &HashMap::new(),
+                    false,
+                    None,
+                    concurrency,
+                    None,
+                )
+                .await
+                .unwrap();
+                out.exact
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.data_file_name.clone(),
+                            r.row_position,
+                            r.distance.is_nan(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let serial = run(1).await;
+        let parallel = run(4).await;
+        // Serial == parallel, and the deterministic BEST_FIRST order is: tied
+        // distance-1.0 candidates first (data-a before data-b by file name), then the
+        // NaN-distance candidates last (again data-a before data-b).
+        assert_eq!(
+            serial,
+            vec![
+                ("data-a".to_string(), 0, false),
+                ("data-b".to_string(), 0, false),
+                ("data-a".to_string(), 1, true),
+                ("data-b".to_string(), 1, true),
+            ]
+        );
+        assert_eq!(
+            parallel, serial,
+            "parallel ranking must equal serial ranking"
         );
     }
 }
