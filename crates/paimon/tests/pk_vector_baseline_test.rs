@@ -32,11 +32,11 @@
 //! binaries and nothing skipped.
 //!
 //! Two constraints the primary-key read path enforces are satisfied by hand
-//! (mirroring Java `PrimaryKeyIndexSourcePolicy` and `PkVectorSourceMeta`):
+//! (mirroring Java `PrimaryKeyIndexSourcePolicy` and `PrimaryKeyIndexSourceMeta`):
 //!   1. Only a compacted (`file_source == COMPACT`), non-level-0 data file backs
 //!      the index, so the written file's meta is cloned with `level = 1` and
 //!      `file_source = Some(1)`.
-//!   2. `GlobalIndexMeta.source_meta` must be the Java `PkVectorSourceMeta` frame
+//!   2. `GlobalIndexMeta.source_meta` must be the Java `PrimaryKeyIndexSourceMeta` frame
 //!      (big-endian ints/longs, `writeUTF` file names), assembled below.
 //!
 //! Determinism: every fixture uses `nlist = 1`, so the single IVF inverted list
@@ -188,7 +188,7 @@ fn data_batch(vectors: &[[f32; DIM]]) -> RecordBatch {
 
 /// Encode one Java `DataOutput#writeUTF` value (u16-BE byte length + modified
 /// UTF-8). ASCII file names are the common case; multibyte handling mirrors the
-/// round-trip helper in `PkVectorSourceMeta`'s own tests.
+/// round-trip helper in `PrimaryKeyIndexSourceMeta`'s own tests.
 fn java_write_utf(s: &str) -> Vec<u8> {
     let mut body = Vec::new();
     for c in s.encode_utf16() {
@@ -208,8 +208,8 @@ fn java_write_utf(s: &str) -> Vec<u8> {
     out
 }
 
-/// Assemble the `_SOURCE_META` frame the way Java `PkVectorSourceMeta` writes it
-/// and `PkVectorSourceMeta::deserialize` expects: `i32-BE version=1`, `i32-BE
+/// Assemble the `_SOURCE_META` frame the way Java `PrimaryKeyIndexSourceMeta` writes it
+/// and `PrimaryKeyIndexSourceMeta::deserialize` expects: `i32-BE version=1`, `i32-BE
 /// data_level`, `i32-BE count`, then per source file a `writeUTF` name and an
 /// `i64-BE` row count. No trailing bytes. Source files are listed in global
 /// ordinal order.
@@ -411,7 +411,7 @@ async fn build_table_with_first_row_id(
         assert_segment_reads_back(&bytes, query, &analytic_topk(query, vectors, k));
     }
 
-    // Constraint 2: GlobalIndexMeta.source_meta must be the Java PkVectorSourceMeta
+    // Constraint 2: GlobalIndexMeta.source_meta must be the Java PrimaryKeyIndexSourceMeta
     // frame naming the backing data file(s) in ordinal order. Here one source file
     // owns all rows, so ordinal == physical position.
     let vector_field_id = schema

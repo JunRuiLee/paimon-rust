@@ -28,7 +28,7 @@ use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
-use crate::spec::PkVectorSourceMeta;
+use crate::spec::PrimaryKeyIndexSourceMeta;
 
 /// Search one uncovered data file for its per-query exact Top-K. Returns one
 /// bounded, BEST_FIRST list per query (outer index aligns to the `queries` slice
@@ -44,7 +44,7 @@ pub(crate) type ExactFileSearchFuture<'a> =
 /// masking; the remaining fields address the segment's index file for the ANN
 /// scorer that reads it.
 pub(crate) struct BucketAnnSegment {
-    pub source_meta: PkVectorSourceMeta,
+    pub source_meta: PrimaryKeyIndexSourceMeta,
     /// Resolved index-file path (globally unique; the scorer's preload key).
     pub path: String,
     pub file_size: u64,
@@ -55,7 +55,7 @@ pub(crate) struct BucketAnnSegment {
 impl BucketAnnSegment {
     /// Build a segment with dummy index-file fields for tests that exercise only
     /// `source_meta`-driven logic.
-    pub(crate) fn for_test(source_meta: PkVectorSourceMeta) -> Self {
+    pub(crate) fn for_test(source_meta: PrimaryKeyIndexSourceMeta) -> Self {
         Self {
             source_meta,
             path: "seg".to_string(),
@@ -714,18 +714,18 @@ pub(crate) async fn bucket_search_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::PkVectorSourceFile;
+    use crate::spec::PrimaryKeyIndexSourceFile;
     use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
     use crate::vindex::pkvector::exact::exact_search;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
     use roaring::RoaringBitmap;
 
-    fn meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
-        PkVectorSourceMeta::new(
+    fn meta(files: &[(&str, i64)]) -> PrimaryKeyIndexSourceMeta {
+        PrimaryKeyIndexSourceMeta::new(
             1,
             files
                 .iter()
-                .map(|(n, r)| PkVectorSourceFile::new((*n).into(), *r).unwrap())
+                .map(|(n, r)| PrimaryKeyIndexSourceFile::new((*n).into(), *r).unwrap())
                 .collect(),
         )
         .unwrap()

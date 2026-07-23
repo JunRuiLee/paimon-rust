@@ -4161,9 +4161,9 @@ mod tests {
     /// A `PkVectorSearchSplit` carrying a single ANN segment addressed by `path`.
     fn pk_split_with_segment(path: &str) -> PkVectorSearchSplit {
         let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-        let source_meta = crate::spec::PkVectorSourceMeta::new(
+        let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
             1,
-            vec![crate::spec::PkVectorSourceFile::new("file-a".to_string(), 3).unwrap()],
+            vec![crate::spec::PrimaryKeyIndexSourceFile::new("file-a".to_string(), 3).unwrap()],
         )
         .unwrap();
         let mut segment = BucketAnnSegment::for_test(source_meta);
@@ -4174,9 +4174,9 @@ mod tests {
 
     fn pk_split_with_lumina_segment(path: &str, metric: &str) -> PkVectorSearchSplit {
         let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-        let source_meta = crate::spec::PkVectorSourceMeta::new(
+        let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
             1,
-            vec![crate::spec::PkVectorSourceFile::new("file-a".to_string(), 3).unwrap()],
+            vec![crate::spec::PrimaryKeyIndexSourceFile::new("file-a".to_string(), 3).unwrap()],
         )
         .unwrap();
         let mut segment = BucketAnnSegment::for_test(source_meta);

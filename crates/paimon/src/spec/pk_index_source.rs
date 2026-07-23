@@ -15,20 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Primary-key vector (bucket-local ANN) source metadata.
+//! Shared primary-key index source metadata.
 //!
 //! Parses the `_SOURCE_META` blob embedded in [`crate::spec::GlobalIndexMeta`],
-//! written by Java Paimon's `PkVectorSourceMeta` (apache/paimon#8549). The blob
-//! lists the ordered source data files backing an ANN segment; a segment's
-//! ordinals concatenate those files in order, so an ordinal maps to a
-//! `(data file, physical row position)` pair.
+//! written by Java Paimon's `PrimaryKeyIndexSourceMeta` (apache/paimon#8549). The
+//! blob lists the ordered source data files backing an index payload; the
+//! payload's ordinals concatenate those files in order, so an ordinal maps to a
+//! `(data file, physical row position)` pair. Shared by the primary-key vector
+//! and full-text read paths.
 //!
 //! Two distinct encodings are involved and must not be conflated: Avro extracts
 //! the opaque `_SOURCE_META` bytes (handled in the Avro decoder), and the bytes
 //! *inside* use Java `DataOutput` (big-endian ints/longs, modified-UTF-8 via
 //! `writeUTF`) — parsed here, independent of Avro.
 
-use crate::spec::GlobalIndexMeta;
+use crate::spec::{DataFileMeta, GlobalIndexMeta};
+
+/// Compacted file source discriminant, matching Java `FileSource.COMPACT`.
+const FILE_SOURCE_COMPACT: i32 = 1;
+
+/// Mirror of `PrimaryKeyIndexSourcePolicy.shouldRead`: only compacted, non-level-0
+/// files back a primary-key index; an absent file source reads as false.
+pub fn should_read_pk_index_source(file: &DataFileMeta) -> bool {
+    matches!(file.file_source, Some(src) if src == FILE_SOURCE_COMPACT) && file.level > 0
+}
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -37,19 +47,19 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-/// The `_SOURCE_META` frame version written by Java `PkVectorSourceMeta`.
+/// The `_SOURCE_META` frame version written by Java `PrimaryKeyIndexSourceMeta`.
 const SOURCE_META_VERSION: i32 = 1;
 
-/// One source data file captured when a PK-vector ANN segment was built.
+/// One source data file captured when a primary-key index payload was built.
 ///
-/// Mirrors Java `org.apache.paimon.index.pkvector.PkVectorSourceFile`.
+/// Mirrors Java `org.apache.paimon.index.pk.PrimaryKeyIndexSourceFile`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PkVectorSourceFile {
+pub struct PrimaryKeyIndexSourceFile {
     file_name: String,
     row_count: i64,
 }
 
-impl PkVectorSourceFile {
+impl PrimaryKeyIndexSourceFile {
     pub fn new(file_name: String, row_count: i64) -> crate::Result<Self> {
         if row_count < 0 {
             return Err(data_invalid(format!(
@@ -71,24 +81,27 @@ impl PkVectorSourceFile {
     }
 }
 
-/// Ordered source data files for a primary-key vector index payload.
+/// Ordered source data files for a primary-key index payload.
 ///
-/// Mirrors Java `org.apache.paimon.index.pkvector.PkVectorSourceMeta`.
+/// Mirrors Java `org.apache.paimon.index.pk.PrimaryKeyIndexSourceMeta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PkVectorSourceMeta {
+pub struct PrimaryKeyIndexSourceMeta {
     data_level: i32,
-    source_files: Vec<PkVectorSourceFile>,
+    source_files: Vec<PrimaryKeyIndexSourceFile>,
 }
 
-impl PkVectorSourceMeta {
-    pub fn new(data_level: i32, source_files: Vec<PkVectorSourceFile>) -> crate::Result<Self> {
+impl PrimaryKeyIndexSourceMeta {
+    pub fn new(
+        data_level: i32,
+        source_files: Vec<PrimaryKeyIndexSourceFile>,
+    ) -> crate::Result<Self> {
         if data_level <= 0 {
             return Err(data_invalid(format!(
                 "source meta data level must be positive: {data_level}"
             )));
         }
         if source_files.is_empty() {
-            return Err(data_invalid("a vector index must reference source files"));
+            return Err(data_invalid("an index must reference source files"));
         }
         Ok(Self {
             data_level,
@@ -100,7 +113,7 @@ impl PkVectorSourceMeta {
         self.data_level
     }
 
-    pub fn source_files(&self) -> &[PkVectorSourceFile] {
+    pub fn source_files(&self) -> &[PrimaryKeyIndexSourceFile] {
         &self.source_files
     }
 
@@ -110,7 +123,7 @@ impl PkVectorSourceMeta {
         let bytes = meta
             .source_meta
             .as_deref()
-            .ok_or_else(|| data_invalid("global index meta has no vector source metadata"))?;
+            .ok_or_else(|| data_invalid("global index meta has no source metadata"))?;
         Self::deserialize(bytes)
     }
 
@@ -122,31 +135,31 @@ impl PkVectorSourceMeta {
     pub fn resolve(&self, ordinal: i64) -> crate::Result<(String, i64)> {
         if ordinal < 0 {
             return Err(data_invalid(format!(
-                "vector ordinal must not be negative: {ordinal}"
+                "source ordinal must not be negative: {ordinal}"
             )));
         }
         let mut cumulative: i64 = 0;
         for file in &self.source_files {
             let next = cumulative
                 .checked_add(file.row_count)
-                .ok_or_else(|| data_invalid("vector source row counts overflow i64"))?;
+                .ok_or_else(|| data_invalid("index source row counts overflow i64"))?;
             if ordinal < next {
                 return Ok((file.file_name.clone(), ordinal - cumulative));
             }
             cumulative = next;
         }
         Err(data_invalid(format!(
-            "vector ordinal {ordinal} is out of range (total rows {cumulative})"
+            "source ordinal {ordinal} is out of range (total rows {cumulative})"
         )))
     }
 
-    /// Parse a Java `PkVectorSourceMeta`-serialized `_SOURCE_META` blob.
+    /// Parse a Java `PrimaryKeyIndexSourceMeta`-serialized `_SOURCE_META` blob.
     pub fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
         let mut cursor = DataInputCursor::new(bytes);
         let version = cursor.read_i32_be()?;
         if version != SOURCE_META_VERSION {
             return Err(data_invalid(format!(
-                "unsupported vector source version: {version}"
+                "unsupported index source version: {version}"
             )));
         }
         let data_level = cursor.read_i32_be()?;
@@ -157,18 +170,18 @@ impl PkVectorSourceMeta {
         }
         let count = cursor.read_i32_be()?;
         if count <= 0 {
-            return Err(data_invalid("a vector index must reference source files"));
+            return Err(data_invalid("an index must reference source files"));
         }
         // NOT Vec::with_capacity(count): count is untrusted and may be huge.
         let mut source_files = Vec::new();
         for _ in 0..count {
             let file_name = read_java_utf(&mut cursor)?;
             let row_count = cursor.read_i64_be()?;
-            source_files.push(PkVectorSourceFile::new(file_name, row_count)?);
+            source_files.push(PrimaryKeyIndexSourceFile::new(file_name, row_count)?);
         }
         if cursor.remaining() != 0 {
             return Err(data_invalid(
-                "unexpected trailing bytes in vector source metadata",
+                "unexpected trailing bytes in index source metadata",
             ));
         }
         Self::new(data_level, source_files)
@@ -195,7 +208,7 @@ impl<'a> DataInputCursor<'a> {
     fn read_exact(&mut self, len: usize) -> crate::Result<&'a [u8]> {
         if self.remaining() < len {
             return Err(data_invalid(format!(
-                "unexpected end of vector source metadata: need {len} bytes, {} remain",
+                "unexpected end of index source metadata: need {len} bytes, {} remain",
                 self.remaining()
             )));
         }
@@ -340,7 +353,7 @@ mod tests {
     #[test]
     fn deserialize_single_source_file() {
         let bytes = frame(1, &[("data-abc.parquet", 100)]);
-        let meta = PkVectorSourceMeta::deserialize(&bytes).unwrap();
+        let meta = PrimaryKeyIndexSourceMeta::deserialize(&bytes).unwrap();
         assert_eq!(meta.data_level(), 1);
         assert_eq!(meta.source_files().len(), 1);
         assert_eq!(meta.source_files()[0].file_name(), "data-abc.parquet");
@@ -350,7 +363,7 @@ mod tests {
     #[test]
     fn deserialize_multi_source_files() {
         let bytes = frame(2, &[("f0", 3), ("f1", 5)]);
-        let meta = PkVectorSourceMeta::deserialize(&bytes).unwrap();
+        let meta = PrimaryKeyIndexSourceMeta::deserialize(&bytes).unwrap();
         assert_eq!(meta.data_level(), 2);
         assert_eq!(meta.source_files().len(), 2);
         assert_eq!(meta.source_files()[1].row_count(), 5);
@@ -360,13 +373,13 @@ mod tests {
     fn deserialize_rejects_bad_version() {
         let mut bytes = frame(1, &[("f0", 1)]);
         bytes[0..4].copy_from_slice(&2i32.to_be_bytes());
-        assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
     fn deserialize_rejects_zero_or_negative_data_level() {
-        assert!(PkVectorSourceMeta::deserialize(&frame(0, &[("f0", 1)])).is_err());
-        assert!(PkVectorSourceMeta::deserialize(&frame(-1, &[("f0", 1)])).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&frame(0, &[("f0", 1)])).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&frame(-1, &[("f0", 1)])).is_err());
     }
 
     #[test]
@@ -375,41 +388,41 @@ mod tests {
         out.extend_from_slice(&1i32.to_be_bytes());
         out.extend_from_slice(&1i32.to_be_bytes());
         out.extend_from_slice(&0i32.to_be_bytes());
-        assert!(PkVectorSourceMeta::deserialize(&out).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&out).is_err());
     }
 
     #[test]
     fn deserialize_rejects_trailing_bytes() {
         let mut bytes = frame(1, &[("f0", 1)]);
         bytes.push(0xFF);
-        assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
     fn deserialize_rejects_truncated_input() {
         let bytes = frame(1, &[("f0", 1)]);
-        assert!(PkVectorSourceMeta::deserialize(&bytes[..bytes.len() - 2]).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&bytes[..bytes.len() - 2]).is_err());
     }
 
     #[test]
     fn deserialize_rejects_negative_row_count() {
         let bytes = frame(1, &[("f0", -1)]);
-        assert!(PkVectorSourceMeta::deserialize(&bytes).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
     fn new_rejects_empty() {
-        assert!(PkVectorSourceMeta::new(1, Vec::new()).is_err());
-        assert!(PkVectorSourceMeta::new(
+        assert!(PrimaryKeyIndexSourceMeta::new(1, Vec::new()).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::new(
             0,
-            vec![PkVectorSourceFile::new("f0".to_string(), 1).unwrap()]
+            vec![PrimaryKeyIndexSourceFile::new("f0".to_string(), 1).unwrap()]
         )
         .is_err());
     }
 
     #[test]
     fn resolve_single_file() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
+        let meta = PrimaryKeyIndexSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert_eq!(meta.resolve(0).unwrap(), ("f0".to_string(), 0));
         assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2));
     }
@@ -417,7 +430,8 @@ mod tests {
     #[test]
     fn resolve_multi_file_prefix_sum_boundaries() {
         // f0 owns ordinals 0..=2, f1 owns 3..=7.
-        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3), ("f1", 5)])).unwrap();
+        let meta =
+            PrimaryKeyIndexSourceMeta::deserialize(&frame(1, &[("f0", 3), ("f1", 5)])).unwrap();
         assert_eq!(meta.resolve(2).unwrap(), ("f0".to_string(), 2)); // last of f0
         assert_eq!(meta.resolve(3).unwrap(), ("f1".to_string(), 0)); // first of f1
         assert_eq!(meta.resolve(7).unwrap(), ("f1".to_string(), 4)); // last of f1
@@ -425,13 +439,13 @@ mod tests {
 
     #[test]
     fn resolve_rejects_negative_ordinal() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
+        let meta = PrimaryKeyIndexSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert!(meta.resolve(-1).is_err());
     }
 
     #[test]
     fn resolve_rejects_ordinal_at_or_past_total() {
-        let meta = PkVectorSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
+        let meta = PrimaryKeyIndexSourceMeta::deserialize(&frame(1, &[("f0", 3)])).unwrap();
         assert!(meta.resolve(3).is_err()); // total == 3, valid range 0..=2
     }
 
@@ -445,7 +459,7 @@ mod tests {
             index_meta: None,
             source_meta: None,
         };
-        assert!(PkVectorSourceMeta::from_global_index_meta(&meta).is_err());
+        assert!(PrimaryKeyIndexSourceMeta::from_global_index_meta(&meta).is_err());
     }
 
     #[test]
@@ -458,7 +472,7 @@ mod tests {
             index_meta: None,
             source_meta: Some(frame(1, &[("f0", 3)])),
         };
-        let parsed = PkVectorSourceMeta::from_global_index_meta(&meta).unwrap();
+        let parsed = PrimaryKeyIndexSourceMeta::from_global_index_meta(&meta).unwrap();
         assert_eq!(parsed.data_level(), 1);
         assert_eq!(parsed.source_files()[0].file_name(), "f0");
     }
@@ -467,11 +481,11 @@ mod tests {
     fn resolve_rejects_row_count_overflow() {
         // Two individually-valid row counts whose prefix sum overflows i64.
         // Resolving past the first file forces the checked_add on the second.
-        let meta = PkVectorSourceMeta::new(
+        let meta = PrimaryKeyIndexSourceMeta::new(
             1,
             vec![
-                PkVectorSourceFile::new("f0".to_string(), i64::MAX).unwrap(),
-                PkVectorSourceFile::new("f1".to_string(), 1).unwrap(),
+                PrimaryKeyIndexSourceFile::new("f0".to_string(), i64::MAX).unwrap(),
+                PrimaryKeyIndexSourceFile::new("f1".to_string(), 1).unwrap(),
             ],
         )
         .unwrap();

@@ -22,7 +22,7 @@
 //! Java writer with the production `ivf-flat` primary-key vector indexer, and
 //! asserts Rust reads + searches it correctly. It validates the cross-language
 //! contract at the table-metadata layer (snapshot / manifest / data-file
-//! `level`+`file_source` / `GlobalIndexMeta` / the `PkVectorSourceMeta` frame);
+//! `level`+`file_source` / `GlobalIndexMeta` / the `PrimaryKeyIndexSourceMeta` frame);
 //! the ANN segment interior is the same native core on both sides
 //! (`paimon-vindex-core` <-> its JNI wrapper), so a divergence here would be a
 //! real metadata-parse bug, not a fixture artifact.

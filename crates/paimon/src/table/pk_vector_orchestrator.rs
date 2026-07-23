@@ -914,7 +914,8 @@ mod e2e_tests {
     use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        DataField, DataFileMeta, DataType, IntType, PkVectorSourceFile, PkVectorSourceMeta,
+        DataField, DataFileMeta, DataType, IntType, PrimaryKeyIndexSourceFile,
+        PrimaryKeyIndexSourceMeta,
     };
     use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplitRead;
     use crate::table::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
@@ -1070,11 +1071,11 @@ mod e2e_tests {
 
     fn ann_segment(sources: &[(&str, i64)]) -> BucketAnnSegment {
         BucketAnnSegment::for_test(
-            PkVectorSourceMeta::new(
+            PrimaryKeyIndexSourceMeta::new(
                 1,
                 sources
                     .iter()
-                    .map(|(n, r)| PkVectorSourceFile::new((*n).to_string(), *r).unwrap())
+                    .map(|(n, r)| PrimaryKeyIndexSourceFile::new((*n).to_string(), *r).unwrap())
                     .collect(),
             )
             .unwrap(),

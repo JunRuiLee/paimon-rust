@@ -23,7 +23,7 @@ use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
-use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
+use crate::spec::{PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta};
 use crate::vector_search::VectorSearch;
 
 /// Build the live-row-id mask for the ANN reader's `include_row_ids` filter, in
@@ -46,7 +46,7 @@ use crate::vector_search::VectorSearch;
 /// no deletion vector is relevant — nothing to mask. Otherwise returns the masked
 /// live ids.
 pub(crate) fn build_live_row_ids(
-    source_files: &[PkVectorSourceFile],
+    source_files: &[PrimaryKeyIndexSourceFile],
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
@@ -122,7 +122,7 @@ pub(crate) fn build_live_row_ids(
 /// sorted BEST_FIRST.
 pub(crate) fn map_ann_results(
     scored: &[(u64, f32)],
-    source_meta: &PkVectorSourceMeta,
+    source_meta: &PrimaryKeyIndexSourceMeta,
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
@@ -327,12 +327,12 @@ mod tests {
     use super::*;
     use roaring::RoaringBitmap;
 
-    fn source_meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
+    fn source_meta(files: &[(&str, i64)]) -> PrimaryKeyIndexSourceMeta {
         let files = files
             .iter()
-            .map(|(name, rows)| PkVectorSourceFile::new((*name).to_string(), *rows).unwrap())
+            .map(|(name, rows)| PrimaryKeyIndexSourceFile::new((*name).to_string(), *rows).unwrap())
             .collect();
-        PkVectorSourceMeta::new(1, files).unwrap()
+        PrimaryKeyIndexSourceMeta::new(1, files).unwrap()
     }
 
     fn dv(deleted: &[u32]) -> Arc<DeletionVector> {
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_build_live_row_ids_none_when_all_active_and_no_relevant_dv() {
-        let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let files = [PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap()];
         let active = active_set(&["f0"]);
         // All active + empty map -> None.
         assert!(build_live_row_ids(&files, &active, &HashMap::new(), None)
@@ -368,8 +368,8 @@ mod tests {
         // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4). f1 is inactive,
         // so its whole ordinal range is masked out; f0 stays fully live. No DV.
         let files = vec![
-            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let live = build_live_row_ids(&files, &active_set(&["f0"]), &HashMap::new(), None)
             .unwrap()
@@ -381,8 +381,8 @@ mod tests {
     fn test_build_live_row_ids_masks_deleted_positions_with_file_offsets() {
         // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4).
         let files = vec![
-            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1])); // deletes global 1
@@ -498,12 +498,12 @@ mod tests {
             ),
         );
         let segment = BucketAnnSegment::for_test({
-            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(
+            use crate::spec::{PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta};
+            PrimaryKeyIndexSourceMeta::new(
                 1,
                 vec![
-                    PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-                    PkVectorSourceFile::new("f1".into(), 5).unwrap(),
+                    PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap(),
+                    PrimaryKeyIndexSourceFile::new("f1".into(), 5).unwrap(),
                 ],
             )
             .unwrap()
@@ -541,9 +541,12 @@ mod tests {
             }),
         );
         let segment = BucketAnnSegment::for_test({
-            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                .unwrap()
+            use crate::spec::{PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta};
+            PrimaryKeyIndexSourceMeta::new(
+                1,
+                vec![PrimaryKeyIndexSourceFile::new("f0".into(), 1).unwrap()],
+            )
+            .unwrap()
         });
         let err = searcher
             .search(
@@ -569,9 +572,12 @@ mod tests {
             }),
         );
         let segment = BucketAnnSegment::for_test({
-            use crate::spec::{PkVectorSourceFile, PkVectorSourceMeta};
-            PkVectorSourceMeta::new(1, vec![PkVectorSourceFile::new("f0".into(), 1).unwrap()])
-                .unwrap()
+            use crate::spec::{PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta};
+            PrimaryKeyIndexSourceMeta::new(
+                1,
+                vec![PrimaryKeyIndexSourceFile::new("f0".into(), 1).unwrap()],
+            )
+            .unwrap()
         });
         let results = searcher
             .search(
@@ -603,8 +609,8 @@ mod tests {
         // entry (empty allow). Result: f0 keeps {0} (1 is residual-allowed but
         // deleted, 2 not residual-allowed); f1 contributes nothing.
         let files = vec![
-            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
@@ -621,8 +627,8 @@ mod tests {
         // f0 rows global 0,1,2; f1 rows global 3,4. residual allows f0={2}, f1={1}.
         // f1 physical pos 1 -> global 3 + 1 = 4. Result {2, 4}. No DV.
         let files = vec![
-            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
-            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap(),
+            PrimaryKeyIndexSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let mut residual = HashMap::new();
         residual.insert("f0".to_string(), treemap(&[2]));
@@ -642,7 +648,7 @@ mod tests {
     fn test_build_live_row_ids_residual_some_returns_mask_even_when_all_active_no_dv() {
         // All active, no DV: without residual this returns None. With a residual
         // present, a mask is always required.
-        let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let files = [PrimaryKeyIndexSourceFile::new("f0".into(), 3).unwrap()];
         let mut residual = HashMap::new();
         residual.insert("f0".to_string(), treemap(&[0, 2]));
         let live = build_live_row_ids(

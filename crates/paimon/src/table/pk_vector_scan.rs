@@ -23,8 +23,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::spec::{
-    BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest, PkVectorSourceFile,
-    PkVectorSourceMeta, Predicate,
+    should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest,
+    Predicate, PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
 };
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
@@ -32,7 +32,6 @@ use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
 
 const INDEX_DIR: &str = "index";
-const FILE_SOURCE_COMPACT: i32 = 1;
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -41,13 +40,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
-/// Mirror of `PrimaryKeyIndexSourcePolicy.shouldRead`: only compacted, non-level-0
-/// files back the PK-vector index; an absent file source reads as false.
-fn should_read_pk_index_source(file: &DataFileMeta) -> bool {
-    matches!(file.file_source, Some(src) if src == FILE_SOURCE_COMPACT) && file.level > 0
-}
-
-fn source_files_unique(files: &[PkVectorSourceFile]) -> bool {
+fn source_files_unique(files: &[PrimaryKeyIndexSourceFile]) -> bool {
     let mut seen = HashSet::new();
     files.iter().all(|file| seen.insert(file.file_name()))
 }
@@ -56,13 +49,13 @@ fn current_ann_segments(
     active_data_files: &[DataFileMeta],
     ann_segments: Vec<BucketAnnSegment>,
 ) -> crate::Result<Vec<BucketAnnSegment>> {
-    let mut sources_by_level: BTreeMap<i32, Vec<PkVectorSourceFile>> = BTreeMap::new();
+    let mut sources_by_level: BTreeMap<i32, Vec<PrimaryKeyIndexSourceFile>> = BTreeMap::new();
     for file in active_data_files {
         if should_read_pk_index_source(file) {
             sources_by_level
                 .entry(file.level)
                 .or_default()
-                .push(PkVectorSourceFile::new(
+                .push(PrimaryKeyIndexSourceFile::new(
                     file.file_name.clone(),
                     file.row_count,
                 )?);
@@ -320,7 +313,7 @@ fn plan_from_inputs(
     // Phase A: group ANN payloads by (partition, bucket).
     let mut segments_by_bucket: BTreeMap<Key, Vec<BucketAnnSegment>> = BTreeMap::new();
     for (partition, bucket, gim, path, file_size, file_name) in index_entries {
-        let source_meta = PkVectorSourceMeta::from_global_index_meta(&gim)
+        let source_meta = PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim)
             .map_err(|_| data_invalid(format!("index file {file_name} is not active")))?;
         let key = (partition.to_serialized_bytes(), bucket);
         segments_by_bucket
@@ -435,9 +428,9 @@ mod tests {
         out
     }
 
-    /// Build a `_SOURCE_META` blob the way `PkVectorSourceMeta::deserialize`
+    /// Build a `_SOURCE_META` blob the way `PrimaryKeyIndexSourceMeta::deserialize`
     /// expects it. There is no public serializer, so we mirror the frame used by
-    /// `pk_vector_source.rs`'s own round-trip tests.
+    /// `pk_index_source.rs`'s own round-trip tests.
     fn source_meta_bytes(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&1i32.to_be_bytes()); // version
@@ -463,12 +456,12 @@ mod tests {
 
     fn ann_segment(data_level: i32, path: &str, source_files: &[(&str, i64)]) -> BucketAnnSegment {
         BucketAnnSegment {
-            source_meta: PkVectorSourceMeta::new(
+            source_meta: PrimaryKeyIndexSourceMeta::new(
                 data_level,
                 source_files
                     .iter()
                     .map(|(name, rows)| {
-                        PkVectorSourceFile::new((*name).to_string(), *rows).unwrap()
+                        PrimaryKeyIndexSourceFile::new((*name).to_string(), *rows).unwrap()
                     })
                     .collect(),
             )
