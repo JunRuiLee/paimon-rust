@@ -190,6 +190,12 @@ impl BucketAccumulator {
 
 /// The per-bucket search splits produced by planning.
 pub(crate) struct PkVectorScanPlan {
+    // The snapshot the plan resolved during planning (pinned before the index
+    // manifest is read). It is authoritative even when planning yields zero
+    // searchable splits, so a cross-route consistency guard can require one
+    // pinned snapshot across routes. It is `0` only for a table with no snapshot
+    // at all (never written), which also yields empty `splits`.
+    pub snapshot_id: i64,
     pub splits: Vec<PkVectorSearchSplit>,
 }
 
@@ -236,19 +242,28 @@ impl<'a> PkVectorScan<'a> {
         if let Some(filter) = &self.filter {
             read_builder.with_filter(filter.clone());
         }
-        let data_splits = read_builder
+        // Plan the data splits and capture the snapshot the scan pinned in one
+        // pass. The trace carries the resolved snapshot id even when the scan
+        // yields zero data splits, so the plan reports its real snapshot id
+        // (required by the cross-route snapshot-consistency guard) instead of
+        // deriving it from a first split that may not exist.
+        let (data_plan, trace) = read_builder
             .new_scan()
             .with_scan_all_files()
-            .plan()
-            .await?
-            .splits()
-            .to_vec();
+            .plan_with_trace()
+            .await?;
+        let data_splits = data_plan.splits().to_vec();
 
-        // No data files -> nothing to search.
-        let Some(first_split) = data_splits.first() else {
-            return Ok(PkVectorScanPlan { splits: Vec::new() });
+        // No snapshot at all (table never written): nothing to search and no
+        // snapshot to pin. The empty split list makes every downstream consumer
+        // treat this as "no candidates", so this is the only plan without a real
+        // snapshot id.
+        let Some(snapshot_id) = trace.snapshot_id else {
+            return Ok(PkVectorScanPlan {
+                snapshot_id: 0,
+                splits: Vec::new(),
+            });
         };
-        let snapshot_id = first_split.snapshot_id();
         let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
 
         // Index-manifest scan into filtered ANN payload tuples.
@@ -295,7 +310,10 @@ impl<'a> PkVectorScan<'a> {
         }
 
         let splits = plan_from_inputs(snapshot_id, data_splits, entries)?;
-        Ok(PkVectorScanPlan { splits })
+        Ok(PkVectorScanPlan {
+            snapshot_id,
+            splits,
+        })
     }
 }
 

@@ -113,6 +113,24 @@ pub struct BatchVectorSearchBuilder<'a> {
     filter: Option<Predicate>,
 }
 
+/// The primary-key vector route's search output plus the source context a later
+/// materialization (or a hybrid fusion across routes) needs. `candidates` are the
+/// best-first hits; `splits` are the per-bucket source splits their `split_index`
+/// refers into (the authority for re-associating a hit to its `DataFileMeta`);
+/// `snapshot_id` is the single snapshot the plan resolved during planning
+/// (authoritative even when the plan yields zero splits; `0` only for a table
+/// with no snapshot at all); `metric` is the resolved distance metric used to
+/// turn distances into scores. Produced by
+/// [`VectorSearchBuilder::search_pk_route`].
+pub(crate) struct PkVectorRouteResult {
+    pub(crate) candidates: Vec<PkVectorCandidate>,
+    // Read by the hybrid route consumer (fuses routes before materializing); the
+    // materialized read reaches candidates/splits/metric directly.
+    pub(crate) snapshot_id: i64,
+    pub(crate) splits: Vec<PkVectorSearchSplit>,
+    pub(crate) metric: VectorSearchMetric,
+}
+
 impl<'a> VectorSearchBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
@@ -411,6 +429,39 @@ impl<'a> VectorSearchBuilder<'a> {
         Ok((candidates.remove(0), plan, metric))
     }
 
+    /// Plan + search the primary-key vector route and return the best-first
+    /// candidates together with the route source context needed to materialize
+    /// them later: the resolved snapshot id and the per-bucket source splits
+    /// (`split_index` is only meaningful against these originating splits), plus
+    /// the resolved distance metric. This is the hybrid-reachable entry point —
+    /// it runs exactly the plan/search core [`execute_read`](Self::execute_read)
+    /// uses but stops before materialization, so a caller can fuse these
+    /// candidates before materializing. The materialized read is layered on top
+    /// of it (see `execute_primary_key_vector_read`). The snapshot id is the one
+    /// the plan pinned during planning — authoritative even for an empty plan
+    /// (which also yields empty candidates and empty splits); it is `0` only for
+    /// a table with no snapshot at all.
+    pub(crate) async fn search_pk_route(
+        &self,
+        core: &CoreOptions<'_>,
+        pk_col: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> crate::Result<PkVectorRouteResult> {
+        let (candidates, plan, metric) = self
+            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
+            .await?;
+        // Planning pins a single snapshot (`plan.snapshot_id`) even when it yields
+        // zero searchable splits, so report it unconditionally rather than deriving
+        // it from a split that may not exist.
+        Ok(PkVectorRouteResult {
+            candidates,
+            snapshot_id: plan.snapshot_id,
+            splits: plan.splits,
+            metric,
+        })
+    }
+
     /// Materialize the best-first PK-vector search hits into Arrow rows. Mirrors
     /// Java `PrimaryKeyVectorRead` feeding its result splits into an ordinary table
     /// read: the search decides which rows, a subsequent read decides which
@@ -428,8 +479,13 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let (candidates, plan, metric) = self
-            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
+        let PkVectorRouteResult {
+            candidates,
+            splits,
+            metric,
+            ..
+        } = self
+            .search_pk_route(core, pk_col, query_vector, limit)
             .await?;
 
         // Resolve the materialization read-type up front so an invalid projection
@@ -450,7 +506,7 @@ impl<'a> VectorSearchBuilder<'a> {
             Vec::new(),
         );
 
-        Self::materialize_candidates(candidates, &plan, metric, &materialize_reader).await
+        Self::materialize_candidates(candidates, &splits, metric, &materialize_reader).await
     }
 
     /// Materialize one best-first candidate list into an Arrow stream, best-first,
@@ -461,7 +517,7 @@ impl<'a> VectorSearchBuilder<'a> {
     /// use this so their materialization is identical.
     async fn materialize_candidates(
         candidates: Vec<PkVectorCandidate>,
-        plan: &PkVectorScanPlan,
+        splits: &[PkVectorSearchSplit],
         metric: VectorSearchMetric,
         materialize_reader: &DataFileReader,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -486,7 +542,7 @@ impl<'a> VectorSearchBuilder<'a> {
             );
         }
 
-        let indexed_splits = build_indexed_splits(candidates, &plan.splits, metric)?;
+        let indexed_splits = build_indexed_splits(candidates, splits, metric)?;
 
         // Materialize every indexed split, retaining each batch and, per row, the
         // (rank, batch_index, row_index) tuple so we can reorder to best-first.
@@ -1163,7 +1219,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             streams.push(
                 VectorSearchBuilder::materialize_candidates(
                     candidates,
-                    &plan,
+                    &plan.splits,
                     metric,
                     &materialize_reader,
                 )
@@ -4383,6 +4439,257 @@ mod tests {
             .unwrap();
         assert!(built > 0, "DE fixture must build a global vector index");
         table
+    }
+
+    /// One Java `DataOutput#writeUTF` value (u16-BE length + modified UTF-8), used
+    /// to assemble the `PrimaryKeyIndexSourceMeta` frame below.
+    fn java_write_utf(s: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for c in s.encode_utf16() {
+            if (0x0001..=0x007F).contains(&c) {
+                body.push(c as u8);
+            } else if c > 0x07FF {
+                body.push(0xE0 | (c >> 12) as u8);
+                body.push(0x80 | ((c >> 6) & 0x3F) as u8);
+                body.push(0x80 | (c & 0x3F) as u8);
+            } else {
+                body.push(0xC0 | (c >> 6) as u8);
+                body.push(0x80 | (c & 0x3F) as u8);
+            }
+        }
+        let mut out = (body.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The Java `PrimaryKeyIndexSourceMeta` frame: `i32-BE version=1`, `i32-BE
+    /// data_level`, `i32-BE count`, then per source file a `writeUTF` name and an
+    /// `i64-BE` row count.
+    fn pk_source_meta_bytes(data_level: i32, files: &[(&str, i64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1i32.to_be_bytes());
+        out.extend_from_slice(&data_level.to_be_bytes());
+        out.extend_from_slice(&(files.len() as i32).to_be_bytes());
+        for (name, rows) in files {
+            out.extend_from_slice(&java_write_utf(name));
+            out.extend_from_slice(&rows.to_be_bytes());
+        }
+        out
+    }
+
+    /// Build a committed primary-key vector table (memory FS) over `vectors`
+    /// (dimension 2): write a real data file via the write path, promote its meta
+    /// to a compacted, non-level-0 file (the PK index-source precondition), then
+    /// build + commit a real vindex IVF-flat ANN segment naming that file. Single
+    /// bucket, `nlist = 1`, so the ANN search is exact. Returns the opened table,
+    /// ready for `search_pk_route`.
+    async fn build_committed_pk_vector_table(vectors: &[[f32; 2]]) -> Table {
+        use crate::spec::{GlobalIndexMeta, IndexFileMeta, VectorType};
+        use crate::table::CommitMessage;
+        use bytes::Bytes;
+        use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+        use paimon_vindex_core::io::PosWriter;
+
+        const DIM: usize = 2;
+        let table_path = "memory:/pk_vector_route_test";
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Vector(
+                    VectorType::try_new(true, DIM as u32, DataType::Float(FloatType::new()))
+                        .unwrap(),
+                ),
+            )
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("pk-vector.index.columns", "embedding")
+            .option("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER)
+            .option("fields.embedding.pk-vector.distance.metric", "l2")
+            .build()
+            .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "pk_vector_route_test"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        for dir in ["snapshot", "manifest", "index"] {
+            file_io
+                .mkdirs(&format!("{table_path}/{dir}"))
+                .await
+                .unwrap();
+        }
+
+        // id + FixedSizeList<Float32> batch matching the table's target schema.
+        let ids: Vec<i32> = (0..vectors.len() as i32).collect();
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vec_builder = FixedSizeListBuilder::new(Float32Builder::new(), DIM as i32)
+            .with_field(element_field.clone());
+        for v in vectors {
+            for &x in v {
+                vec_builder.values().append_value(x);
+            }
+            vec_builder.append(true);
+        }
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new(
+                "embedding",
+                ArrowDataType::FixedSizeList(element_field, DIM as i32),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(vec_builder.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // Real data-file meta via the write path (these messages are not committed
+        // as-is; the meta is promoted below and committed with the index).
+        let mut writer = TableWrite::new(&table, "route-test".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let base = &messages[0];
+        let base_meta = base.new_files[0].clone();
+        let bucket = base.bucket;
+        let partition = base.partition.clone();
+        let data_file_name = base_meta.file_name.clone();
+        let row_count = base_meta.row_count;
+
+        // PK index-source precondition: compacted, non-level-0, first_row_id pinned.
+        let indexed_meta = DataFileMeta {
+            level: 1,
+            file_source: Some(1),
+            first_row_id: Some(0),
+            ..base_meta
+        };
+
+        // Real vindex IVF-flat segment (nlist=1 -> exact) over the vectors.
+        let n = vectors.len();
+        let flat: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let seg_ids: Vec<i64> = (0..n as i64).collect();
+        let native = HashMap::from([
+            ("index.type".to_string(), "ivf_flat".to_string()),
+            ("dimension".to_string(), DIM.to_string()),
+            ("nlist".to_string(), "1".to_string()),
+            ("metric".to_string(), "l2".to_string()),
+        ]);
+        let config = VectorIndexConfig::from_options(&native).unwrap();
+        let training = VectorIndexTrainer::train(config, &flat, n).unwrap();
+        let mut ann_writer = VectorIndexWriter::new(training);
+        ann_writer.add_vectors(&seg_ids, &flat, n).unwrap();
+        let mut seg_bytes = Vec::new();
+        {
+            let mut out = PosWriter::new(&mut seg_bytes);
+            ann_writer.write(&mut out).unwrap();
+        }
+        let index_file_name = "vector-ivf-flat-route.index".to_string();
+        let index_file_size = seg_bytes.len() as u64;
+        file_io
+            .new_output(&format!("{table_path}/index/{index_file_name}"))
+            .unwrap()
+            .write(Bytes::from(seg_bytes))
+            .await
+            .unwrap();
+
+        let vector_field_id = schema
+            .fields()
+            .iter()
+            .find(|f| f.name() == "embedding")
+            .unwrap()
+            .id();
+        let index_file = IndexFileMeta {
+            index_type: IVF_FLAT_IDENTIFIER.to_string(),
+            file_name: index_file_name,
+            file_size: i64::try_from(index_file_size).unwrap(),
+            row_count: i32::try_from(row_count).unwrap(),
+            deletion_vectors_ranges: None,
+            global_index_meta: Some(GlobalIndexMeta {
+                row_range_start: 0,
+                row_range_end: row_count - 1,
+                index_field_id: vector_field_id,
+                extra_field_ids: None,
+                source_meta: Some(pk_source_meta_bytes(1, &[(&data_file_name, row_count)])),
+                index_meta: None,
+            }),
+        };
+
+        let mut message = CommitMessage::new(partition, bucket, vec![indexed_meta]);
+        message.new_index_files = vec![index_file];
+        TableCommit::new(table.clone(), "route-test".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+        table
+    }
+
+    // ---- search_pk_route: candidate-only producer returns candidates + context ----
+    #[tokio::test]
+    async fn search_pk_route_returns_candidates_and_source_context() {
+        // query [0,1]: squared-L2 distances pos1=0 < pos2=1 < pos0=2, so the
+        // strict-gap top-2 is [pos1, pos2] (best-first, not physical order).
+        let table = build_committed_pk_vector_table(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]).await;
+        let core = CoreOptions::new(table.schema().options());
+        let builder = table.new_vector_search_builder();
+        let route = builder
+            .search_pk_route(&core, "embedding", &[0.0, 1.0], 2)
+            .await
+            .unwrap();
+
+        // Two nearest neighbours recalled, best-first, without materialization.
+        assert_eq!(route.candidates.len(), 2, "top-2 candidates expected");
+        assert_eq!(route.candidates[0].row_position, 1, "nearest is position 1");
+        assert_eq!(
+            route.candidates[1].row_position, 2,
+            "second nearest is position 2"
+        );
+        assert!(
+            route.candidates[0].distance <= route.candidates[1].distance,
+            "candidates must be best-first by distance"
+        );
+
+        // Source context present for a non-empty plan: the snapshot the plan
+        // pinned during planning (a real id, not None/0), per-bucket source
+        // splits, and the resolved metric.
+        assert_eq!(route.snapshot_id, 1, "first commit -> snapshot 1");
+        assert!(!route.splits.is_empty(), "non-empty source splits expected");
+        assert_eq!(route.metric, VectorSearchMetric::L2);
+        assert!(
+            route
+                .candidates
+                .iter()
+                .all(|c| c.split_index < route.splits.len()),
+            "candidate split_index must refer into the returned splits"
+        );
+    }
+
+    /// A table with no snapshot at all (never written) yields empty candidates
+    /// and empty source splits; with no snapshot to pin the id is `0`, and the
+    /// metric still resolves.
+    #[tokio::test]
+    async fn search_pk_route_empty_plan_yields_empty_context() {
+        let table = pk_vector_table(&[
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+        ]);
+        let core = CoreOptions::new(table.schema().options());
+        let builder = table.new_vector_search_builder();
+        let route = builder
+            .search_pk_route(&core, "embedding", &[1.0f32; 128], 3)
+            .await
+            .unwrap();
+        assert!(route.candidates.is_empty(), "no data -> no candidates");
+        assert!(route.splits.is_empty(), "no data -> no source splits");
+        assert_eq!(route.snapshot_id, 0, "no snapshot -> zero id");
+        assert_eq!(route.metric, VectorSearchMetric::L2);
     }
 
     #[tokio::test]
