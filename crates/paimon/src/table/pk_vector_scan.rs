@@ -223,11 +223,6 @@ impl<'a> PkVectorScan<'a> {
     }
 
     pub(crate) async fn plan(&self) -> crate::Result<PkVectorScanPlan> {
-        let snapshot_manager = crate::table::snapshot_manager::SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-
         // Data splits first, via the table's own scan resolution (which honors
         // time travel / scan.snapshot-id). Deriving the snapshot from the scan's
         // own output — rather than resolving `get_latest_snapshot()` separately —
@@ -253,6 +248,27 @@ impl<'a> PkVectorScan<'a> {
             .await?
             .splits()
             .to_vec();
+
+        self.plan_for_data_splits(data_splits).await
+    }
+
+    /// Assemble the search plan from caller-supplied data splits: derive the
+    /// snapshot from the first split, read that snapshot's index manifest, and
+    /// group into per-bucket search splits via `plan_from_inputs`.
+    ///
+    /// Shared by `plan()` (which scans the table for the splits) and by callers
+    /// that are handed pre-planned splits — e.g. a query engine fanning out one
+    /// bucket per node. Deriving the snapshot from the split (not
+    /// `get_latest_snapshot()`) keeps data and index on ONE snapshot and honors
+    /// time travel, matching Java `PrimaryKeyVectorScan`.
+    pub(crate) async fn plan_for_data_splits(
+        &self,
+        data_splits: Vec<DataSplit>,
+    ) -> crate::Result<PkVectorScanPlan> {
+        let snapshot_manager = crate::table::snapshot_manager::SnapshotManager::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+        );
 
         // No data files -> nothing to search.
         let Some(first_split) = data_splits.first() else {

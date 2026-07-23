@@ -231,3 +231,80 @@ async fn reads_back_java_written_pk_vector_table() {
         );
     }
 }
+
+// Bucket-scoped read: a query engine plans the bucket splits itself and fans one
+// whole-bucket split out per node, calling `execute_read_for_data_split` on each,
+// then merges the per-split local Top-K by `__paimon_search_score`. This must
+// reproduce the whole-table `execute_read` result. The fixture is a single
+// bucket, so one split already reproduces it; the per-split merge keeps the test
+// correct should the fixture ever gain buckets.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn read_for_data_split_matches_whole_table_read() {
+    let (_tmp, table) = open_java_fixture().await;
+    let query = vec![0.0f32, 0.0];
+    let k = 3;
+
+    // Ground truth: the whole-table read.
+    let mut whole = table.new_vector_search_builder();
+    whole
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vector(query.clone())
+        .with_limit(k)
+        .with_projection(&["id"]);
+    let whole_batches = whole
+        .execute_read()
+        .await
+        .expect("whole-table read failed")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collecting whole-table batches failed");
+    let whole_ids = batch_i32(&whole_batches, "id");
+    assert_eq!(whole_ids, vec![0, 1, 2], "sanity: whole-table top-3");
+
+    // Plan the bucket splits the same way the whole-snapshot path does internally.
+    let splits = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .expect("scan planning failed")
+        .splits()
+        .to_vec();
+    assert!(
+        !splits.is_empty(),
+        "fixture must yield at least one data split"
+    );
+
+    // Run the bucket-scoped read per split and collect (id, score) pairs.
+    let mut merged: Vec<(i32, f32)> = Vec::new();
+    for split in splits {
+        let mut b = table.new_vector_search_builder();
+        b.with_vector_column(VECTOR_COLUMN)
+            .with_query_vector(query.clone())
+            .with_limit(k)
+            .with_projection(&["id"]);
+        let batches = b
+            .execute_read_for_data_split(split)
+            .await
+            .expect("per-split read failed")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collecting per-split batches failed");
+        let ids = batch_i32(&batches, "id");
+        let scores = batch_f32(&batches, "__paimon_search_score");
+        assert_eq!(ids.len(), scores.len());
+        merged.extend(ids.into_iter().zip(scores));
+    }
+
+    // Global merge by score desc (= distance asc); tie-break by id only to make the
+    // assertion deterministic (the distance/score merge does not fix tie order).
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    merged.truncate(k);
+    let merged_ids: Vec<i32> = merged.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        merged_ids, whole_ids,
+        "per-split merged top-k must match the whole-table read"
+    );
+}

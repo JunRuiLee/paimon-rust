@@ -982,6 +982,26 @@ paimon_error *paimon_vector_search_builder_with_filter(paimon_vector_search_buil
 paimon_result_record_batch_reader paimon_vector_search_builder_execute_read(paimon_vector_search_builder *b)
 ;
 
+/**
+ * Execute the primary-key vector search scoped to a single caller-supplied
+ * `DataSplit` (one bucket), returning a streaming Arrow reader over that split's
+ * local Top-K (projected columns + `__paimon_search_score`, best-first). Intended
+ * for a query engine that plans buckets itself and fans one whole-bucket split
+ * out per node, then merges the per-split results by `__paimon_search_score`.
+ * `split_bytes` is the Paimon-native serialized `DataSplit`.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns an error result). `split_bytes` must point to `split_len` valid,
+ * initialized bytes that stay live for the duration of the call; the caller
+ * retains ownership of the buffer (it is copied/decoded here, not freed).
+ */
+
+paimon_result_record_batch_reader paimon_vector_search_builder_execute_read_for_data_split(paimon_vector_search_builder *b,
+                                                                                           const uint8_t *split_bytes,
+                                                                                           uintptr_t split_len)
+;
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

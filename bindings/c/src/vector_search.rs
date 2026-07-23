@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
 use paimon::spec::Predicate;
-use paimon::table::Table;
+use paimon::table::{deserialize_data_split, Table};
 
 use crate::block_on;
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
@@ -296,6 +296,96 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
 }
 
+/// Execute the primary-key vector search scoped to a single caller-supplied
+/// `DataSplit` (one bucket), returning a streaming Arrow reader over that split's
+/// local Top-K (projected columns + `__paimon_search_score`, best-first). Intended
+/// for a query engine that plans buckets itself and fans one whole-bucket split
+/// out per node, then merges the per-split results by `__paimon_search_score`.
+/// `split_bytes` is the Paimon-native serialized `DataSplit`.
+///
+/// # Safety
+/// `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+/// null (returns an error result). `split_bytes` must point to `split_len` valid,
+/// initialized bytes that stay live for the duration of the call; the caller
+/// retains ownership of the buffer (it is copied/decoded here, not freed).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_execute_read_for_data_split(
+    b: *mut paimon_vector_search_builder,
+    split_bytes: *const u8,
+    split_len: usize,
+) -> paimon_result_record_batch_reader {
+    if let Err(e) = check_non_null(b, "b") {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: e,
+        };
+    }
+    if split_bytes.is_null() || split_len == 0 {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "execute_read_for_data_split: null or empty split bytes".to_string(),
+            ),
+        };
+    }
+    let state = &*((*b).inner as *const VectorSearchState);
+
+    // Same as `execute_read`: the PK vector path configures its ANN reader from
+    // table options, so reject per-search options rather than silently drop them.
+    if !state.options.is_empty() {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::Unsupported,
+                "per-search options are not supported; configure the ANN reader via table options"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let split = match deserialize_data_split(std::slice::from_raw_parts(split_bytes, split_len)) {
+        Ok(s) => s,
+        Err(e) => {
+            return paimon_result_record_batch_reader {
+                reader: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(e),
+            };
+        }
+    };
+
+    let mut builder = state.table.new_vector_search_builder();
+    if let Some(col) = &state.vector_column {
+        builder.with_vector_column(col);
+    }
+    if let Some(v) = &state.query_vector {
+        builder.with_query_vector(v.clone());
+    }
+    if let Some(limit) = state.limit {
+        builder.with_limit(limit);
+    }
+    if let Some(f) = &state.filter {
+        builder.with_filter(f.clone());
+    }
+
+    match block_on(builder.execute_read_for_data_split(split)) {
+        Ok(stream) => {
+            let reader = Box::new(stream);
+            let wrapper = Box::new(paimon_record_batch_reader {
+                inner: Box::into_raw(reader) as *mut c_void,
+            });
+            paimon_result_record_batch_reader {
+                reader: Box::into_raw(wrapper),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(e) => paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
 // --- C ABI signature guards -------------------------------------------------
 //
 // These symbols are called across the FFI boundary with fixed argument counts:
@@ -335,3 +425,32 @@ const _: unsafe extern "C" fn(*mut paimon_vector_search_builder) =
 const _: unsafe extern "C" fn(
     *mut paimon_vector_search_builder,
 ) -> paimon_result_record_batch_reader = paimon_vector_search_builder_execute_read;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+    *const u8,
+    usize,
+) -> paimon_result_record_batch_reader = paimon_vector_search_builder_execute_read_for_data_split;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The happy path (searching a real bucket split) is covered end-to-end by the
+    // Rust integration test `pk_vector_java_fixture_test`. Here we only pin the
+    // C-symbol guard that needs no table: a null builder fails loud rather than
+    // dereferencing a bad pointer.
+    #[test]
+    fn execute_read_for_data_split_rejects_null_builder() {
+        let split = [1u8, 2, 3];
+        unsafe {
+            let result = paimon_vector_search_builder_execute_read_for_data_split(
+                std::ptr::null_mut(),
+                split.as_ptr(),
+                split.len(),
+            );
+            assert!(result.reader.is_null());
+            assert!(!result.error.is_null());
+            crate::error::paimon_error_free(result.error);
+        }
+    }
+}

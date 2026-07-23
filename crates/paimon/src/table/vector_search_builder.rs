@@ -39,9 +39,7 @@ use crate::table::pk_vector_position_read::{
 use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::snapshot_manager::SnapshotManager;
 use crate::table::source::DataSplit;
-use crate::table::{
-    find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
-};
+use crate::table::{find_field_id_by_name, ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
@@ -266,6 +264,19 @@ impl<'a> VectorSearchBuilder<'a> {
     /// [`with_projection`](Self::with_projection)) plus `_PKEY_VECTOR_SCORE`;
     /// `_ROW_ID` and `_PKEY_VECTOR_POSITION` are always hidden.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
+        self.execute_read_inner(None).await
+    }
+
+    /// Shared body for [`execute_read`](Self::execute_read) and
+    /// [`execute_read_for_data_split`](Self::execute_read_for_data_split).
+    /// `data_splits`: `None` scans the whole table; `Some(splits)` searches only
+    /// the caller-supplied splits (one bucket per split). Only the primary-key
+    /// vector path can materialize rows — a data-evolution table or a non-PK-vector
+    /// column fails loud.
+    async fn execute_read_inner(
+        &self,
+        data_splits: Option<Vec<DataSplit>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -294,7 +305,13 @@ impl<'a> VectorSearchBuilder<'a> {
             if targets_pk_column {
                 let pk_col = core.primary_key_vector_index_column()?;
                 return self
-                    .execute_primary_key_vector_read(&core, &pk_col, query_vector, limit)
+                    .execute_primary_key_vector_read(
+                        &core,
+                        &pk_col,
+                        query_vector,
+                        limit,
+                        data_splits,
+                    )
                     .await;
             }
         }
@@ -315,6 +332,7 @@ impl<'a> VectorSearchBuilder<'a> {
         pk_col: &str,
         query_vector: &[f32],
         limit: usize,
+        data_splits: Option<Vec<DataSplit>>,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
         // kwai's single-query builder carries no query-side options; the batch core
         // reads all config (dimension, refine-factor, ANN options) from the table
@@ -329,6 +347,7 @@ impl<'a> VectorSearchBuilder<'a> {
             pk_col,
             &[query_vector],
             limit,
+            data_splits,
         )
         .await?;
         debug_assert_eq!(candidates.len(), 1);
@@ -351,9 +370,10 @@ impl<'a> VectorSearchBuilder<'a> {
         pk_col: &str,
         query_vector: &[f32],
         limit: usize,
+        data_splits: Option<Vec<DataSplit>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let (candidates, plan, metric) = self
-            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit)
+            .plan_and_search_pk_candidates(core, pk_col, query_vector, limit, data_splits)
             .await?;
 
         // Resolve the materialization read-type up front so an invalid projection
@@ -378,6 +398,20 @@ impl<'a> VectorSearchBuilder<'a> {
         );
 
         Self::materialize_candidates(candidates, &plan, metric, &materialize_reader).await
+    }
+
+    /// Like [`execute_read`](Self::execute_read), but scoped to a single
+    /// caller-supplied `DataSplit` (one bucket) instead of scanning the whole
+    /// table: runs the PK-vector search over just that split and materializes its
+    /// local Top-K best-first. Intended for a query engine that plans buckets
+    /// itself and fans one whole-bucket split out per node, then merges the
+    /// per-split results by `__paimon_search_score`. Same guards as
+    /// [`execute_read`](Self::execute_read) (primary-key vector indexes only).
+    pub async fn execute_read_for_data_split(
+        &self,
+        split: DataSplit,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.execute_read_inner(Some(vec![split])).await
     }
 
     /// Materialize one best-first candidate list into an Arrow stream, best-first,
@@ -518,34 +552,32 @@ fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Result<()> {
     Ok(())
 }
 
-/// Batch PK-vector search core shared by the single and batch builders: plan ONE
-/// per-bucket split set, segment preload, ANN scorer, exact-fallback search
-/// closure, and residual allow-list (all query-independent), then run
-/// `search_candidates_batch` ONCE so N queries share the opened readers. Per
-/// query, the approximate candidates are exact-reranked (when a refine factor is
-/// set) and merged with the exact fallback into one best-first list bounded to
-/// `limit`. Returns one candidate list per query (outer index aligned to
-/// `queries`), together with the shared plan and resolved metric so the caller can
-/// materialize each query's rows. An empty plan yields one empty candidate list
-/// per query.
-///
-/// The residual allow-list depends only on `filter` and the plan, NOT the query
-/// vector, so it is computed once and the SAME slice is shared across all queries.
-/// Rerank stays per-query (each query reranks its own indexed list).
-#[allow(clippy::too_many_arguments)]
-async fn plan_and_search_pk_candidates_batch(
+/// Config resolved once before planning, independent of how the plan is obtained
+/// (whole-table scan vs caller-supplied splits).
+struct PkVectorSearchParams {
+    metric: VectorSearchMetric,
+    concurrency: usize,
+    index_type: String,
+    field_id: i32,
+    vector_field: DataField,
+    skip_exact_fallback: bool,
+    refine_factor: usize,
+    indexed_limit: usize,
+}
+
+/// Resolve metric / index type / field / search-mode / refine params and validate
+/// every query, independent of the plan. Extracted from the former prefix of
+/// `plan_and_search_pk_candidates_batch` so the whole-snapshot and bucket-scoped
+/// paths share identical config resolution.
+fn resolve_pk_vector_search_params(
     table: &Table,
-    query_options: &HashMap<String, String>,
-    filter: Option<&Predicate>,
     core: &CoreOptions<'_>,
     pk_col: &str,
+    query_options: &HashMap<String, String>,
     queries: &[&[f32]],
     limit: usize,
-) -> crate::Result<(
-    Vec<Vec<PkVectorCandidate>>,
-    PkVectorScanPlan,
-    VectorSearchMetric,
-)> {
+    filter: Option<&Predicate>,
+) -> crate::Result<PkVectorSearchParams> {
     // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
     // predicate set via `with_filter` is applied post-recall by re-reading each
     // candidate file's physical rows (see below). That physical-position filtering
@@ -632,9 +664,98 @@ async fn plan_and_search_pk_candidates_batch(
         }
     }
 
-    let plan = PkVectorScan::new(table, field_id, index_type.clone(), filter.cloned())
-        .plan()
-        .await?;
+    Ok(PkVectorSearchParams {
+        metric,
+        concurrency,
+        index_type,
+        field_id,
+        vector_field,
+        skip_exact_fallback,
+        refine_factor,
+        indexed_limit,
+    })
+}
+
+/// Plan and search PK-vector candidates for a batch of queries. `data_splits`
+/// selects how the plan is obtained — `None` scans the whole table (the default
+/// read path), `Some(splits)` plans from caller-supplied splits (e.g. a query
+/// engine fanning out one bucket per node). Only the plan step differs; config
+/// resolution ([`resolve_pk_vector_search_params`]) and the search body
+/// ([`search_pk_candidates_batch_with_plan`]) are shared.
+#[allow(clippy::too_many_arguments)]
+async fn plan_and_search_pk_candidates_batch(
+    table: &Table,
+    query_options: &HashMap<String, String>,
+    filter: Option<&Predicate>,
+    core: &CoreOptions<'_>,
+    pk_col: &str,
+    queries: &[&[f32]],
+    limit: usize,
+    data_splits: Option<Vec<DataSplit>>,
+) -> crate::Result<(
+    Vec<Vec<PkVectorCandidate>>,
+    PkVectorScanPlan,
+    VectorSearchMetric,
+)> {
+    let params = resolve_pk_vector_search_params(
+        table,
+        core,
+        pk_col,
+        query_options,
+        queries,
+        limit,
+        filter,
+    )?;
+    let scan = PkVectorScan::new(
+        table,
+        params.field_id,
+        params.index_type.clone(),
+        filter.cloned(),
+    );
+    let plan = match data_splits {
+        Some(splits) => scan.plan_for_data_splits(splits).await?,
+        None => scan.plan().await?,
+    };
+    search_pk_candidates_batch_with_plan(
+        table,
+        core,
+        filter,
+        query_options,
+        queries,
+        limit,
+        plan,
+        &params,
+    )
+    .await
+}
+
+/// Search a resolved plan across all queries and merge per-query Top-K. Shared by
+/// the whole-snapshot and bucket-scoped entry points; preserves metric, refine /
+/// rerank, search-mode (FAST skip), exact fallback, residual filtering, deletion
+/// vectors and projection semantics.
+#[allow(clippy::too_many_arguments)]
+async fn search_pk_candidates_batch_with_plan(
+    table: &Table,
+    core: &CoreOptions<'_>,
+    filter: Option<&Predicate>,
+    query_options: &HashMap<String, String>,
+    queries: &[&[f32]],
+    limit: usize,
+    plan: PkVectorScanPlan,
+    params: &PkVectorSearchParams,
+) -> crate::Result<(
+    Vec<Vec<PkVectorCandidate>>,
+    PkVectorScanPlan,
+    VectorSearchMetric,
+)> {
+    let metric = params.metric;
+    let concurrency = params.concurrency;
+    let index_type = params.index_type.clone();
+    let vector_field = params.vector_field.clone();
+    let skip_exact_fallback = params.skip_exact_fallback;
+    let refine_factor = params.refine_factor;
+    let indexed_limit = params.indexed_limit;
+
     if plan.splits.is_empty() {
         return Ok((vec![Vec::new(); queries.len()], plan, metric));
     }
@@ -678,7 +799,7 @@ async fn plan_and_search_pk_candidates_batch(
         o
     };
     let search_options = options.clone();
-    let field_name = pk_col.to_string();
+    let field_name = vector_field.name().to_string();
     let scorer: crate::vindex::pkvector::ann::BatchScorer = Box::new(
         move |segment: &BucketAnnSegment, searches: &[VectorSearch]| {
             let data = segment_bytes
@@ -1076,6 +1197,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             &pk_col,
             &query_refs,
             limit,
+            None,
         )
         .await?;
 
