@@ -123,6 +123,7 @@ pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
+const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
 
 /// Merge engine for primary-key tables.
 ///
@@ -1198,6 +1199,23 @@ impl<'a> CoreOptions<'a> {
         crate::vindex::pkvector::metric::VectorSearchMetric::parse(&raw)?;
         Ok(raw)
     }
+
+    /// True when the PK full-text index column option key is present (any value).
+    pub fn primary_key_full_text_index_enabled(&self) -> bool {
+        self.options.contains_key(PK_FULL_TEXT_INDEX_COLUMNS_OPTION)
+    }
+
+    /// Configured PK full-text index columns: split on ',' and trim each token,
+    /// mirroring Java `split(",",-1).map(trim)`. Blank tokens are PRESERVED (do NOT
+    /// filter them) so parsing matches Java exactly; `[]` only when the key is
+    /// absent. Never returns a `Result`, never errors (do not copy the fail-loud
+    /// shape of `primary_key_vector_index_columns`).
+    pub fn primary_key_full_text_index_columns(&self) -> Vec<String> {
+        match self.options.get(PK_FULL_TEXT_INDEX_COLUMNS_OPTION) {
+            None => Vec::new(),
+            Some(raw) => raw.split(',').map(|c| c.trim().to_string()).collect(),
+        }
+    }
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics.
@@ -2146,5 +2164,57 @@ mod tests {
         assert!(CoreOptions::new(&opts)
             .primary_key_vector_index_type("e")
             .is_err());
+    }
+
+    #[test]
+    fn test_pk_full_text_index_absent_is_disabled_and_empty() {
+        let opts = HashMap::new();
+        let co = CoreOptions::new(&opts);
+        assert!(!co.primary_key_full_text_index_enabled());
+        assert_eq!(
+            co.primary_key_full_text_index_columns(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_pk_full_text_index_columns_split_and_trim() {
+        let opts = HashMap::from([(
+            "pk-full-text.index.columns".to_string(),
+            "a, b ,c".to_string(),
+        )]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_full_text_index_enabled());
+        assert_eq!(
+            co.primary_key_full_text_index_columns(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pk_full_text_index_columns_preserve_blank_tokens() {
+        // Java `split(",",-1).map(trim)` keeps empty tokens, so "a,,b" yields
+        // three columns with a blank in the middle.
+        let opts = HashMap::from([("pk-full-text.index.columns".to_string(), "a,,b".to_string())]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_full_text_index_enabled());
+        assert_eq!(
+            co.primary_key_full_text_index_columns(),
+            vec!["a".to_string(), "".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pk_full_text_index_blank_value_is_enabled_but_empty_no_error() {
+        // key present but only blanks: enabled (key exists), NO error (lenient,
+        // unlike vector). Blank tokens are PRESERVED to match Java's
+        // `split(",",-1).map(trim)`, so " , " yields two empty tokens (NOT []).
+        let opts = HashMap::from([("pk-full-text.index.columns".to_string(), " , ".to_string())]);
+        let co = CoreOptions::new(&opts);
+        assert!(co.primary_key_full_text_index_enabled());
+        assert_eq!(
+            co.primary_key_full_text_index_columns(),
+            vec!["".to_string(), "".to_string()]
+        );
     }
 }
