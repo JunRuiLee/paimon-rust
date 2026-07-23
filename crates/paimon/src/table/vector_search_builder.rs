@@ -1845,7 +1845,7 @@ async fn rerank_indexed_positional(
 
 /// One materialized row tagged with its best-first `rank` and its `(batch_index,
 /// row_index)` location in the retained materialization batches.
-struct RankedRow {
+pub(crate) struct RankedRow {
     rank: usize,
     batch_index: usize,
     row_index: usize,
@@ -1857,7 +1857,7 @@ struct RankedRow {
 /// map to a candidate rank (the batch came from that candidate's file), so a miss
 /// fails loud rather than silently dropping a row.
 #[allow(clippy::too_many_arguments)]
-fn collect_ranked_rows(
+pub(crate) fn collect_ranked_rows(
     batch: &RecordBatch,
     batch_index: usize,
     partition_bytes: &[u8],
@@ -1908,7 +1908,7 @@ fn collect_ranked_rows(
 /// `_PKEY_VECTOR_POSITION` column, yielding a single output batch (empty input
 /// yields no batches). The projected user columns and `__paimon_search_score` are
 /// retained.
-fn reorder_and_strip_position(
+pub(crate) fn reorder_and_strip_position(
     batches: &[RecordBatch],
     mut ranked: Vec<RankedRow>,
 ) -> crate::Result<Vec<RecordBatch>> {

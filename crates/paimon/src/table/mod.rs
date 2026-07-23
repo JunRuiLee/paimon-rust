@@ -58,7 +58,13 @@ mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
 mod partition_filter;
 mod partition_stat;
+#[cfg(feature = "fulltext")]
+mod pk_full_text_bucket_search;
 mod pk_full_text_bucket_state;
+#[cfg(feature = "fulltext")]
+mod pk_full_text_read;
+#[cfg(feature = "fulltext")]
+mod pk_full_text_scan;
 mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
