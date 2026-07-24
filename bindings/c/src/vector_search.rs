@@ -60,6 +60,7 @@ pub unsafe extern "C" fn paimon_table_new_vector_search_builder(
         limit: None,
         options: HashMap::new(),
         filter: None,
+        projection: None,
     };
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
     paimon_result_vector_search_builder {
@@ -214,6 +215,62 @@ pub unsafe extern "C" fn paimon_vector_search_builder_with_filter(
     std::ptr::null_mut()
 }
 
+/// Restrict the columns materialized by the execute-read terminals
+/// (`paimon_vector_search_builder_execute_read` and
+/// `paimon_vector_search_builder_execute_read_for_data_split`) to `columns` (plus
+/// the always-appended `__paimon_search_score`). Without this call both terminals
+/// materialize every user table column.
+///
+/// `columns` is a null-terminated array of null-terminated C strings; output
+/// order follows the caller-specified order. An empty list is a valid zero-column
+/// projection (only the score column is materialized). Pass null to clear any
+/// previously set projection.
+///
+/// Unlike `paimon_read_builder_with_projection`, this does not validate column
+/// names eagerly: the vector builder resolves the projection against the schema
+/// when the search runs, so an unknown column surfaces as an error from the
+/// execute-read terminal.
+///
+/// # Safety
+/// `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+/// null (returns error). `columns` must be a null-terminated array of
+/// null-terminated C strings, or null to clear the projection.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_with_projection(
+    b: *mut paimon_vector_search_builder,
+    columns: *const *const c_char,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(b, "b") {
+        return e;
+    }
+
+    let state = &mut *((*b).inner as *mut VectorSearchState);
+
+    if columns.is_null() {
+        state.projection = None;
+        return std::ptr::null_mut();
+    }
+
+    let mut col_names = Vec::new();
+    let mut ptr = columns;
+    while !(*ptr).is_null() {
+        let c_str = std::ffi::CStr::from_ptr(*ptr);
+        match c_str.to_str() {
+            Ok(s) => col_names.push(s.to_string()),
+            Err(e) => {
+                return paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Invalid UTF-8 in projection column name: {e}"),
+                );
+            }
+        }
+        ptr = ptr.add(1);
+    }
+
+    state.projection = Some(col_names);
+    std::ptr::null_mut()
+}
+
 /// Free a paimon_vector_search_builder.
 ///
 /// # Safety
@@ -276,6 +333,10 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
     if let Some(f) = &state.filter {
         builder.with_filter(f.clone());
+    }
+    if let Some(cols) = &state.projection {
+        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        builder.with_projection(&col_refs);
     }
 
     match block_on(builder.execute_read()) {
@@ -367,6 +428,10 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read_for_data_spli
     if let Some(f) = &state.filter {
         builder.with_filter(f.clone());
     }
+    if let Some(cols) = &state.projection {
+        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        builder.with_projection(&col_refs);
+    }
 
     match block_on(builder.execute_read_for_data_split(split)) {
         Ok(stream) => {
@@ -420,6 +485,10 @@ const _: unsafe extern "C" fn(
     *mut paimon_vector_search_builder,
     *mut paimon_predicate,
 ) -> *mut paimon_error = paimon_vector_search_builder_with_filter;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+    *const *const c_char,
+) -> *mut paimon_error = paimon_vector_search_builder_with_projection;
 const _: unsafe extern "C" fn(*mut paimon_vector_search_builder) =
     paimon_vector_search_builder_free;
 const _: unsafe extern "C" fn(
@@ -451,6 +520,98 @@ mod tests {
             assert!(result.reader.is_null());
             assert!(!result.error.is_null());
             crate::error::paimon_error_free(result.error);
+        }
+    }
+
+    #[test]
+    fn with_projection_rejects_null_builder() {
+        unsafe {
+            let err = paimon_vector_search_builder_with_projection(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!err.is_null(), "null builder must fail loud");
+            crate::error::paimon_error_free(err);
+        }
+    }
+
+    // The projected read is exercised end-to-end by the Rust integration test; here
+    // we pin the C setter's own contract, which needs no PK-vector fixture: it
+    // stores/clears the projection on the builder state and never validates column
+    // names (deferred to the execute-read terminal), so setting a valid, an unknown,
+    // and an empty projection all succeed, and null clears a previously set one.
+    #[cfg(not(windows))] // Local-fs paths under tempfile are POSIX-only.
+    #[test]
+    fn with_projection_stores_and_clears_without_validating_names() {
+        use paimon::catalog::Identifier as Id;
+        use paimon::spec::{DataType, IntType, Schema};
+        use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
+        use std::ffi::CString;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let warehouse = temp.path().to_str().unwrap().to_string();
+        let mut opts = Options::new();
+        opts.set(CatalogOptions::WAREHOUSE, &warehouse);
+        let catalog = FileSystemCatalog::new(opts).unwrap();
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .build()
+            .unwrap();
+        let table = block_on(async {
+            catalog
+                .create_database("db1", false, std::collections::HashMap::new())
+                .await
+                .unwrap();
+            catalog
+                .create_table(&Id::new("db1", "users"), schema, false)
+                .await
+                .unwrap();
+            catalog.get_table(&Id::new("db1", "users")).await.unwrap()
+        });
+
+        unsafe {
+            let handle = Box::into_raw(Box::new(paimon_table {
+                inner: Box::into_raw(Box::new(table)) as *mut c_void,
+            }));
+            let builder = paimon_table_new_vector_search_builder(handle);
+            assert!(builder.error.is_null());
+            let b = builder.builder;
+
+            let state = &*((*b).inner as *const VectorSearchState);
+            assert!(state.projection.is_none(), "starts unset");
+
+            // A valid column is stored verbatim (no eager validation).
+            let id = CString::new("id").unwrap();
+            let cols = [id.as_ptr(), std::ptr::null()];
+            assert!(paimon_vector_search_builder_with_projection(b, cols.as_ptr()).is_null());
+            let state = &*((*b).inner as *const VectorSearchState);
+            assert_eq!(state.projection.as_deref(), Some(&["id".to_string()][..]));
+
+            // An unknown column is also stored — validation is deferred to execute.
+            let bad = CString::new("does_not_exist").unwrap();
+            let bad_cols = [bad.as_ptr(), std::ptr::null()];
+            assert!(paimon_vector_search_builder_with_projection(b, bad_cols.as_ptr()).is_null());
+            let state = &*((*b).inner as *const VectorSearchState);
+            assert_eq!(
+                state.projection.as_deref(),
+                Some(&["does_not_exist".to_string()][..])
+            );
+
+            // An empty list is a valid zero-column projection (only the score column).
+            let empty: [*const c_char; 1] = [std::ptr::null()];
+            assert!(paimon_vector_search_builder_with_projection(b, empty.as_ptr()).is_null());
+            let state = &*((*b).inner as *const VectorSearchState);
+            assert_eq!(state.projection.as_deref(), Some(&[][..]));
+
+            // Null clears any previously set projection.
+            assert!(paimon_vector_search_builder_with_projection(b, std::ptr::null()).is_null());
+            let state = &*((*b).inner as *const VectorSearchState);
+            assert!(state.projection.is_none(), "null clears the projection");
+
+            paimon_vector_search_builder_free(b);
+            let handle_box = Box::from_raw(handle);
+            drop(Box::from_raw(handle_box.inner as *mut Table));
         }
     }
 }

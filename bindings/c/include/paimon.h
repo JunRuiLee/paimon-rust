@@ -960,6 +960,33 @@ paimon_error *paimon_vector_search_builder_with_filter(paimon_vector_search_buil
 ;
 
 /**
+ * Restrict the columns materialized by the execute-read terminals
+ * (`paimon_vector_search_builder_execute_read` and
+ * `paimon_vector_search_builder_execute_read_for_data_split`) to `columns` (plus
+ * the always-appended `__paimon_search_score`). Without this call both terminals
+ * materialize every user table column.
+ *
+ * `columns` is a null-terminated array of null-terminated C strings; output
+ * order follows the caller-specified order. An empty list is a valid zero-column
+ * projection (only the score column is materialized). Pass null to clear any
+ * previously set projection.
+ *
+ * Unlike `paimon_read_builder_with_projection`, this does not validate column
+ * names eagerly: the vector builder resolves the projection against the schema
+ * when the search runs, so an unknown column surfaces as an error from the
+ * execute-read terminal.
+ *
+ * # Safety
+ * `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+ * null (returns error). `columns` must be a null-terminated array of
+ * null-terminated C strings, or null to clear the projection.
+ */
+
+paimon_error *paimon_vector_search_builder_with_projection(paimon_vector_search_builder *b,
+                                                           const char *const *columns)
+;
+
+/**
  * Free a paimon_vector_search_builder.
  *
  * # Safety
