@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "paimon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "apache-avro",
  "arrow-arith",
@@ -4586,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-c"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4600,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-datafusion"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-integration-tests"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-rest-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4686,7 +4686,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-tpcds-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5233,7 +5233,7 @@ dependencies = [
 
 [[package]]
 name = "pypaimon_rust"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "chrono",
