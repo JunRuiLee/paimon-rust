@@ -26,6 +26,7 @@ use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
     IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
+use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
@@ -767,44 +768,63 @@ async fn plan_and_search_pk_candidates_batch(
     // Residual (post-recall) filtering: for each candidate file, re-read its
     // physical rows and keep the positions whose rows satisfy the filter. The
     // per-split allow-list is threaded into the bucket search so the residual folds
-    // into recall (best-first order and Top-K are preserved). Built only when a
-    // filter is set; otherwise `None` leaves the search unfiltered. The residual
-    // depends only on the filter and the plan, not the query vector, so it is
-    // computed once here and shared across every query in the batch. The residual
-    // reader projects only the predicate columns and carries no pushdown;
-    // `residual_positions_by_file` recovers each surviving row's file-local
-    // physical position from its ordinal in the unfiltered scan (no `_ROW_ID`, no
-    // `first_row_id`). A file the allow-list leaves empty is skipped by the bucket
-    // search without opening an exact reader.
+    // into recall (best-first order and Top-K are preserved). Built only when the
+    // filter has data (non-partition) conjuncts; a partition-only filter (or no
+    // filter) leaves `None`, which leaves the search unfiltered — partition
+    // pruning is already handled in planning. The residual depends only on the
+    // filter and the plan, not the query vector, so it is computed once here and
+    // shared across every query in the batch. The residual reader projects only
+    // the predicate columns and carries no pushdown; `residual_positions_by_file`
+    // recovers each surviving row's file-local physical position from its ordinal
+    // in the unfiltered scan (no `_ROW_ID`, no `first_row_id`). A file the
+    // allow-list leaves empty is skipped by the bucket search without opening an
+    // exact reader.
     let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match filter {
         Some(filter) => {
-            let file_predicates = FilePredicates {
-                predicates: vec![filter.clone()],
-                row_filter_factory: None,
-                file_fields: table.schema().fields().to_vec(),
-            };
-            let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
-            let residual_reader = DataFileReader::new(
-                table.file_io().clone(),
-                table.schema_manager().clone(),
-                table.schema().id(),
-                table.schema().fields().to_vec(),
-                residual_read_type,
-                Vec::new(),
+            // The whole filter is pushed into scan planning (`PkVectorScan`), where
+            // partition-only conjuncts already prune partitions/files. Re-applying
+            // them as a per-row residual would be redundant, so keep only the data
+            // conjuncts here — a partition-only filter then needs no residual at
+            // all. Mixed partition/data conjuncts stay whole in `data_predicates`
+            // and evaluate against the materialized partition column (partition
+            // columns are physically present in primary-key data files), so there
+            // is no missing-column case to reject.
+            let (_partition_predicate, data_predicates) = split_partition_and_data_predicates(
+                filter.clone(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
             );
-            let mut per_split = Vec::with_capacity(plan.splits.len());
-            for split in &plan.splits {
-                per_split.push(
-                    residual_positions_by_file(
-                        &residual_reader,
-                        &split.data_split,
-                        &split.active_files,
-                        &file_predicates,
-                    )
-                    .await?,
+            if data_predicates.is_empty() {
+                None
+            } else {
+                let file_predicates = FilePredicates {
+                    predicates: data_predicates,
+                    row_filter_factory: None,
+                    file_fields: table.schema().fields().to_vec(),
+                };
+                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
+                let residual_reader = DataFileReader::new(
+                    table.file_io().clone(),
+                    table.schema_manager().clone(),
+                    table.schema().id(),
+                    table.schema().fields().to_vec(),
+                    residual_read_type,
+                    Vec::new(),
                 );
+                let mut per_split = Vec::with_capacity(plan.splits.len());
+                for split in &plan.splits {
+                    per_split.push(
+                        residual_positions_by_file(
+                            &residual_reader,
+                            &split.data_split,
+                            &split.active_files,
+                            &file_predicates,
+                        )
+                        .await?,
+                    );
+                }
+                Some(per_split)
             }
-            Some(per_split)
         }
         None => None,
     };
@@ -4491,6 +4511,77 @@ mod tests {
         PredicateBuilder::new(table.schema().fields())
             .greater_than("id", Datum::Int(threshold))
             .unwrap()
+    }
+
+    /// The vector residual is derived from the DATA conjuncts of the filter:
+    /// partition-only conjuncts are enforced by scan planning (`PkVectorScan`
+    /// pushes the whole filter through the normal scan) and must not enter the
+    /// per-row residual, so a partition-only filter yields no residual at all.
+    #[test]
+    fn residual_uses_only_data_conjuncts_of_the_filter() {
+        use crate::spec::VarCharType;
+        use crate::table::bucket_filter::split_partition_and_data_predicates;
+
+        // Partitioned table: `dt` (partition key) + `id`.
+        let schema = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["dt"])
+            .build()
+            .unwrap();
+        let ts = TableSchema::new(0, &schema);
+        let fields = ts.fields();
+        let partition_keys = ts.partition_keys();
+        let pb = PredicateBuilder::new(fields);
+
+        // Partition-only `dt = 'a'` -> no residual data predicate (residual skipped;
+        // the partition is enforced by planning alone).
+        let (_p, data) = split_partition_and_data_predicates(
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            fields,
+            partition_keys,
+        );
+        assert!(
+            data.is_empty(),
+            "partition-only filter must leave no residual data predicate"
+        );
+
+        // Data-only `id > 5` -> kept as the residual.
+        let (_p, data) = split_partition_and_data_predicates(
+            pb.greater_than("id", Datum::Int(5)).unwrap(),
+            fields,
+            partition_keys,
+        );
+        assert_eq!(data.len(), 1, "data-only filter must remain the residual");
+
+        // `dt = 'a' AND id > 5` -> only the data conjunct enters the residual.
+        let (_p, data) = split_partition_and_data_predicates(
+            Predicate::and(vec![
+                pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+                pb.greater_than("id", Datum::Int(5)).unwrap(),
+            ]),
+            fields,
+            partition_keys,
+        );
+        assert_eq!(
+            data.len(),
+            1,
+            "AND(partition, data) residual must drop the partition conjunct"
+        );
+
+        // `dt = 'a' OR id > 5` is a single mixed conjunct: it is NOT partition-only,
+        // so it stays whole in the residual (evaluated against the materialized
+        // partition column), rather than being dropped or split.
+        let mixed = Predicate::or(vec![
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            pb.greater_than("id", Datum::Int(5)).unwrap(),
+        ]);
+        let (_p, data) = split_partition_and_data_predicates(mixed.clone(), fields, partition_keys);
+        assert_eq!(
+            data,
+            vec![mixed],
+            "a mixed partition/data conjunct must stay whole in the residual"
+        );
     }
 
     #[tokio::test]
