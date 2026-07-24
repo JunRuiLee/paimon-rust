@@ -619,12 +619,12 @@ fn is_reserved_read_column(name: &str) -> bool {
 /// Reject a materialized read type whose resolved fields contain a reserved
 /// metadata column name. Applied to the RESOLVED field list so the default
 /// (all user columns) projection is covered, not only an explicit one.
-fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Result<()> {
+pub(crate) fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Result<()> {
     for field in fields {
         if is_reserved_read_column(field.name()) {
             return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "vector search read projection must not include reserved column '{}'",
+                    "search read must not include reserved column '{}'",
                     field.name()
                 ),
                 source: None,

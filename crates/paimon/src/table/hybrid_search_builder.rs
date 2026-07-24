@@ -32,7 +32,7 @@ use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorI
 use crate::table::pk_vector_orchestrator::build_indexed_splits;
 use crate::table::source::DataSplit;
 use crate::table::vector_search_builder::{
-    collect_ranked_rows, reorder_and_strip_position, RankedRow,
+    collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
 use crate::vector_search::SearchResult;
@@ -412,6 +412,14 @@ impl<'a> HybridSearchBuilder<'a> {
         core: &CoreOptions<'_>,
         limit: usize,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // The materialized read projects every user column and then appends the
+        // internal `_PKEY_VECTOR_POSITION` and `__paimon_search_score` columns; a
+        // user column whose name collides with either (or with `_ROW_ID`) would be
+        // shadowed by a positional lookup, corrupting the reorder/strip and the
+        // fused score. Reject it up front — before any route runs and even when the
+        // fused result is empty — reusing the primary-key vector read's guard.
+        ensure_no_reserved_read_columns(self.table.schema().fields())?;
+
         // Snapshot pinning: resolve ONE snapshot for the whole primary-key hybrid
         // read and plan every route against it, mirroring Java
         // `HybridSearchBuilderImpl.routeBuilders()` (which resolves the snapshot
@@ -1625,6 +1633,68 @@ mod pk_hybrid_tests {
             format!("{execute_err:?}").contains("execute_read"),
             "PK hybrid execute must point at execute_read, got: {execute_err:?}"
         );
+    }
+
+    /// A primary-key hybrid table whose user schema carries an extra column named
+    /// `reserved`, used to prove the materialized read rejects a reserved metadata
+    /// name arriving via the default (all-columns) projection.
+    fn pk_hybrid_table_with_reserved_column(reserved: &str) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                VECTOR_COLUMN,
+                DataType::Vector(
+                    VectorType::try_new(true, DIM as u32, DataType::Float(FloatType::new()))
+                        .unwrap(),
+                ),
+            )
+            .column(TEXT_COLUMN, DataType::VarChar(VarCharType::string_type()))
+            .column(reserved, DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"]);
+        for (k, v) in table_options() {
+            builder = builder.option(k, v);
+        }
+        let schema = TableSchema::new(0, &builder.build().unwrap());
+        Table::new(
+            file_io,
+            Identifier::new("default", "pk_hybrid_reserved"),
+            "memory:/pk_hybrid_reserved".to_string(),
+            schema,
+            None,
+        )
+    }
+
+    // A user column colliding with an injected metadata column
+    // (`_PKEY_VECTOR_POSITION`, `__paimon_search_score`, or `_ROW_ID`) must make the
+    // primary-key hybrid materialized read fail loud up front — before any route
+    // runs and regardless of results — mirroring the primary-key vector read guard.
+    #[tokio::test]
+    async fn pk_hybrid_read_rejects_reserved_user_column() {
+        for reserved in ["_PKEY_VECTOR_POSITION", "__paimon_search_score", "_ROW_ID"] {
+            let table = pk_hybrid_table_with_reserved_column(reserved);
+            let mut builder = table.new_hybrid_search_builder();
+            builder
+                .add_vector_route(
+                    VECTOR_COLUMN,
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    2,
+                    1.0,
+                    HashMap::new(),
+                )
+                .unwrap();
+            builder.with_limit(2);
+            let err = builder
+                .execute_read()
+                .await
+                .err()
+                .expect("reserved user column must fail loud");
+            assert!(
+                matches!(&err, crate::Error::DataInvalid { message, .. }
+                    if message.contains("reserved column")),
+                "unexpected error for {reserved}: {err:?}"
+            );
+        }
     }
 
     // (e) DE regression: a hybrid over non-PK routes (no PK configs) still takes the
