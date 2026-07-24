@@ -60,6 +60,7 @@ pub unsafe extern "C" fn paimon_table_new_vector_search_builder(
         limit: None,
         options: HashMap::new(),
         filter: None,
+        projection: None,
     };
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
     paimon_result_vector_search_builder {
@@ -214,6 +215,61 @@ pub unsafe extern "C" fn paimon_vector_search_builder_with_filter(
     std::ptr::null_mut()
 }
 
+/// Restrict the columns materialized by `paimon_vector_search_builder_execute_read`
+/// to `columns` (plus the always-appended `__paimon_search_score`). Without this
+/// call `execute_read` materializes every user table column. Only affects
+/// `execute_read`.
+///
+/// `columns` is a null-terminated array of null-terminated C strings; output
+/// order follows the caller-specified order. An empty list is a valid zero-column
+/// projection (only the score column is materialized). Pass null to clear any
+/// previously set projection.
+///
+/// Unlike `paimon_read_builder_with_projection`, this does not validate column
+/// names eagerly: the vector builder resolves the projection against the schema
+/// when the search runs, so an unknown column surfaces as an error from
+/// `paimon_vector_search_builder_execute_read`.
+///
+/// # Safety
+/// `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+/// null (returns error). `columns` must be a null-terminated array of
+/// null-terminated C strings, or null to clear the projection.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_with_projection(
+    b: *mut paimon_vector_search_builder,
+    columns: *const *const c_char,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(b, "b") {
+        return e;
+    }
+
+    let state = &mut *((*b).inner as *mut VectorSearchState);
+
+    if columns.is_null() {
+        state.projection = None;
+        return std::ptr::null_mut();
+    }
+
+    let mut col_names = Vec::new();
+    let mut ptr = columns;
+    while !(*ptr).is_null() {
+        let c_str = std::ffi::CStr::from_ptr(*ptr);
+        match c_str.to_str() {
+            Ok(s) => col_names.push(s.to_string()),
+            Err(e) => {
+                return paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Invalid UTF-8 in projection column name: {e}"),
+                );
+            }
+        }
+        ptr = ptr.add(1);
+    }
+
+    state.projection = Some(col_names);
+    std::ptr::null_mut()
+}
+
 /// Free a paimon_vector_search_builder.
 ///
 /// # Safety
@@ -263,6 +319,10 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
     if let Some(f) = &state.filter {
         builder.with_filter(f.clone());
+    }
+    if let Some(cols) = &state.projection {
+        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        builder.with_projection(&col_refs);
     }
 
     match runtime().block_on(builder.execute_read()) {
@@ -317,6 +377,10 @@ const _: unsafe extern "C" fn(
     *mut paimon_vector_search_builder,
     *mut paimon_predicate,
 ) -> *mut paimon_error = paimon_vector_search_builder_with_filter;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+    *const *const c_char,
+) -> *mut paimon_error = paimon_vector_search_builder_with_projection;
 const _: unsafe extern "C" fn(*mut paimon_vector_search_builder) =
     paimon_vector_search_builder_free;
 const _: unsafe extern "C" fn(

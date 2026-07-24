@@ -2474,3 +2474,146 @@ fn plan_from_split_bytes_rejects_garbage() {
     assert!(!r.error.is_null());
     unsafe { paimon_error_free(r.error) };
 }
+
+// --- Vector-search projection through execute_read ------------------------
+
+/// Core Rust reference: sorted output column names materialized by `execute_read`
+/// under an optional projection.
+fn rust_execute_read_column_names(
+    table: &Table,
+    column: &str,
+    query: Vec<f32>,
+    limit: usize,
+    projection: Option<&[&str]>,
+) -> Vec<String> {
+    crate::runtime().block_on(async {
+        let mut builder = table.new_vector_search_builder();
+        builder
+            .with_vector_column(column)
+            .with_query_vector(query)
+            .with_limit(limit);
+        if let Some(cols) = projection {
+            builder.with_projection(cols);
+        }
+        let mut stream = builder.execute_read().await.unwrap();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(b) = stream.try_next().await.unwrap() {
+            names = b
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect();
+        }
+        names.sort();
+        names
+    })
+}
+
+/// C path: sorted output column names materialized by a configured builder's
+/// `execute_read`. Frees the builder and reader.
+unsafe fn c_execute_read_column_names(builder: *mut paimon_vector_search_builder) -> Vec<String> {
+    let result = paimon_vector_search_builder_execute_read(builder);
+    paimon_vector_search_builder_free(builder);
+    assert!(result.error.is_null(), "execute_read should not error");
+    assert!(!result.reader.is_null());
+
+    let mut names: Vec<String> = Vec::new();
+    loop {
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        if next.batch.array.is_null() {
+            break; // EOF
+        }
+        let batch = import_batch(&next.batch);
+        names = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        paimon_arrow_batch_free(next.batch);
+    }
+    paimon_record_batch_reader_free(result.reader);
+    names.sort();
+    names
+}
+
+#[test]
+fn vector_search_pk_projection_restricts_columns() {
+    // Projecting a subset through execute_read must materialize only those user
+    // columns plus the score column — the unprojected vector column is excluded.
+    let path = "memory:/vsearch_pk_projection";
+    let (query, vectors) = pk_fixture_smoke();
+    let table = build_pk_vector_table(path, &vectors);
+
+    // Reference: unprojected read materializes every user column (id, embedding);
+    // projecting ["id"] yields id + score only. Sorted, `__paimon_search_score`
+    // (leading underscore) precedes `id`.
+    let full = rust_execute_read_column_names(&table, VECTOR_COLUMN, query.to_vec(), 3, None);
+    assert!(
+        full.contains(&"id".to_string()) && full.contains(&VECTOR_COLUMN.to_string()),
+        "unprojected read must materialize every user column, got {full:?}"
+    );
+    let rust_projected =
+        rust_execute_read_column_names(&table, VECTOR_COLUMN, query.to_vec(), 3, Some(&["id"]));
+    assert_eq!(
+        rust_projected,
+        vec![SCORE_COLUMN.to_string(), "id".to_string()],
+        "reference projection ['id'] must yield id + score only"
+    );
+
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let id = CString::new("id").unwrap();
+        let cols = [id.as_ptr(), ptr::null()];
+        assert!(
+            paimon_vector_search_builder_with_projection(builder, cols.as_ptr()).is_null(),
+            "with_projection must accept a valid column"
+        );
+        let c_names = c_execute_read_column_names(builder);
+        assert_eq!(
+            c_names, rust_projected,
+            "C projected columns must match the Rust reference (id + score, no vector column)"
+        );
+        assert!(
+            !c_names.contains(&VECTOR_COLUMN.to_string()),
+            "projected read must exclude the unprojected vector column"
+        );
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_projection_unknown_column_errors_at_execute_read() {
+    // The C setter defers column-name validation (the core vector builder's
+    // with_projection is infallible). An unknown projected column must therefore
+    // surface as an error from execute_read, not a silent empty/EOF reader.
+    let path = "memory:/vsearch_pk_projection_unknown";
+    let (query, vectors) = pk_fixture_smoke();
+    let table = build_pk_vector_table(path, &vectors);
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let bad = CString::new("does_not_exist").unwrap();
+        let cols = [bad.as_ptr(), ptr::null()];
+        // The setter itself accepts the name (validation is deferred).
+        assert!(
+            paimon_vector_search_builder_with_projection(builder, cols.as_ptr()).is_null(),
+            "with_projection defers validation, so the setter must not error"
+        );
+        let result = paimon_vector_search_builder_execute_read(builder);
+        paimon_vector_search_builder_free(builder);
+        assert!(
+            result.reader.is_null(),
+            "an unknown projected column must not yield a reader"
+        );
+        assert!(
+            !result.error.is_null(),
+            "an unknown projected column must fail loud at execute_read"
+        );
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
