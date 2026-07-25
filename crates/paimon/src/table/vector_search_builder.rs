@@ -579,7 +579,7 @@ fn resolve_pk_vector_search_params(
     limit: usize,
     filter: Option<&Predicate>,
 ) -> crate::Result<PkVectorSearchParams> {
-    // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
+    // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A DATA
     // predicate set via `with_filter` is applied post-recall by re-reading each
     // candidate file's physical rows (see below). That physical-position filtering
     // only agrees with the bucket search when the table exposes physical rows
@@ -587,11 +587,26 @@ fn resolve_pk_vector_search_params(
     // merge-on-read (or without deletion vectors) a read merges multiple key
     // versions, so a scalar filter could retain a stale version whose live version
     // does not match — a silent wrong-read. Reject such queries rather than answer
-    // them incorrectly. No filter → nothing to guard, so the search-only and read
-    // paths are unaffected.
+    // them incorrectly.
+    //
+    // Guard on the DATA conjuncts, not the whole filter: partition-only conjuncts
+    // are enforced entirely by scan planning (partition pruning) and produce no
+    // per-row residual, so they need no physical-row read. This mirrors Java, where
+    // `BatchVectorSearchBuilderImpl.withFilter` splits at the builder level and
+    // leaves `this.filter == null` for a partition-only filter — the scan guard is
+    // then skipped. No data predicate (partition-only or no filter) → nothing to
+    // guard, so the search-only and read paths are unaffected.
     let physical_row_read =
         core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
-    if filter.is_some() && !physical_row_read {
+    let has_data_predicate = filter.is_some_and(|f| {
+        let (_partition, data) = split_partition_and_data_predicates(
+            f.clone(),
+            table.schema().fields(),
+            table.schema().partition_keys(),
+        );
+        !data.is_empty()
+    });
+    if has_data_predicate && !physical_row_read {
         return Err(crate::Error::DataInvalid {
             message:
                 "primary-key vector pre-filter requires deletion vectors without merge-on-read"
@@ -3258,6 +3273,79 @@ mod tests {
             .await
             .expect("guarded filter query must be admitted");
         assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    /// A partition-only `with_filter` needs no per-row residual (partition pruning
+    /// happens in scan planning), so the deletion-vector pre-filter guard must NOT
+    /// reject it even when deletion vectors are off. Mirrors Java, where a
+    /// partition-only filter leaves `this.filter == null` and the scan guard is
+    /// skipped. Regression test for the guard keying on the whole filter rather
+    /// than its data conjuncts.
+    #[tokio::test]
+    async fn execute_read_partition_only_filter_without_deletion_vectors_passes_guard() {
+        use crate::spec::VarCharType;
+
+        // Partitioned PK-vector table, deletion vectors OFF (default).
+        let mut builder = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .partition_keys(["dt"]);
+        for (k, v) in [
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("fields.embedding.dimension", "4"),
+        ] {
+            builder = builder.option(k, v);
+        }
+        let schema = builder.build().unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "pk_vector_partitioned"),
+            "memory:/pk_vector_partitioned".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        // Partition-only `dt = 'a'`: no data residual, so the guard admits it and
+        // (with no snapshot) the query yields an empty stream instead of the
+        // deletion-vector error.
+        let filter = PredicateBuilder::new(table.schema().fields())
+            .equal("dt", Datum::String("a".to_string()))
+            .unwrap();
+        let mut stream = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_read()
+            .await
+            .expect("partition-only filter must be admitted without deletion vectors");
+        assert!(stream.try_next().await.unwrap().is_none());
+
+        // But a DATA conjunct (`id > 2`) on the same non-DV table must still fail
+        // loud — the guard now keys on data predicates, not the whole filter.
+        let data_filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(data_filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("data filter without deletion vectors must still fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
     }
 
     fn make_lumina_entry(
