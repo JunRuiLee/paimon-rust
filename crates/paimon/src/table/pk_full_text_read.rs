@@ -130,7 +130,7 @@ pub(crate) fn top_k_by_score(
 /// scores are already final relevance scores, so any transform would corrupt them
 /// (spec D1). Groups are emitted in ascending group-key order for a deterministic
 /// file/position materialization order; the caller reorders back to best-first.
-fn build_full_text_indexed_splits(
+pub(crate) fn build_full_text_indexed_splits(
     survivors: Vec<PrimaryKeyFullTextCandidate>,
     splits: &[PrimaryKeyFullTextSearchSplit],
 ) -> crate::Result<Vec<PkVectorIndexedSplit>> {
@@ -246,6 +246,21 @@ fn build_full_text_indexed_splits(
     Ok(out)
 }
 
+/// The primary-key full-text route's search output plus the source context a
+/// later materialization (or a hybrid fusion across routes) needs. `candidates`
+/// are the best-score-first survivors; `splits` are the planned per-bucket source
+/// splits their `split_index` refers into; `snapshot_id` is the snapshot the plan
+/// resolved. The splits are borrowed from the originating plan (kept alive by the
+/// caller) because `split_index` is only meaningful against that plan. Produced by
+/// [`PrimaryKeyFullTextRead::search_route`].
+pub(crate) struct PrimaryKeyFullTextRouteResult<'a> {
+    pub(crate) candidates: Vec<PrimaryKeyFullTextCandidate>,
+    // Read by the hybrid route consumer (fuses routes before materializing); the
+    // materialized read reaches candidates directly and holds the plan itself.
+    pub(crate) snapshot_id: i64,
+    pub(crate) splits: &'a [PrimaryKeyFullTextSearchSplit],
+}
+
 /// FAST-only primary-key full-text materialized read. Given a planned set of
 /// per-bucket search splits, it searches each bucket through the full-text archive
 /// reader, fuses the hits cross-bucket by score, materializes the winning physical
@@ -277,16 +292,19 @@ impl PrimaryKeyFullTextRead {
         }
     }
 
-    /// Search every planned bucket, fuse the hits by score into a global Top-`limit`,
-    /// materialize the winning rows, and emit them best-score-first with the
-    /// unified score column. An empty plan or an empty result yields an empty
-    /// stream. `query` is passed verbatim to the archive reader (spec D2).
-    pub(crate) async fn read(
+    /// Search every planned bucket and fuse the hits by score into the global
+    /// best-score-first Top-`limit`, WITHOUT materializing any rows. Returns the
+    /// surviving candidates together with the route source context (the plan's
+    /// resolved snapshot id and its per-bucket source splits) so a caller can fuse
+    /// them with another route before materializing. [`read`](Self::read) is
+    /// layered on top of this. `query` is passed verbatim to the archive reader
+    /// (spec D2).
+    pub(crate) async fn search_route<'p>(
         &self,
-        plan: &PrimaryKeyFullTextScanPlan,
+        plan: &'p PrimaryKeyFullTextScanPlan,
         query: &str,
         limit: usize,
-    ) -> crate::Result<ArrowRecordBatchStream> {
+    ) -> crate::Result<PrimaryKeyFullTextRouteResult<'p>> {
         // Every planned split must belong to the plan's resolved snapshot; mixing
         // snapshots would search/materialize physical rows against the wrong
         // version. The scan already pins one snapshot, so a mismatch is malformed
@@ -334,6 +352,24 @@ impl PrimaryKeyFullTextRead {
 
         // Global cross-bucket fusion: score-descending Top-`limit`.
         let survivors = top_k_by_score(candidates, limit);
+        Ok(PrimaryKeyFullTextRouteResult {
+            candidates: survivors,
+            snapshot_id: plan.snapshot_id,
+            splits: &plan.splits,
+        })
+    }
+
+    /// Search every planned bucket, fuse the hits by score into a global Top-`limit`,
+    /// materialize the winning rows, and emit them best-score-first with the
+    /// unified score column. An empty plan or an empty result yields an empty
+    /// stream. `query` is passed verbatim to the archive reader (spec D2).
+    pub(crate) async fn read(
+        &self,
+        plan: &PrimaryKeyFullTextScanPlan,
+        query: &str,
+        limit: usize,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let survivors = self.search_route(plan, query, limit).await?.candidates;
         if survivors.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
@@ -965,5 +1001,91 @@ mod read_tests {
         )
         .await;
         assert!(batches.is_empty(), "no match must yield an empty stream");
+    }
+
+    // ---- search_route: candidate-only producer returns candidates + context ----
+    #[tokio::test]
+    async fn search_route_returns_candidates_and_source_context() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/pk_ft_route";
+        // pos2 ("alpha alpha alpha") scores higher for "alpha" than pos0 ("alpha").
+        let archive = build_archive(&[
+            (0, "alpha"),
+            (1, "beta"),
+            (2, "alpha alpha alpha"),
+            (3, "gamma"),
+        ]);
+        write_bytes(&file_io, &format!("{table_path}/index/ft-0"), archive).await;
+
+        let (reader, split) = build_data(&file_io, table_path, vec![100, 101, 102, 103], &[]).await;
+        let plan = PrimaryKeyFullTextScanPlan {
+            snapshot_id: 1,
+            splits: vec![PrimaryKeyFullTextSearchSplit::new(
+                split,
+                vec![ft_payload("ft-0", &[("d0.mosaic", 4)])],
+                Vec::new(),
+            )
+            .unwrap()],
+        };
+
+        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let route = read
+            .search_route(&plan, r#"{"match":{"query":"alpha"}}"#, 10)
+            .await
+            .unwrap();
+
+        // Two docs contain "alpha" -> two best-score-first candidates, no
+        // materialization performed.
+        assert_eq!(route.candidates.len(), 2, "both alpha hits must survive");
+        assert!(
+            route.candidates[0].score >= route.candidates[1].score,
+            "candidates must be best-score-first: {:?}",
+            route.candidates.iter().map(|c| c.score).collect::<Vec<_>>()
+        );
+        // The strong "alpha alpha alpha" hit (physical position 2) ranks first.
+        assert_eq!(route.candidates[0].row_position, 2);
+        assert_eq!(route.candidates[1].row_position, 0);
+
+        // Source context: the plan's snapshot and its per-bucket source splits are
+        // carried through so a caller can materialize (or fuse) without the plan.
+        assert_eq!(route.snapshot_id, 1);
+        assert_eq!(route.splits.len(), 1, "one bucket split expected");
+        // The candidate's split_index refers into the returned splits.
+        assert!(route
+            .candidates
+            .iter()
+            .all(|c| c.split_index < route.splits.len()));
+    }
+
+    /// A real (non-empty) plan whose query matches nothing still reports the
+    /// plan's pinned snapshot id and its source splits — a zero-candidate route
+    /// must not lose the snapshot the cross-route consistency guard requires.
+    #[tokio::test]
+    async fn search_route_zero_candidates_still_carries_snapshot() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/pk_ft_route_empty";
+        let archive = build_archive(&[(0, "alpha"), (1, "beta")]);
+        write_bytes(&file_io, &format!("{table_path}/index/ft-0"), archive).await;
+
+        let (reader, split) = build_data(&file_io, table_path, vec![100, 101], &[]).await;
+        let plan = PrimaryKeyFullTextScanPlan {
+            snapshot_id: 1,
+            splits: vec![PrimaryKeyFullTextSearchSplit::new(
+                split,
+                vec![ft_payload("ft-0", &[("d0.mosaic", 2)])],
+                Vec::new(),
+            )
+            .unwrap()],
+        };
+
+        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let route = read
+            .search_route(&plan, r#"{"match":{"query":"zeta"}}"#, 10)
+            .await
+            .unwrap();
+
+        assert!(route.candidates.is_empty(), "no doc matches 'zeta'");
+        assert_eq!(route.snapshot_id, 1, "real snapshot id survives zero hits");
+        assert_eq!(route.splits.len(), 1, "source splits still carried through");
     }
 }

@@ -65,6 +65,8 @@ mod pk_full_text_bucket_state;
 mod pk_full_text_read;
 #[cfg(feature = "fulltext")]
 mod pk_full_text_scan;
+mod pk_search_position;
+mod pk_search_ranker;
 mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
