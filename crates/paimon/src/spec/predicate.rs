@@ -602,6 +602,414 @@ impl fmt::Display for Predicate {
 }
 
 // ---------------------------------------------------------------------------
+// REST catalog Predicate/Transform JSON interop
+// ---------------------------------------------------------------------------
+
+impl Predicate {
+    /// Parse a `Predicate` from the REST catalog wire format (Java
+    /// `LeafPredicate`/`CompoundPredicate` JSON). Fields resolve by name against
+    /// `fields`; anything unknown errors (fail-closed).
+    pub fn from_rest_json(json: &str, fields: &[DataField]) -> Result<Predicate> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(rest_json_err)?;
+        let builder = PredicateBuilder::new(fields);
+        parse_rest_predicate(&value, &builder, fields)
+    }
+
+    /// Collect the table-schema field indices referenced by every leaf of this
+    /// predicate.
+    pub fn collect_leaf_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
+        match self {
+            Predicate::Leaf { index, .. } => {
+                out.insert(*index);
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children
+                    .iter()
+                    .for_each(|c| c.collect_leaf_field_indices(out));
+            }
+            Predicate::Not(inner) => inner.collect_leaf_field_indices(out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
+}
+
+fn rest_json_err(detail: impl fmt::Display) -> Error {
+    Error::DataInvalid {
+        message: format!("cannot parse REST catalog predicate JSON: {detail}"),
+        source: None,
+    }
+}
+
+fn parse_rest_predicate(
+    value: &serde_json::Value,
+    builder: &PredicateBuilder,
+    fields: &[DataField],
+) -> Result<Predicate> {
+    let kind = str_prop(value, "kind")?;
+    match kind {
+        "COMPOUND" => {
+            let raw_children = value
+                .get("children")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| rest_json_err("COMPOUND without children"))?;
+            // Java rejects empty AND/OR; normalizing an empty AND to AlwaysTrue
+            // would turn a malformed auth filter into allow-all.
+            if raw_children.is_empty() {
+                return Err(rest_json_err("COMPOUND with empty children"));
+            }
+            let children = raw_children
+                .iter()
+                .map(|child| parse_rest_predicate(child, builder, fields))
+                .collect::<Result<Vec<_>>>()?;
+            match str_prop(value, "function")? {
+                "AND" => Ok(Predicate::and(children)),
+                "OR" => Ok(Predicate::or(children)),
+                other => Err(rest_json_err(format!("compound function `{other}`"))),
+            }
+        }
+        "LEAF" => parse_rest_leaf(value, builder, fields),
+        other => Err(rest_json_err(format!("predicate kind `{other}`"))),
+    }
+}
+
+fn parse_rest_leaf(
+    value: &serde_json::Value,
+    builder: &PredicateBuilder,
+    fields: &[DataField],
+) -> Result<Predicate> {
+    // Java requires a well-formed transform on every leaf (`fromJson` calls
+    // `transform.outputType()`), so resolve it before anything else — accepting
+    // a malformed leaf as AlwaysTrue would turn it into allow-all.
+    let transform = value
+        .get("transform")
+        .ok_or_else(|| rest_json_err("LEAF without transform"))?;
+    let transform_name = str_prop(transform, "name")?;
+
+    // AlwaysTrue/AlwaysFalse: Java builds them with the NULL transform
+    // (`PredicateBuilder::alwaysTrue`), so the function decides and no field is
+    // resolved. Any other transform with these functions fails closed.
+    if let function @ ("TRUE" | "FALSE") = str_prop(value, "function")? {
+        if transform_name != "NULL" {
+            return Err(rest_json_err(format!(
+                "{function} with transform `{transform_name}`"
+            )));
+        }
+        return Ok(if function == "TRUE" {
+            Predicate::AlwaysTrue
+        } else {
+            Predicate::AlwaysFalse
+        });
+    }
+
+    // Non-FIELD_REF transforms (CAST, CONCAT, ...) cannot be evaluated here.
+    if transform_name != "FIELD_REF" {
+        return Err(rest_json_err(format!("transform `{transform_name}`")));
+    }
+    let field = transform
+        .get("fieldRef")
+        .and_then(|r| r.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| rest_json_err("FIELD_REF without field name"))?;
+    // Resolve by name; the local type is authoritative (Java PredicateRemapper).
+    let data_type = fields
+        .iter()
+        .find(|f| f.name() == field)
+        .map(|f| f.data_type())
+        .ok_or_else(|| rest_json_err(format!("unknown field `{field}`")))?;
+
+    let function = str_prop(value, "function")?;
+    // Convert every literal up front (like Java `deserializeLiterals`) so a
+    // malformed extra literal fails the parse. JSON null -> `None` (SQL NULL).
+    let literals: Vec<Option<Datum>> = value
+        .get("literals")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| rest_json_err(format!("{function} without literals")))?
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::Null => Ok(None),
+            v => Ok(Some(json_to_datum(v, data_type)?)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Binary/ternary leaves test false for every row on a null literal
+    // (`None` -> AlwaysFalse).
+    let one_literal = || -> Result<Option<Datum>> {
+        literals
+            .first()
+            .cloned()
+            .ok_or_else(|| rest_json_err(format!("{function} without literal")))
+    };
+    let two_literals = || -> Result<Option<(Datum, Datum)>> {
+        match (literals.first(), literals.get(1)) {
+            (Some(low), Some(high)) => Ok(low.clone().zip(high.clone())),
+            _ => Err(rest_json_err(format!("{function} needs two literals"))),
+        }
+    };
+    let binary =
+        |lit: Option<Datum>, build: &dyn Fn(Datum) -> Result<Predicate>| -> Result<Predicate> {
+            match lit {
+                Some(lit) => build(lit),
+                None => Ok(Predicate::AlwaysFalse),
+            }
+        };
+
+    match function {
+        "IS_NULL" => builder.is_null(field),
+        "IS_NOT_NULL" => builder.is_not_null(field),
+        "EQUAL" => binary(one_literal()?, &|l| builder.equal(field, l)),
+        "NOT_EQUAL" => binary(one_literal()?, &|l| builder.not_equal(field, l)),
+        "GREATER_THAN" => binary(one_literal()?, &|l| builder.greater_than(field, l)),
+        "GREATER_OR_EQUAL" => binary(one_literal()?, &|l| builder.greater_or_equal(field, l)),
+        "LESS_THAN" => binary(one_literal()?, &|l| builder.less_than(field, l)),
+        "LESS_OR_EQUAL" => binary(one_literal()?, &|l| builder.less_or_equal(field, l)),
+        "IN" => {
+            // Java In: null literals never match; an empty/all-null list matches nothing.
+            let datums: Vec<Datum> = literals.iter().flatten().cloned().collect();
+            if datums.is_empty() {
+                Ok(Predicate::AlwaysFalse)
+            } else {
+                builder.is_in(field, datums)
+            }
+        }
+        "NOT_IN" => {
+            // Java NotIn: any null literal fails every row; an empty list keeps
+            // exactly the non-null rows.
+            if literals.iter().any(Option::is_none) {
+                Ok(Predicate::AlwaysFalse)
+            } else if literals.is_empty() {
+                builder.is_not_null(field)
+            } else {
+                builder.is_not_in(field, literals.iter().flatten().cloned().collect())
+            }
+        }
+        "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
+        "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
+        "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
+        "LIKE" => match one_literal()? {
+            Some(l) => {
+                if let Datum::String(pattern) = &l {
+                    validate_rest_like_escapes(pattern)?;
+                }
+                builder.like(field, l, None)
+            }
+            None => Ok(Predicate::AlwaysFalse),
+        },
+        "BETWEEN" => match two_literals()? {
+            Some((low, high)) => builder.between(field, low, high),
+            None => Ok(Predicate::AlwaysFalse),
+        },
+        "NOT_BETWEEN" => match two_literals()? {
+            Some((low, high)) => builder.not_between(field, low, high),
+            None => Ok(Predicate::AlwaysFalse),
+        },
+        other => Err(rest_json_err(format!("leaf function `{other}`"))),
+    }
+}
+
+/// Reject the LIKE escapes Java `Like.sqlToRegexLike` rejects (`\` must precede
+/// `_`, `%`, or `\` and can't be trailing).
+fn validate_rest_like_escapes(pattern: &str) -> Result<()> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            match chars.get(i + 1) {
+                Some('_') | Some('%') | Some('\\') => i += 2,
+                _ => {
+                    return Err(rest_json_err(format!(
+                        "invalid LIKE escape sequence in `{pattern}`"
+                    )))
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn str_prop<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| rest_json_err(format!("missing `{key}`")))
+}
+
+fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datum> {
+    let type_err = || rest_json_err(format!("literal {value} for type {data_type:?}"));
+    match data_type {
+        DataType::Boolean(_) => value.as_bool().map(Datum::Bool).ok_or_else(type_err),
+        DataType::TinyInt(_) => int_datum(value, |v| i8::try_from(v).ok().map(Datum::TinyInt)),
+        DataType::SmallInt(_) => int_datum(value, |v| i16::try_from(v).ok().map(Datum::SmallInt)),
+        DataType::Int(_) => int_datum(value, |v| i32::try_from(v).ok().map(Datum::Int)),
+        DataType::BigInt(_) => int_datum(value, |v| Some(Datum::Long(v))),
+        // Integral FLOAT forms narrow directly (Java `Long.floatValue()`, one
+        // rounding); going through f64 would round twice.
+        DataType::Float(_) => {
+            let narrowed = if let Some(i) = value.as_i64() {
+                Some(i as f32)
+            } else if let Some(u) = value.as_u64() {
+                Some(u as f32)
+            } else {
+                value.as_f64().map(|v| v as f32)
+            };
+            narrowed.map(Datum::Float).ok_or_else(type_err)
+        }
+        DataType::Double(_) => value.as_f64().map(Datum::Double).ok_or_else(type_err),
+        DataType::Char(_) | DataType::VarChar(_) => value
+            .as_str()
+            .map(|s| Datum::String(s.to_string()))
+            .ok_or_else(type_err),
+        // Temporal/decimal literals fail closed: Java's own JSON deserializer
+        // cannot round-trip them.
+        other => Err(rest_json_err(format!(
+            "literal conversion for type {other:?} is not supported"
+        ))),
+    }
+}
+
+fn int_datum(value: &serde_json::Value, build: impl Fn(i64) -> Option<Datum>) -> Result<Datum> {
+    value
+        .as_i64()
+        .and_then(build)
+        .ok_or_else(|| rest_json_err(format!("integer literal {value}")))
+}
+
+/// Java `Transform` counterpart (see `org.apache.paimon.predicate.Transform`):
+/// the value-producing side of Java predicates and column masking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transform {
+    /// `NULL`: always null.
+    Null,
+    /// `FIELD_REF`: another field's value.
+    FieldRef(usize),
+    /// `CAST`: a field cast to a type.
+    Cast(usize, DataType),
+    /// String transforms over mixed literal / field inputs.
+    Upper(Vec<TransformInput>),
+    /// Lowercase of the inputs.
+    Lower(Vec<TransformInput>),
+    /// Concatenation of the inputs.
+    Concat(Vec<TransformInput>),
+    /// Concatenation where the first input is the separator.
+    ConcatWs(Vec<TransformInput>),
+}
+
+/// One input of a string [`Transform`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformInput {
+    /// A string literal (`None` = a JSON `null` input, i.e. SQL NULL).
+    Literal(Option<String>),
+    /// A field reference.
+    Field(usize),
+}
+
+impl Transform {
+    /// Parse a `Transform` from the REST catalog wire format (Java `Transform`
+    /// JSON). Fields resolve by name against `fields`; anything unknown errors
+    /// (fail-closed).
+    pub fn from_rest_json(json: &str, fields: &[DataField]) -> Result<Transform> {
+        let value: serde_json::Value = serde_json::from_str(json).map_err(rest_json_err)?;
+        parse_rest_transform(&value, fields)
+    }
+
+    /// Collect the table-schema field indices this transform reads.
+    pub fn collect_field_indices(&self, out: &mut std::collections::HashSet<usize>) {
+        match self {
+            Transform::Null => {}
+            Transform::FieldRef(index) | Transform::Cast(index, _) => {
+                out.insert(*index);
+            }
+            Transform::Upper(inputs)
+            | Transform::Lower(inputs)
+            | Transform::Concat(inputs)
+            | Transform::ConcatWs(inputs) => {
+                for input in inputs {
+                    if let TransformInput::Field(index) = input {
+                        out.insert(*index);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_rest_transform(value: &serde_json::Value, fields: &[DataField]) -> Result<Transform> {
+    let field_index = |name: &str| -> Result<usize> {
+        fields
+            .iter()
+            .position(|f| f.name() == name)
+            .ok_or_else(|| rest_json_err(format!("unknown field `{name}`")))
+    };
+    let field_ref_index = |v: &serde_json::Value| -> Result<usize> {
+        v.get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| rest_json_err("FIELD_REF without field name"))
+            .and_then(field_index)
+    };
+    // Mirrors Java StringTransform: inputs are strings, nulls, or string-typed
+    // field references; arity checks match the Java constructors.
+    let string_inputs = |min: usize, max: usize| -> Result<Vec<TransformInput>> {
+        let inputs = value
+            .get("inputs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| rest_json_err("string transform without inputs"))?
+            .iter()
+            .map(|input| match input {
+                serde_json::Value::String(s) => Ok(TransformInput::Literal(Some(s.clone()))),
+                serde_json::Value::Null => Ok(TransformInput::Literal(None)),
+                serde_json::Value::Object(_) => {
+                    let index = field_ref_index(input)?;
+                    match fields[index].data_type() {
+                        DataType::Char(_) | DataType::VarChar(_) => {
+                            Ok(TransformInput::Field(index))
+                        }
+                        other => Err(rest_json_err(format!(
+                            "string transform input `{}` has non-string type {other:?}",
+                            fields[index].name()
+                        ))),
+                    }
+                }
+                other => Err(rest_json_err(format!("transform input {other}"))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if inputs.len() < min || inputs.len() > max {
+            return Err(rest_json_err(format!(
+                "string transform expects {min}..={max} inputs, got {}",
+                inputs.len()
+            )));
+        }
+        Ok(inputs)
+    };
+    match str_prop(value, "name")? {
+        "NULL" => Ok(Transform::Null),
+        "FIELD_REF" => Ok(Transform::FieldRef(field_ref_index(
+            value
+                .get("fieldRef")
+                .ok_or_else(|| rest_json_err("FIELD_REF without fieldRef"))?,
+        )?)),
+        "CAST" => {
+            let index = field_ref_index(
+                value
+                    .get("fieldRef")
+                    .ok_or_else(|| rest_json_err("CAST without fieldRef"))?,
+            )?;
+            let to: DataType = value
+                .get("type")
+                .and_then(|t| serde_json::from_value(t.clone()).ok())
+                .ok_or_else(|| rest_json_err("CAST without a parseable type"))?;
+            // Whether the cast is applicable is checked where the mask is
+            // applied (arrow cast + output-type equality), not here.
+            Ok(Transform::Cast(index, to))
+        }
+        "UPPER" => Ok(Transform::Upper(string_inputs(1, 1)?)),
+        "LOWER" => Ok(Transform::Lower(string_inputs(1, 1)?)),
+        "CONCAT" => Ok(Transform::Concat(string_inputs(0, usize::MAX)?)),
+        "CONCAT_WS" => Ok(Transform::ConcatWs(string_inputs(2, usize::MAX)?)),
+        other => Err(rest_json_err(format!("transform `{other}`"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PredicateBuilder
 // ---------------------------------------------------------------------------
 
@@ -2617,5 +3025,415 @@ mod tests {
         }
         // NULL value → false (matches existing NotEq null-semantics).
         assert!(!eval_leaf(PredicateOperator::NotBetween, None, &lits));
+    }
+
+    // ======================== REST catalog Predicate JSON interop ========================
+
+    fn rest_leaf_json_typed(function: &str, field: &str, ftype: &str, literals: &str) -> String {
+        format!(
+            r#"{{"kind":"LEAF","transform":{{"name":"FIELD_REF","fieldRef":{{"index":0,"name":"{field}","type":"{ftype}"}}}},"function":"{function}","literals":{literals}}}"#
+        )
+    }
+
+    fn rest_leaf_json(function: &str, field: &str, literals: &str) -> String {
+        format!(
+            r#"{{"kind":"LEAF","transform":{{"name":"FIELD_REF","fieldRef":{{"index":0,"name":"{field}","type":"INT"}}}},"function":"{function}","literals":{literals}}}"#
+        )
+    }
+
+    /// Wire strings below are taken verbatim from Java `PredicateJsonSerdeTest`.
+    #[test]
+    fn test_from_rest_json_matches_java_wire_format() {
+        let fields = vec![DataField::new(
+            0,
+            "f0".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let json = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(
+            &parsed,
+            Predicate::Leaf { column, op: PredicateOperator::Eq, literals, .. }
+                if column == "f0" && literals == &vec![Datum::Int(1)]
+        ));
+
+        // IS_NULL carries an empty literals array.
+        let json = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"IS_NULL","literals":[]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(
+            &parsed,
+            Predicate::Leaf {
+                op: PredicateOperator::IsNull,
+                ..
+            }
+        ));
+
+        // AlwaysTrue/AlwaysFalse: LEAF with a placeholder NULL transform.
+        let json = r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"TRUE","literals":[]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(parsed, Predicate::AlwaysTrue));
+        let json =
+            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"FALSE","literals":[]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(parsed, Predicate::AlwaysFalse));
+        // ... and as a COMPOUND child, absorbed: AND(FALSE, x) -> AlwaysFalse.
+        let json = r#"{"kind":"COMPOUND","function":"AND","children":[{"kind":"LEAF","transform":{"name":"NULL"},"function":"FALSE","literals":[]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]}]}"#;
+        let parsed = Predicate::from_rest_json(json, &fields).unwrap();
+        assert!(matches!(&parsed, Predicate::AlwaysFalse));
+
+        // Nested COMPOUND(OR).
+        let json = r#"{"kind":"COMPOUND","function":"OR","children":[{"kind":"COMPOUND","function":"OR","children":[{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[2]}]},{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[3]}]}"#;
+        assert!(matches!(
+            Predicate::from_rest_json(json, &fields).unwrap(),
+            Predicate::Or(_)
+        ));
+
+        // BETWEEN carries two literals.
+        let json = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"BETWEEN","literals":[3,7]}"#;
+        assert!(Predicate::from_rest_json(json, &fields).is_ok());
+    }
+
+    #[test]
+    fn test_from_rest_json_rejects_empty_compounds() {
+        let fields = test_fields();
+        for function in ["AND", "OR"] {
+            let json = format!(r#"{{"kind":"COMPOUND","function":"{function}","children":[]}}"#);
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_err(),
+                "empty {function} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_rest_json_resolves_by_name_with_local_type() {
+        // Wire says index 0 / INT; by-name resolution and the local type win.
+        let parsed =
+            Predicate::from_rest_json(&rest_leaf_json("EQUAL", "name", "[\"x\"]"), &test_fields())
+                .unwrap();
+        assert!(matches!(
+            &parsed,
+            Predicate::Leaf { index: 1, literals, .. }
+                if literals == &vec![Datum::String("x".to_string())]
+        ));
+    }
+
+    #[test]
+    fn test_from_rest_json_parses_every_supported_function() {
+        let fields = test_fields();
+        for (function, field, literals) in [
+            ("IS_NULL", "id", "[]"),
+            ("IS_NOT_NULL", "id", "[]"),
+            ("EQUAL", "id", "[5]"),
+            ("NOT_EQUAL", "id", "[5]"),
+            ("GREATER_THAN", "id", "[5]"),
+            ("GREATER_OR_EQUAL", "id", "[5]"),
+            ("LESS_THAN", "id", "[5]"),
+            ("LESS_OR_EQUAL", "id", "[5]"),
+            ("IN", "id", "[1,2,3]"),
+            ("NOT_IN", "id", "[1,2,3]"),
+            ("STARTS_WITH", "name", "[\"a\"]"),
+            ("ENDS_WITH", "name", "[\"a\"]"),
+            ("CONTAINS", "name", "[\"a\"]"),
+            ("LIKE", "name", "[\"%a%\"]"),
+            ("BETWEEN", "id", "[1,9]"),
+            ("NOT_BETWEEN", "id", "[1,9]"),
+        ] {
+            let json = rest_leaf_json(function, field, literals);
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_ok(),
+                "must parse {function}: {json}"
+            );
+        }
+        // DATE has no Java-round-trippable wire form; every shape fails closed.
+        for literals in ["[19000]", "[\"2022-01-15\"]", "[[2022,1,15]]"] {
+            let json = rest_leaf_json("EQUAL", "dt", literals);
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_err(),
+                "DATE literal must be rejected: {json}"
+            );
+        }
+    }
+
+    /// Null-literal semantics mirror the Java evaluators (binary/ternary test
+    /// false on null; In skips nulls; NotIn fails every row on null).
+    #[test]
+    fn test_from_rest_json_null_literal_semantics() {
+        let fields = test_fields();
+        // Binary / ternary functions with a null literal -> AlwaysFalse.
+        for (function, literals) in [
+            ("EQUAL", "[null]"),
+            ("GREATER_THAN", "[null]"),
+            ("LIKE", "[null]"),
+            ("BETWEEN", "[null,7]"),
+            ("NOT_BETWEEN", "[1,null]"),
+            // NOT_IN with any null literal fails every row.
+            ("NOT_IN", "[1,null]"),
+            // IN with only null literals matches nothing.
+            ("IN", "[null]"),
+            ("IN", "[]"),
+        ] {
+            let json = rest_leaf_json(function, "id", literals);
+            assert!(
+                matches!(
+                    Predicate::from_rest_json(&json, &fields).unwrap(),
+                    Predicate::AlwaysFalse
+                ),
+                "{function} {literals} must parse to AlwaysFalse"
+            );
+        }
+
+        // IN drops null literals and keeps the rest.
+        let parsed =
+            Predicate::from_rest_json(&rest_leaf_json("IN", "id", "[1,null,2]"), &fields).unwrap();
+        assert!(matches!(
+            &parsed,
+            Predicate::Leaf { op: PredicateOperator::In, literals, .. }
+                if literals == &vec![Datum::Int(1), Datum::Int(2)]
+        ));
+
+        // Empty NOT_IN keeps exactly the non-null rows (Java: null -> false).
+        let parsed =
+            Predicate::from_rest_json(&rest_leaf_json("NOT_IN", "id", "[]"), &fields).unwrap();
+        assert!(matches!(
+            &parsed,
+            Predicate::Leaf {
+                op: PredicateOperator::IsNotNull,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_from_rest_json_like_escape_grammar() {
+        let fields = test_fields();
+        // Invalid escapes (Java `sqlToRegexLike` throws) fail closed.
+        for pattern in ["_\\a", "abc\\"] {
+            let json = rest_leaf_json("LIKE", "name", &format!("[{pattern:?}]"));
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_err(),
+                "invalid LIKE escape must be rejected: {json}"
+            );
+        }
+        // Valid patterns (incl. unescaped `_`) parse.
+        for pattern in ["a\\%b", "a\\_b", "a\\\\b", "%abc_", "a_b"] {
+            let json = rest_leaf_json("LIKE", "name", &format!("[{pattern:?}]"));
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_ok(),
+                "valid LIKE pattern must parse: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_rest_json_accepts_zero_and_less_than_floats() {
+        let double_fields = vec![DataField::new(
+            0,
+            "f".to_string(),
+            DataType::Double(crate::spec::DoubleType::new()),
+        )];
+        // Zero literals and `<` on floats parse.
+        for json in [
+            rest_leaf_json_typed("EQUAL", "f", "DOUBLE", "[0.0]"),
+            rest_leaf_json_typed("EQUAL", "f", "DOUBLE", "[-0.0]"),
+            rest_leaf_json_typed("LESS_THAN", "f", "DOUBLE", "[5.0]"),
+        ] {
+            assert!(
+                Predicate::from_rest_json(&json, &double_fields).is_ok(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_rest_json_validates_every_literal() {
+        let fields = test_fields();
+        // A malformed extra literal in a binary leaf fails the whole parse
+        // (Java deserializeLiterals converts every element), not just first().
+        let json = rest_leaf_json("EQUAL", "id", r#"[1,"bad"]"#);
+        assert!(Predicate::from_rest_json(&json, &fields).is_err());
+        // A malformed element in an IN list also fails.
+        let json = rest_leaf_json("IN", "id", r#"[1,"bad",3]"#);
+        assert!(Predicate::from_rest_json(&json, &fields).is_err());
+        // A valid extra literal is accepted (Java validates but ignores it).
+        let json = rest_leaf_json("EQUAL", "id", "[1,2]");
+        assert!(Predicate::from_rest_json(&json, &fields).is_ok());
+    }
+
+    #[test]
+    fn test_from_rest_json_float_integral_single_rounding() {
+        let float_fields = vec![DataField::new(
+            0,
+            "f".to_string(),
+            DataType::Float(crate::spec::FloatType::new()),
+        )];
+        // An integral FLOAT literal above 2^53 must be narrowed directly to f32
+        // (Java `Long.floatValue()`), not via f64 (which would round twice).
+        let json = rest_leaf_json_typed("EQUAL", "f", "FLOAT", "[9007199791611905]");
+        let pred = Predicate::from_rest_json(&json, &float_fields).unwrap();
+        let Predicate::Leaf { literals, .. } = &pred else {
+            panic!("expected leaf");
+        };
+        let Datum::Float(v) = literals[0] else {
+            panic!("expected float literal");
+        };
+        let single = 9_007_199_791_611_905_i64 as f32;
+        let double_rounded = 9_007_199_791_611_905_i64 as f64 as f32;
+        assert_eq!(v.to_bits(), single.to_bits());
+        assert_ne!(v.to_bits(), double_rounded.to_bits());
+    }
+
+    #[test]
+    fn test_from_rest_json_rejects_unknown_constructs() {
+        let fields = test_fields();
+        for json in [
+            // Unknown leaf function.
+            rest_leaf_json("SOME_UDF", "id", "[5]"),
+            // Unknown field.
+            rest_leaf_json("EQUAL", "missing", "[5]"),
+            // Non-FIELD_REF transforms (verbatim shapes from Java serde tests).
+            r#"{"kind":"LEAF","transform":{"name":"UPPER","inputs":[{"index":1,"name":"name","type":"STRING"}]},"function":"STARTS_WITH","literals":["A"]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"CAST","fieldRef":{"index":0,"name":"id","type":"INT"},"type":"BIGINT"},"function":"GREATER_THAN","literals":[10]}"#.to_string(),
+            // NULL transform with a field function (TRUE/FALSE is accepted).
+            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"EQUAL","literals":[5]}"#.to_string(),
+            // A constant leaf must still carry a well-formed NULL transform;
+            // accepting a malformed one as TRUE would be allow-all.
+            r#"{"kind":"LEAF","function":"TRUE","literals":[]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"BOGUS"},"function":"TRUE","literals":[]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"INT"}},"function":"TRUE","literals":[]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"LOWER","inputs":[{"index":2,"name":"f2","type":"STRING"}]},"function":"STARTS_WITH","literals":["abc"]}"#.to_string(),
+            r#"{"kind":"LEAF","transform":{"name":"CONCAT_WS","inputs":["|",{"index":1,"name":"f1","type":"STRING"},"X",null,{"index":2,"name":"f2","type":"STRING"}]},"function":"ENDS_WITH","literals":["z"]}"#.to_string(),
+            // Unknown kind, malformed JSON, type-mismatched literal.
+            r#"{"kind":"CUSTOM"}"#.to_string(),
+            "not json".to_string(),
+            rest_leaf_json("EQUAL", "id", "[\"text\"]"),
+        ] {
+            assert!(
+                Predicate::from_rest_json(&json, &fields).is_err(),
+                "must reject: {json}"
+            );
+        }
+    }
+
+    /// Wire strings below are taken verbatim from Java `TransformJsonSerdeTest`.
+    #[test]
+    fn test_transform_from_rest_json_matches_java_wire_format() {
+        let fields = vec![
+            DataField::new(0, "f0".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "f1".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+            DataField::new(
+                2,
+                "f2".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+        ];
+        let cases: Vec<(&str, Transform)> = vec![
+            (
+                r#"{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}}"#,
+                Transform::FieldRef(0),
+            ),
+            (
+                r#"{"name":"CAST","fieldRef":{"index":0,"name":"f0","type":"INT"},"type":"BIGINT"}"#,
+                Transform::Cast(0, DataType::BigInt(BigIntType::new())),
+            ),
+            (
+                r#"{"name":"UPPER","inputs":[{"index":1,"name":"f1","type":"STRING"}]}"#,
+                Transform::Upper(vec![TransformInput::Field(1)]),
+            ),
+            (
+                r#"{"name":"CONCAT","inputs":[{"index":1,"name":"f1","type":"STRING"},"-",{"index":2,"name":"f2","type":"STRING"},null]}"#,
+                Transform::Concat(vec![
+                    TransformInput::Field(1),
+                    TransformInput::Literal(Some("-".to_string())),
+                    TransformInput::Field(2),
+                    TransformInput::Literal(None),
+                ]),
+            ),
+            (
+                r#"{"name":"CONCAT_WS","inputs":["|",{"index":1,"name":"f1","type":"STRING"},"X",null,{"index":2,"name":"f2","type":"STRING"}]}"#,
+                Transform::ConcatWs(vec![
+                    TransformInput::Literal(Some("|".to_string())),
+                    TransformInput::Field(1),
+                    TransformInput::Literal(Some("X".to_string())),
+                    TransformInput::Literal(None),
+                    TransformInput::Field(2),
+                ]),
+            ),
+            (
+                r#"{"name":"LOWER","inputs":[{"index":1,"name":"f1","type":"STRING"}]}"#,
+                Transform::Lower(vec![TransformInput::Field(1)]),
+            ),
+            (r#"{"name":"NULL"}"#, Transform::Null),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(
+                Transform::from_rest_json(json, &fields).unwrap(),
+                expected,
+                "for {json}"
+            );
+        }
+
+        // A CAST parses structurally (its applicability is checked when the
+        // mask is applied, via arrow cast + output-type equality).
+        assert!(Transform::from_rest_json(
+            r#"{"name":"CAST","fieldRef":{"index":0,"name":"f0","type":"INT"},"type":"STRING"}"#,
+            &fields
+        )
+        .is_ok());
+
+        // Rejections: unknown transform name (verbatim from the Java test),
+        // unknown field, non-string/-null/-fieldRef input.
+        for json in [
+            r#"{"name":"invalid"}"#,
+            r#"{"name":"FIELD_REF","fieldRef":{"index":0,"name":"missing","type":"INT"}}"#,
+            r#"{"name":"CONCAT","inputs":[42]}"#,
+            r#"{"name":"CAST","fieldRef":{"index":0,"name":"f0","type":"INT"}}"#,
+            // Java constructor rules: UPPER/LOWER take exactly one input,
+            // CONCAT_WS at least two, field inputs must be string-typed.
+            r#"{"name":"UPPER","inputs":[{"index":1,"name":"f1","type":"STRING"},{"index":2,"name":"f2","type":"STRING"}]}"#,
+            r#"{"name":"CONCAT_WS","inputs":["|"]}"#,
+            r#"{"name":"CONCAT","inputs":[{"index":0,"name":"f0","type":"INT"}]}"#,
+        ] {
+            assert!(
+                Transform::from_rest_json(json, &fields).is_err(),
+                "must reject: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transform_collect_field_indices() {
+        let mut indices = std::collections::HashSet::new();
+        Transform::Null.collect_field_indices(&mut indices);
+        assert!(indices.is_empty());
+        Transform::Cast(3, DataType::Int(IntType::new())).collect_field_indices(&mut indices);
+        Transform::Concat(vec![
+            TransformInput::Field(1),
+            TransformInput::Literal(Some("-".to_string())),
+            TransformInput::Field(2),
+        ])
+        .collect_field_indices(&mut indices);
+        assert_eq!(indices, std::collections::HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_collect_leaf_field_indices() {
+        let fields = test_fields();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            pb.equal("id", Datum::Int(1)).unwrap(),
+            Predicate::or(vec![
+                pb.is_null("name").unwrap(),
+                Predicate::Not(Box::new(pb.equal("hr", Datum::Int(2)).unwrap())),
+            ]),
+            Predicate::AlwaysTrue,
+        ]);
+        let mut indices = std::collections::HashSet::new();
+        pred.collect_leaf_field_indices(&mut indices);
+        assert_eq!(indices, std::collections::HashSet::from([0, 1, 3]));
     }
 }

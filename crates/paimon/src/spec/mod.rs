@@ -102,7 +102,8 @@ pub(crate) use predicate::extract_datum;
 pub(crate) use predicate::java_bytes_cmp;
 pub(crate) use predicate::like_match;
 pub use predicate::{
-    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
+    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator, Transform,
+    TransformInput,
 };
 pub(crate) mod murmur_hash;
 mod partition_statistics;
