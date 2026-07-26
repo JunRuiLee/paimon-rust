@@ -26,6 +26,7 @@ use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
     IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
+use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
@@ -606,7 +607,7 @@ async fn plan_and_search_pk_candidates_batch(
     PkVectorScanPlan,
     VectorSearchMetric,
 )> {
-    // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A data
+    // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A DATA
     // predicate set via `with_filter` is applied post-recall by re-reading each
     // candidate file's physical rows (see below). That physical-position filtering
     // only agrees with the bucket search when the table exposes physical rows
@@ -614,11 +615,26 @@ async fn plan_and_search_pk_candidates_batch(
     // merge-on-read (or without deletion vectors) a read merges multiple key
     // versions, so a scalar filter could retain a stale version whose live version
     // does not match — a silent wrong-read. Reject such queries rather than answer
-    // them incorrectly. No filter → nothing to guard, so the search-only and read
-    // paths are unaffected.
+    // them incorrectly.
+    //
+    // Guard on the DATA conjuncts, not the whole filter: partition-only conjuncts
+    // are enforced entirely by scan planning (partition pruning) and produce no
+    // per-row residual, so they need no physical-row read. This mirrors Java, where
+    // `BatchVectorSearchBuilderImpl.withFilter` splits at the builder level and
+    // leaves `this.filter == null` for a partition-only filter — the scan guard is
+    // then skipped. No data predicate (partition-only or no filter) → nothing to
+    // guard, so the search-only and read paths are unaffected.
     let physical_row_read =
         core.deletion_vectors_enabled() && !core.deletion_vectors_merge_on_read();
-    if filter.is_some() && !physical_row_read {
+    let has_data_predicate = filter.is_some_and(|f| {
+        let (_partition, data) = split_partition_and_data_predicates(
+            f.clone(),
+            table.schema().fields(),
+            table.schema().partition_keys(),
+        );
+        !data.is_empty()
+    });
+    if has_data_predicate && !physical_row_read {
         return Err(crate::Error::DataInvalid {
             message:
                 "primary-key vector pre-filter requires deletion vectors without merge-on-read"
@@ -767,44 +783,63 @@ async fn plan_and_search_pk_candidates_batch(
     // Residual (post-recall) filtering: for each candidate file, re-read its
     // physical rows and keep the positions whose rows satisfy the filter. The
     // per-split allow-list is threaded into the bucket search so the residual folds
-    // into recall (best-first order and Top-K are preserved). Built only when a
-    // filter is set; otherwise `None` leaves the search unfiltered. The residual
-    // depends only on the filter and the plan, not the query vector, so it is
-    // computed once here and shared across every query in the batch. The residual
-    // reader projects only the predicate columns and carries no pushdown;
-    // `residual_positions_by_file` recovers each surviving row's file-local
-    // physical position from its ordinal in the unfiltered scan (no `_ROW_ID`, no
-    // `first_row_id`). A file the allow-list leaves empty is skipped by the bucket
-    // search without opening an exact reader.
+    // into recall (best-first order and Top-K are preserved). Built only when the
+    // filter has data (non-partition) conjuncts; a partition-only filter (or no
+    // filter) leaves `None`, which leaves the search unfiltered — partition
+    // pruning is already handled in planning. The residual depends only on the
+    // filter and the plan, not the query vector, so it is computed once here and
+    // shared across every query in the batch. The residual reader projects only
+    // the predicate columns and carries no pushdown; `residual_positions_by_file`
+    // recovers each surviving row's file-local physical position from its ordinal
+    // in the unfiltered scan (no `_ROW_ID`, no `first_row_id`). A file the
+    // allow-list leaves empty is skipped by the bucket search without opening an
+    // exact reader.
     let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match filter {
         Some(filter) => {
-            let file_predicates = FilePredicates {
-                predicates: vec![filter.clone()],
-                row_filter_factory: None,
-                file_fields: table.schema().fields().to_vec(),
-            };
-            let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
-            let residual_reader = DataFileReader::new(
-                table.file_io().clone(),
-                table.schema_manager().clone(),
-                table.schema().id(),
-                table.schema().fields().to_vec(),
-                residual_read_type,
-                Vec::new(),
+            // The whole filter is pushed into scan planning (`PkVectorScan`), where
+            // partition-only conjuncts already prune partitions/files. Re-applying
+            // them as a per-row residual would be redundant, so keep only the data
+            // conjuncts here — a partition-only filter then needs no residual at
+            // all. Mixed partition/data conjuncts stay whole in `data_predicates`
+            // and evaluate against the materialized partition column (partition
+            // columns are physically present in primary-key data files), so there
+            // is no missing-column case to reject.
+            let (_partition_predicate, data_predicates) = split_partition_and_data_predicates(
+                filter.clone(),
+                table.schema().fields(),
+                table.schema().partition_keys(),
             );
-            let mut per_split = Vec::with_capacity(plan.splits.len());
-            for split in &plan.splits {
-                per_split.push(
-                    residual_positions_by_file(
-                        &residual_reader,
-                        &split.data_split,
-                        &split.active_files,
-                        &file_predicates,
-                    )
-                    .await?,
+            if data_predicates.is_empty() {
+                None
+            } else {
+                let file_predicates = FilePredicates {
+                    predicates: data_predicates,
+                    row_filter_factory: None,
+                    file_fields: table.schema().fields().to_vec(),
+                };
+                let residual_read_type = widen_scan_fields(&[], Some(&file_predicates));
+                let residual_reader = DataFileReader::new(
+                    table.file_io().clone(),
+                    table.schema_manager().clone(),
+                    table.schema().id(),
+                    table.schema().fields().to_vec(),
+                    residual_read_type,
+                    Vec::new(),
                 );
+                let mut per_split = Vec::with_capacity(plan.splits.len());
+                for split in &plan.splits {
+                    per_split.push(
+                        residual_positions_by_file(
+                            &residual_reader,
+                            &split.data_split,
+                            &split.active_files,
+                            &file_predicates,
+                        )
+                        .await?,
+                    );
+                }
+                Some(per_split)
             }
-            Some(per_split)
         }
         None => None,
     };
@@ -4493,6 +4528,77 @@ mod tests {
             .unwrap()
     }
 
+    /// The vector residual is derived from the DATA conjuncts of the filter:
+    /// partition-only conjuncts are enforced by scan planning (`PkVectorScan`
+    /// pushes the whole filter through the normal scan) and must not enter the
+    /// per-row residual, so a partition-only filter yields no residual at all.
+    #[test]
+    fn residual_uses_only_data_conjuncts_of_the_filter() {
+        use crate::spec::VarCharType;
+        use crate::table::bucket_filter::split_partition_and_data_predicates;
+
+        // Partitioned table: `dt` (partition key) + `id`.
+        let schema = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["dt"])
+            .build()
+            .unwrap();
+        let ts = TableSchema::new(0, &schema);
+        let fields = ts.fields();
+        let partition_keys = ts.partition_keys();
+        let pb = PredicateBuilder::new(fields);
+
+        // Partition-only `dt = 'a'` -> no residual data predicate (residual skipped;
+        // the partition is enforced by planning alone).
+        let (_p, data) = split_partition_and_data_predicates(
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            fields,
+            partition_keys,
+        );
+        assert!(
+            data.is_empty(),
+            "partition-only filter must leave no residual data predicate"
+        );
+
+        // Data-only `id > 5` -> kept as the residual.
+        let (_p, data) = split_partition_and_data_predicates(
+            pb.greater_than("id", Datum::Int(5)).unwrap(),
+            fields,
+            partition_keys,
+        );
+        assert_eq!(data.len(), 1, "data-only filter must remain the residual");
+
+        // `dt = 'a' AND id > 5` -> only the data conjunct enters the residual.
+        let (_p, data) = split_partition_and_data_predicates(
+            Predicate::and(vec![
+                pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+                pb.greater_than("id", Datum::Int(5)).unwrap(),
+            ]),
+            fields,
+            partition_keys,
+        );
+        assert_eq!(
+            data.len(),
+            1,
+            "AND(partition, data) residual must drop the partition conjunct"
+        );
+
+        // `dt = 'a' OR id > 5` is a single mixed conjunct: it is NOT partition-only,
+        // so it stays whole in the residual (evaluated against the materialized
+        // partition column), rather than being dropped or split.
+        let mixed = Predicate::or(vec![
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            pb.greater_than("id", Datum::Int(5)).unwrap(),
+        ]);
+        let (_p, data) = split_partition_and_data_predicates(mixed.clone(), fields, partition_keys);
+        assert_eq!(
+            data,
+            vec![mixed],
+            "a mixed partition/data conjunct must stay whole in the residual"
+        );
+    }
+
     #[tokio::test]
     async fn execute_read_filter_without_deletion_vectors_fails_loud() {
         let table = pk_vector_table(&[
@@ -4599,6 +4705,124 @@ mod tests {
             .await
             .expect("guarded filter query must be admitted");
         assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    /// A partition-only `with_filter` needs no per-row residual (partition pruning
+    /// happens in scan planning), so the deletion-vector pre-filter guard must NOT
+    /// reject it even when deletion vectors are off. Mirrors Java, where a
+    /// partition-only filter leaves `this.filter == null` and the scan guard is
+    /// skipped. Regression test for the guard keying on the whole filter rather
+    /// than its data conjuncts.
+    #[tokio::test]
+    async fn execute_read_partition_only_filter_without_deletion_vectors_passes_guard() {
+        use crate::spec::VarCharType;
+
+        // Partitioned PK-vector table, deletion vectors OFF (default).
+        let mut builder = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .partition_keys(["dt"]);
+        for (k, v) in [
+            ("pk-vector.index.columns", "embedding"),
+            ("fields.embedding.pk-vector.index.type", IVF_FLAT_IDENTIFIER),
+            ("fields.embedding.pk-vector.distance.metric", "l2"),
+            ("fields.embedding.dimension", "4"),
+        ] {
+            builder = builder.option(k, v);
+        }
+        let schema = builder.build().unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "pk_vector_partitioned"),
+            "memory:/pk_vector_partitioned".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        // Partition-only `dt = 'a'`: no data residual, so the guard admits it and
+        // (with no snapshot) the query yields an empty stream instead of the
+        // deletion-vector error.
+        let filter = PredicateBuilder::new(table.schema().fields())
+            .equal("dt", Datum::String("a".to_string()))
+            .unwrap();
+        let mut stream = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(filter)
+            .execute_read()
+            .await
+            .expect("partition-only filter must be admitted without deletion vectors");
+        assert!(stream.try_next().await.unwrap().is_none());
+
+        // But a DATA conjunct (`id > 2`) on the same non-DV table must still fail
+        // loud — the guard now keys on data predicates, not the whole filter.
+        let data_filter = id_gt_filter(&table, 2);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(data_filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("data filter without deletion vectors must still fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+
+        // `AND(partition, data)` still has a data conjunct after the split, so it
+        // must fail loud on the non-DV table just like the data-only filter.
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let and_filter = Predicate::and(vec![
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            pb.greater_than("id", Datum::Int(2)).unwrap(),
+        ]);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(and_filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("AND(partition, data) without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
+
+        // A mixed `OR(partition, data)` conjunct is not partition-only, so it stays
+        // whole as a data predicate and must also fail loud without deletion vectors.
+        let or_filter = Predicate::or(vec![
+            pb.equal("dt", Datum::String("a".to_string())).unwrap(),
+            pb.greater_than("id", Datum::Int(2)).unwrap(),
+        ]);
+        let err = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0; 4])
+            .with_limit(5)
+            .with_filter(or_filter)
+            .execute_read()
+            .await
+            .map(|_| ())
+            .expect_err("mixed OR(partition, data) without deletion vectors must fail loud");
+        assert!(
+            matches!(err, crate::Error::DataInvalid { ref message, .. }
+                if message.contains("deletion vectors without merge-on-read")),
+            "unexpected error: {err:?}"
+        );
     }
 
     fn make_lumina_entry(
