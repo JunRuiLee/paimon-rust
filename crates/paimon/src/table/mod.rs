@@ -189,6 +189,41 @@ impl Table {
         }
     }
 
+    /// Create a table from an already resolved schema without loading a catalog.
+    ///
+    /// The supplied schema is preserved as-is. The branch only selects the
+    /// branch-scoped managers used by subsequent reads.
+    pub fn from_resolved_schema(
+        file_io: FileIO,
+        identifier: Identifier,
+        location: String,
+        schema: TableSchema,
+        branch: impl Into<String>,
+    ) -> Result<Self> {
+        let branch = branch.into();
+        validate_branch_name(&branch)?;
+        let schema_manager = SchemaManager::new(file_io.clone(), location.clone());
+        let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+            schema_manager
+        } else {
+            schema_manager.with_branch(&branch)
+        };
+        let branch_reference = branch != DEFAULT_MAIN_BRANCH;
+
+        Ok(Self {
+            file_io,
+            identifier,
+            location,
+            schema,
+            schema_manager,
+            branch,
+            branch_reference,
+            rest_env: None,
+            time_traveled: false,
+            travel_snapshot: None,
+        })
+    }
+
     /// Get the table's identifier.
     pub fn identifier(&self) -> &Identifier {
         &self.identifier

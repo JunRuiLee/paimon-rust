@@ -16,19 +16,22 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, StructArray};
 use futures::StreamExt;
-use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder};
+use paimon::catalog::Identifier;
+use paimon::io::FileIO;
+use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder, TableSchema};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
-    paimon_result_new_read, paimon_result_next_batch, paimon_result_plan, paimon_result_predicate,
-    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_table_scan,
+    paimon_result_get_table, paimon_result_new_read, paimon_result_next_batch, paimon_result_plan,
+    paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
+    paimon_result_table_scan,
 };
 use crate::runtime;
 use crate::types::*;
@@ -58,10 +61,160 @@ unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read 
 
 // ======================= Table ===============================
 
+/// Create a table directly from a resolved Paimon table schema JSON.
+///
+/// This constructor does not create a catalog or derive a warehouse. Storage
+/// options are used only to build FileIO; they are not merged into the supplied
+/// table schema. `branch` selects the branch-scoped managers while preserving
+/// the supplied schema.
+///
+/// # Safety
+/// All string pointers must be valid null-terminated C strings. `storage_options`
+/// must point to `storage_options_len` valid `paimon_option` values, or be null
+/// when `storage_options_len` is 0.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_from_schema_json(
+    table_path: *const c_char,
+    table_schema_json: *const c_char,
+    database: *const c_char,
+    table_name: *const c_char,
+    branch: *const c_char,
+    storage_options: *const paimon_option,
+    storage_options_len: usize,
+) -> paimon_result_get_table {
+    let table_path = match validate_cstr(table_path, "table_path") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let table_schema_json = match validate_cstr(table_schema_json, "table_schema_json") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let database = match validate_cstr(database, "database") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let table_name = match validate_cstr(table_name, "table_name") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let branch = match validate_cstr(branch, "branch") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    if storage_options.is_null() && storage_options_len > 0 {
+        return paimon_result_get_table {
+            table: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "null storage_options pointer with non-zero length".to_string(),
+            ),
+        };
+    }
+
+    let schema = match serde_json::from_str::<TableSchema>(&table_schema_json) {
+        Ok(schema) => schema,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Failed to parse table schema JSON: {error}"),
+                ),
+            }
+        }
+    };
+
+    let mut options = HashMap::with_capacity(storage_options_len);
+    if storage_options_len > 0 {
+        for option in std::slice::from_raw_parts(storage_options, storage_options_len) {
+            let key = match validate_cstr(option.key, "storage option key") {
+                Ok(value) => value,
+                Err(error) => {
+                    return paimon_result_get_table {
+                        table: std::ptr::null_mut(),
+                        error,
+                    }
+                }
+            };
+            let value = match validate_cstr(option.value, "storage option value") {
+                Ok(value) => value,
+                Err(error) => {
+                    return paimon_result_get_table {
+                        table: std::ptr::null_mut(),
+                        error,
+                    }
+                }
+            };
+            options.insert(key, value);
+        }
+    }
+
+    let file_io = match FileIO::from_path(&table_path)
+        .and_then(|builder| builder.with_props(options.iter()).build())
+    {
+        Ok(file_io) => file_io,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(error),
+            }
+        }
+    };
+    let table = match Table::from_resolved_schema(
+        file_io,
+        Identifier::new(database, table_name),
+        table_path,
+        schema,
+        branch,
+    ) {
+        Ok(table) => table,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(error),
+            }
+        }
+    };
+    let wrapper = Box::new(paimon_table {
+        inner: Box::into_raw(Box::new(table)) as *mut c_void,
+    });
+    paimon_result_get_table {
+        table: Box::into_raw(wrapper),
+        error: std::ptr::null_mut(),
+    }
+}
+
 /// Free a paimon_table.
 ///
 /// # Safety
-/// Only call with a table returned from `paimon_catalog_get_table`.
+/// Only call with a table returned from `paimon_catalog_get_table` or
+/// `paimon_table_from_schema_json`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
     free_table_wrapper(table, |t| t.inner);
@@ -1773,6 +1926,15 @@ const _: unsafe extern "C" fn(
 // constructors so an accidental signature change fails to compile rather than
 // silently breaking header consumers. To add behavior, introduce a new
 // `paimon_table_new_read_builder_*` symbol instead of changing one of these.
+const _: unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const paimon_option,
+    usize,
+) -> paimon_result_get_table = paimon_table_from_schema_json;
 const _: unsafe extern "C" fn(*const paimon_table) -> paimon_result_read_builder =
     paimon_table_new_read_builder;
 const _: unsafe extern "C" fn(

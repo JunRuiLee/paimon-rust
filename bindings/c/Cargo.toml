@@ -37,6 +37,7 @@ futures = "0.3"
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+serde_json = "1.0.120"
 
 [dev-dependencies]
 # Test-only: the vector-search integration tests build a real primary-key vindex
