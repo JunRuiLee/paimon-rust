@@ -715,10 +715,7 @@ async fn extract_index_rows(
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
     let read = read_builder.new_read()?;
     let batches = read.to_arrow(&splits)?.try_collect::<Vec<_>>().await?;
-    let expected_row_count = i64::from(checked_row_count(
-        shard.row_range_start,
-        shard.row_range_end,
-    )?);
+    let expected_row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
     if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
         let DataType::Array(array_type) = index_field.data_type() else {
             unreachable!("multivalue field was validated before extraction")
@@ -1017,7 +1014,7 @@ fn checked_i64(value: u64, context: &str) -> Result<i64> {
     })
 }
 
-fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
+fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i64> {
     if row_range_end < row_range_start {
         return Err(Error::DataInvalid {
             message: format!(
@@ -1026,12 +1023,15 @@ fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
             source: None,
         });
     }
-    i32::try_from(row_range_end - row_range_start + 1).map_err(|_| Error::DataInvalid {
-        message: format!(
-            "Sorted global index row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
-        ),
-        source: None,
-    })
+    row_range_end
+        .checked_sub(row_range_start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Row count overflows for row range [{row_range_start}, {row_range_end}]"
+            ),
+            source: None,
+        })
 }
 
 fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> bool {
@@ -1040,6 +1040,20 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 
 #[cfg(test)]
 mod tests {
+
+    /// A row range wider than `i32::MAX` yields the full count instead of being
+    /// rejected, and an inverted or overflowing range is still an error.
+    #[test]
+    fn checked_row_count_spans_beyond_i32() {
+        let start = 0;
+        let end = i64::from(i32::MAX) + 10;
+        assert_eq!(
+            super::checked_row_count(start, end).unwrap(),
+            i64::from(i32::MAX) + 11
+        );
+        assert!(super::checked_row_count(5, 4).is_err());
+        assert!(super::checked_row_count(i64::MIN, i64::MAX).is_err());
+    }
     use super::*;
     use crate::btree::BTreeIndexMeta;
     use crate::catalog::Identifier;
@@ -3105,7 +3119,7 @@ mod tests {
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
             file_name: "btree-synthetic-hole.index".to_string(),
             file_size: 1,
-            row_count: (hole_end - hole_start + 1) as i32,
+            row_count: (hole_end - hole_start + 1),
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: hole_start,

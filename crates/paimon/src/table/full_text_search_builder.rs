@@ -1270,7 +1270,7 @@ mod tests {
                 index_type: FULL_TEXT_INDEX_TYPE.to_string(),
                 file_name: name.to_string(),
                 file_size: 0,
-                row_count: i32::try_from(end - start + 1).unwrap(),
+                row_count: end - start + 1,
                 deletion_vectors_ranges: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: start,

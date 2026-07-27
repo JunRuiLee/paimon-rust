@@ -424,7 +424,7 @@ async fn build_table_with_first_row_id(
         index_type: INDEX_TYPE.to_string(),
         file_name: index_file_name,
         file_size: i64::try_from(index_file_size).unwrap(),
-        row_count: i32::try_from(row_count).unwrap(),
+        row_count,
         deletion_vectors_ranges: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,
@@ -1271,7 +1271,7 @@ async fn pk_vector_refine_factor_matches_exact_ground_truth() {
         index_type: INDEX_TYPE.to_string(),
         file_name: index_file_name,
         file_size: i64::try_from(index_file_size).unwrap(),
-        row_count: i32::try_from(row_count).unwrap(),
+        row_count,
         deletion_vectors_ranges: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,

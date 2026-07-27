@@ -3288,7 +3288,7 @@ mod tests {
             index_type: "lumina".to_string(),
             file_name: name.to_string(),
             file_size: 128,
-            row_count: (row_range_end - row_range_start + 1) as i32,
+            row_count: (row_range_end - row_range_start + 1),
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start,

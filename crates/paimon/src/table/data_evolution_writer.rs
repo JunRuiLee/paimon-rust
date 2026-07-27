@@ -713,7 +713,7 @@ impl DataEvolutionDeleteWriter {
             index_type: DELETION_VECTORS_INDEX_TYPE.to_string(),
             file_name,
             file_size,
-            row_count,
+            row_count: i64::from(row_count),
             deletion_vectors_ranges: Some(ranges),
             global_index_meta: None,
         })

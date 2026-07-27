@@ -1159,7 +1159,7 @@ fn checked_i64(value: u64, context: &str) -> Result<i64> {
     })
 }
 
-fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
+fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i64> {
     if row_range_end < row_range_start {
         return Err(Error::DataInvalid {
             message: format!("Invalid vindex row range [{row_range_start}, {row_range_end}]"),
@@ -1169,10 +1169,9 @@ fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
     row_range_end
         .checked_sub(row_range_start)
         .and_then(|count| count.checked_add(1))
-        .and_then(|count| i32::try_from(count).ok())
         .ok_or_else(|| Error::DataInvalid {
             message: format!(
-                "vindex row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
+                "Row count overflows for row range [{row_range_start}, {row_range_end}]"
             ),
             source: None,
         })
@@ -1580,7 +1579,7 @@ mod tests {
             index_type: IVF_FLAT_IDENTIFIER.to_string(),
             file_name: format!("vector-ivf-flat-synthetic-{start}-{end}.index"),
             file_size: 1,
-            row_count: (end - start + 1) as i32,
+            row_count: end - start + 1,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: start,
@@ -1851,7 +1850,7 @@ mod tests {
             index_type: "lumina".to_string(),
             file_name: "lumina-synthetic-0.index".to_string(),
             file_size: 1,
-            row_count: (coverage[0].to() - coverage[0].from() + 1) as i32,
+            row_count: (coverage[0].to() - coverage[0].from() + 1) as i64,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: coverage[0].from(),

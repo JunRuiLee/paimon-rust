@@ -684,7 +684,7 @@ mod read_tests {
             index_type: PK_FULL_TEXT_INDEX_TYPE.into(),
             file_name: file_name.into(),
             file_size: 1,
-            row_count: total as i32,
+            row_count: total,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,

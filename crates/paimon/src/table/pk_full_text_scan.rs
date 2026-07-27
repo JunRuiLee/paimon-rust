@@ -508,7 +508,7 @@ mod tests {
     fn payload(
         file_name: &str,
         index_type: &str,
-        row_count: i32,
+        row_count: i64,
         global_index_meta: Option<GlobalIndexMeta>,
     ) -> IndexFileMeta {
         IndexFileMeta {
@@ -526,7 +526,7 @@ mod tests {
         payload(
             file_name,
             PK_FULL_TEXT_INDEX_TYPE,
-            total as i32,
+            total,
             Some(gim(7, 0, total - 1, Some(frame(level, files)))),
         )
     }

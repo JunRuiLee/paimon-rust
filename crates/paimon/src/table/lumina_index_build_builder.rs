@@ -200,7 +200,15 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         index_meta: Vec<u8>,
     ) -> Result<IndexFileMeta> {
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-        validate_vector_buffer(vectors, row_count, dimension)?;
+        // The native Lumina builder counts rows in an i32; the manifest keeps the
+        // full width.
+        let native_row_count = i32::try_from(row_count).map_err(|_| Error::DataInvalid {
+            message: format!(
+                "Lumina shard row count {row_count} exceeds what the native builder accepts"
+            ),
+            source: None,
+        })?;
+        validate_vector_buffer(vectors, native_row_count, dimension)?;
         let ids = (0..row_count as u64).collect::<Vec<_>>();
         let native_options = LuminaIndexMeta::deserialize(&index_meta)?.options().clone();
 
@@ -208,8 +216,8 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
         let temp_file = TempFileGuard::new(temp_path.clone());
         let temp_path_str = temp_path.to_string_lossy().to_string();
         let builder = LuminaBuilder::create(&native_options)?;
-        builder.pretrain(vectors, row_count, dimension)?;
-        builder.insert(vectors, &ids, row_count, dimension)?;
+        builder.pretrain(vectors, native_row_count, dimension)?;
+        builder.insert(vectors, &ids, native_row_count, dimension)?;
         builder.dump(&temp_path_str)?;
 
         let file_name = format!("lumina-global-index-{}.index", uuid::Uuid::new_v4());
@@ -596,10 +604,7 @@ async fn extract_vectors(
         index_column,
         dimension,
         shard.row_range_start,
-        i64::from(checked_row_count(
-            shard.row_range_start,
-            shard.row_range_end,
-        )?),
+        checked_row_count(shard.row_range_start, shard.row_range_end)?,
     )
 }
 
@@ -751,19 +756,22 @@ fn checked_i64(value: u64, context: &str) -> Result<i64> {
     })
 }
 
-fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
+fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i64> {
     if row_range_end < row_range_start {
         return Err(Error::DataInvalid {
             message: format!("Invalid Lumina row range [{row_range_start}, {row_range_end}]"),
             source: None,
         });
     }
-    i32::try_from(row_range_end - row_range_start + 1).map_err(|_| Error::DataInvalid {
-        message: format!(
-            "Lumina row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
-        ),
-        source: None,
-    })
+    row_range_end
+        .checked_sub(row_range_start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Row count overflows for row range [{row_range_start}, {row_range_end}]"
+            ),
+            source: None,
+        })
 }
 
 fn validate_vector_buffer(vectors: &[f32], row_count: i32, dimension: i32) -> Result<()> {
@@ -1701,7 +1709,7 @@ mod tests {
             index_type: LUMINA_IDENTIFIER.to_string(),
             file_name: format!("lumina-synthetic-{start}-{end}.index"),
             file_size: 1,
-            row_count: (end - start + 1) as i32,
+            row_count: (end - start + 1),
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: start,
