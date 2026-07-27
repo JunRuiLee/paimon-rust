@@ -1719,14 +1719,16 @@ mod fulltext_tests {
 mod vector_search_tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Float32Builder, Int32Array, ListBuilder};
+    use datafusion::arrow::array::{
+        ArrayRef, Float32Builder, Int32Array, ListBuilder, StringArray,
+    };
     use datafusion::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use paimon::catalog::Identifier;
-    use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema};
+    use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema, VarCharType};
     use paimon::table::BranchManager;
     use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
     use paimon_datafusion::{register_vector_search, SQLContext};
@@ -1877,6 +1879,22 @@ mod vector_search_tests {
         ids
     }
 
+    /// Like [`extract_ids`] but preserves the row order returned by the query (used to
+    /// assert relevance ordering).
+    fn extract_ids_in_order(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_array = batch
+                .column_by_name("id")
+                .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+                .expect("Expected Int32Array for id");
+            for i in 0..batch.num_rows() {
+                ids.push(id_array.value(i));
+            }
+        }
+        ids
+    }
+
     fn extract_query_result_ids(
         batches: &[datafusion::arrow::record_batch::RecordBatch],
     ) -> Vec<(i32, i32)> {
@@ -1959,6 +1977,216 @@ mod vector_search_tests {
         let ids = extract_ids(&batches);
         assert_eq!(ids.len(), 3);
         assert!(ids.contains(&0), "exact match [1,0,0,0] should be in top 3");
+    }
+
+    /// `vector_search` must return rows in relevance order, not file order. Querying
+    /// id 2's vector ranks `[2, 5, 1]` by L2 distance, which differs from the
+    /// ascending-id file order `[1, 2, 5]` the pre-fix scan produced.
+    #[tokio::test]
+    async fn test_vector_search_orders_by_relevance() {
+        let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
+        let identifier = Identifier::new("default", "vindex_order_e2e");
+        catalog
+            .create_table(&identifier, build_vindex_table_schema(), false)
+            .await
+            .expect("Failed to create table");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to load table");
+
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("Failed to configure write builder");
+        let mut table_write = write_builder
+            .new_write()
+            .expect("Failed to create table write");
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                vec![0, 1, 2, 3, 4, 5],
+                vec![
+                    vec![1.0, 0.0],
+                    vec![0.9, 0.1],
+                    vec![0.0, 1.0],
+                    vec![-1.0, 0.0],
+                    vec![0.0, -1.0],
+                    vec![0.7, 0.3],
+                ],
+            ))
+            .await
+            .expect("Failed to write vector batch");
+        let messages = table_write
+            .prepare_commit()
+            .await
+            .expect("Failed to prepare commit");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("Failed to commit vector data");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.vindex_order_e2e', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("vindex index build SQL should parse")
+        .collect()
+        .await
+        .expect("vindex index build SQL should execute");
+
+        let batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+
+        let ordered = extract_ids_in_order(&batches);
+        assert_eq!(
+            ordered,
+            vec![2, 5, 1],
+            "vector_search must return rows best-first by relevance, not in file order"
+        );
+
+        // The full-projection path (`SELECT *`, i.e. projection = None) must stay
+        // ordered too, and round-trip the other columns.
+        let star_batches = ctx
+            .sql("SELECT * FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+        assert_eq!(
+            extract_ids_in_order(&star_batches),
+            vec![2, 5, 1],
+            "SELECT * must also be relevance-ordered"
+        );
+
+        // An outer LIMIT truncates the ranked result: top-2 of [2, 5, 1] is [2, 5].
+        let limited = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_order_e2e', 'embedding', '[0.0, 1.0]', 3) LIMIT 2")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query should execute");
+        assert_eq!(extract_ids_in_order(&limited), vec![2, 5]);
+    }
+
+    /// Regression: a result containing a string column must not fail on the provider's
+    /// `Utf8View` schema vs the Paimon read's `Utf8` — the gather casts to the output
+    /// schema (the plain scan path did this via `to_datafusion_batch`).
+    #[tokio::test]
+    async fn test_vector_search_casts_string_column() {
+        let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
+        let identifier = Identifier::new("default", "vindex_string_e2e");
+
+        let mut options = std::collections::HashMap::new();
+        options.insert("row-tracking.enabled".to_string(), "true".to_string());
+        options.insert("data-evolution.enabled".to_string(), "true".to_string());
+        options.insert("global-index.enabled".to_string(), "true".to_string());
+        options.insert(
+            "global-index.row-count-per-shard".to_string(),
+            "3".to_string(),
+        );
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(64).unwrap()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .options(options)
+            .build()
+            .expect("Failed to build table schema");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .expect("Failed to create table");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("Failed to load table");
+
+        let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+        let mut vector_builder =
+            ListBuilder::new(Float32Builder::new()).with_field(element_field.clone());
+        for vector in [vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.3]] {
+            for value in vector {
+                vector_builder.values().append_value(value);
+            }
+            vector_builder.append(true);
+        }
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("embedding", ArrowDataType::List(element_field), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["zero", "one", "two"])) as ArrayRef,
+                Arc::new(vector_builder.finish()) as ArrayRef,
+            ],
+        )
+        .expect("Failed to build batch");
+
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("Failed to configure write builder");
+        let mut table_write = write_builder
+            .new_write()
+            .expect("Failed to create table write");
+        table_write
+            .write_arrow_batch(&batch)
+            .await
+            .expect("Failed to write batch");
+        let messages = table_write
+            .prepare_commit()
+            .await
+            .expect("Failed to prepare commit");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("Failed to commit data");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.vindex_string_e2e', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=2,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("vindex index build SQL should parse")
+        .collect()
+        .await
+        .expect("vindex index build SQL should execute");
+
+        // The point of this test is that the string `name` column round-trips without
+        // a Utf8/Utf8View schema-cast error (guarded by the successful collect below).
+        // Relevance ordering is covered by test_vector_search_orders_by_relevance, so
+        // here we only assert the hit set, order-independently.
+        let batches = ctx
+            .sql("SELECT id, name FROM vector_search('paimon.default.vindex_string_e2e', 'embedding', '[0.0, 1.0]', 2)")
+            .await
+            .expect("SQL should parse")
+            .collect()
+            .await
+            .expect("query with a string column should execute");
+        let mut ids = extract_ids_in_order(&batches);
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[tokio::test]
