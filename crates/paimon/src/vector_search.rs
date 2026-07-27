@@ -218,12 +218,10 @@ impl SearchResult {
         }
 
         if best_by_row_id.len() <= k {
-            // Keep the original row order when no truncation is needed.
-            let rows = self
-                .row_ids
-                .iter()
-                .filter_map(|row_id| best_by_row_id.remove(row_id))
-                .collect();
+            // Still sort best-first: the scored map is unordered, and consumers rely
+            // on relevance rank.
+            let mut rows: Vec<ScoredRow> = best_by_row_id.into_values().collect();
+            sort_scored_rows_by_rank(&mut rows);
             return Self::from_scored_rows(rows);
         }
 
@@ -382,12 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn test_search_result_top_k_preserves_order_without_truncation() {
+    fn test_search_result_top_k_sorts_best_first_without_truncation() {
+        // Even when k >= candidate count (no truncation), results must be returned
+        // best-first by score, not in the input/insertion order.
         let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
 
         let top = result.top_k(3);
-        assert_eq!(top.row_ids, result.row_ids);
-        assert_eq!(top.scores, result.scores);
+        assert_eq!(top.row_ids, vec![1, 2, 3]);
+        assert_eq!(top.scores, vec![0.9, 0.5, 0.1]);
     }
 
     #[test]
@@ -409,8 +409,9 @@ mod tests {
             .without_deleted_row_ranges(Some(&deleted))
             .unwrap()
             .top_k(10);
-        assert_eq!(filtered.row_ids, vec![1, 4]);
-        assert_eq!(filtered.scores, vec![0.1, 0.2]);
+        // Rows 2..3 are deleted; the remaining rows come back best-first by score.
+        assert_eq!(filtered.row_ids, vec![4, 1]);
+        assert_eq!(filtered.scores, vec![0.2, 0.1]);
     }
 
     #[test]

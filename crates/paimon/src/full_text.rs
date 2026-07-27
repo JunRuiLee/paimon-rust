@@ -126,14 +126,16 @@ impl SearchResult {
 
     /// Return top-k results by score (descending).
     pub fn top_k(&self, k: usize) -> Self {
-        if self.row_ids.len() <= k {
-            return self.clone();
-        }
+        // Always sort best-first, even when no truncation is needed (len <= k):
+        // downstream consumers rely on relevance order, not input/shard order.
         let mut indices: Vec<usize> = (0..self.row_ids.len()).collect();
+        // Best-first by score (total_cmp is NaN-safe), then smaller row id. This
+        // matches vector_search's top_k and keeps the order deterministic regardless
+        // of the input/shard order.
         indices.sort_by(|&a, &b| {
             self.scores[b]
-                .partial_cmp(&self.scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&self.scores[a])
+                .then_with(|| self.row_ids[a].cmp(&self.row_ids[b]))
         });
         indices.truncate(k);
         let row_ids = indices.iter().map(|&i| self.row_ids[i]).collect();
@@ -258,8 +260,30 @@ mod tests {
             .without_deleted_row_ranges(Some(&deleted))
             .unwrap()
             .top_k(10);
-        assert_eq!(filtered.row_ids, vec![1, 4]);
-        assert_eq!(filtered.scores, vec![0.1, 0.2]);
+        // Rows 2..3 are deleted; the remaining rows come back best-first by score.
+        assert_eq!(filtered.row_ids, vec![4, 1]);
+        assert_eq!(filtered.scores, vec![0.2, 0.1]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_sorts_best_first_without_truncation() {
+        // k >= candidate count: results must still be best-first by score, not in
+        // input/shard order.
+        let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
+
+        let top = result.top_k(3);
+        assert_eq!(top.row_ids, vec![1, 2, 3]);
+        assert_eq!(top.scores, vec![0.9, 0.5, 0.1]);
+    }
+
+    #[test]
+    fn test_search_result_top_k_tie_breaks_by_smaller_row_id() {
+        // Equal scores: order by smaller row id, independent of input order.
+        let result = SearchResult::new(vec![30, 10, 20], vec![0.9, 0.9, 0.9]);
+
+        let top = result.top_k(3);
+        assert_eq!(top.row_ids, vec![10, 20, 30]);
+        assert_eq!(top.scores, vec![0.9, 0.9, 0.9]);
     }
 
     #[test]
