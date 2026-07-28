@@ -23,9 +23,11 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::spec::{
-    BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest, PkVectorSourceFile,
-    PkVectorSourceMeta, Predicate,
+    BinaryRow, DataField, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest,
+    PkVectorSourceFile, PkVectorSourceMeta, Predicate,
 };
+use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::partition_filter::PartitionFilter;
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
 use crate::table::Table;
@@ -45,6 +47,47 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 /// files back the PK-vector index; an absent file source reads as false.
 fn should_read_pk_index_source(file: &DataFileMeta) -> bool {
     matches!(file.file_source, Some(src) if src == FILE_SOURCE_COMPACT) && file.level > 0
+}
+
+/// Drop caller-supplied data splits whose partition cannot satisfy the filter's
+/// partition conjuncts, mirroring how whole-table scan planning prunes partitions
+/// before the search runs. `filter` is the full `with_filter` predicate (partition
+/// + data) with leaf indices in `schema_fields` space; only its partition half
+/// prunes here (the data half stays a per-row residual downstream). Splits are
+/// kept on any evaluation error, matching `table_scan`'s fail-open partition
+/// check. A `None` filter, no partition conjunct, or a table without partition
+/// fields leaves every split in place.
+fn prune_data_splits_by_partition(
+    data_splits: Vec<DataSplit>,
+    filter: Option<&Predicate>,
+    schema_fields: &[DataField],
+    partition_fields: &[DataField],
+) -> Vec<DataSplit> {
+    if partition_fields.is_empty() {
+        return data_splits;
+    }
+    let partition_keys: Vec<String> = partition_fields
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    // Split against the FULL schema fields (the predicate's leaf indices are in
+    // that space); keep only the partition half, projected to partition-index
+    // space, which is what `PartitionFilter::from_predicate` expects.
+    let partition_predicate = filter.and_then(|f| {
+        split_partition_and_data_predicates(f.clone(), schema_fields, &partition_keys).0
+    });
+    let Some(pred) = partition_predicate else {
+        return data_splits;
+    };
+    let partition_filter = PartitionFilter::from_predicate(pred, partition_fields);
+    data_splits
+        .into_iter()
+        .filter(|split| {
+            partition_filter
+                .matches_entry(&split.partition().to_serialized_bytes())
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 fn source_files_unique(files: &[PkVectorSourceFile]) -> bool {
@@ -270,6 +313,19 @@ impl<'a> PkVectorScan<'a> {
             self.table.location().to_string(),
         );
 
+        // Honor the partition half of `with_filter` at this lower layer, so a
+        // caller (e.g. a query engine fanning out buckets) passes the whole
+        // predicate and need not pre-split partition vs data itself — matching how
+        // `plan()` pushes the filter into scan planning. The data half stays a
+        // per-row residual downstream. `plan()`'s own splits are already
+        // partition-pruned, so re-checking them here is a cheap idempotent no-op.
+        let data_splits = prune_data_splits_by_partition(
+            data_splits,
+            self.filter.as_ref(),
+            self.table.schema().fields(),
+            &self.table.schema().partition_fields(),
+        );
+
         // No data files -> nothing to search.
         let Some(first_split) = data_splits.first() else {
             return Ok(PkVectorScanPlan { splits: Vec::new() });
@@ -397,7 +453,10 @@ fn plan_from_inputs(
 mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, DataFileMeta, GlobalIndexMeta};
+    use crate::spec::{
+        BinaryRow, DataField, DataFileMeta, DataType, Datum, GlobalIndexMeta, IntType,
+        PredicateBuilder,
+    };
     use crate::table::source::{DataSplitBuilder, DeletionFile};
 
     fn dfm(name: &str, rows: i64, level: i32, file_source: Option<i32>) -> DataFileMeta {
@@ -596,7 +655,90 @@ mod tests {
         assert!(plan_from_inputs(1, vec![data], Vec::new()).is_err());
     }
 
+    // Build a one-partition-column BinaryRow holding a single int, for a supplied
+    // split's partition value.
+    fn int_partition(value: i32) -> BinaryRow {
+        use crate::spec::BinaryRowBuilder;
+        let mut b = BinaryRowBuilder::new(1);
+        b.write_datum(0, &Datum::Int(value), &DataType::Int(IntType::new()));
+        BinaryRow::from_serialized_bytes(&b.build_serialized()).unwrap()
+    }
+
+    fn split_in_partition(part: i32, bucket: i32) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(int_partition(part))
+            .with_bucket(bucket)
+            .with_bucket_path(format!("memory:/t/dt={part}/bucket-{bucket}"))
+            .with_total_buckets(1)
+            .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
+            .build()
+            .unwrap()
+    }
+
+    // A partition predicate `dt = 1` must drop a supplied split whose partition is
+    // `dt = 2` and keep the `dt = 1` split — the bucket-scoped terminal honors the
+    // partition half of `with_filter` at the lower layer, exactly like the
+    // whole-table scan prunes partitions. Without this the caller would have to
+    // pre-prune partitions itself. Schema order is `[id, dt]` with `dt` (schema
+    // index 1) the sole partition field (partition index 0), so the schema-index →
+    // partition-index projection is genuinely exercised — a mis-projection would
+    // read `id`'s leaf against the partition row and mismatch.
     #[test]
+    fn prune_data_splits_by_partition_drops_non_matching() {
+        let schema_fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "dt".to_string(), DataType::Int(IntType::new())),
+        ];
+        // `dt` is schema field 1 but partition field 0 — projection must remap.
+        let partition_fields = vec![schema_fields[1].clone()];
+        // `dt = 1 AND id > 0`: the partition half (`dt = 1`) prunes; the data half
+        // (`id > 0`) is ignored here (it stays a residual).
+        let pb = PredicateBuilder::new(&schema_fields);
+        let pred = Predicate::and(vec![
+            pb.equal("dt", Datum::Int(1)).unwrap(),
+            pb.greater_than("id", Datum::Int(0)).unwrap(),
+        ]);
+
+        let splits = vec![split_in_partition(1, 0), split_in_partition(2, 0)];
+        let kept =
+            prune_data_splits_by_partition(splits, Some(&pred), &schema_fields, &partition_fields);
+
+        assert_eq!(kept.len(), 1, "only the dt=1 split survives");
+        assert_eq!(kept[0].partition(), &int_partition(1));
+    }
+
+    // No filter, or a filter with no partition conjunct, leaves every supplied
+    // split in place (partition pruning is a no-op).
+    #[test]
+    fn prune_data_splits_by_partition_keeps_all_without_partition_predicate() {
+        let schema_fields = vec![
+            DataField::new(0, "dt".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+        ];
+        let partition_fields = vec![schema_fields[0].clone()];
+        let splits = vec![split_in_partition(1, 0), split_in_partition(2, 0)];
+
+        // None filter keeps everything.
+        let kept = prune_data_splits_by_partition(splits, None, &schema_fields, &partition_fields);
+        assert_eq!(kept.len(), 2, "no filter keeps every split");
+
+        // A data-only conjunct (`id > 0`) has no partition half, so still a no-op.
+        let data_only = PredicateBuilder::new(&schema_fields)
+            .greater_than("id", Datum::Int(0))
+            .unwrap();
+        let splits = vec![split_in_partition(1, 0), split_in_partition(2, 0)];
+        let kept = prune_data_splits_by_partition(
+            splits,
+            Some(&data_only),
+            &schema_fields,
+            &partition_fields,
+        );
+        assert_eq!(kept.len(), 2, "data-only filter prunes no partition");
+    }
+
+    #[test]
+
     fn accumulator_rejects_duplicate_file_name() {
         // Two splits in the SAME (partition, bucket) carrying a data file with the
         // same name must fail loud via the accumulator's duplicate-file guard.

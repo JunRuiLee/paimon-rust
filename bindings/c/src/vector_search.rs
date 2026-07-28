@@ -306,21 +306,6 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
     let state = &*((*b).inner as *const VectorSearchState);
 
-    // This binding drives the primary-key vector path, whose ANN reader is
-    // configured from the table options directly; there is no per-search
-    // options override on the builder. Reject options rather than silently
-    // dropping them so a caller relying on them fails loud.
-    if !state.options.is_empty() {
-        return paimon_result_record_batch_reader {
-            reader: std::ptr::null_mut(),
-            error: paimon_error::new(
-                PaimonErrorCode::Unsupported,
-                "per-search options are not supported; configure the ANN reader via table options"
-                    .to_string(),
-            ),
-        };
-    }
-
     let mut builder = state.table.new_vector_search_builder();
     if let Some(col) = &state.vector_column {
         builder.with_vector_column(col);
@@ -330,6 +315,12 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
     if let Some(limit) = state.limit {
         builder.with_limit(limit);
+    }
+    // Forward per-search options to the builder: they resolve ahead of the table
+    // options they override (e.g. refine-factor for one query). Empty map = leave
+    // the builder default, so the table options alone drive the ANN reader.
+    if !state.options.is_empty() {
+        builder.with_options(state.options.clone());
     }
     if let Some(f) = &state.filter {
         builder.with_filter(f.clone());
@@ -392,19 +383,6 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read_for_data_spli
     }
     let state = &*((*b).inner as *const VectorSearchState);
 
-    // Same as `execute_read`: the PK vector path configures its ANN reader from
-    // table options, so reject per-search options rather than silently drop them.
-    if !state.options.is_empty() {
-        return paimon_result_record_batch_reader {
-            reader: std::ptr::null_mut(),
-            error: paimon_error::new(
-                PaimonErrorCode::Unsupported,
-                "per-search options are not supported; configure the ANN reader via table options"
-                    .to_string(),
-            ),
-        };
-    }
-
     let split = match deserialize_data_split(std::slice::from_raw_parts(split_bytes, split_len)) {
         Ok(s) => s,
         Err(e) => {
@@ -424,6 +402,11 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read_for_data_spli
     }
     if let Some(limit) = state.limit {
         builder.with_limit(limit);
+    }
+    // Same as `execute_read`: forward per-search options so they override the
+    // matching table options; empty map leaves the table options in charge.
+    if !state.options.is_empty() {
+        builder.with_options(state.options.clone());
     }
     if let Some(f) = &state.filter {
         builder.with_filter(f.clone());

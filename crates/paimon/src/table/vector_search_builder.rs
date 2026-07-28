@@ -88,6 +88,7 @@ pub struct VectorSearchBuilder<'a> {
     vector_column: Option<String>,
     query_vector: Option<Vec<f32>>,
     limit: Option<usize>,
+    options: HashMap<String, String>,
     projection: Option<Vec<String>>,
     filter: Option<Predicate>,
 }
@@ -109,6 +110,7 @@ impl<'a> VectorSearchBuilder<'a> {
             vector_column: None,
             query_vector: None,
             limit: None,
+            options: HashMap::new(),
             projection: None,
             filter: None,
         }
@@ -126,6 +128,17 @@ impl<'a> VectorSearchBuilder<'a> {
 
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Attach per-search (query-side) options, resolved ahead of the table
+    /// options they override — e.g. `fields.<col>.ivf.refine-factor` to request
+    /// exact rerank for one query. Kept as a distinct map from the table schema
+    /// options so a broad query key cannot be shadowed by a more specific table
+    /// key; query options win as a whole. Mirrors the batch builder and the
+    /// community read path (both thread this into the shared search core).
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
         self
     }
 
@@ -335,14 +348,17 @@ impl<'a> VectorSearchBuilder<'a> {
         limit: usize,
         data_splits: Option<Vec<DataSplit>>,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        // kwai's single-query builder carries no query-side options; the batch core
-        // reads all config (dimension, refine-factor, ANN options) from the table
-        // options itself, so pass an empty query-options map (passing the table
-        // options here would wrongly feed them to the vindex option validator).
-        let query_options = HashMap::new();
+        // Thread the builder's query-side options into the shared batch core so a
+        // per-search option (e.g. refine-factor) resolves ahead of the table
+        // option it overrides — matching the batch path and the community read
+        // path. These query options are kept distinct from the table schema
+        // options in `resolve_pk_vector_search_params`; for an `ARRAY<FLOAT>`
+        // column they are also validated by the vindex option whitelist (an
+        // unknown key fails loud there), exactly as on the batch path and
+        // community main.
         let (mut candidates, plan, metric) = plan_and_search_pk_candidates_batch(
             self.table,
-            &query_options,
+            &self.options,
             self.filter.as_ref(),
             core,
             pk_col,

@@ -1018,8 +1018,9 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
 /// The table-option `(key, value)` that requests exact rerank for the
 /// `embedding` PK-vector column. `fields.<col>.ivf.refine-factor` is one of the
 /// aliases the read path accepts for an `ivf-flat` index (the `ivf.` prefix,
-/// `refine-factor` suffix). kwai resolves the refine factor from table options
-/// (there is no query-side option), so tests bake it into the table schema.
+/// `refine-factor` suffix). The read path also accepts this as a query-side
+/// option (which overrides the table option); these tests pin it at the table
+/// level to keep the rerank config independent of the per-query map.
 fn refine_factor_table_option(factor: usize) -> (String, String) {
     (
         format!("fields.{VECTOR_COLUMN}.ivf.refine-factor"),
@@ -1259,10 +1260,10 @@ async fn pk_vector_refine_factor_matches_exact_ground_truth() {
     // file holds the true vectors, and confirm the segment really recalls the
     // perturbed order before the read path runs.
     // Build a table whose ANN segment encodes the perturbed order while the data
-    // file holds the true vectors. kwai resolves the refine factor from table
-    // options (no query-side option), so the raw-ANN and exact-rerank cases use
-    // two tables built over the identical fixture, differing only in whether the
-    // refine-factor table option is set.
+    // file holds the true vectors. The refine factor is pinned as a table option
+    // here (the query-side option is exercised separately), so the raw-ANN and
+    // exact-rerank cases use two tables built over the identical fixture,
+    // differing only in whether the refine-factor table option is set.
 
     // No refine factor: raw ANN recall order [5, 4, 3] (the rerank never runs), so
     // any reordering below is attributable to the refine factor and not to the
@@ -1475,4 +1476,48 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
             "expected a non-integer refine-factor error, got: {err}"
         );
     }
+}
+
+/// The single-query read path must resolve the refine factor from the query-side
+/// options set via `with_options`, not only from table options. A non-integer
+/// refine factor supplied as a query option therefore has to fail loud through
+/// `execute_read` — proving the option map reaches `configured_refine_factor`
+/// rather than being dropped. Regression for the kwai single-query wrapper that
+/// passed an empty query-options map (so query options were silently ignored,
+/// unlike community main and unlike this table's own batch path).
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn pk_vector_query_option_refine_factor_reaches_single_query_read() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let location = format!("file://{}", tmp.path().display());
+    let file_io = FileIOBuilder::new("file").build().unwrap();
+    // Schema carries NO refine-factor table option; the only source is the query
+    // option below, so a fail-loud can only come from the query map being honored.
+    file_io.mkdirs(&format!("{location}/schema")).await.unwrap();
+    let schema = pk_vector_schema_with(&[]);
+    file_io
+        .new_output(&format!("{location}/schema/schema-{}", schema.id()))
+        .unwrap()
+        .write(Bytes::from(serde_json::to_vec(&schema).unwrap()))
+        .await
+        .unwrap();
+    let table = open_table(&file_io, &location).await;
+
+    let mut builder = table.new_vector_search_builder();
+    builder
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vector(vec![0.0f32; DIM])
+        .with_limit(3)
+        .with_options(HashMap::from([(
+            format!("fields.{VECTOR_COLUMN}.ivf.refine-factor"),
+            "abc".to_string(),
+        )]));
+    let err = match builder.execute_read().await {
+        Ok(_) => panic!("a non-integer query-option refine factor must fail loud"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("Invalid vector refine factor"),
+        "expected a non-integer refine-factor error from the query option, got: {err}"
+    );
 }
