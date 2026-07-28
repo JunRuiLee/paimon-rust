@@ -783,10 +783,20 @@ impl<'a> CoreOptions<'a> {
     }
 
     /// Explicit bucket key columns. If not set, defaults to primary keys for PK tables.
+    ///
+    /// Blank entries are dropped and an all-blank option resolves to `None`,
+    /// mirroring Java `TableSchema#originalBucketKeys`, so callers fall back to
+    /// the primary keys instead of treating `""` as a column name.
     pub fn bucket_key(&self) -> Option<Vec<String>> {
-        self.options
-            .get(BUCKET_KEY_OPTION)
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        let keys: Vec<String> = self
+            .options
+            .get(BUCKET_KEY_OPTION)?
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!keys.is_empty()).then_some(keys)
     }
 
     pub fn commit_max_retries(&self) -> u32 {
