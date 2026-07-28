@@ -4595,6 +4595,7 @@ dependencies = [
  "futures",
  "paimon",
  "paimon-vindex-core",
+ "serde_json",
  "tokio",
 ]
 

@@ -85,6 +85,10 @@ unsafe fn unwrap_table(table: *mut paimon_table) {
     }
 }
 
+unsafe fn table_ref<'a>(table: *const paimon_table) -> &'a Table {
+    &*((*table).inner as *const Table)
+}
+
 fn make_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", ArrowDataType::Int32, false),
@@ -291,6 +295,310 @@ unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
     paimon_read_builder_free(rb);
 
     rows
+}
+
+// =========================================================================
+//  Catalog-free table construction tests
+// =========================================================================
+
+#[test]
+fn test_table_from_schema_json_preserves_resolved_schema_and_branch() {
+    let path = CString::new("memory:/test_resolved_branch").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let branch = CString::new("dev").unwrap();
+    let schema = simple_table_schema();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+    let option_key = CString::new("storage-only-option").unwrap();
+    let option_value = CString::new("secret").unwrap();
+    let storage_options = [paimon_option {
+        key: option_key.as_ptr(),
+        value: option_value.as_ptr(),
+    }];
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            storage_options.as_ptr(),
+            storage_options.len(),
+        );
+
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let table = table_ref(result.table);
+        assert_eq!(table.location(), "memory:/test_resolved_branch");
+        assert_eq!(table.identifier(), &Identifier::new("default", "test"));
+        // The resolved schema is preserved as-is (no normalization or mutation).
+        assert_eq!(table.schema(), &schema);
+        assert_eq!(table.branch(), "dev");
+        assert!(table.is_branch_reference());
+        assert_eq!(
+            table.schema_manager().schema_path(schema.id()),
+            "memory:/test_resolved_branch/branch/branch-dev/schema/schema-0"
+        );
+        assert_eq!(
+            table.snapshot_manager().snapshot_path(1),
+            "memory:/test_resolved_branch/branch/branch-dev/snapshot/snapshot-1"
+        );
+        assert_eq!(
+            table.tag_manager().tag_path("release"),
+            "memory:/test_resolved_branch/branch/branch-dev/tag/tag-release"
+        );
+        assert!(!table.schema().options().contains_key("storage-only-option"));
+
+        let read_builder = paimon_table_new_read_builder(result.table);
+        assert!(read_builder.error.is_null());
+        assert!(!read_builder.read_builder.is_null());
+        paimon_read_builder_free(read_builder.read_builder);
+
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_rejects_missing_primary_key_column() {
+    // A syntactically valid schema whose primaryKeys reference a non-existent
+    // column must be rejected at construction, not panic later (e.g. the write
+    // path unwraps a PartitionComputer built from missing columns).
+    let path = CString::new("memory:/test_resolved_bad_pk").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let branch = CString::new("main").unwrap();
+
+    // simple_table_schema has columns id, name; declare a PK on a missing column.
+    let base = simple_table_schema();
+    let bad_json = serde_json::to_value(&base).unwrap();
+    let mut bad_json = bad_json;
+    bad_json["primaryKeys"] = serde_json::json!(["missing"]);
+    let schema_json = CString::new(serde_json::to_string(&bad_json).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(result.table.is_null());
+        assert!(!result.error.is_null());
+        assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(result.error);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_rejects_reserved_field_name() {
+    // A user column colliding with a system field name (_ROW_ID) would be
+    // silently replaced by the system row number on read; reject at construction.
+    let path = CString::new("memory:/test_resolved_reserved_field").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let branch = CString::new("main").unwrap();
+
+    let base = simple_table_schema();
+    let mut bad_json = serde_json::to_value(&base).unwrap();
+    // Rename the second field ("name") to the reserved system name "_ROW_ID".
+    bad_json["fields"][1]["name"] = serde_json::json!("_ROW_ID");
+    let schema_json = CString::new(serde_json::to_string(&bad_json).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(result.table.is_null());
+        assert!(!result.error.is_null());
+        assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(result.error);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_main_branch_uses_main_schema_directory() {
+    let path = CString::new("memory:/test_resolved_main").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let branch = CString::new("main").unwrap();
+    let schema = simple_table_schema();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let table = table_ref(result.table);
+        assert_eq!(table.branch(), "main");
+        assert!(!table.is_branch_reference());
+        assert_eq!(
+            table.schema_manager().schema_path(schema.id()),
+            "memory:/test_resolved_main/schema/schema-0"
+        );
+
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_null_branch_defaults_to_main() {
+    let path = CString::new("memory:/test_resolved_null_branch").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let schema = simple_table_schema();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let table = table_ref(result.table);
+        assert_eq!(table.branch(), "main");
+        assert!(!table.is_branch_reference());
+        assert_eq!(
+            table.schema_manager().schema_path(schema.id()),
+            "memory:/test_resolved_null_branch/schema/schema-0"
+        );
+
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_rejects_invalid_input() {
+    let path = CString::new("memory:/test_resolved_invalid").unwrap();
+    let malformed_schema = CString::new("not-json").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let branch = CString::new("main").unwrap();
+
+    unsafe {
+        let malformed = paimon_table_from_schema_json(
+            path.as_ptr(),
+            malformed_schema.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(malformed.table.is_null());
+        assert!(!malformed.error.is_null());
+        assert_eq!(
+            (*malformed.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(malformed.error);
+
+        let schema = simple_table_schema();
+        let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+        let null_path = paimon_table_from_schema_json(
+            std::ptr::null(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(null_path.table.is_null());
+        assert!(!null_path.error.is_null());
+        assert_eq!(
+            (*null_path.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(null_path.error);
+
+        let null_options = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            1,
+        );
+        assert!(null_options.table.is_null());
+        assert!(!null_options.error.is_null());
+        assert_eq!(
+            (*null_options.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(null_options.error);
+
+        let invalid_branch = CString::new("../dev").unwrap();
+        let unsafe_branch = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            invalid_branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(unsafe_branch.table.is_null());
+        assert!(!unsafe_branch.error.is_null());
+        assert_eq!(
+            (*unsafe_branch.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(unsafe_branch.error);
+    }
+}
+
+#[test]
+fn test_table_from_schema_json_rejects_invalid_identifier() {
+    let path = CString::new("memory:/test_resolved_bad_ident").unwrap();
+    let schema = simple_table_schema();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+    let branch = CString::new("main").unwrap();
+    // Path separators are rejected by Identifier::validate.
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("nested/table").unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            branch.as_ptr(),
+            std::ptr::null(),
+            0,
+        );
+        assert!(result.table.is_null());
+        assert!(!result.error.is_null());
+        assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(result.error);
+    }
 }
 
 // =========================================================================

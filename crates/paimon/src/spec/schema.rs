@@ -164,6 +164,97 @@ impl TableSchema {
         new_schema
     }
 
+    /// Validate the structural invariants of an externally supplied, already
+    /// resolved schema, without normalizing or mutating it.
+    ///
+    /// This is the safety check for [`crate::table::Table::from_resolved_schema`],
+    /// whose input is untrusted JSON. It rejects the malformed shapes that would
+    /// otherwise panic or silently read the wrong column downstream:
+    /// - duplicate top-level field names (a projected name could resolve to a
+    ///   different field than a predicate on the same name),
+    /// - duplicate field ids (including nested), which break schema-evolution
+    ///   column mapping,
+    /// - primary-key or partition columns that do not exist (e.g. the
+    ///   `PartitionComputer` unwraps on a missing partition column),
+    /// - primary keys that are exactly the partition columns (the read path
+    ///   selects the key-value merge path from the raw primary keys but feeds
+    ///   the reader the *trimmed* keys, which are then empty, panicking on a
+    ///   zero-column key),
+    /// - reserved system field names / ids (e.g. a user column named `_ROW_ID`
+    ///   would be silently replaced by the system row number on read).
+    ///
+    /// It intentionally does NOT run create-time policy checks (merge-engine,
+    /// changelog, aggregation, rowkind, blob strategy, bucket-key existence, …):
+    /// those normalize the schema or reject shapes that are valid to *read*,
+    /// which is not this entry point's contract.
+    pub(crate) fn validate_resolved_structure(&self) -> crate::Result<()> {
+        let field_names: Vec<String> = self.fields.iter().map(|f| f.name().to_string()).collect();
+        Schema::validate_no_duplicate_fields(&field_names)?;
+        Schema::validate_primary_keys(&field_names, &self.primary_keys)?;
+        Schema::validate_partition_keys(&field_names, &self.partition_keys)?;
+        Schema::validate_primary_keys_not_partition_only(&self.partition_keys, &self.primary_keys)?;
+        self.validate_no_duplicate_field_ids()?;
+        self.validate_no_reserved_fields()?;
+        Ok(())
+    }
+
+    /// Reject reserved system field names, the `_KEY_` key-field prefix, and
+    /// reserved system field ids, mirroring Java `SpecialFields`. A user column
+    /// colliding with a system field (e.g. `_ROW_ID`) is otherwise excluded
+    /// from the physical read and silently filled with the system value.
+    fn validate_no_reserved_fields(&self) -> crate::Result<()> {
+        // Java SpecialFields.SYSTEM_FIELD_NAMES.
+        const SYSTEM_FIELD_NAMES: [&str; 5] = [
+            SEQUENCE_NUMBER_FIELD_NAME,
+            VALUE_KIND_FIELD_NAME,
+            "_LEVEL",
+            ROW_KIND_FIELD_NAME,
+            ROW_ID_FIELD_NAME,
+        ];
+        const KEY_FIELD_PREFIX: &str = "_KEY_";
+        // Java SpecialFields.SYSTEM_FIELD_ID_START = Integer.MAX_VALUE / 2.
+        const SYSTEM_FIELD_ID_START: i32 = i32::MAX / 2;
+
+        for field in &self.fields {
+            let name = field.name();
+            if name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Field name '{name}' is reserved for system use and cannot be used in a table schema"
+                    ),
+                });
+            }
+            if field.id() >= SYSTEM_FIELD_ID_START {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Field '{name}' uses reserved system field id {}",
+                        field.id()
+                    ),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject duplicate field ids, including ids nested inside complex types.
+    /// Field ids key schema-evolution column mapping, so a collision would map
+    /// two logical columns onto one id.
+    fn validate_no_duplicate_field_ids(&self) -> crate::Result<()> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        collect_field_ids(&self.fields, &mut ids);
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Table schema must not contain duplicate field id: {id}"),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a list of schema changes and return a new schema with incremented ID.
     ///
     /// Column-level changes operate on **top-level** columns only: a
@@ -607,6 +698,28 @@ fn highest_nested_field_id(data_type: &DataType) -> i32 {
             .max()
             .unwrap_or(-1),
         _ => -1,
+    }
+}
+
+/// Collect the field ids of `fields` and of any fields nested inside their
+/// complex types, in traversal order. Used to detect duplicate ids.
+fn collect_field_ids(fields: &[DataField], out: &mut Vec<i32>) {
+    for field in fields {
+        out.push(field.id());
+        collect_nested_field_ids(field.data_type(), out);
+    }
+}
+
+fn collect_nested_field_ids(data_type: &DataType, out: &mut Vec<i32>) {
+    match data_type {
+        DataType::Array(t) => collect_nested_field_ids(t.element_type(), out),
+        DataType::Multiset(t) => collect_nested_field_ids(t.element_type(), out),
+        DataType::Map(t) => {
+            collect_nested_field_ids(t.key_type(), out);
+            collect_nested_field_ids(t.value_type(), out);
+        }
+        DataType::Row(t) => collect_field_ids(t.fields(), out),
+        _ => {}
     }
 }
 
@@ -2570,6 +2683,173 @@ mod tests {
 
     fn vector_4f() -> DataType {
         DataType::Vector(VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap())
+    }
+
+    // Build a raw TableSchema without going through Schema::build validation,
+    // so we can exercise validate_resolved_structure against malformed input.
+    fn raw_table_schema(
+        fields: Vec<DataField>,
+        partition_keys: Vec<String>,
+        primary_keys: Vec<String>,
+    ) -> TableSchema {
+        let highest_field_id = TableSchema::current_highest_field_id(&fields);
+        TableSchema {
+            version: TableSchema::CURRENT_VERSION,
+            id: 0,
+            fields,
+            highest_field_id,
+            partition_keys,
+            primary_keys,
+            options: HashMap::new(),
+            comment: None,
+            time_millis: 0,
+        }
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_accepts_valid_schema() {
+        let schema = raw_table_schema(
+            vec![
+                DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+                DataField::new(1, "name".to_string(), DataType::Int(IntType::new())),
+            ],
+            vec![],
+            vec!["id".to_string()],
+        );
+        assert!(schema.validate_resolved_structure().is_ok());
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_missing_primary_key() {
+        let schema = raw_table_schema(
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            vec![],
+            vec!["missing".to_string()],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { .. }),
+            "missing PK column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_missing_partition_key() {
+        let schema = raw_table_schema(
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            vec!["missing".to_string()],
+            vec![],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { .. }),
+            "missing partition column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_duplicate_field_names() {
+        let schema = raw_table_schema(
+            vec![
+                DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+                DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+            ],
+            vec![],
+            vec![],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { .. }),
+            "duplicate field names should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_duplicate_field_ids() {
+        let schema = raw_table_schema(
+            vec![
+                DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+                DataField::new(0, "name".to_string(), DataType::Int(IntType::new())),
+            ],
+            vec![],
+            vec![],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "duplicate field ids should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_partition_only_primary_key() {
+        // PK == partition columns: the read path selects the KV/merge path from
+        // the raw primary keys but feeds the reader the trimmed keys (empty),
+        // which panics on a zero-column key. Must be rejected up front.
+        let schema = raw_table_schema(
+            vec![
+                DataField::new(0, "p".to_string(), DataType::Int(IntType::new())),
+                DataField::new(1, "v".to_string(), DataType::Int(IntType::new())),
+            ],
+            vec!["p".to_string()],
+            vec!["p".to_string()],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { .. }),
+            "partition-only primary key should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_reserved_field_name() {
+        for reserved in [
+            "_ROW_ID",
+            "_SEQUENCE_NUMBER",
+            "_VALUE_KIND",
+            "_LEVEL",
+            "_KEY_x",
+        ] {
+            let schema = raw_table_schema(
+                vec![
+                    DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+                    DataField::new(1, reserved.to_string(), DataType::Int(IntType::new())),
+                ],
+                vec![],
+                vec![],
+            );
+            let err = schema.validate_resolved_structure().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { .. }),
+                "reserved field name {reserved:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_resolved_structure_rejects_reserved_field_id() {
+        let schema = raw_table_schema(
+            vec![DataField::new(
+                i32::MAX / 2,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            vec![],
+            vec![],
+        );
+        let err = schema.validate_resolved_structure().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataInvalid { .. }),
+            "reserved system field id should be rejected, got {err:?}"
+        );
     }
 
     #[test]
