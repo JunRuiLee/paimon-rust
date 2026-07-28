@@ -21,7 +21,7 @@ use std::ffi::{c_char, c_void};
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, StructArray};
 use futures::StreamExt;
-use paimon::catalog::Identifier;
+use paimon::catalog::{Identifier, DEFAULT_MAIN_BRANCH};
 use paimon::io::FileIO;
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder, TableSchema};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, Table};
@@ -66,12 +66,14 @@ unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read 
 /// This constructor does not create a catalog or derive a warehouse. Storage
 /// options are used only to build FileIO; they are not merged into the supplied
 /// table schema. `branch` selects the branch-scoped managers while preserving
-/// the supplied schema.
+/// the supplied schema; pass null to default to the `main` branch.
 ///
 /// # Safety
-/// All string pointers must be valid null-terminated C strings. `storage_options`
-/// must point to `storage_options_len` valid `paimon_option` values, or be null
-/// when `storage_options_len` is 0.
+/// All string pointers except `branch` must be valid null-terminated C strings.
+/// `branch` may be null to select the default `main` branch, or a valid
+/// null-terminated C string. `storage_options` must point to
+/// `storage_options_len` valid `paimon_option` values, or be null when
+/// `storage_options_len` is 0.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_from_schema_json(
     table_path: *const c_char,
@@ -118,12 +120,16 @@ pub unsafe extern "C" fn paimon_table_from_schema_json(
             }
         }
     };
-    let branch = match validate_cstr(branch, "branch") {
-        Ok(value) => value,
-        Err(error) => {
-            return paimon_result_get_table {
-                table: std::ptr::null_mut(),
-                error,
+    let branch = if branch.is_null() {
+        DEFAULT_MAIN_BRANCH.to_string()
+    } else {
+        match validate_cstr(branch, "branch") {
+            Ok(value) => value,
+            Err(error) => {
+                return paimon_result_get_table {
+                    table: std::ptr::null_mut(),
+                    error,
+                }
             }
         }
     };

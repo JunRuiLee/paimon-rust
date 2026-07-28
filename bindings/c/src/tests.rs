@@ -393,6 +393,39 @@ fn test_table_from_schema_json_main_branch_uses_main_schema_directory() {
 }
 
 #[test]
+fn test_table_from_schema_json_null_branch_defaults_to_main() {
+    let path = CString::new("memory:/test_resolved_null_branch").unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    let schema = simple_table_schema();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+
+    unsafe {
+        let result = paimon_table_from_schema_json(
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+
+        assert!(result.error.is_null());
+        assert!(!result.table.is_null());
+        let table = table_ref(result.table);
+        assert_eq!(table.branch(), "main");
+        assert!(!table.is_branch_reference());
+        assert_eq!(
+            table.schema_manager().schema_path(schema.id()),
+            "memory:/test_resolved_null_branch/schema/schema-0"
+        );
+
+        paimon_table_free(result.table);
+    }
+}
+
+#[test]
 fn test_table_from_schema_json_rejects_invalid_input() {
     let path = CString::new("memory:/test_resolved_invalid").unwrap();
     let malformed_schema = CString::new("not-json").unwrap();
