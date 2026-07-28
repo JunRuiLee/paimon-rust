@@ -1228,14 +1228,15 @@ impl<'a> CoreOptions<'a> {
     }
 }
 
-/// Parse a memory size string to bytes using binary (1024-based) semantics.
+/// Parse a memory size string to bytes using binary (1024-based) semantics,
+/// mirroring Java Paimon's `MemorySize.parseBytes`.
 ///
-/// Supports formats like `128 mb`, `128mb`, `4 gb`, `1024` (plain bytes).
-/// Uses binary units: `kb` = 1024, `mb` = 1024², `gb` = 1024³, matching Java Paimon's `MemorySize`.
-///
-/// NOTE: Java Paimon's `MemorySize` also accepts long unit names such as `bytes`,
-/// `kibibytes`, `mebibytes`, `gibibytes`, and `tebibytes`. This implementation
-/// only supports short units (`b`, `kb`, `mb`, `gb`, `tb`), which covers all practical usage.
+/// Accepts every unit spelling Java accepts — short (`b`, `k`, `kb`, `m`, `mb`,
+/// `g`, `gb`, `t`, `tb`) and long (`bytes`, `kibibytes`, `mebibytes`,
+/// `gibibytes`, `tebibytes`) — plus a bare number, which is interpreted as
+/// bytes. Returns `None` for an empty string, a missing or non-numeric number,
+/// an unrecognized unit, or a value that would overflow `i64`, matching the
+/// inputs on which Java throws.
 fn parse_memory_size(value: &str) -> Option<i64> {
     let value = value.trim();
     if value.is_empty() {
@@ -1248,14 +1249,14 @@ fn parse_memory_size(value: &str) -> Option<i64> {
     let (num_str, unit_str) = value.split_at(pos);
     let num: i64 = num_str.trim().parse().ok()?;
     let multiplier = match unit_str.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "kb" | "k" => 1024,
-        "mb" | "m" => 1024 * 1024,
-        "gb" | "g" => 1024 * 1024 * 1024,
-        "tb" | "t" => 1024 * 1024 * 1024 * 1024,
+        "" | "b" | "bytes" => 1,
+        "k" | "kb" | "kibibytes" => 1024,
+        "m" | "mb" | "mebibytes" => 1024 * 1024,
+        "g" | "gb" | "gibibytes" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tebibytes" => 1024 * 1024 * 1024 * 1024,
         _ => return None,
     };
-    Some(num * multiplier)
+    num.checked_mul(multiplier)
 }
 
 #[cfg(test)]
@@ -1529,6 +1530,62 @@ mod tests {
         assert_eq!(parse_memory_size("100 b"), Some(100));
         assert_eq!(parse_memory_size(""), None);
         assert_eq!(parse_memory_size("abc"), None);
+    }
+
+    #[test]
+    fn test_parse_memory_size_accepts_every_java_unit_spelling() {
+        // Every alias in Java `MemorySize.MemoryUnit`, which lists three
+        // spellings per unit (e.g. `m`, `mb`, `mebibytes`).
+        for (unit, multiplier) in [
+            ("b", 1_i64),
+            ("bytes", 1),
+            ("k", 1024),
+            ("kb", 1024),
+            ("kibibytes", 1024),
+            ("m", 1024 * 1024),
+            ("mb", 1024 * 1024),
+            ("mebibytes", 1024 * 1024),
+            ("g", 1024 * 1024 * 1024),
+            ("gb", 1024 * 1024 * 1024),
+            ("gibibytes", 1024 * 1024 * 1024),
+            ("t", 1024_i64 * 1024 * 1024 * 1024),
+            ("tb", 1024_i64 * 1024 * 1024 * 1024),
+            ("tebibytes", 1024_i64 * 1024 * 1024 * 1024),
+        ] {
+            assert_eq!(
+                parse_memory_size(&format!("3{unit}")),
+                Some(3 * multiplier),
+                "unit '{unit}' should parse as {multiplier} bytes"
+            );
+            // Java lower-cases the unit and trims the gap, so these are equal.
+            assert_eq!(
+                parse_memory_size(&format!("3 {}", unit.to_uppercase())),
+                Some(3 * multiplier),
+                "unit '{unit}' should parse case-insensitively with a space"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_size_rejects_overflow_instead_of_wrapping() {
+        // Java raises "numeric overflow" for these; returning `None` lets the
+        // callers fall back to their default rather than wrap to a negative
+        // size (a debug build would panic on the multiplication).
+        assert_eq!(parse_memory_size("9007199254740993 kb"), None);
+        assert_eq!(parse_memory_size("9223372036854775807 tb"), None);
+        // The largest representable value still parses.
+        assert_eq!(
+            parse_memory_size("8589934591 gb"),
+            Some(8589934591 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_parse_memory_size_rejects_unknown_and_malformed_units() {
+        assert_eq!(parse_memory_size("128 zb"), None);
+        assert_eq!(parse_memory_size("128 megabytes"), None);
+        assert_eq!(parse_memory_size("mb"), None);
+        assert_eq!(parse_memory_size("-1"), None);
     }
 
     #[test]
