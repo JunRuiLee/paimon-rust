@@ -26,7 +26,10 @@ use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::{create_local_cache, LocalCache};
 use crate::io::FileIO;
-use crate::spec::{CoreOptions, Schema, TableSchema, TableType, TABLE_TYPE_OPTION};
+use crate::spec::{
+    CoreOptions, Schema, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
+    TABLE_TYPE_OPTION,
+};
 use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -540,7 +543,7 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
-        reject_table_type_changes(current.options(), &changes)?;
+        reject_immutable_option_changes(current.options(), &changes)?;
 
         let new_schema = current
             .apply_changes(changes)
@@ -549,10 +552,19 @@ impl Catalog for FileSystemCatalog {
     }
 }
 
-/// The declared type picks the reader, so it is fixed at creation: flipping
-/// it strands a populated table behind a reader that cannot see its data.
-/// Only case-insensitive no-ops pass, matching Java `SchemaManager`.
-fn reject_table_type_changes(
+/// Options whose value is baked into the on-disk layout, so changing one on a
+/// populated table strands the files already written under the old value.
+///
+/// Java rejects any alteration of an option annotated `@Immutable`
+/// (`SchemaManager.checkAlterTableOption` against `CoreOptions.IMMUTABLE_OPTIONS`);
+/// this mirrors the subset this crate acts on:
+///
+/// * `type` picks the reader, so flipping it strands a populated table behind a
+///   reader that cannot see its data. Only case-insensitive no-ops pass.
+/// * `index-file-in-data-file-dir` picks the directory every bucket-local index
+///   file is written to and read from, so flipping it hides every index file the
+///   table already has.
+fn reject_immutable_option_changes(
     current_options: &HashMap<String, String>,
     changes: &[crate::spec::SchemaChange],
 ) -> Result<()> {
@@ -574,6 +586,18 @@ fn reject_table_type_changes(
             crate::spec::SchemaChange::RemoveOption { key } if key == TABLE_TYPE_OPTION => {
                 return Err(Error::Unsupported {
                     message: format!("removing '{TABLE_TYPE_OPTION}' is not supported"),
+                });
+            }
+            crate::spec::SchemaChange::SetOption { key, .. }
+            | crate::spec::SchemaChange::RemoveOption { key }
+                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION =>
+            {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "changing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' is not supported: \
+                         it selects the directory index files are written to, so the files \
+                         already written would no longer be found"
+                    ),
                 });
             }
             _ => {}
@@ -827,6 +851,51 @@ mod tests {
             .await
             .is_ok());
         catalog.get_table(&identifier).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_cannot_change_where_index_files_live() {
+        use crate::spec::SchemaChange;
+
+        // The option selects the directory every bucket-local index file is written
+        // to and read from. Flipping it on a populated table would hide every index
+        // file already written, so it is fixed at creation, as in Java where it is
+        // annotated `@Immutable`.
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        for change in [
+            SchemaChange::set_option(
+                "index-file-in-data-file-dir".to_string(),
+                "true".to_string(),
+            ),
+            SchemaChange::set_option(
+                "index-file-in-data-file-dir".to_string(),
+                "false".to_string(),
+            ),
+            SchemaChange::remove_option("index-file-in-data-file-dir".to_string()),
+        ] {
+            let err = catalog
+                .alter_table(&identifier, vec![change], false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+        }
     }
 
     #[tokio::test]

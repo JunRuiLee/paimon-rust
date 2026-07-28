@@ -17,9 +17,10 @@
 
 //! Resolution of deletion-vector positions into global row ranges.
 
-use super::{DELETION_VECTORS_INDEX_TYPE, INDEX_DIR};
+use super::DELETION_VECTORS_INDEX_TYPE;
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::spec::{FileKind, IndexManifestEntry};
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::{merge_row_ranges, DeletionFile, RowRange, Table};
 use crate::Result;
 use std::collections::HashMap;
@@ -48,9 +49,16 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
         .await?;
 
     let mut first_row_ids: HashMap<(Vec<u8>, i32, String), i64> = HashMap::new();
+    // A deletion vector is an index file, so it may live beside its bucket's data
+    // files. Capture each bucket's directory from the plan rather than rebuilding
+    // it, so custom data directories are honored.
+    let mut bucket_paths: HashMap<(Vec<u8>, i32), String> = HashMap::new();
     for split in plan.splits() {
         let partition = split.partition().to_serialized_bytes();
         let bucket = split.bucket();
+        bucket_paths
+            .entry((partition.clone(), bucket))
+            .or_insert_with(|| split.bucket_path().to_string());
         for file in split.data_files() {
             if let Some(first_row_id) = file.first_row_id {
                 first_row_ids.insert(
@@ -63,6 +71,7 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
 
     let mut ranges = Vec::new();
     let table_path = table.location().trim_end_matches('/');
+    let index_file_in_data_file_dir = table.schema().core_options().index_file_in_data_file_dir();
     for entry in index_entries {
         if entry.kind != FileKind::Add || entry.index_file.index_type != DELETION_VECTORS_INDEX_TYPE
         {
@@ -71,7 +80,10 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
         let Some(dv_ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
             continue;
         };
-        let index_path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+        // A deletion vector is resolved against the bucket that owns it; a bucket
+        // with no captured directory has no live split, and the row-id join below
+        // rejects every data file in the entry before any path is needed.
+        let bucket_path = bucket_paths.get(&(entry.partition.clone(), entry.bucket));
         for (data_file_name, meta) in dv_ranges {
             let key = (
                 entry.partition.clone(),
@@ -87,8 +99,26 @@ pub(crate) async fn deleted_row_ranges_for_data_evolution_dvs(
                     source: None,
                 }
             })?;
+            // The join above found a live row-tracked file in this bucket, so the
+            // loop over the plan captured its directory.
+            let bucket_path = bucket_path.ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "no bucket directory captured for deletion vector '{}'",
+                    entry.index_file.file_name
+                ),
+                source: None,
+            })?;
+            let index_path = IndexFileLocation::BucketLocal {
+                table_path,
+                bucket_path,
+                index_file_in_data_file_dir,
+            }
+            .resolve(
+                &entry.index_file.file_name,
+                entry.index_file.external_path.as_deref(),
+            );
             let deletion_file = DeletionFile::new(
-                index_path.clone(),
+                index_path,
                 meta.offset as i64,
                 meta.length as i64,
                 meta.cardinality,

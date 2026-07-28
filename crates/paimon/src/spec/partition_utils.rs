@@ -31,6 +31,40 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
+/// The directory holding one bucket's data files, `<table>/[<partition>/]bucket-N`.
+///
+/// Mirrors Java `FileStorePathFactory.bucketPath`. Every consumer that needs a
+/// bucket directory — data files, and index files kept beside them — must derive
+/// it here: a writer and a reader that disagree by one segment silently lose the
+/// file, and there is no compile error to catch that.
+///
+/// `partition_computer` is `None` for an unpartitioned table, whose buckets sit
+/// directly under the table path.
+pub(crate) fn bucket_path(
+    table_path: &str,
+    partition_computer: Option<&PartitionComputer>,
+    partition: &BinaryRow,
+    bucket: i32,
+) -> crate::Result<String> {
+    let partition_path = match partition_computer {
+        Some(computer) => computer.generate_partition_path(partition)?,
+        None => String::new(),
+    };
+    Ok(bucket_path_under(table_path, &partition_path, bucket))
+}
+
+/// [`bucket_path`] for a partition directory that is already computed.
+///
+/// `partition_path` is empty for an unpartitioned table and otherwise ends with `/`,
+/// matching [`PartitionComputer::generate_partition_path`].
+pub(crate) fn bucket_path_under(table_path: &str, partition_path: &str, bucket: i32) -> String {
+    format!(
+        "{}/{partition_path}{}",
+        table_path.trim_end_matches('/'),
+        crate::spec::bucket_dir_name(bucket)
+    )
+}
+
 /// Computes partition string values and directory paths from a partition `BinaryRow`.
 ///
 /// Mirrors Java `InternalRowPartitionComputer` — holds resolved partition field metadata
@@ -38,7 +72,7 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// (escaped directory path).
 ///
 /// Reference: `org.apache.paimon.utils.InternalRowPartitionComputer` in Java Paimon.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PartitionComputer {
     partition_keys: Vec<String>,
     partition_fields: Vec<DataField>,

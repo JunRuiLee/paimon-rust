@@ -2007,7 +2007,7 @@ Columns:
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
 | `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
-| `file_name` | STRING | Index file name under the table index directory |
+| `file_name` | STRING | Index file name. It resolves to the table `index/` directory, or to the bucket's data-file directory when `index-file-in-data-file-dir` is set; an index file with an external path is read from that path instead |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
 | `dv_ranges` | ARRAY | Deletion-vector ranges, only populated for deletion-vector metadata |
@@ -2024,7 +2024,8 @@ Files are classified by their table-relative path:
 - `manifest/manifest-*`, `manifest/manifest-list-*`, and `manifest/index-manifest-*` → manifest
 - `statistics/*` → manifest file counters for the current compatible output schema
 - `index/*` → index
-- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth, except names starting with `index-`
+- `<partition>/bucket-*/index-*` and `<partition>/bucket-postpone/index-*` → index, where `index-file-in-data-file-dir` puts them; classification follows the file's physical form, not the current option value
+- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth
 - unknown files are ignored by this summary
 
 ```sql

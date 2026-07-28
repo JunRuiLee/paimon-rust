@@ -21,7 +21,7 @@ use super::entry::{
     sorted_entry_meta, GlobalIndexEntry, GlobalIndexEntryMeta, GlobalIndexFileKind,
 };
 use super::query_plan::{add_file_size, EntryQueryPlan, EntryQueryResult, FallbackScanPlan};
-use super::{BoxedCmp, GlobalIndexScanner, INDEX_DIR};
+use super::{BoxedCmp, GlobalIndexScanner};
 use crate::btree::query::{BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::fm_index::FMGlobalIndexReader;
@@ -164,7 +164,7 @@ impl GlobalIndexScanner {
         // Each concurrent task owns its reader. Only return it to the shared
         // cache after all predicates for this shard have completed.
         if let Some(OpenedGlobalIndexReader::BTree(reader)) = reader.take() {
-            self.return_reader(entry.file_name.clone(), reader);
+            self.return_reader(entry.resolved_path(&self.table_path), reader);
         }
         Ok(EntryQueryResult {
             bitmap: file_result,
@@ -183,24 +183,27 @@ impl GlobalIndexScanner {
         }
     }
 
-    /// Get a cached reader or open a new one for the given file.
+    /// Get a cached reader or open a new one for the given resolved path. The
+    /// cache is keyed by the resolved path (not the bare file name) so two entries
+    /// that share a file name but resolve to different locations — e.g. distinct
+    /// external paths — never reuse each other's reader.
     async fn get_or_open_reader(
         &self,
         entry: &GlobalIndexEntry,
         meta: &BTreeIndexMeta,
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
+        let resolved_path = entry.resolved_path(&self.table_path);
         // Try to take from cache
         {
             let mut cache = self.reader_cache.lock().unwrap();
-            if let Some(reader) = cache.remove(&entry.file_name) {
+            if let Some(reader) = cache.remove(&resolved_path) {
                 return Ok(OpenedGlobalIndexReader::BTree(reader));
             }
         }
 
         // Open new reader
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
-        let input = self.file_io.new_input(&path)?;
+        let input = self.file_io.new_input(&resolved_path)?;
         let file_size = if entry.file_size > 0 {
             entry.file_size as u64
         } else {
@@ -213,7 +216,7 @@ impl GlobalIndexScanner {
             .await
             .map(OpenedGlobalIndexReader::BTree)
             .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to open BTree index file: {}", entry.file_name),
+                message: format!("Failed to open BTree index file: {resolved_path}"),
                 source: Some(Box::new(e)),
             })
     }
@@ -275,7 +278,7 @@ impl GlobalIndexScanner {
                 "FM entry has non-FM manifest metadata",
             ));
         };
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
+        let path = entry.resolved_path(&self.table_path);
         let input = self
             .file_io
             .new_input(&path)
@@ -308,7 +311,7 @@ impl GlobalIndexScanner {
         &self,
         entry: &GlobalIndexEntry,
     ) -> std::io::Result<BitmapGlobalIndexReader> {
-        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
+        let path = entry.resolved_path(&self.table_path);
         let input = self
             .file_io
             .new_input(&path)
@@ -373,8 +376,8 @@ impl GlobalIndexScanner {
     }
 
     /// Return a reader to the cache for future reuse.
-    fn return_reader(&self, file_name: String, reader: BTreeIndexReader<BoxedCmp>) {
+    fn return_reader(&self, resolved_path: String, reader: BTreeIndexReader<BoxedCmp>) {
         let mut cache = self.reader_cache.lock().unwrap();
-        cache.insert(file_name, reader);
+        cache.insert(resolved_path, reader);
     }
 }

@@ -2274,6 +2274,7 @@ async fn incremental_build_splits_gap_around_mid_coverage_indexed_hole() {
         file_size: 1,
         row_count: (hole_end - hole_start + 1),
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: hole_start,
             row_range_end: hole_end,

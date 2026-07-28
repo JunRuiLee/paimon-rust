@@ -20,6 +20,7 @@
 use crate::btree::BTreeIndexMeta;
 use crate::spec::{DataType, PredicateOperator};
 use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
+use crate::table::index_file_path::IndexFileLocation;
 use crate::{Error, Result};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -31,7 +32,17 @@ pub(super) struct GlobalIndexEntry {
     pub(super) file_size: i64,
     pub(super) row_range_start: i64,
     pub(super) row_range_end: i64,
+    pub(super) external_path: Option<String>,
     pub(super) meta: GlobalIndexEntryMeta,
+}
+
+impl GlobalIndexEntry {
+    /// The entry's on-disk path: its external path if set, else the table's
+    /// global index directory. Also the BTree reader-cache key.
+    pub(super) fn resolved_path(&self, table_path: &str) -> String {
+        IndexFileLocation::Global { table_path }
+            .resolve(&self.file_name, self.external_path.as_deref())
+    }
 }
 
 pub(super) fn sorted_entry_meta(entry: &GlobalIndexEntry) -> &BTreeIndexMeta {

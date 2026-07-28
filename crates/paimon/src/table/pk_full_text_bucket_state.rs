@@ -306,6 +306,7 @@ mod tests {
             file_size: 1,
             row_count,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta,
         }
     }

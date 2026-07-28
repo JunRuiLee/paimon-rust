@@ -398,6 +398,7 @@ fn make_global_index_entry_with_type(
             file_size: 0,
             row_count: 0,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start,
                 row_range_end,
@@ -442,6 +443,7 @@ async fn make_fm_index_entry(
             file_size: output.to_vec().len() as i64,
             row_count: result.row_count as i64,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(crate::spec::GlobalIndexMeta {
                 row_range_start,
                 row_range_end,
@@ -496,6 +498,7 @@ fn test_mixed_fm_and_btree_select_compatible_index_family() {
         file_size: 1,
         row_range_start: 0,
         row_range_end: 9,
+        external_path: None,
         meta: GlobalIndexEntryMeta::Sorted(BTreeIndexMeta::new(None, None, false)),
     };
     let fm = GlobalIndexEntry {
@@ -504,6 +507,7 @@ fn test_mixed_fm_and_btree_select_compatible_index_family() {
         file_size: 1,
         row_range_start: 0,
         row_range_end: 9,
+        external_path: None,
         meta: GlobalIndexEntryMeta::FM {
             bytes: Vec::new(),
             first_row_id: 0,

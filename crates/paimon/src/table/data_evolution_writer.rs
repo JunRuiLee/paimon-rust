@@ -29,11 +29,12 @@
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
-    BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, DeletionVectorMeta, FileKind,
-    IndexFileMeta, IndexManifest, PartitionComputer,
+    bucket_path, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, DeletionVectorMeta,
+    FileKind, IndexFileMeta, IndexManifest, PartitionComputer, EMPTY_BINARY_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::data_evolution_anchor_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::DataSplitBuilder;
@@ -53,7 +54,6 @@ use uuid::Uuid;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 const DELETION_VECTORS_INDEX_VERSION_V1: u8 = 1;
-const INDEX_DIR: &str = "index";
 const MANIFEST_DIR: &str = "manifest";
 
 /// Engine-agnostic writer for partial-column updates via `_ROW_ID`.
@@ -388,6 +388,25 @@ impl DataEvolutionWriter {
     }
 }
 
+/// One bucket's deletion-vector location, owning the strings the shared resolver
+/// borrows. Built once per bucket so the read that merges existing vectors and the
+/// write that follows it cannot disagree about where the file goes.
+struct DeletionVectorLayout {
+    table_path: String,
+    bucket_path: String,
+    index_file_in_data_file_dir: bool,
+}
+
+impl DeletionVectorLayout {
+    fn location(&self) -> IndexFileLocation<'_> {
+        IndexFileLocation::BucketLocal {
+            table_path: &self.table_path,
+            bucket_path: &self.bucket_path,
+            index_file_in_data_file_dir: self.index_file_in_data_file_dir,
+        }
+    }
+}
+
 /// Engine-agnostic DELETE writer for data evolution tables.
 ///
 /// DELETE is represented by a deletion-vector index file keyed by the normal
@@ -589,12 +608,53 @@ impl DataEvolutionDeleteWriter {
             return Ok(None);
         }
 
-        let new_index_file = self.write_deletion_vector_index_file(bitmaps).await?;
+        let new_index_file = self
+            .write_deletion_vector_index_file(&partition, bucket, bitmaps)
+            .await?;
         let mut message = CommitMessage::new(partition, bucket, vec![]);
         message.check_from_snapshot = Some(delete_plan.check_from_snapshot);
         message.new_index_files = vec![new_index_file];
         message.deleted_index_files = deleted_index_files;
         Ok(Some(message))
+    }
+
+    /// Where this bucket's deletion vectors live. A deletion vector is an index
+    /// file, so it sits beside the bucket's data files when the table keeps index
+    /// files there, and under the table `index/` directory otherwise. Reads and
+    /// writes both go through this, so a file written here is found again.
+    fn deletion_vector_layout(
+        &self,
+        partition: &[u8],
+        bucket: i32,
+    ) -> Result<DeletionVectorLayout> {
+        let schema = self.table.schema();
+        let partition_keys = schema.partition_keys();
+        let core_options = CoreOptions::new(schema.options());
+        let computer = if partition_keys.is_empty() {
+            None
+        } else {
+            Some(PartitionComputer::new(
+                partition_keys,
+                schema.fields(),
+                core_options.partition_default_name(),
+                core_options.legacy_partition_name(),
+            )?)
+        };
+        let partition_row = if computer.is_some() {
+            BinaryRow::from_serialized_bytes(partition)?
+        } else {
+            EMPTY_BINARY_ROW
+        };
+        Ok(DeletionVectorLayout {
+            table_path: self.table.location().trim_end_matches('/').to_string(),
+            bucket_path: bucket_path(
+                self.table.location(),
+                computer.as_ref(),
+                &partition_row,
+                bucket,
+            )?,
+            index_file_in_data_file_dir: core_options.index_file_in_data_file_dir(),
+        })
     }
 
     async fn read_existing_bucket_deletion_vectors(
@@ -611,6 +671,7 @@ impl DataEvolutionDeleteWriter {
         let Some(index_manifest_name) = snapshot.index_manifest() else {
             return Ok((IndexMap::new(), Vec::new()));
         };
+        let layout = self.deletion_vector_layout(partition, bucket)?;
 
         let manifest_path = format!(
             "{}/{MANIFEST_DIR}/{}",
@@ -633,10 +694,9 @@ impl DataEvolutionDeleteWriter {
             let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
                 continue;
             };
-            let index_path = format!(
-                "{}/{INDEX_DIR}/{}",
-                self.table.location().trim_end_matches('/'),
-                entry.index_file.file_name
+            let index_path = layout.location().resolve(
+                &entry.index_file.file_name,
+                entry.index_file.external_path.as_deref(),
             );
             for (data_file_name, meta) in ranges {
                 let deletion_file = crate::DeletionFile::new(
@@ -657,15 +717,19 @@ impl DataEvolutionDeleteWriter {
 
     async fn write_deletion_vector_index_file(
         &self,
+        partition: &[u8],
+        bucket: i32,
         mut bitmaps: IndexMap<String, RoaringBitmap>,
     ) -> Result<IndexFileMeta> {
         bitmaps.sort_keys();
 
         let file_name = format!("index-{}-1", Uuid::new_v4());
-        let table_path = self.table.location().trim_end_matches('/');
-        let index_dir = format!("{table_path}/{INDEX_DIR}");
-        self.table.file_io().mkdirs(&index_dir).await?;
-        let path = format!("{index_dir}/{file_name}");
+        // Write where the reader resolves it, so a deletion vector written here is
+        // found again on the next scan.
+        let layout = self.deletion_vector_layout(partition, bucket)?;
+        let location = layout.location();
+        let path = location.resolve(&file_name, None);
+        self.table.file_io().mkdirs(&location.directory()).await?;
 
         let mut bytes = vec![DELETION_VECTORS_INDEX_VERSION_V1];
         let mut ranges = IndexMap::new();
@@ -715,6 +779,7 @@ impl DataEvolutionDeleteWriter {
             file_size,
             row_count: i64::from(row_count),
             deletion_vectors_ranges: Some(ranges),
+            external_path: None,
             global_index_meta: None,
         })
     }

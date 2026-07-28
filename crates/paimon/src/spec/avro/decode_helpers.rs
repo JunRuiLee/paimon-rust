@@ -58,13 +58,23 @@ pub(crate) fn read_bytes_field(cursor: &mut AvroCursor, nullable: bool) -> crate
 }
 
 pub(crate) fn read_string_field(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<String> {
+    Ok(read_nullable_string_field(cursor, nullable)?.unwrap_or_default())
+}
+
+/// Reads a nullable string field, preserving the null/present distinction.
+/// Returns `None` for the null branch of a `["null", "string"]` union (a
+/// non-nullable field is always `Some`).
+pub(crate) fn read_nullable_string_field(
+    cursor: &mut AvroCursor,
+    nullable: bool,
+) -> crate::Result<Option<String>> {
     if nullable {
         let idx = cursor.read_union_index()?;
         if idx == 0 {
-            return Ok(String::new());
+            return Ok(None);
         }
     }
-    Ok(cursor.read_string()?.to_string())
+    Ok(Some(cursor.read_string()?.to_string()))
 }
 
 const EMPTY_PARTITION: [u8; 4] = [0, 0, 0, 0];

@@ -1568,6 +1568,7 @@ mod fulltext_tests {
             file_size: i64::try_from(index_bytes.len()).unwrap(),
             row_count: 5,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: 4,

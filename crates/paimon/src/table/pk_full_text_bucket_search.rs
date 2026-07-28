@@ -37,6 +37,7 @@ use crate::deletion_vector::DeletionVector;
 use crate::ftindex::reader::FullTextArchiveReader;
 use crate::io::FileIO;
 use crate::spec::PrimaryKeyIndexSourceMeta;
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_full_text_read::PrimaryKeyFullTextCandidate;
 use crate::table::pk_full_text_scan::PrimaryKeyFullTextSearchSplit;
 
@@ -187,10 +188,11 @@ fn owning_active_source(
 /// Search one bucket's full-text payloads and return its scored candidates
 /// (unsorted; the read path fuses them cross-bucket via `top_k_by_score`).
 ///
-/// `dvs` is keyed by data file name; `table_path` roots the index directory
-/// (`{table_path}/index/{payload}`). Mirrors Java
+/// `dvs` is keyed by data file name. Each payload is opened at its resolved
+/// bucket-local (or external) path. Mirrors Java
 /// `PrimaryKeyFullTextBucketSearch.searchRankings`, flattened to one candidate
 /// list per bucket.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn search_bucket(
     split: &PrimaryKeyFullTextSearchSplit,
     query: &str,
@@ -198,6 +200,7 @@ pub(crate) async fn search_bucket(
     dvs: &HashMap<String, DeletionVector>,
     file_io: &FileIO,
     table_path: &str,
+    index_file_in_data_file_dir: bool,
     split_index: usize,
 ) -> crate::Result<Vec<PrimaryKeyFullTextCandidate>> {
     if limit == 0 {
@@ -243,7 +246,12 @@ pub(crate) async fn search_bucket(
             }
         }
 
-        let path = format!("{table_path}/index/{}", payload.file_name);
+        let path = IndexFileLocation::BucketLocal {
+            table_path,
+            bucket_path: data_split.bucket_path(),
+            index_file_in_data_file_dir,
+        }
+        .resolve(&payload.file_name, payload.external_path.as_deref());
         let input = file_io.new_input(&path)?;
         let reader = FullTextArchiveReader::from_input_file(&input).await?;
         let hits = match &prepared.include {
@@ -371,6 +379,7 @@ mod tests {
             file_size: 1,
             row_count: total,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(gim(7, frame(level, files))),
         }
     }
@@ -458,6 +467,7 @@ mod tests {
             &dvs,
             &file_io,
             table_path,
+            false,
             0,
         )
         .await
@@ -477,6 +487,46 @@ mod tests {
                 ("d1".to_string(), 3),
             ]
         );
+    }
+
+    /// A full-text archive is an index file, so with `index-file-in-data-file-dir`
+    /// it lives beside the bucket's data files. The directory must come from the
+    /// split, not be rebuilt from the table root.
+    #[tokio::test]
+    async fn archive_resolves_into_the_split_bucket_directory() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/ftbs_bucket_local";
+        let bytes = build_archive(&[(0, "alpha"), (1, "beta"), (2, "alpha")]);
+        // `data_split` roots this bucket outside the table path on purpose.
+        write_archive(&file_io, "memory:/t/bucket-0/ft-0", bytes).await;
+
+        let split = PrimaryKeyFullTextSearchSplit::new(
+            data_split(vec![dfm("d0", 3)]),
+            vec![ft_payload("ft-0", 1, &[("d0", 3)])],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let dvs: HashMap<String, DeletionVector> = HashMap::new();
+        let out = search_bucket(
+            &split,
+            r#"{"match":{"query":"alpha"}}"#,
+            10,
+            &dvs,
+            &file_io,
+            table_path,
+            true,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let mut got: Vec<(String, i64)> = out
+            .iter()
+            .map(|c| (c.data_file_name.clone(), c.row_position))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![("d0".to_string(), 0), ("d0".to_string(), 2)]);
     }
 
     // ---- (b) a DV-deleted archive position is excluded from results ----
@@ -515,6 +565,7 @@ mod tests {
             &dvs,
             &file_io,
             table_path,
+            false,
             0,
         )
         .await
@@ -635,6 +686,7 @@ mod tests {
             &dvs,
             &file_io,
             "memory:/x",
+            false,
             0
         )
         .await

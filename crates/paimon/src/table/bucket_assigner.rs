@@ -59,7 +59,6 @@ pub(crate) trait BucketAssigner: Send {
     fn prepare_commit_index(
         &mut self,
         file_io: &FileIO,
-        index_dir: &str,
     ) -> impl std::future::Future<Output = Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>>> + Send;
 }
 
@@ -67,7 +66,7 @@ pub(crate) trait BucketAssigner: Send {
 pub(crate) enum BucketAssignerEnum {
     Constant(ConstantBucketAssigner),
     Fixed(FixedBucketAssigner),
-    Dynamic(DynamicBucketAssigner),
+    Dynamic(Box<DynamicBucketAssigner>),
     CrossPartition(Box<CrossPartitionAssigner>),
 }
 
@@ -88,13 +87,12 @@ impl BucketAssignerEnum {
     pub async fn prepare_commit_index(
         &mut self,
         file_io: &FileIO,
-        index_dir: &str,
     ) -> Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>> {
         match self {
-            Self::Constant(a) => a.prepare_commit_index(file_io, index_dir).await,
-            Self::Fixed(a) => a.prepare_commit_index(file_io, index_dir).await,
-            Self::Dynamic(a) => a.prepare_commit_index(file_io, index_dir).await,
-            Self::CrossPartition(a) => a.prepare_commit_index(file_io, index_dir).await,
+            Self::Constant(a) => a.prepare_commit_index(file_io).await,
+            Self::Fixed(a) => a.prepare_commit_index(file_io).await,
+            Self::Dynamic(a) => a.prepare_commit_index(file_io).await,
+            Self::CrossPartition(a) => a.prepare_commit_index(file_io).await,
         }
     }
 

@@ -429,6 +429,7 @@ async fn commit_synthetic_vindex_index(table: &Table, field_id: i32, start: i64,
         file_size: 1,
         row_count: end - start + 1,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: start,
             row_range_end: end,
@@ -700,6 +701,7 @@ async fn vindex_build_coexists_with_different_index_type_on_same_field() {
         file_size: 1,
         row_count: (coverage[0].to() - coverage[0].from() + 1) as i64,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: coverage[0].from(),
             row_range_end: coverage[0].to(),

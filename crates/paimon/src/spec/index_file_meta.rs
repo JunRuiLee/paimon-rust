@@ -77,6 +77,15 @@ pub struct IndexFileMeta {
     )]
     pub deletion_vectors_ranges: Option<IndexMap<String, DeletionVectorMeta>>,
 
+    /// Absolute path of an externally-stored index file. `None` when the file
+    /// lives under the table's index directory (or bucket data-file directory).
+    #[serde(
+        default,
+        rename = "_EXTERNAL_PATH",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_path: Option<String>,
+
     #[serde(
         default,
         rename = "_GLOBAL_INDEX",

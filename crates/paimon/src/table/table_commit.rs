@@ -24,14 +24,15 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_dir_name, extract_datum, merge_active_entries, BinaryRow, BinaryRowBuilder, CommitKind,
-    CoreOptions, DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
-    IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
-    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
-    POSTPONE_BUCKET,
+    bucket_path, bucket_path_under, extract_datum, merge_active_entries, BinaryRow,
+    BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
+    GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
+    ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
+    EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::global_index_build_common::same_extra_field_ids;
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
@@ -704,6 +705,10 @@ impl TableCommit {
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         self.table.ensure_not_branch_reference_for_write()?;
 
+        let table_path = self.table.location().trim_end_matches('/');
+        let index_file_in_data_file_dir =
+            CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
+
         for message in commit_messages {
             let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
             for file in message
@@ -715,9 +720,18 @@ impl TableCommit {
                     let _ = self.table.file_io().delete_file(&path).await;
                 }
             }
-            let index_dir = format!("{}/index", self.table.location().trim_end_matches('/'));
+            // An index file must be deleted where it was written: beside this
+            // bucket's data files when the table keeps index files there, at its
+            // external path when it has one, and under the table `index/`
+            // directory otherwise. Mirrors Java `FileStoreCommitImpl.abort`,
+            // which deletes through `indexFileFactory(partition, bucket)`.
+            let index_location = IndexFileLocation::BucketLocal {
+                table_path,
+                bucket_path: &bucket_path,
+                index_file_in_data_file_dir,
+            };
             for file in &message.new_index_files {
-                let path = format!("{index_dir}/{}", file.file_name);
+                let path = index_location.resolve(&file.file_name, file.external_path.as_deref());
                 let _ = self.table.file_io().delete_file(&path).await;
             }
         }
@@ -725,13 +739,13 @@ impl TableCommit {
     }
 
     fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {
-        let base = self.table.location().trim_end_matches('/');
         let partition_keys = self.table.schema().partition_keys();
         if partition_keys.is_empty() {
-            return Ok(format!("{base}/{}", bucket_dir_name(bucket)));
+            // An unpartitioned table's buckets sit directly under the table path,
+            // so the partition blob is never decoded — callers are free to pass an
+            // empty one.
+            return Ok(bucket_path_under(self.table.location(), "", bucket));
         }
-
-        let partition_row = BinaryRow::from_serialized_bytes(partition)?;
         let core_options = CoreOptions::new(self.table.schema().options());
         let computer = PartitionComputer::new(
             partition_keys,
@@ -739,11 +753,12 @@ impl TableCommit {
             core_options.partition_default_name(),
             core_options.legacy_partition_name(),
         )?;
-        Ok(format!(
-            "{base}/{}{}",
-            computer.generate_partition_path(&partition_row)?,
-            bucket_dir_name(bucket)
-        ))
+        bucket_path(
+            self.table.location(),
+            Some(&computer),
+            &BinaryRow::from_serialized_bytes(partition)?,
+            bucket,
+        )
     }
 
     /// Try to commit with retries.
@@ -3290,6 +3305,7 @@ mod tests {
             file_size: 128,
             row_count: (row_range_end - row_range_start + 1),
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start,
                 row_range_end,
@@ -3330,6 +3346,7 @@ mod tests {
                     cardinality: Some(1),
                 },
             )])),
+            external_path: None,
             global_index_meta: None,
         }
     }
@@ -5482,6 +5499,7 @@ mod tests {
             file_size: 5,
             row_count: 1,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: None,
         }];
         commit.abort(&[message]).await.unwrap();
@@ -5489,6 +5507,89 @@ mod tests {
         assert!(
             !file_io.exists(&index_path).await.unwrap(),
             "abort must remove newly written index files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_deletes_index_files_from_the_data_file_directory() {
+        // With `index-file-in-data-file-dir`, a new index file is written beside the
+        // bucket's data files, so abort must delete it there. Deleting is best-effort
+        // (`let _ =`), so a wrong path leaks the file silently.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_abort_index_in_bucket_dir";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([(
+                "index-file-in-data-file-dir".to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+
+        let bucket_dir = format!("{table_path}/bucket-0");
+        let index_path = format!("{bucket_dir}/index-in-bucket");
+        file_io.mkdirs(&format!("{bucket_dir}/")).await.unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "HASH".to_string(),
+            file_name: "index-in-bucket".to_string(),
+            file_size: 5,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            external_path: None,
+            global_index_meta: None,
+        }];
+        commit.abort(&[message]).await.unwrap();
+
+        assert!(
+            !file_io.exists(&index_path).await.unwrap(),
+            "abort must remove an index file written into the bucket data-file directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_deletes_index_files_at_their_external_path() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_abort_index_external";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+
+        let external_dir = "memory:/elsewhere/index";
+        let external_path = format!("{external_dir}/index-external");
+        file_io.mkdirs(&format!("{external_dir}/")).await.unwrap();
+        file_io
+            .new_output(&external_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "HASH".to_string(),
+            file_name: "index-external".to_string(),
+            file_size: 5,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            external_path: Some(external_path.clone()),
+            global_index_meta: None,
+        }];
+        commit.abort(&[message]).await.unwrap();
+
+        assert!(
+            !file_io.exists(&external_path).await.unwrap(),
+            "abort must remove an index file recorded at an external path"
         );
     }
 

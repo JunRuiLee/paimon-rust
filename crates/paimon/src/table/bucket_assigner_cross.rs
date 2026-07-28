@@ -354,7 +354,6 @@ impl BucketAssigner for CrossPartitionAssigner {
     async fn prepare_commit_index(
         &mut self,
         _file_io: &FileIO,
-        _index_dir: &str,
     ) -> Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>> {
         Ok(HashMap::new())
     }

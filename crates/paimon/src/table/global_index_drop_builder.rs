@@ -261,6 +261,7 @@ mod tests {
             file_size: 128,
             row_count: (row_range_end - row_range_start + 1),
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start,
                 row_range_end,
@@ -279,6 +280,7 @@ mod tests {
             file_size: 64,
             row_count: 1,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: None,
         }
     }
@@ -297,6 +299,7 @@ mod tests {
                     cardinality: Some(1),
                 },
             )])),
+            external_path: None,
             global_index_meta: None,
         }
     }

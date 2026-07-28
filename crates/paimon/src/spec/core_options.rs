@@ -32,6 +32,7 @@ const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-pe
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
+pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
@@ -684,6 +685,16 @@ impl<'a> CoreOptions<'a> {
             .get(GLOBAL_INDEX_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(true)
+    }
+
+    /// Whether index files are stored in the bucket data-file directory rather
+    /// than the table `index/` directory (option `index-file-in-data-file-dir`,
+    /// default false).
+    pub fn index_file_in_data_file_dir(&self) -> bool {
+        self.options
+            .get(INDEX_FILE_IN_DATA_FILE_DIR_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {

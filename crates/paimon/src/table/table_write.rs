@@ -329,7 +329,7 @@ impl TableWrite {
                 merge_engine,
             )))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(DynamicBucketAssigner::new(
+            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
                 partition_field_indices,
                 primary_key_indices.clone(),
                 schema.fields().to_vec(),
@@ -337,7 +337,12 @@ impl TableWrite {
                 table.file_io().clone(),
                 table.location().to_string(),
                 is_overwrite,
-            ))
+                // The same computer this writer already built: a hash index kept in
+                // the data-file directory must land in the directory the writer and
+                // the reader both derive, so both must agree on partition naming.
+                partition_computer.clone(),
+                core_options.index_file_in_data_file_dir(),
+            )))
         } else if total_buckets == POSTPONE_BUCKET {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_field_indices,
@@ -830,11 +835,7 @@ impl TableWrite {
 
         // Collect index files from bucket assigner
         let file_io = self.table.file_io();
-        let index_dir = format!("{}/index", self.table.location());
-        let mut index_files_by_key = self
-            .bucket_assigner
-            .prepare_commit_index(file_io, &index_dir)
-            .await?;
+        let mut index_files_by_key = self.bucket_assigner.prepare_commit_index(file_io).await?;
 
         let mut messages = Vec::new();
         for (partition_bytes, bucket, files) in results {

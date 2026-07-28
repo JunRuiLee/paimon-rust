@@ -58,6 +58,7 @@ pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
                 }]
             }]
         },
+        {"name": "_EXTERNAL_PATH", "type": ["null", "string"], "default": null},
         {
             "default": null,
             "name": "_GLOBAL_INDEX",
@@ -202,6 +203,7 @@ mod tests {
                             cardinality: Some(3),
                         }
                     )])),
+                    external_path: None,
                     global_index_meta: None,
                 }
             }]
@@ -228,6 +230,7 @@ mod tests {
                         cardinality: Some(7),
                     },
                 )])),
+                external_path: None,
                 global_index_meta: None,
             },
         };
@@ -288,6 +291,7 @@ mod tests {
                 file_size: 42,
                 row_count: 7,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: 10,
                     row_range_end: 20,
@@ -399,9 +403,122 @@ mod tests {
     }
 
     #[test]
-    fn legacy_five_field_global_index_decodes_without_source_meta() {
-        // 5-field _GLOBAL_INDEX schema (pre-#8549): no _SOURCE_META. Identical to
-        // INDEX_MANIFEST_ENTRY_SCHEMA with the trailing _SOURCE_META line removed.
+    fn decodes_index_external_path_at_its_schema_position() {
+        // `_EXTERNAL_PATH` (nullable string) is field 5 of Java `IndexFileMeta.SCHEMA`,
+        // between `_DELETIONS_VECTORS_RANGES` and `_GLOBAL_INDEX`. A manifest written
+        // for an externally-stored index file records the absolute path there; the
+        // decoder must read it from that position rather than skip it.
+        const SCHEMA_WITH_EXTERNAL_PATH: &str = r#"{
+    "type": "record",
+    "name": "org.apache.paimon.avro.generated.record",
+    "fields": [
+        {"name": "_VERSION", "type": "int"},
+        {"name": "_KIND", "type": "int"},
+        {"name": "_PARTITION", "type": "bytes"},
+        {"name": "_BUCKET", "type": "int"},
+        {"name": "_INDEX_TYPE", "type": "string"},
+        {"name": "_FILE_NAME", "type": "string"},
+        {"name": "_FILE_SIZE", "type": "long"},
+        {"name": "_ROW_COUNT", "type": "long"},
+        {
+            "default": null,
+            "name": "_DELETIONS_VECTORS_RANGES",
+            "type": ["null", {
+                "type": "array",
+                "items": ["null", {
+                    "type": "record",
+                    "name": "org.apache.paimon.avro.generated.record__DELETIONS_VECTORS_RANGES",
+                    "fields": [
+                        {"name": "f0", "type": "string"},
+                        {"name": "f1", "type": "int"},
+                        {"name": "f2", "type": "int"},
+                        {"name": "_CARDINALITY", "type": ["null", "long"], "default": null}
+                    ]
+                }]
+            }]
+        },
+        {"name": "_EXTERNAL_PATH", "type": ["null", "string"], "default": null},
+        {
+            "default": null,
+            "name": "_GLOBAL_INDEX",
+            "type": ["null", {
+                "type": "record",
+                "name": "org.apache.paimon.avro.generated.record__GLOBAL_INDEX",
+                "fields": [
+                    {"name": "_ROW_RANGE_START", "type": "long"},
+                    {"name": "_ROW_RANGE_END", "type": "long"},
+                    {"name": "_INDEX_FIELD_ID", "type": "int"},
+                    {"name": "_EXTRA_FIELD_IDS", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                    {"name": "_INDEX_META", "type": ["null", "bytes"], "default": null},
+                    {"name": "_SOURCE_META", "type": ["null", "bytes"], "default": null}
+                ]
+            }]
+        }
+    ]
+}"#;
+
+        let external = "s3://bucket/warehouse/db/tbl/index/idx-external-0";
+        let entry: IndexManifestEntry = serde_json::from_value(serde_json::json!({
+            "_VERSION": 1,
+            "_KIND": 0,
+            "_PARTITION": [0, 0, 0, 0],
+            "_BUCKET": 0,
+            "_INDEX_TYPE": "TEST",
+            "_FILE_NAME": "idx-external-0",
+            "_FILE_SIZE": 42,
+            "_ROW_COUNT": 7,
+            "_EXTERNAL_PATH": external
+        }))
+        .unwrap();
+
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            SCHEMA_WITH_EXTERNAL_PATH,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded[0].index_file.external_path.as_deref(),
+            Some(external)
+        );
+    }
+
+    #[test]
+    fn decodes_null_index_external_path_as_none() {
+        // A manifest whose `_EXTERNAL_PATH` is present but null decodes to `None`.
+        // The field being absent from the writer schema entirely is covered by
+        // `legacy_schema_without_external_path_field_decodes_as_none`.
+        let entry: IndexManifestEntry = serde_json::from_value(serde_json::json!({
+            "_VERSION": 1,
+            "_KIND": 0,
+            "_PARTITION": [0, 0, 0, 0],
+            "_BUCKET": 0,
+            "_INDEX_TYPE": "TEST",
+            "_FILE_NAME": "idx-local-0",
+            "_FILE_SIZE": 42,
+            "_ROW_COUNT": 7
+        }))
+        .unwrap();
+
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            INDEX_MANIFEST_ENTRY_SCHEMA,
+            std::slice::from_ref(&entry),
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded[0].index_file.external_path, None);
+    }
+
+    #[test]
+    fn legacy_schema_without_external_path_field_decodes_as_none() {
+        // A writer schema from before either field existed: no `_SOURCE_META` inside
+        // `_GLOBAL_INDEX` (pre-#8549), and no `_EXTERNAL_PATH` at all. The decoder
+        // walks the writer's own field list, so both must simply be absent from the
+        // decoded entry without misaligning the stream.
         const LEGACY_SCHEMA: &str = r#"{
     "type": "record",
     "name": "org.apache.paimon.avro.generated.record",
@@ -457,7 +574,7 @@ mod tests {
             crate::spec::DEFAULT_AVRO_COMPRESSION,
         )
         .unwrap();
-        // Decoding with the current 6-field reader must not misalign the stream.
+        // Decoding with the current reader must not misalign the stream.
         let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
         assert_eq!(decoded[0], entry);
         assert_eq!(
@@ -469,5 +586,6 @@ mod tests {
                 .source_meta,
             None
         );
+        assert_eq!(decoded[0].index_file.external_path, None);
     }
 }

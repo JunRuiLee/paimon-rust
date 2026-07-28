@@ -287,6 +287,7 @@ async fn build_table(vectors: &[[f32; DIM]]) -> (tempfile::TempDir, Table) {
         file_size: i64::try_from(index_file_size).unwrap(),
         row_count,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,
             row_range_end: row_count - 1,
