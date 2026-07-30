@@ -76,7 +76,8 @@ unsafe fn new_write_builder(
 /// used by both `new_write()` and `new_commit()` for duplicate-commit detection.
 ///
 /// # Safety
-/// `table` must be a valid pointer from `paimon_catalog_get_table`, or null (returns error).
+/// `table` must be a valid pointer from `paimon_catalog_get_table` or
+/// `paimon_table_from_schema_json`, or null (returns error).
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_new_write_builder(
     table: *const paimon_table,
