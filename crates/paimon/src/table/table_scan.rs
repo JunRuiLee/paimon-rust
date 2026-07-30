@@ -1122,7 +1122,7 @@ impl<'a> PaimonTableScan<'a> {
     pub async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let snapshot = match self.resolve_snapshot().await? {
+        let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
             Some(snapshot) => snapshot,
             None => return Ok(Plan::new(Vec::new())),
         };
@@ -1138,7 +1138,7 @@ impl<'a> PaimonTableScan<'a> {
             ..Default::default()
         };
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let snapshot = match self.resolve_snapshot().await? {
+        let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
             Some(snapshot) => snapshot,
             None => return Ok((Plan::new(Vec::new()), trace)),
         };
@@ -1162,41 +1162,6 @@ impl<'a> PaimonTableScan<'a> {
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
         Ok(self.projected_read_field_ids.clone())
-    }
-
-    async fn resolve_snapshot(&self) -> crate::Result<Option<Snapshot>> {
-        // A table copy produced by `copy_with_time_travel` already resolved
-        // the selector in its options; reuse it instead of re-reading
-        // tag/snapshot files on every plan.
-        if let Some(snapshot) = self.table.travel_snapshot() {
-            return Ok(Some(snapshot.clone()));
-        }
-        // A time-travelled schema without its resolved snapshot means the
-        // selector was changed after the travel (`copy_with_options`).
-        // Resolving the new selector here would evolve a different snapshot's
-        // files to the stale historical schema, so fail instead.
-        if self.table.is_time_traveled() {
-            return Err(crate::Error::DataInvalid {
-                message: "Table options changed after time travel; \
-                          use copy_with_time_travel to re-resolve the snapshot and schema"
-                    .to_string(),
-                source: None,
-            });
-        }
-
-        match super::time_travel::travel_to_snapshot(
-            &self.table.snapshot_manager(),
-            &self.table.tag_manager(),
-            self.table.schema().options(),
-        )
-        .await?
-        {
-            Some(snapshot) => Ok(Some(snapshot)),
-            None => {
-                let snapshot_manager = self.table.snapshot_manager();
-                snapshot_manager.get_latest_snapshot().await
-            }
-        }
     }
 
     /// Apply a limit-pushdown hint to the generated splits.

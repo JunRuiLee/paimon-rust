@@ -55,6 +55,7 @@ use crate::table_function_args::{
     extract_int_literal, extract_string_literal, parse_table_identifier,
 };
 use crate::table_loader::load_data_table_for_read;
+use crate::DynamicOptions;
 
 const FUNCTION_NAME: &str = "vector_search";
 
@@ -63,15 +64,29 @@ pub fn register_vector_search(
     catalog: Arc<dyn Catalog>,
     default_database: &str,
 ) {
+    register_vector_search_with_dynamic_options(ctx, catalog, default_database, Default::default());
+}
+
+pub(crate) fn register_vector_search_with_dynamic_options(
+    ctx: &SessionContext,
+    catalog: Arc<dyn Catalog>,
+    default_database: &str,
+    dynamic_options: DynamicOptions,
+) {
     ctx.register_udtf(
         "vector_search",
-        Arc::new(VectorSearchFunction::new(catalog, default_database)),
+        Arc::new(VectorSearchFunction::new_with_dynamic_options(
+            catalog,
+            default_database,
+            dynamic_options,
+        )),
     );
 }
 
 pub struct VectorSearchFunction {
     catalog: Arc<dyn Catalog>,
     default_database: String,
+    dynamic_options: DynamicOptions,
 }
 
 impl Debug for VectorSearchFunction {
@@ -84,9 +99,18 @@ impl Debug for VectorSearchFunction {
 
 impl VectorSearchFunction {
     pub fn new(catalog: Arc<dyn Catalog>, default_database: &str) -> Self {
+        Self::new_with_dynamic_options(catalog, default_database, Default::default())
+    }
+
+    pub(crate) fn new_with_dynamic_options(
+        catalog: Arc<dyn Catalog>,
+        default_database: &str,
+        dynamic_options: DynamicOptions,
+    ) -> Self {
         Self {
             catalog,
             default_database: default_database.to_string(),
+            dynamic_options,
         }
     }
 }
@@ -113,8 +137,20 @@ impl TableFunctionImpl for VectorSearchFunction {
             parse_table_identifier(FUNCTION_NAME, &table_name, &self.default_database)?;
 
         let catalog = Arc::clone(&self.catalog);
+        let dynamic_options = self.dynamic_options.read().unwrap().clone();
         let table = block_on_with_runtime(
-            async move { load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await },
+            async move {
+                let table = load_data_table_for_read(&catalog, &identifier, FUNCTION_NAME).await?;
+                let table = if dynamic_options.is_empty() {
+                    table
+                } else {
+                    table
+                        .copy_with_time_travel(dynamic_options)
+                        .await
+                        .map_err(to_datafusion_error)?
+                };
+                Ok::<_, DataFusionError>(table)
+            },
             "vector_search: catalog access thread panicked",
         )?;
 
@@ -534,4 +570,101 @@ fn gather_rows_by_rank(
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
     RecordBatch::try_new_with_options(Arc::clone(output_schema), columns, &options)
         .map_err(DataFusionError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::catalog::TableFunctionArgs;
+    use datafusion::logical_expr::lit;
+    use paimon::spec::SCAN_VERSION_OPTION;
+    use paimon::{CatalogOptions, FileSystemCatalog, Options};
+
+    use super::*;
+    use crate::SQLContext;
+
+    #[tokio::test]
+    async fn test_vector_search_applies_supported_session_dynamic_options() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut catalog_options = Options::new();
+        catalog_options.set(
+            CatalogOptions::WAREHOUSE,
+            format!("file://{}", temp_dir.path().display()),
+        );
+        let catalog = Arc::new(FileSystemCatalog::new(catalog_options).unwrap());
+
+        let mut sql_context = SQLContext::new();
+        sql_context
+            .register_catalog("paimon", catalog)
+            .await
+            .unwrap();
+        sql_context
+            .sql(
+                "CREATE TABLE paimon.default.vector_blob (\
+                    id INT, \
+                    embedding ARRAY<FLOAT>, \
+                    picture BLOB\
+                ) WITH (\
+                    'data-evolution.enabled' = 'true', \
+                    'row-tracking.enabled' = 'true'\
+                )",
+            )
+            .await
+            .unwrap();
+        sql_context
+            .sql("INSERT INTO paimon.default.vector_blob (id) VALUES (1)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        sql_context
+            .sql("SET 'paimon.blob-as-descriptor' = 'true'")
+            .await
+            .unwrap();
+        sql_context
+            .sql("SET 'paimon.scan.version' = '1'")
+            .await
+            .unwrap();
+
+        let state = sql_context.ctx().state();
+        let table_function = state
+            .table_functions()
+            .get(FUNCTION_NAME)
+            .expect("vector_search should be registered");
+        let args = [
+            lit("paimon.default.vector_blob"),
+            lit("embedding"),
+            lit("[1.0]"),
+            lit(1_i64),
+        ];
+        let provider = table_function
+            .create_table_provider_with_args(TableFunctionArgs::new(&args, &state))
+            .unwrap();
+        let provider = provider
+            .downcast_ref::<VectorSearchTableProvider>()
+            .expect("vector_search should return its table provider");
+
+        assert!(
+            CoreOptions::new(provider.inner.table().schema().options()).blob_as_descriptor(),
+            "vector_search should apply session dynamic options to the loaded table"
+        );
+        assert!(
+            provider
+                .inner
+                .table()
+                .schema()
+                .options()
+                .contains_key(SCAN_VERSION_OPTION),
+            "vector_search should keep session time-travel options"
+        );
+        assert_eq!(
+            provider
+                .inner
+                .table()
+                .travel_snapshot()
+                .map(|snapshot| snapshot.id()),
+            Some(1),
+            "vector_search should resolve the session time-travel snapshot"
+        );
+    }
 }

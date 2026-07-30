@@ -18,8 +18,7 @@
 //! Snapshot resolution for time travel, mirroring Java `TimeTravelUtil`.
 
 use crate::spec::{CoreOptions, Snapshot, TimeTravelSelector};
-use crate::table::SnapshotManager;
-use crate::table::TagManager;
+use crate::table::{SnapshotManager, Table, TagManager};
 use crate::Error;
 use std::collections::HashMap;
 
@@ -90,6 +89,37 @@ pub(crate) async fn travel_to_snapshot(
             }
         }
         None => Ok(None),
+    }
+}
+
+/// Resolve the snapshot a read should use, including the latest-snapshot fallback.
+///
+/// Reuses a snapshot cached by [`Table::copy_with_time_travel`] so every read path
+/// observes the same snapshot/schema pair. A historical schema whose selector was
+/// subsequently changed is rejected instead of mixing that stale schema with a
+/// different snapshot.
+pub(crate) async fn resolve_snapshot(table: &Table) -> crate::Result<Option<Snapshot>> {
+    if let Some(snapshot) = table.travel_snapshot() {
+        return Ok(Some(snapshot.clone()));
+    }
+    if table.is_time_traveled() {
+        return Err(Error::DataInvalid {
+            message: "Table options changed after time travel; \
+                      use copy_with_time_travel to re-resolve the snapshot and schema"
+                .to_string(),
+            source: None,
+        });
+    }
+
+    match travel_to_snapshot(
+        &table.snapshot_manager(),
+        &table.tag_manager(),
+        table.schema().options(),
+    )
+    .await?
+    {
+        Some(snapshot) => Ok(Some(snapshot)),
+        None => table.snapshot_manager().get_latest_snapshot().await,
     }
 }
 

@@ -1129,7 +1129,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
         let snapshot_manager = self.table.snapshot_manager();
 
-        let snapshot = match snapshot_manager.get_latest_snapshot().await? {
+        let snapshot = match crate::table::time_travel::resolve_snapshot(self.table).await? {
             Some(s) => s,
             None => return Ok(vec![SearchResult::empty(); vector_searches.len()]),
         };
@@ -5760,6 +5760,48 @@ mod tests {
         assert!(
             saw_score,
             "DE read output must carry the search score column"
+        );
+    }
+
+    #[tokio::test]
+    async fn de_vector_search_uses_time_travel_snapshot() {
+        let table = de_vector_table().await;
+        let latest = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(3)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(
+            !latest.is_empty(),
+            "latest snapshot should contain the committed vector index"
+        );
+
+        let traveled = table
+            .copy_with_time_travel(HashMap::from([(
+                crate::spec::SCAN_VERSION_OPTION.to_string(),
+                "1".to_string(),
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(
+            traveled.travel_snapshot().map(|snapshot| snapshot.id()),
+            Some(1)
+        );
+
+        let historical = traveled
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(3)
+            .execute_scored()
+            .await
+            .unwrap();
+        assert!(
+            historical.is_empty(),
+            "snapshot 1 predates the vector index and should return no hits"
         );
     }
 

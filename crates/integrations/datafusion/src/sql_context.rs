@@ -200,7 +200,12 @@ impl SQLContext {
                 Some(session_state),
             )),
         );
-        register_table_functions(&self.ctx, &catalog, default_db.unwrap_or("default"));
+        register_table_functions(
+            &self.ctx,
+            &catalog,
+            default_db.unwrap_or("default"),
+            self.dynamic_options.clone(),
+        );
         self.catalogs.insert(catalog_name.clone(), catalog);
         if is_first {
             self.set_current_catalog(catalog_name).await?;
@@ -3311,9 +3316,15 @@ fn register_table_functions(
     ctx: &SessionContext,
     catalog: &Arc<dyn Catalog>,
     default_database: &str,
+    dynamic_options: DynamicOptions,
 ) {
     crate::blob_view::register_blob_view(ctx, Arc::clone(catalog), default_database);
-    crate::vector_search::register_vector_search(ctx, Arc::clone(catalog), default_database);
+    crate::vector_search::register_vector_search_with_dynamic_options(
+        ctx,
+        Arc::clone(catalog),
+        default_database,
+        dynamic_options,
+    );
     #[cfg(feature = "fulltext")]
     crate::full_text_search::register_full_text_search(ctx, Arc::clone(catalog), default_database);
     crate::hybrid_search::register_hybrid_search(ctx, Arc::clone(catalog), default_database);
