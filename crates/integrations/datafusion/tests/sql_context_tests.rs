@@ -719,7 +719,114 @@ async fn test_branch_partitions_system_table_reads_branch_snapshot() {
     assert!(catalog.take_partition_identifiers().is_empty());
 }
 
-// ======================= CREATE / DROP SCHEMA =======================
+// ======================= DATABASE / SCHEMA =======================
+
+#[tokio::test]
+async fn test_database_statements() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    sql_context.sql("CREATE DATABASE analytics").await.unwrap();
+    sql_context
+        .sql("CREATE DATABASE IF NOT EXISTS analytics")
+        .await
+        .unwrap();
+
+    let databases = collect_string_column(&sql_context, "SHOW DATABASES", "database_name").await;
+    assert_eq!(databases, vec!["analytics", "default"]);
+
+    sql_context
+        .sql("CREATE TABLE analytics.events (id INT)")
+        .await
+        .unwrap();
+    sql_context
+        .sql("DROP DATABASE analytics CASCADE")
+        .await
+        .unwrap();
+    sql_context
+        .sql("DROP DATABASE IF EXISTS analytics")
+        .await
+        .unwrap();
+
+    assert!(!catalog
+        .list_databases()
+        .await
+        .unwrap()
+        .contains(&"analytics".to_string()));
+}
+
+#[tokio::test]
+async fn test_database_statements_reject_unsupported_options() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+
+    assert_sql_error_contains(
+        &sql_context,
+        "SHOW DATABASES LIKE 'a%'",
+        "SHOW DATABASES options are not supported",
+    )
+    .await;
+    assert_sql_error_contains(
+        &sql_context,
+        "CREATE DATABASE analytics LOCATION 'file:///tmp/analytics'",
+        "CREATE DATABASE options are not supported",
+    )
+    .await;
+
+    catalog
+        .create_database("keep_me", false, Default::default())
+        .await
+        .unwrap();
+    assert_sql_error_contains(
+        &sql_context,
+        "DROP DATABASE keep_me PURGE",
+        "DROP DATABASE options are not supported",
+    )
+    .await;
+
+    assert!(catalog
+        .list_databases()
+        .await
+        .unwrap()
+        .contains(&"keep_me".to_string()));
+}
+
+#[tokio::test]
+async fn test_use_catalog_qualified_database() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("cat1", catalog1.clone())
+        .await
+        .unwrap();
+    sql_context
+        .register_catalog("cat2", catalog2.clone())
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("CREATE DATABASE cat2.analytics")
+        .await
+        .unwrap();
+    sql_context.sql("USE cat2.analytics").await.unwrap();
+    sql_context
+        .sql("CREATE TABLE events (id INT)")
+        .await
+        .unwrap();
+
+    assert!(catalog1.list_tables("analytics").await.is_err());
+    assert_eq!(
+        catalog2.list_tables("analytics").await.unwrap(),
+        vec!["events"]
+    );
+    assert_sql_error_contains(
+        &sql_context,
+        "USE missing_database",
+        "Database missing_database does not exist",
+    )
+    .await;
+}
 
 #[tokio::test]
 async fn test_create_schema() {

@@ -18,12 +18,15 @@
 //! SQL support for Paimon tables.
 //!
 //! DataFusion does not natively support all SQL statements needed by Paimon.
-//! This module provides [`SQLContext`] which intercepts CREATE TABLE,
-//! ALTER TABLE, MERGE INTO, UPDATE and other SQL, translates them to Paimon
-//! catalog operations, and delegates everything else (SELECT, CREATE/DROP
-//! SCHEMA, DROP TABLE, etc.) to the underlying [`SessionContext`].
+//! This module provides [`SQLContext`] which intercepts database and table
+//! statements needed by Paimon, translates them to catalog operations, and
+//! delegates everything else to the underlying [`SessionContext`].
 //!
 //! Supported DDL:
+//! - `SHOW DATABASES`
+//! - `CREATE DATABASE [IF NOT EXISTS] [catalog.]db`
+//! - `DROP DATABASE [IF EXISTS] [catalog.]db [CASCADE]`
+//! - `USE [catalog.]db`
 //! - `CREATE TABLE db.t (col TYPE, ..., PRIMARY KEY (col, ...)) [PARTITIONED BY (col, ...)] [WITH ('key' = 'val')]`
 //! - `ALTER TABLE db.t ADD COLUMN col TYPE`
 //! - `ALTER TABLE db.t DROP COLUMN col`
@@ -61,7 +64,7 @@ use datafusion::sql::sqlparser::ast::{
     ColumnOption, CreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions, CreateView,
     Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Insert, Merge,
     ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
-    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Value as SqlValue,
+    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -218,6 +221,10 @@ impl SQLContext {
 
     /// Sets the current catalog for unqualified table references.
     pub async fn set_current_catalog(&mut self, catalog_name: impl Into<String>) -> DFResult<()> {
+        self.set_current_catalog_inner(catalog_name).await
+    }
+
+    async fn set_current_catalog_inner(&self, catalog_name: impl Into<String>) -> DFResult<()> {
         let catalog_name = catalog_name.into();
         if !self.catalogs.contains_key(&catalog_name) {
             return Err(DataFusionError::Plan(format!(
@@ -357,8 +364,8 @@ impl SQLContext {
         &self.dynamic_options
     }
 
-    /// Execute a SQL statement. ALTER TABLE is handled by Paimon directly;
-    /// everything else is delegated to DataFusion.
+    /// Execute a SQL statement. Paimon database and table extensions are handled
+    /// directly; everything else is delegated to DataFusion.
     pub async fn sql(&self, sql: &str) -> DFResult<DataFrame> {
         let is_create_table = looks_like_create_table(sql);
         let (rewritten_sql, partition_keys) = if is_create_table {
@@ -380,6 +387,48 @@ impl SQLContext {
         }
 
         match &statements[0] {
+            Statement::ShowDatabases {
+                terse,
+                history,
+                show_options,
+            } => {
+                if *terse
+                    || *history
+                    || show_options.show_in.is_some()
+                    || show_options.starts_with.is_some()
+                    || show_options.limit.is_some()
+                    || show_options.limit_from.is_some()
+                    || show_options.filter_position.is_some()
+                {
+                    return Err(DataFusionError::Plan(
+                        "SHOW DATABASES options are not supported".to_string(),
+                    ));
+                }
+                self.handle_show_databases().await
+            }
+            Statement::CreateDatabase {
+                db_name,
+                if_not_exists,
+                location,
+                managed_location,
+                clone,
+                default_charset,
+                default_collation,
+                ..
+            } => {
+                if location.is_some()
+                    || managed_location.is_some()
+                    || clone.is_some()
+                    || default_charset.is_some()
+                    || default_collation.is_some()
+                {
+                    return Err(DataFusionError::Plan(
+                        "CREATE DATABASE options are not supported".to_string(),
+                    ));
+                }
+                self.handle_create_database(db_name, *if_not_exists).await
+            }
+            Statement::Use(Use::Object(name)) => self.handle_use_database(name).await,
             Statement::CreateTable(create_table) => {
                 if create_table.temporary {
                     self.handle_create_temp_table(create_table).await
@@ -470,6 +519,28 @@ impl SQLContext {
                 } else {
                     self.ctx.sql(sql).await
                 }
+            }
+            Statement::Drop {
+                object_type: ObjectType::Database,
+                if_exists,
+                names,
+                cascade,
+                restrict,
+                purge,
+                temporary,
+                table,
+            } => {
+                let [name] = names.as_slice() else {
+                    return Err(DataFusionError::Plan(
+                        "DROP DATABASE requires exactly one database".to_string(),
+                    ));
+                };
+                if *restrict || *purge || *temporary || table.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "DROP DATABASE options are not supported".to_string(),
+                    ));
+                }
+                self.handle_drop_database(name, *if_exists, *cascade).await
             }
             Statement::Drop {
                 object_type,
@@ -1025,6 +1096,66 @@ impl SQLContext {
             ],
         )?;
         self.ctx.read_batch(batch)
+    }
+
+    async fn handle_show_databases(&self) -> DFResult<DataFrame> {
+        let catalog = self.current_catalog()?;
+        let mut databases = catalog
+            .list_databases()
+            .await
+            .map_err(to_datafusion_error)?;
+        databases.sort_unstable();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "database_name",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(databases))])?;
+        self.ctx.read_batch(batch)
+    }
+
+    async fn handle_create_database(
+        &self,
+        name: &ObjectName,
+        if_not_exists: bool,
+    ) -> DFResult<DataFrame> {
+        let (catalog, _, database) = self.resolve_catalog_and_database(name)?;
+        catalog
+            .create_database(&database, if_not_exists, Default::default())
+            .await
+            .map_err(to_datafusion_error)?;
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_drop_database(
+        &self,
+        name: &ObjectName,
+        if_exists: bool,
+        cascade: bool,
+    ) -> DFResult<DataFrame> {
+        let (catalog, _, database) = self.resolve_catalog_and_database(name)?;
+        catalog
+            .drop_database(&database, if_exists, cascade)
+            .await
+            .map_err(to_datafusion_error)?;
+        ok_result(&self.ctx)
+    }
+
+    async fn handle_use_database(&self, name: &ObjectName) -> DFResult<DataFrame> {
+        let (catalog, catalog_name, database) = self.resolve_catalog_and_database(name)?;
+        if database.contains('\'') {
+            return Err(DataFusionError::Plan(
+                "Database name must not contain single quotes".to_string(),
+            ));
+        }
+        catalog
+            .get_database(&database)
+            .await
+            .map_err(to_datafusion_error)?;
+        self.set_current_catalog_inner(catalog_name).await?;
+        self.set_current_database(&database).await?;
+        ok_result(&self.ctx)
     }
 
     async fn handle_alter_table(
@@ -1719,6 +1850,39 @@ impl SQLContext {
                 "No catalog registered. Call register_catalog() first.".to_string(),
             )
         })
+    }
+
+    fn resolve_catalog_and_database(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<(Arc<dyn Catalog>, String, String)> {
+        let parts = name
+            .0
+            .iter()
+            .map(|part| {
+                part.as_ident()
+                    .map(|identifier| identifier.value.clone())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!("Invalid database reference: {name}"))
+                    })
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        match parts.as_slice() {
+            [database] => Ok((
+                self.current_catalog()?,
+                self.current_catalog_name(),
+                database.clone(),
+            )),
+            [catalog_name, database] => {
+                let catalog = self.catalogs.get(catalog_name).cloned().ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
+                })?;
+                Ok((catalog, catalog_name.clone(), database.clone()))
+            }
+            _ => Err(DataFusionError::Plan(format!(
+                "Invalid database reference: {name}"
+            ))),
+        }
     }
 
     /// Check whether a TableReference targets a registered Paimon catalog.

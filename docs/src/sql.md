@@ -546,13 +546,18 @@ register_variant_functions(&ctx);
 
 ## DDL
 
-### CREATE DATABASE / CREATE SCHEMA / DROP SCHEMA
+### DATABASE
 
 ```sql
-CREATE SCHEMA paimon.my_db;
+SHOW DATABASES;
 CREATE DATABASE paimon.my_db;
-DROP SCHEMA paimon.my_db CASCADE;
+USE paimon.my_db;
+DROP DATABASE paimon.my_db CASCADE;
 ```
+
+`CREATE DATABASE` supports `IF NOT EXISTS`, and `DROP DATABASE` supports
+`IF EXISTS` and `CASCADE`. `CREATE SCHEMA` and `DROP SCHEMA` remain supported
+as compatibility aliases.
 
 ### CREATE TABLE
 
