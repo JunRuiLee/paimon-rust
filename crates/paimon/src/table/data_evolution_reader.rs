@@ -5592,7 +5592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_and_read_retains_complete_rolled_dedicated_group() {
+    async fn test_scan_and_read_prunes_unselected_rolled_dedicated_sources() {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -5688,15 +5688,11 @@ mod tests {
         let expected_planned_files = vec![
             "data.parquet".to_string(),
             "emb-1.vector.parquet".to_string(),
-            "emb-2.vector.parquet".to_string(),
-            "emb-3.vector.parquet".to_string(),
             "payload-1.blob".to_string(),
-            "payload-2.blob".to_string(),
-            "payload-3.blob".to_string(),
         ];
         assert_eq!(planned_files, expected_planned_files);
-        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
-        assert_eq!(trace.final_files, 7);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 4);
+        assert_eq!(trace.final_files, 3);
 
         let batches = builder
             .new_read()
