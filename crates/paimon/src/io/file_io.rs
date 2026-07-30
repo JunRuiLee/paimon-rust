@@ -372,6 +372,7 @@ pub struct FileIOBuilder {
     scheme_str: Option<String>,
     props: HashMap<String, String>,
     cache: Option<Arc<LocalCache>>,
+    operator: Option<Operator>,
 }
 
 impl FileIOBuilder {
@@ -380,11 +381,28 @@ impl FileIOBuilder {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
             cache: None,
+            operator: None,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
-        (self.scheme_str.unwrap_or_default(), self.props)
+    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>, Option<Operator>) {
+        (
+            self.scheme_str.unwrap_or_default(),
+            self.props,
+            self.operator,
+        )
+    }
+
+    /// Uses a caller-provided opendal operator as a **filesystem** backend instead of building
+    /// one from the scheme: embedders bring a customized local-filesystem service without
+    /// registering a scheme. Paths are resolved with the local-filesystem rules — absolute
+    /// paths, `file:` URLs, and Windows drive paths — and handed to the operator in relative
+    /// form, so the operator's root decides what they resolve against. Scheme'd paths
+    /// (`s3://…`, `oss://…`) are rejected rather than misresolved: an object-store operator
+    /// needs bucket/scheme resolution this hook deliberately does not provide.
+    pub fn with_fs_operator(mut self, operator: Operator) -> Self {
+        self.operator = Some(operator);
+        self
     }
 
     pub fn with_prop(mut self, key: impl ToString, value: impl ToString) -> Self {
