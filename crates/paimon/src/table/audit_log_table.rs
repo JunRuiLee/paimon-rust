@@ -27,7 +27,7 @@ use crate::spec::{
 /// Incremental reads produce:
 /// - Delta: primary-key rows use physical `_VALUE_KIND`; append rows are `+I`
 /// - Changelog: kinds come from physical `_VALUE_KIND` (`+I`/`-U`/`+U`/`-D`)
-/// - Diff: not implemented in this release
+/// - Diff: before/after image comparison (`+I`/`-U`/`+U`/`-D`, equal keys skipped)
 #[derive(Debug, Clone)]
 pub struct AuditLogTable {
     wrapped: Table,
@@ -81,6 +81,7 @@ impl AuditLogTable {
     }
 
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
+        plan.validate()?;
         let read = self.wrapped.new_read_builder().new_read()?;
         read.to_audit_log_arrow(plan)
     }

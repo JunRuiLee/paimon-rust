@@ -35,10 +35,11 @@ pub enum IncrementalScanMode {
     /// Resolve to [`Delta`](Self::Delta) when `changelog-producer=none`,
     /// otherwise to [`Changelog`](Self::Changelog).
     Auto,
-    /// Diff before/after snapshots.
+    /// Diff before/after snapshot states for PK tables.
     ///
-    /// Not fully implemented in this release; planning returns
-    /// [`Error::Unsupported`](crate::Error::Unsupported).
+    /// Phase 1 supports only `merge-engine=deduplicate`. Planning compares the
+    /// full table state at `start_exclusive` vs `end_inclusive` and yields
+    /// per-(partition, bucket) [`IncrementalSplit::DiffPair`] units.
     Diff,
 }
 
@@ -46,7 +47,7 @@ pub enum IncrementalScanMode {
 #[derive(Debug, Clone)]
 pub enum IncrementalSplit {
     Data(DataSplit),
-    /// Per-(partition, bucket) diff pair. Memory bounded by one bucket's data.
+    /// Per-(partition, bucket) diff pair.
     DiffPair {
         before: Vec<DataSplit>,
         after: Vec<DataSplit>,
@@ -63,6 +64,80 @@ pub struct IncrementalPlan {
 impl IncrementalPlan {
     pub fn new(mode: IncrementalScanMode, splits: Vec<IncrementalSplit>) -> Self {
         Self { mode, splits }
+    }
+
+    pub fn try_new(
+        mode: IncrementalScanMode,
+        splits: Vec<IncrementalSplit>,
+    ) -> crate::Result<Self> {
+        let plan = Self::new(mode, splits);
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Validate the plan at every point it crosses into a reader.
+    ///
+    /// `new` is retained for source compatibility, so callers can still build
+    /// an invalid plan. Readers must call this method instead of assuming a
+    /// plan came from the scanner.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.mode == IncrementalScanMode::Auto {
+            return Err(crate::Error::DataInvalid {
+                message: "Incremental plan mode Auto must be resolved before consumption"
+                    .to_string(),
+                source: None,
+            });
+        }
+        if self.mode == IncrementalScanMode::Diff {
+            let mut before_snapshot_id = None;
+            let mut after_snapshot_id = None;
+            for split in &self.splits {
+                let IncrementalSplit::DiffPair { before, after } = split else {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Diff incremental plan contains a Data split".to_string(),
+                        source: None,
+                    });
+                };
+                validate_diff_pair(before, after)?;
+                if let Some(snapshot_id) = before.first().map(DataSplit::snapshot_id) {
+                    if before_snapshot_id.is_some_and(|expected| expected != snapshot_id) {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Diff plan contains different before snapshots".to_string(),
+                            source: None,
+                        });
+                    }
+                    before_snapshot_id = Some(snapshot_id);
+                }
+                if let Some(snapshot_id) = after.first().map(DataSplit::snapshot_id) {
+                    if after_snapshot_id.is_some_and(|expected| expected != snapshot_id) {
+                        return Err(crate::Error::DataInvalid {
+                            message: "Diff plan contains different after snapshots".to_string(),
+                            source: None,
+                        });
+                    }
+                    after_snapshot_id = Some(snapshot_id);
+                }
+            }
+            if let (Some(before), Some(after)) = (before_snapshot_id, after_snapshot_id) {
+                if before >= after {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Diff plan before snapshot must be earlier than after snapshot"
+                            .to_string(),
+                        source: None,
+                    });
+                }
+            }
+        } else if self
+            .splits
+            .iter()
+            .any(|split| matches!(split, IncrementalSplit::DiffPair { .. }))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Non-Diff incremental plan contains a DiffPair".to_string(),
+                source: None,
+            });
+        }
+        Ok(())
     }
 
     /// Resolved mode (`Auto` already collapsed to `Delta` / `Changelog`).
@@ -83,6 +158,49 @@ impl IncrementalPlan {
             })
             .collect()
     }
+}
+
+pub(crate) fn validate_diff_pair(before: &[DataSplit], after: &[DataSplit]) -> crate::Result<()> {
+    if before
+        .iter()
+        .chain(after)
+        .any(|split| split.row_ranges().is_some())
+    {
+        return Err(crate::Error::DataInvalid {
+            message: "Diff pair must not contain physical row ranges".to_string(),
+            source: None,
+        });
+    }
+    let first = before.first().or(after.first());
+    let Some(first) = first else {
+        return Ok(());
+    };
+    for side in [before, after] {
+        if let Some(first_in_side) = side.first() {
+            if side
+                .iter()
+                .any(|split| split.snapshot_id() != first_in_side.snapshot_id())
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "Diff pair side contains splits from different snapshots".to_string(),
+                    source: None,
+                });
+            }
+        }
+    }
+    for split in before.iter().chain(after) {
+        if split.partition() != first.partition()
+            || split.bucket() != first.bucket()
+            || split.bucket_path() != first.bucket_path()
+            || split.total_buckets() != first.total_buckets()
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Diff pair contains splits from different partition buckets".to_string(),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Batch incremental scan over a snapshot id range.
@@ -201,7 +319,7 @@ impl<'a> IncrementalScan<'a> {
             let plan = self.scan.plan_snapshot_delta(&snapshot).await?;
             splits.extend(plan.splits().iter().cloned().map(IncrementalSplit::Data));
         }
-        Ok(IncrementalPlan::new(mode, splits))
+        IncrementalPlan::try_new(mode, splits)
     }
 
     async fn plan_changelog(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {
@@ -219,13 +337,60 @@ impl<'a> IncrementalScan<'a> {
             let plan = self.scan.plan_snapshot_changelog(&snapshot).await?;
             splits.extend(plan.splits().iter().cloned().map(IncrementalSplit::Data));
         }
-        Ok(IncrementalPlan::new(mode, splits))
+        IncrementalPlan::try_new(mode, splits)
     }
 
     async fn plan_diff(&self, mode: IncrementalScanMode) -> crate::Result<IncrementalPlan> {
-        let _ = mode;
-        Err(crate::Error::Unsupported {
-            message: "Batch incremental Diff scan is not implemented yet".to_string(),
-        })
+        if self.table.schema().primary_keys().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff requires a table with primary keys".to_string(),
+            });
+        }
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if core_options.merge_engine()? != crate::spec::MergeEngine::Deduplicate {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff only supports merge-engine=deduplicate in Phase 1"
+                    .to_string(),
+            });
+        }
+        let before = self
+            .snapshot_manager
+            .get_snapshot(self.start_exclusive)
+            .await?;
+        let after = self
+            .snapshot_manager
+            .get_snapshot(self.end_inclusive)
+            .await?;
+        let (before_plan, after_plan) = self.scan.plan_snapshot_diff(&before, &after).await?;
+
+        use std::collections::BTreeMap;
+        type PBKey = (Vec<u8>, i32);
+
+        let mut before_map: BTreeMap<PBKey, Vec<DataSplit>> = BTreeMap::new();
+        for split in before_plan.splits() {
+            let key = (split.partition().to_serialized_bytes(), split.bucket());
+            before_map.entry(key).or_default().push(split.clone());
+        }
+
+        let mut after_map: BTreeMap<PBKey, Vec<DataSplit>> = BTreeMap::new();
+        for split in after_plan.splits() {
+            let key = (split.partition().to_serialized_bytes(), split.bucket());
+            after_map.entry(key).or_default().push(split.clone());
+        }
+
+        let mut keys: std::collections::BTreeSet<PBKey> = before_map.keys().cloned().collect();
+        keys.extend(after_map.keys().cloned());
+
+        let mut splits = Vec::new();
+        for key in keys {
+            let before = before_map.remove(&key).unwrap_or_default();
+            let after = after_map.remove(&key).unwrap_or_default();
+            if before.is_empty() && after.is_empty() {
+                continue;
+            }
+            splits.push(IncrementalSplit::DiffPair { before, after });
+        }
+
+        IncrementalPlan::try_new(mode, splits)
     }
 }

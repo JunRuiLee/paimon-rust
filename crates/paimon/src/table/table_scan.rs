@@ -681,6 +681,18 @@ fn global_index_detail_data_ranges(entries: &[ManifestEntry]) -> Vec<RowRange> {
     )
 }
 
+fn should_use_global_index_row_range_optimization(
+    row_range_optimization_disabled: bool,
+    data_evolution_enabled: bool,
+    global_index_enabled: bool,
+    has_data_predicates: bool,
+) -> bool {
+    !row_range_optimization_disabled
+        && data_evolution_enabled
+        && global_index_enabled
+        && has_data_predicates
+}
+
 fn should_skip_level_zero_for_scan(
     scan_all_files: bool,
     has_primary_keys: bool,
@@ -987,6 +999,20 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan before/after full-snapshot splits for batch incremental Diff.
+    pub(crate) async fn plan_snapshot_diff(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> crate::Result<(Plan, Plan)> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_diff(before, after).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental Diff scan".to_string(),
+            }),
+        }
+    }
+
     #[cfg(test)]
     fn apply_limit_pushdown(&self, splits: Vec<DataSplit>) -> Vec<DataSplit> {
         match &self.0 {
@@ -1009,6 +1035,9 @@ struct PaimonTableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
+    /// Diff compares complete logical states, so it must not accept physical
+    /// row-range pruning from an explicit range or a global-index lookup.
+    row_range_optimization_disabled: bool,
     /// When true, disables level-0 filtering so all files are visible.
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
@@ -1032,6 +1061,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
+            row_range_optimization_disabled: false,
             scan_all_files: false,
             projected_read_field_ids: None,
         }
@@ -1057,6 +1087,12 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             Some(ranges)
         };
+        self
+    }
+
+    fn without_row_range_optimization(mut self) -> Self {
+        self.row_ranges = None;
+        self.row_range_optimization_disabled = true;
         self
     }
 
@@ -1299,10 +1335,12 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if data_evolution_enabled
-            && core_options.global_index_enabled()
-            && !self.data_predicates.is_empty()
-        {
+        if should_use_global_index_row_range_optimization(
+            self.row_range_optimization_disabled,
+            data_evolution_enabled,
+            core_options.global_index_enabled(),
+            !self.data_predicates.is_empty(),
+        ) {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.global_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -1533,6 +1571,76 @@ impl<'a> PaimonTableScan<'a> {
             None,
         )
         .await
+    }
+
+    /// Plan before/after full-snapshot states for Diff incremental scan.
+    ///
+    /// Loads full manifest entries for both snapshots, rejects bucket rescale,
+    /// then builds splits via the shared snapshot planning path. Diff keeps the
+    /// complete state on both sides because serialized key bytes do not preserve
+    /// the logical ordering required for safe overlap pruning.
+    pub(crate) async fn plan_snapshot_diff(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> crate::Result<(Plan, Plan)> {
+        self.ensure_query_auth_allowed()?;
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if core_options.deletion_vectors_enabled() {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "Batch incremental Diff does not support tables with deletion-vectors.enabled=true"
+                        .to_string(),
+            });
+        }
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff does not support _ROW_ID row-range filters"
+                    .to_string(),
+            });
+        }
+        // A limit hint cannot be pushed into either side of a Diff: truncating
+        // the states independently can both hide changes and invent them.
+        let mut full_state_scan = self.clone();
+        full_state_scan.limit = None;
+        // Row ranges identify physical positions in individual files, whereas
+        // Diff compares complete logical states across both snapshots.
+        full_state_scan = full_state_scan.without_row_range_optimization();
+        full_state_scan
+            .validate_diff_bucket_layout(before, after)
+            .await?;
+        let before_entries = full_state_scan.plan_manifest_entries(before).await?;
+        let after_entries = full_state_scan.plan_manifest_entries(after).await?;
+        let before_plan = full_state_scan
+            .plan_snapshot_from_entries(before.clone(), before_entries, None, None, None, None)
+            .await?;
+        let after_plan = full_state_scan
+            .plan_snapshot_from_entries(after.clone(), after_entries, None, None, None, None)
+            .await?;
+        Ok((before_plan, after_plan))
+    }
+
+    async fn validate_diff_bucket_layout(
+        &self,
+        before: &Snapshot,
+        after: &Snapshot,
+    ) -> crate::Result<()> {
+        if before.schema_id() == after.schema_id() {
+            return Ok(());
+        }
+
+        let schema_manager = self.table.schema_manager();
+        let (before_schema, after_schema) = futures::try_join!(
+            schema_manager.schema(before.schema_id()),
+            schema_manager.schema(after.schema_id())
+        )?;
+        if before_schema.core_options().bucket() != after_schema.core_options().bucket() {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff does not support bucket rescale between snapshots"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Read entries from a single manifest list (delta or changelog) with
@@ -3147,6 +3255,44 @@ mod tests {
         )
     }
 
+    fn diff_test_table(table_path: &str, deletion_vectors_enabled: bool) -> Table {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "deduplicate");
+        if deletion_vectors_enabled {
+            schema = schema.option("deletion-vectors.enabled", "true");
+        }
+        Table::new(
+            file_io,
+            Identifier::new("test_db", "diff_gate"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
+    }
+
+    fn diff_snapshot(snapshot_id: i64) -> Snapshot {
+        diff_snapshot_with_schema(snapshot_id, 0)
+    }
+
+    fn diff_snapshot_with_schema(snapshot_id: i64, schema_id: i64) -> Snapshot {
+        Snapshot::builder()
+            .version(1)
+            .id(snapshot_id)
+            .schema_id(schema_id)
+            .base_manifest_list(String::new())
+            .delta_manifest_list(String::new())
+            .commit_user("test-user".to_string())
+            .commit_identifier(snapshot_id)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(snapshot_id as u64)
+            .build()
+    }
+
     fn two_int_stats_row(id: Option<i32>, value: Option<i32>) -> Vec<u8> {
         let mut builder = BinaryRowBuilder::new(2);
         match id {
@@ -4198,5 +4344,76 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"
         );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_deletion_vectors_enabled() {
+        let table = diff_test_table("memory:/diff_dv_gate", true);
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
+        let before = diff_snapshot(1);
+        let after = diff_snapshot(2);
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
+            "Diff must fail closed on deletion-vector tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_bucket_rescale_from_snapshot_schemas() {
+        let table = diff_test_table("memory:/diff_bucket_rescale_gate", false);
+        let before_schema = table.schema().clone();
+        let after_schema = before_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "bucket".to_string(),
+                "2".to_string(),
+            )])
+            .unwrap();
+        write_schema_file(&table, &before_schema).await;
+        write_schema_file(&table, &after_schema).await;
+
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
+        let before = diff_snapshot_with_schema(1, before_schema.id());
+        let after = diff_snapshot_with_schema(2, after_schema.id());
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("bucket rescale")),
+            "Diff must reject bucket rescale even when both snapshots are empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_rejects_row_id_filters() {
+        let table = diff_test_table("memory:/diff_row_id_gate", false);
+        let mut builder = table.new_read_builder();
+        let filter = Predicate::Leaf {
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            index: 0,
+            data_type: DataType::BigInt(crate::spec::BigIntType::new()),
+            op: PredicateOperator::GtEq,
+            literals: vec![Datum::Long(10)],
+        };
+        builder.with_filter(filter);
+        let scan = builder.new_scan();
+        let before = diff_snapshot(1);
+        let after = diff_snapshot(2);
+
+        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("_ROW_ID")),
+            "Diff must reject _ROW_ID row-range filters instead of dropping them"
+        );
+    }
+
+    #[test]
+    fn diff_full_state_disables_global_index_row_range_optimization() {
+        assert!(!super::should_use_global_index_row_range_optimization(
+            true, true, true, true,
+        ));
+        assert!(super::should_use_global_index_row_range_optimization(
+            false, true, true, true,
+        ));
     }
 }

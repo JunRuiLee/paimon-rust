@@ -73,6 +73,10 @@ pub(crate) struct KeyValueReadConfig {
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
+    /// Merge files from all supplied splits into one globally key-sorted stream.
+    pub merge_splits: bool,
+    /// Optional cap on file streams opened by a single sort-merge group.
+    pub max_merge_file_streams: Option<usize>,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -144,6 +148,20 @@ fn widen_partial_update_sequence_group_fields(
         user_fields.push(field);
     }
     Ok(user_fields)
+}
+
+fn ensure_merge_fan_in_limit(stream_count: usize, limit: Option<usize>) -> crate::Result<()> {
+    if let Some(limit) = limit {
+        if stream_count <= limit {
+            return Ok(());
+        }
+        return Err(Error::Unsupported {
+            message: format!(
+                "KeyValueFileReader refuses to merge {stream_count} file streams in one sort-merge group; maximum is {limit}. Compact the table before reading this highly fragmented group"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl KeyValueFileReader {
@@ -368,7 +386,15 @@ impl KeyValueFileReader {
             }
         }
 
-        let splits: Vec<DataSplit> = data_splits.to_vec();
+        let split_groups: Vec<Vec<DataSplit>> = if self.config.merge_splits {
+            vec![data_splits.to_vec()]
+        } else {
+            data_splits
+                .iter()
+                .cloned()
+                .map(|split| vec![split])
+                .collect()
+        };
         let file_io = self.file_io;
         let merge_engine = self.config.merge_engine;
         let schema_manager = self.config.schema_manager;
@@ -381,6 +407,7 @@ impl KeyValueFileReader {
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
+        let max_merge_file_streams = self.config.max_merge_file_streams;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -391,21 +418,31 @@ impl KeyValueFileReader {
         let merge_output_schema = build_target_arrow_schema(&merge_output_fields)?;
 
         Ok(try_stream! {
-            for split in &splits {
+            for split_group in &split_groups {
                 // DV mode should not reach KeyValueFileReader.
-                if split
-                    .data_deletion_files()
-                    .is_some_and(|files| files.iter().any(Option::is_some))
-                {
-                    Err(Error::Unsupported {
-                        message: "KeyValueFileReader does not support deletion vectors".to_string(),
-                    })?;
+                for split in split_group {
+                    if split
+                        .data_deletion_files()
+                        .is_some_and(|files| files.iter().any(Option::is_some))
+                    {
+                        Err(Error::Unsupported {
+                            message: "KeyValueFileReader does not support deletion vectors".to_string(),
+                        })?;
+                    }
                 }
-
+                let file_count = split_group
+                    .iter()
+                    .map(|split| split.data_files().len())
+                    .sum::<usize>();
+                if file_count == 0 {
+                    continue;
+                }
+                ensure_merge_fan_in_limit(file_count, max_merge_file_streams)?;
                 // Create one stream per data file.
                 let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
-                for file_meta in split.data_files().to_vec() {
+                for split in split_group {
+                    for file_meta in split.data_files().to_vec() {
                     let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
                         let data_schema = schema_manager.schema(file_meta.schema_id).await?;
                         Some(data_schema.fields().to_vec())
@@ -428,7 +465,7 @@ impl KeyValueFileReader {
                         file_meta,
                         data_fields,
                         None,
-                        None,
+                        split.row_ranges().map(|ranges| ranges.to_vec()),
                     )?;
                     #[cfg(test)]
                     let stream = if let Some(batch_sizes) = input_batch_sizes.clone() {
@@ -443,6 +480,7 @@ impl KeyValueFileReader {
                         stream
                     };
                     file_streams.push(stream);
+                    }
                 }
 
                 if file_streams.is_empty() {
@@ -534,8 +572,10 @@ mod tests {
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema, VarCharType,
+        stats::BinaryTableStats, BinaryRow, DataFileMeta, DataType, Datum, IntType,
+        PredicateBuilder, Schema, TableSchema, VarCharType,
     };
+    use crate::table::source::DataSplitBuilder;
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
     use arrow_array::{Array, Int32Array, StringArray};
@@ -684,6 +724,31 @@ mod tests {
             .collect()
     }
 
+    fn dummy_data_file(name: String) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name,
+            file_size: 128,
+            row_count: 1,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+        }
+    }
+
     #[test]
     fn retain_primary_key_conjuncts_semantics() {
         let fields = vec![
@@ -764,6 +829,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_merge_rejects_too_many_file_streams_on_read_path() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_merge_fan_in_limit";
+        let table = pk_table(&file_io, table_path, &[]);
+        let core_options = table.schema().core_options();
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(
+                (0..257)
+                    .map(|i| dummy_data_file(format!("file-{i}.parquet")))
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+        let reader = KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: true,
+                max_merge_file_streams: Some(256),
+            },
+        );
+
+        let err = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { message } if message.contains("file streams")),
+            "KV merge must fail before opening an unbounded number of file streams"
+        );
+    }
+
+    #[tokio::test]
     async fn kv_input_decode_honors_read_batch_size_without_changing_merge_batching() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_read_batch_size";
@@ -809,6 +924,8 @@ mod tests {
                     .map(|field| field.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: false,
+                max_merge_file_streams: None,
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());
