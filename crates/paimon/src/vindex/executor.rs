@@ -22,13 +22,16 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 const DEFAULT_IO_BOUND_WORKERS: usize = 32;
 const IO_BOUND_WORKERS_PER_CPU: usize = 4;
 const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+static PROCESS_GLOBAL_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+static PROCESS_GLOBAL_CAPACITY: AtomicUsize = AtomicUsize::new(0);
 
 struct ExecutorState {
     receiver: Receiver<Job>,
@@ -249,6 +252,64 @@ pub(crate) fn ensure_global_index_executor_capacity(max_workers: usize) {
     global_executor().ensure_capacity(max_workers);
 }
 
+/// Grow a shared semaphore monotonically. The successful CAS owns one disjoint
+/// capacity delta, so concurrent callers neither over-add permits nor shrink the
+/// high-watermark established by an earlier, larger query configuration.
+fn grow_semaphore_capacity(
+    tracked_capacity: &AtomicUsize,
+    semaphore: &Semaphore,
+    capacity: usize,
+) -> usize {
+    loop {
+        let current = tracked_capacity.load(Ordering::SeqCst);
+        if capacity <= current {
+            return 0;
+        }
+        if tracked_capacity
+            .compare_exchange(current, capacity, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let added = capacity - current;
+            semaphore.add_permits(added);
+            return added;
+        }
+    }
+}
+
+/// Java's shared executor is initially sized to `availableProcessors()` and is
+/// only replaced by a larger pool. A smaller configured `thread-num` limits one
+/// query through its per-query scheduler or semaphore, but does not shrink
+/// cross-query process capacity below the machine's available parallelism.
+fn effective_process_global_capacity(requested: usize) -> usize {
+    requested.max(default_worker_count()).max(1)
+}
+
+/// Return the process-global permit pool, growing both it and the dedicated CPU
+/// executor to the same monotonic high-watermark. This caps aggregate work across
+/// queries while preserving Java's available-CPU floor.
+fn process_global_semaphore(capacity: usize) -> &'static Semaphore {
+    let effective = effective_process_global_capacity(capacity);
+    ensure_global_index_executor_capacity(effective);
+    let semaphore = PROCESS_GLOBAL_SEMAPHORE.get_or_init(|| {
+        PROCESS_GLOBAL_CAPACITY.store(effective, Ordering::SeqCst);
+        Semaphore::new(effective)
+    });
+    grow_semaphore_capacity(&PROCESS_GLOBAL_CAPACITY, semaphore, effective);
+    semaphore
+}
+
+pub(crate) async fn acquire_process_global_search_permit(
+    capacity: usize,
+) -> crate::Result<tokio::sync::SemaphorePermit<'static>> {
+    process_global_semaphore(capacity)
+        .acquire()
+        .await
+        .map_err(|error| crate::Error::UnexpectedError {
+            message: "global-index process concurrency budget was closed".to_string(),
+            source: Some(Box::new(error)),
+        })
+}
+
 /// Runs bounded global-index jobs to completion, restores submission order, and
 /// returns the first error by submission index. Dedicated executor jobs cannot be
 /// interrupted after they start, so short-circuiting would only hide background
@@ -280,6 +341,23 @@ where
     F: FnOnce() -> crate::Result<T> + Send + 'static,
 {
     execute_on(global_executor(), panic_context, task).await
+}
+
+pub(crate) async fn execute_global_index_with_guard<T, F, G>(
+    panic_context: &'static str,
+    guard: G,
+    task: F,
+) -> crate::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> crate::Result<T> + Send + 'static,
+    G: Send + 'static,
+{
+    execute_global_index(panic_context, move || {
+        let _guard = guard;
+        task()
+    })
+    .await
 }
 
 async fn execute_on<T, F>(
@@ -499,6 +577,39 @@ mod tests {
             .expect("submitted task stopped before reporting completion");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_task_keeps_guard_after_waiter_cancellation() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let join = tokio::spawn(async move {
+            execute_global_index_with_guard("guarded task failed", permit, move || {
+                let _ = started_sender.send(());
+                let _ = release_receiver.recv();
+                Ok(())
+            })
+            .await
+        });
+        started_receiver.await.unwrap();
+
+        join.abort();
+        assert!(join.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), semaphore.clone().acquire_owned())
+                .await
+                .is_err(),
+            "cancelling the waiter released the guard while the task was still running"
+        );
+
+        release_sender.send(()).unwrap();
+        let _recovered_permit =
+            tokio::time::timeout(Duration::from_secs(1), semaphore.acquire_owned())
+                .await
+                .expect("guard was not released after the task finished")
+                .unwrap();
+    }
+
     #[test]
     fn cancelling_started_search_keeps_current_thread_runtime_live() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -599,5 +710,28 @@ mod tests {
             "cancelling a queued task waited for the task ahead of it"
         );
         assert!(!second_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn semaphore_capacity_is_monotonic_high_watermark() {
+        let tracked = AtomicUsize::new(0);
+        let semaphore = Semaphore::new(0);
+        assert_eq!(grow_semaphore_capacity(&tracked, &semaphore, 4), 4);
+        assert_eq!(semaphore.available_permits(), 4);
+        assert_eq!(tracked.load(Ordering::SeqCst), 4);
+        assert_eq!(grow_semaphore_capacity(&tracked, &semaphore, 7), 3);
+        assert_eq!(semaphore.available_permits(), 7);
+        assert_eq!(grow_semaphore_capacity(&tracked, &semaphore, 4), 0);
+        assert_eq!(grow_semaphore_capacity(&tracked, &semaphore, 7), 0);
+        assert_eq!(tracked.load(Ordering::SeqCst), 7);
+        assert_eq!(semaphore.available_permits(), 7);
+    }
+
+    #[test]
+    fn process_capacity_floors_at_available_parallelism() {
+        let cores = default_worker_count();
+        assert_eq!(effective_process_global_capacity(1), cores);
+        assert_eq!(effective_process_global_capacity(cores + 100), cores + 100);
+        assert!(effective_process_global_capacity(0) >= 1);
     }
 }

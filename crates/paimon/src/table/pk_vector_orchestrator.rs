@@ -28,17 +28,15 @@ use std::sync::Arc;
 
 use roaring::RoaringTreemap;
 
-use futures::stream::{self, StreamExt, TryStreamExt};
-use tokio::sync::Semaphore;
-
 use crate::deletion_vector::DeletionVector;
 use crate::spec::BinaryRow;
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, RowRange};
+use crate::vindex::executor::drain_indexed_jobs;
 use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
 use crate::vindex::pkvector::bucket::{
-    bucket_search_batch, BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture,
+    bucket_search_batch, BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture, SearchBudget,
 };
 use crate::vindex::pkvector::metric::{java_float_compare, VectorSearchMetric};
 use crate::vindex::pkvector::result::PkVectorSearchResult;
@@ -379,7 +377,7 @@ impl PkVectorOrchestrator {
         metric: VectorSearchMetric,
         limit: usize,
         indexed_limit: usize,
-        ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+        ann_searcher: Option<Arc<dyn PkVectorAnnSearcher>>,
         exact_file_search: &(dyn for<'s, 'a> Fn(
             usize,
             &'s PkVectorSearchSplit,
@@ -430,17 +428,12 @@ impl PkVectorOrchestrator {
     /// count) is applied per query / once as appropriate.
     ///
     /// `concurrency` is the global fan-out limit (Java `GLOBAL_INDEX_THREAD_NUM`):
-    /// `1` runs the buckets and their files strictly sequentially, larger values fan
-    /// them out with `buffer_unordered`. To match Java's single shared
-    /// `GlobalIndexReadThreadPool`, a single [`Semaphore`] budget of `concurrency`
-    /// permits is shared across BOTH the per-bucket and per-exact-file fan-outs and
-    /// acquired only around leaf exact-file I/O, so total in-flight exact-file
-    /// searches are capped at `concurrency` overall — not `concurrency` per bucket,
-    /// which would allow up to `concurrency * concurrency`. Each bucket's per-query
-    /// results feed per-query cross-bucket global Top-K heaps, which are
-    /// order-independent, so the output does not depend on which bucket finished
-    /// first; results are collected and merged into the correct per-query slot after
-    /// the parallel stage.
+    /// `1` runs buckets and their leaves strictly sequentially, while larger values
+    /// fan them out concurrently. A shared [`SearchBudget`] gates every ANN segment
+    /// and exact-file leaf across all buckets, so a query cannot multiply the limit
+    /// at each nesting level. The process-global side of the budget also bounds
+    /// concurrent work across separate queries. Each query's final cross-bucket
+    /// Top-K merge is order-independent, so completion order does not affect output.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn search_candidates_batch(
@@ -450,7 +443,7 @@ impl PkVectorOrchestrator {
         metric: VectorSearchMetric,
         limit: usize,
         indexed_limit: usize,
-        ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+        ann_searcher: Option<Arc<dyn PkVectorAnnSearcher>>,
         exact_file_search: &(dyn for<'s, 'a> Fn(
             usize,
             &'s PkVectorSearchSplit,
@@ -497,14 +490,11 @@ impl PkVectorOrchestrator {
         let mut exact_candidates: Vec<Vec<PkVectorCandidate>> =
             (0..queries.len()).map(|_| Vec::new()).collect();
 
-        // One shared concurrency budget for the WHOLE search, mirroring Java's single
-        // `GlobalIndexReadThreadPool`: the per-bucket and per-exact-file fan-outs draw
-        // slots from the SAME N permits, so total in-flight exact-file I/O is capped at
-        // N across all buckets and files (not N per bucket, which would allow N*N).
-        // Only leaf exact-file work acquires a permit; bucket orchestration never holds
-        // one, so it cannot starve leaf work. `concurrency <= 1` takes the strictly
-        // sequential path at both levels and needs no budget.
-        let search_budget = (concurrency > 1).then(|| Arc::new(Semaphore::new(concurrency)));
+        // One shared budget for the whole search. Every ANN and exact-file leaf
+        // draws from the same query-local permits and process-global pool; bucket
+        // orchestration itself never holds a permit, so it cannot starve leaf work.
+        // The budget also applies at concurrency 1 to preserve process-wide bounds.
+        let search_budget = Some(SearchBudget::production(concurrency));
 
         // One lazy future per bucket. Each builds its own DV map + per-file search
         // closure, searches all queries against the bucket, and returns per-query
@@ -513,6 +503,7 @@ impl PkVectorOrchestrator {
         // below, so the sequential branch observes buckets in strict split order.
         let per_bucket = splits.iter().enumerate().map(|(split_index, split)| {
             let search_budget = search_budget.clone();
+            let ann_searcher = ann_searcher.clone();
             async move {
                 let dvs = build_bucket_dv_map(&self.reader, split).await?;
                 // Adapt the split-scoped search closure to bucket_search's per-file
@@ -589,7 +580,7 @@ impl PkVectorOrchestrator {
 
         // Drive the per-bucket futures. `concurrency == 1` uses a strictly
         // sequential loop so buckets are searched in split order; larger values fan
-        // them out with `buffer_unordered`. Either way each bucket's per-query lists
+        // them out through `drain_indexed_jobs`. Either way each bucket's per-query lists
         // are collected and only then folded into the per-query candidate
         // accumulators, and the final per-query `global_top_k` is order-independent
         // (deterministic `candidate_cmp`), so the result does not depend on bucket
@@ -602,10 +593,7 @@ impl PkVectorOrchestrator {
                 }
                 out
             } else {
-                stream::iter(per_bucket)
-                    .buffer_unordered(concurrency)
-                    .try_collect::<Vec<_>>()
-                    .await?
+                drain_indexed_jobs(per_bucket, concurrency).await?
             };
         for tagged in collected {
             for (query_index, (indexed, exact)) in tagged.into_iter().enumerate() {
@@ -1256,9 +1244,17 @@ mod e2e_tests {
         hits: Vec<PkVectorSearchResult>,
     }
     impl PkVectorAnnSearcher for FakeAnn {
+        fn load_segment(
+            &self,
+            _segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+
         fn search_batch(
             &self,
             _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
             queries: &[&[f32]],
             _metric: VectorSearchMetric,
             _limit: usize,
@@ -1283,7 +1279,7 @@ mod e2e_tests {
         query: &[f32],
         metric: VectorSearchMetric,
         limit: usize,
-        ann: Option<&dyn PkVectorAnnSearcher>,
+        ann: Option<Arc<dyn PkVectorAnnSearcher>>,
         search: &(dyn for<'a> Fn(
             &'a BucketActiveFile,
             &'a [&'a [f32]],
@@ -1429,7 +1425,7 @@ mod e2e_tests {
             &[0.0, 0.0],
             VectorSearchMetric::L2,
             3,
-            Some(&ann),
+            Some(Arc::new(ann)),
             &factory,
             &opts,
         )
