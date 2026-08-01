@@ -1482,65 +1482,40 @@ async fn evaluate_batch_vector_search(
                             .await?
                         }
                         VectorIndexBackend::Vindex => {
-                            if vector_searches.len() > 1 {
-                                let data = input.read().await.map_err(|e| {
-                                    crate::Error::DataInvalid {
+                            let file_reader = input.reader().await.map_err(|e| {
+                                crate::Error::DataInvalid {
+                                    message: format!(
+                                        "Failed to open vindex file '{}' for range reads: {}",
+                                        file_name, e
+                                    ),
+                                    source: None,
+                                }
+                            })?;
+                            let source = VindexFileReader::new(
+                                Arc::new(file_reader),
+                                current_tokio_runtime_handle()?,
+                                file_size,
+                                file_name.clone(),
+                            );
+                            let panic_context = if query_count > 1 {
+                                "vindex global-index batch search task failed"
+                            } else {
+                                "vindex global-index search task failed"
+                            };
+                            execute_global_index(panic_context, move || {
+                                let mut reader =
+                                    VindexVectorGlobalIndexReader::new(io_meta, options);
+                                reader
+                                    .visit_batch_vector_search(&vector_searches, |_| Ok(source))
+                                    .map_err(|e| crate::Error::DataInvalid {
                                         message: format!(
                                             "Failed to read vindex index file '{}': {}",
                                             file_name, e
                                         ),
-                                        source: None,
-                                    }
-                                })?;
-                                execute_global_index(
-                                    "vindex global-index batch search task failed",
-                                    move || {
-                                        let mut reader = VindexVectorGlobalIndexReader::new(
-                                            io_meta, options,
-                                        );
-                                        reader.visit_batch_vector_search(&vector_searches, |_| {
-                                            Ok(Cursor::new(data))
-                                        })
-                                    },
-                                )
-                                .await?
-                            } else {
-                                let file_reader = input.reader().await.map_err(|e| {
-                                    crate::Error::DataInvalid {
-                                        message: format!(
-                                            "Failed to open vindex file '{}' for range reads: {}",
-                                            file_name, e
-                                        ),
-                                        source: None,
-                                    }
-                                })?;
-                                let source = VindexFileReader::new(
-                                    Arc::new(file_reader),
-                                    current_tokio_runtime_handle()?,
-                                    file_size,
-                                    file_name.clone(),
-                                );
-                                execute_global_index(
-                                    "vindex global-index search task failed",
-                                    move || {
-                                        let mut reader = VindexVectorGlobalIndexReader::new(
-                                            io_meta, options,
-                                        );
-                                        reader
-                                            .visit_batch_vector_search(&vector_searches, |_| {
-                                                Ok(source)
-                                            })
-                                            .map_err(|e| crate::Error::DataInvalid {
-                                                message: format!(
-                                                    "Failed to read vindex index file '{}': {}",
-                                                    file_name, e
-                                                ),
-                                                source: Some(Box::new(e)),
-                                            })
-                                    },
-                                )
-                                .await?
-                            }
+                                        source: Some(Box::new(e)),
+                                    })
+                            })
+                            .await?
                         }
                     };
                     if results.len() != query_count {

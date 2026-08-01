@@ -95,7 +95,7 @@ impl VindexVectorGlobalIndexReader {
         vector_search: &VectorSearch,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<Option<HashMap<u64, f32>>> {
-        self.ensure_loaded(stream_fn)?;
+        self.ensure_loaded(stream_fn, |_| Ok(()))?;
         self.search(vector_search)
     }
 
@@ -104,11 +104,46 @@ impl VindexVectorGlobalIndexReader {
         vector_searches: &[VectorSearch],
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
-        self.ensure_loaded(stream_fn)?;
-        vector_searches
-            .iter()
-            .map(|vector_search| self.search(vector_search))
-            .collect()
+        self.ensure_loaded(stream_fn, |_| Ok(()))?;
+        self.search_batch(vector_searches)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load<S: SeekRead + 'static>(
+        &mut self,
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+    ) -> crate::Result<()> {
+        self.ensure_loaded(stream_fn, |_| Ok(()))
+    }
+
+    pub(crate) fn metadata(&self) -> crate::Result<&VectorIndexMetadata> {
+        self.metadata
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "vindex metadata not initialized".to_string(),
+                source: None,
+            })
+    }
+
+    pub(crate) fn search_batch(
+        &mut self,
+        vector_searches: &[VectorSearch],
+    ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "vindex reader not initialized".to_string(),
+                source: None,
+            })?;
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "vindex metadata not initialized".to_string(),
+                source: None,
+            })?;
+        search_batch_vindex(reader, metadata, &self.options, vector_searches)
     }
 
     fn search(&mut self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
@@ -130,12 +165,38 @@ impl VindexVectorGlobalIndexReader {
         search_vindex(reader, metadata, &self.options, vector_search)
     }
 
-    fn ensure_loaded<S: SeekRead + 'static>(
+    fn ensure_loaded<S, F>(
         &mut self,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
-    ) -> crate::Result<()> {
+        validate: F,
+    ) -> crate::Result<()>
+    where
+        S: SeekRead + 'static,
+        F: FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
+    {
+        self.ensure_loaded_with_optimizer(stream_fn, validate, |reader| {
+            reader
+                .optimize_for_search()
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Failed to optimize paimon-vindex-core reader: {}", e),
+                    source: Some(Box::new(e)),
+                })
+        })
+    }
+
+    fn ensure_loaded_with_optimizer<S, F, O>(
+        &mut self,
+        stream_fn: impl FnOnce(&str) -> crate::Result<S>,
+        validate: F,
+        optimize: O,
+    ) -> crate::Result<()>
+    where
+        S: SeekRead + 'static,
+        F: FnOnce(&VectorIndexMetadata) -> crate::Result<()>,
+        O: FnOnce(&mut VIndexReader<VindexInput>) -> crate::Result<()>,
+    {
         if self.reader.is_some() {
-            return Ok(());
+            return validate(self.metadata()?);
         }
 
         let source = stream_fn(&self.io_meta.file_path)?;
@@ -146,12 +207,8 @@ impl VindexVectorGlobalIndexReader {
             }
         })?;
         let metadata = reader.metadata();
-        reader
-            .optimize_for_search()
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to optimize paimon-vindex-core reader: {}", e),
-                source: Some(Box::new(e)),
-            })?;
+        validate(&metadata)?;
+        optimize(&mut reader)?;
 
         self.reader = Some(reader);
         self.metadata = Some(metadata);
@@ -165,12 +222,35 @@ fn search_vindex(
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
 ) -> crate::Result<Option<HashMap<u64, f32>>> {
-    let expected_dim = metadata.dimension;
-    if vector_search.vector.len() != expected_dim {
+    let Some(prepared) = prepare_search(metadata, options, vector_search)? else {
+        return Ok(None);
+    };
+    let (labels, distances) = execute_scalar_search(reader, vector_search, &prepared)?;
+    let id_to_scores = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
+    if id_to_scores.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(id_to_scores))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct PreparedSearch {
+    top_k: usize,
+    nprobe: usize,
+    filter_bytes: Option<Vec<u8>>,
+}
+
+fn prepare_search(
+    metadata: &VectorIndexMetadata,
+    options: &HashMap<String, String>,
+    vector_search: &VectorSearch,
+) -> crate::Result<Option<PreparedSearch>> {
+    if vector_search.vector.len() != metadata.dimension {
         return Err(crate::Error::DataInvalid {
             message: format!(
                 "Query vector dimension mismatch: index expects {}, but got {}",
-                expected_dim,
+                metadata.dimension,
                 vector_search.vector.len()
             ),
             source: None,
@@ -178,48 +258,139 @@ fn search_vindex(
     }
 
     let count = usize::try_from(metadata.total_vectors).unwrap_or(0);
-    let effective_k = std::cmp::min(vector_search.limit, count);
-    if effective_k == 0 {
+    let mut top_k = vector_search.limit.min(count);
+    if top_k == 0 {
         return Ok(None);
     }
-
     let nprobe = int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?;
-    let params = VectorSearchParams::new(effective_k, nprobe);
 
-    let (labels, distances) = if let Some(include_ids) = &vector_search.include_row_ids {
+    let filter_bytes = if let Some(include_ids) = &vector_search.include_row_ids {
         if include_ids.is_empty() {
             return Ok(None);
         }
-        let ek = std::cmp::min(effective_k, include_ids.len() as usize);
-        let params = VectorSearchParams::new(params.top_k.min(ek), nprobe);
-        let mut filter_bytes = Vec::new();
+        top_k = top_k.min(include_ids.len() as usize);
+        let mut bytes = Vec::new();
         include_ids
-            .serialize_into(&mut filter_bytes)
+            .serialize_into(&mut bytes)
             .map_err(|e| crate::Error::DataInvalid {
                 message: format!("Failed to serialize vector search row-id filter: {}", e),
                 source: Some(Box::new(e)),
             })?;
-        reader
-            .search_with_roaring_filter(&vector_search.vector, params, &filter_bytes)
+        Some(bytes)
+    } else {
+        None
+    };
+
+    Ok(Some(PreparedSearch {
+        top_k,
+        nprobe,
+        filter_bytes,
+    }))
+}
+
+fn execute_scalar_search(
+    reader: &mut VIndexReader<impl SeekRead>,
+    vector_search: &VectorSearch,
+    prepared: &PreparedSearch,
+) -> crate::Result<(Vec<i64>, Vec<f32>)> {
+    let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
+    match &prepared.filter_bytes {
+        Some(filter) => reader
+            .search_with_roaring_filter(&vector_search.vector, params, filter)
             .map_err(|e| crate::Error::DataInvalid {
                 message: format!("paimon-vindex-core filtered search failed: {}", e),
                 source: Some(Box::new(e)),
-            })?
-    } else {
-        reader
-            .search(&vector_search.vector, params)
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("paimon-vindex-core search failed: {}", e),
-                source: Some(Box::new(e)),
-            })?
-    };
+            }),
+        None => {
+            reader
+                .search(&vector_search.vector, params)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("paimon-vindex-core search failed: {}", e),
+                    source: Some(Box::new(e)),
+                })
+        }
+    }
+}
 
-    let id_to_scores = collect_results(&labels, &distances, effective_k, metadata.metric);
-    if id_to_scores.is_empty() {
-        return Ok(None);
+fn search_batch_vindex(
+    reader: &mut VIndexReader<impl SeekRead>,
+    metadata: &VectorIndexMetadata,
+    options: &HashMap<String, String>,
+    vector_searches: &[VectorSearch],
+) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+    let mut results: Vec<Option<HashMap<u64, f32>>> =
+        (0..vector_searches.len()).map(|_| None).collect();
+    let mut groups: Vec<(PreparedSearch, Vec<usize>)> = Vec::new();
+
+    for (index, search) in vector_searches.iter().enumerate() {
+        let Some(prepared) = prepare_search(metadata, options, search)? else {
+            continue;
+        };
+        if let Some((_, indices)) = groups.iter_mut().find(|(key, _)| key == &prepared) {
+            indices.push(index);
+        } else {
+            groups.push((prepared, vec![index]));
+        }
     }
 
-    Ok(Some(id_to_scores))
+    for (prepared, indices) in groups {
+        if indices.len() == 1 {
+            let index = indices[0];
+            let (labels, distances) =
+                execute_scalar_search(reader, &vector_searches[index], &prepared)?;
+            let map = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
+            if !map.is_empty() {
+                results[index] = Some(map);
+            }
+            continue;
+        }
+
+        let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
+        for &index in &indices {
+            queries.extend_from_slice(&vector_searches[index].vector);
+        }
+        let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
+        let (labels, distances) = match &prepared.filter_bytes {
+            Some(filter) => reader
+                .search_batch_with_roaring_filter(&queries, indices.len(), params, filter)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("paimon-vindex-core filtered batch search failed: {}", e),
+                    source: Some(Box::new(e)),
+                })?,
+            None => reader
+                .search_batch(&queries, indices.len(), params)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("paimon-vindex-core batch search failed: {}", e),
+                    source: Some(Box::new(e)),
+                })?,
+        };
+        let expected = indices.len() * prepared.top_k;
+        if labels.len() != expected || distances.len() != expected {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "paimon-vindex-core batch search returned labels/distances of length {}/{}, expected {expected}",
+                    labels.len(),
+                    distances.len()
+                ),
+                source: None,
+            });
+        }
+        for (query_index, &result_index) in indices.iter().enumerate() {
+            let start = query_index * prepared.top_k;
+            let end = start + prepared.top_k;
+            let map = collect_results(
+                &labels[start..end],
+                &distances[start..end],
+                prepared.top_k,
+                metadata.metric,
+            );
+            if !map.is_empty() {
+                results[result_index] = Some(map);
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 fn collect_results(
@@ -305,6 +476,8 @@ mod tests {
     use bytes::Bytes;
     use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
     use paimon_vindex_core::io::{PosWriter, SeekReadCapabilities};
+    use std::cell::Cell;
+    use std::io::Cursor;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -385,15 +558,48 @@ mod tests {
         Bytes::from(output)
     }
 
-    fn query() -> VectorSearch {
+    fn query_for_cluster(cluster: usize, limit: usize) -> VectorSearch {
+        let cluster = cluster as f32 * 100.0;
         VectorSearch::new(
             (0..TEST_DIMENSION)
-                .map(|dimension| dimension as f32 * 0.01)
+                .map(|dimension| cluster + dimension as f32 * 0.01)
                 .collect(),
-            10,
+            limit,
             "embedding".to_string(),
         )
         .unwrap()
+    }
+
+    fn query() -> VectorSearch {
+        query_for_cluster(0, 10)
+    }
+
+    async fn tracked_batch_search(
+        index: Bytes,
+        query_count: usize,
+    ) -> (Vec<Option<HashMap<u64, f32>>>, usize) {
+        let tracking = TrackingIndexRead::new(index.clone());
+        let source: Arc<dyn FileRead> = tracking.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let results = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                source,
+                runtime,
+                index.len() as u64,
+                "batch.index".to_string(),
+            );
+            let io_meta =
+                GlobalIndexIOMeta::new("batch.index".to_string(), index.len() as u64, Vec::new());
+            let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+            let searches = vec![query(); query_count];
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+            reader
+                .visit_batch_vector_search(&searches, |_| Ok(source))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        (results, tracking.bytes_read.load(Ordering::SeqCst))
     }
 
     #[test]
@@ -498,6 +704,252 @@ mod tests {
                 .iter()
                 .all(|range| range.start != 0 || range.end != index_size as u64),
             "range search unexpectedly read the entire index"
+        );
+    }
+
+    #[test]
+    fn mixed_batch_matches_scalar_searches_and_preserves_order() {
+        let index = build_ivf_flat_index();
+        let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+        let mut include_row_ids = roaring::RoaringTreemap::new();
+        include_row_ids.insert(0);
+        include_row_ids.insert(16);
+        include_row_ids.insert(32);
+        let searches = vec![
+            query_for_cluster(0, 4),
+            query_for_cluster(5, 1),
+            query_for_cluster(15, 4),
+            query_for_cluster(0, 10).with_include_row_ids(include_row_ids),
+        ];
+
+        let scalar_meta =
+            GlobalIndexIOMeta::new("scalar.index".to_string(), index.len() as u64, Vec::new());
+        let mut scalar_reader = VindexVectorGlobalIndexReader::new(scalar_meta, options.clone());
+        scalar_reader
+            .load(|_| Ok(Cursor::new(index.clone())))
+            .unwrap();
+        let expected: Vec<_> = searches
+            .iter()
+            .map(|search| scalar_reader.search(search).unwrap())
+            .collect();
+
+        let batch_meta =
+            GlobalIndexIOMeta::new("batch.index".to_string(), index.len() as u64, Vec::new());
+        let mut batch_reader = VindexVectorGlobalIndexReader::new(batch_meta, options);
+        let actual = batch_reader
+            .visit_batch_vector_search(&searches, |_| Ok(Cursor::new(index)))
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_ne!(
+            actual[0], actual[2],
+            "interleaved batch groups lost query order"
+        );
+        assert_eq!(actual[1].as_ref().map(HashMap::len), Some(1));
+        assert_eq!(actual[3].as_ref().map(HashMap::len), Some(3));
+    }
+
+    #[test]
+    fn metadata_validation_runs_before_optimization() {
+        let index = build_ivf_flat_index();
+        let io_meta = GlobalIndexIOMeta::new(
+            "validated.index".to_string(),
+            index.len() as u64,
+            Vec::new(),
+        );
+        let mut reader = VindexVectorGlobalIndexReader::new(io_meta, HashMap::new());
+        let optimized = Cell::new(false);
+
+        let error = reader
+            .ensure_loaded_with_optimizer(
+                |_| Ok(Cursor::new(index)),
+                |metadata| {
+                    assert_eq!(metadata.dimension, TEST_DIMENSION);
+                    Err(crate::Error::DataInvalid {
+                        message: "rejected test metric".to_string(),
+                        source: None,
+                    })
+                },
+                |_| {
+                    optimized.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("rejected test metric"));
+        assert!(!optimized.get());
+        assert!(reader.metadata().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_search_reuses_probed_lists_and_avoids_full_file_read() {
+        let index = build_ivf_flat_index();
+        let batch_index = index.clone();
+        let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+        let search = query();
+
+        let scalar_tracking = TrackingIndexRead::new(index.clone());
+        let scalar_source: Arc<dyn FileRead> = scalar_tracking.clone();
+        let scalar_options = options.clone();
+        let scalar_search = search.clone();
+        let scalar_runtime = tokio::runtime::Handle::current();
+        let scalar_results = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                scalar_source,
+                scalar_runtime,
+                index.len() as u64,
+                "scalar.index".to_string(),
+            );
+            let io_meta =
+                GlobalIndexIOMeta::new("scalar.index".to_string(), index.len() as u64, Vec::new());
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, scalar_options);
+            reader.load(|_| Ok(source)).unwrap();
+            vec![
+                reader.search(&scalar_search).unwrap(),
+                reader.search(&scalar_search).unwrap(),
+            ]
+        })
+        .await
+        .unwrap();
+
+        let batch_tracking = TrackingIndexRead::new(batch_index.clone());
+        let batch_source: Arc<dyn FileRead> = batch_tracking.clone();
+        let batch_options = options;
+        let batch_search = search.clone();
+        let batch_runtime = tokio::runtime::Handle::current();
+        let batch_results = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                batch_source,
+                batch_runtime,
+                batch_index.len() as u64,
+                "batch.index".to_string(),
+            );
+            let io_meta = GlobalIndexIOMeta::new(
+                "batch.index".to_string(),
+                batch_index.len() as u64,
+                Vec::new(),
+            );
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, batch_options);
+            reader
+                .visit_batch_vector_search(&[batch_search.clone(), batch_search], |_| Ok(source))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(batch_results, scalar_results);
+        let scalar_bytes = scalar_tracking.bytes_read.load(Ordering::SeqCst);
+        let batch_bytes = batch_tracking.bytes_read.load(Ordering::SeqCst);
+        assert!(
+            batch_bytes < scalar_bytes,
+            "batch should read a shared probed list once: batch={batch_bytes}, scalar={scalar_bytes}"
+        );
+        assert!(
+            batch_bytes < batch_tracking.data.len() / 2,
+            "nprobe=1 should read substantially less than the full index: read={batch_bytes}, file={} ",
+            batch_tracking.data.len()
+        );
+        assert!(batch_tracking
+            .ranges()
+            .iter()
+            .all(|range| { range.start != 0 || range.end != batch_tracking.data.len() as u64 }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filtered_batch_matches_scalar_searches_and_reuses_probed_lists() {
+        let index = build_ivf_flat_index();
+        let batch_index = index.clone();
+        let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+        let mut include_row_ids = roaring::RoaringTreemap::new();
+        for row_id in (0..256).step_by(16) {
+            include_row_ids.insert(row_id);
+        }
+        let searches = vec![
+            query().with_include_row_ids(include_row_ids.clone()),
+            query().with_include_row_ids(include_row_ids),
+        ];
+
+        let scalar_tracking = TrackingIndexRead::new(index.clone());
+        let scalar_source: Arc<dyn FileRead> = scalar_tracking.clone();
+        let scalar_options = options.clone();
+        let scalar_searches = searches.clone();
+        let scalar_runtime = tokio::runtime::Handle::current();
+        let scalar_results = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                scalar_source,
+                scalar_runtime,
+                index.len() as u64,
+                "scalar-filtered.index".to_string(),
+            );
+            let io_meta = GlobalIndexIOMeta::new(
+                "scalar-filtered.index".to_string(),
+                index.len() as u64,
+                Vec::new(),
+            );
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, scalar_options);
+            reader.load(|_| Ok(source)).unwrap();
+            scalar_searches
+                .iter()
+                .map(|search| reader.search(search).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+
+        let batch_tracking = TrackingIndexRead::new(batch_index.clone());
+        let batch_source: Arc<dyn FileRead> = batch_tracking.clone();
+        let batch_runtime = tokio::runtime::Handle::current();
+        let batch_results = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                batch_source,
+                batch_runtime,
+                batch_index.len() as u64,
+                "batch-filtered.index".to_string(),
+            );
+            let io_meta = GlobalIndexIOMeta::new(
+                "batch-filtered.index".to_string(),
+                batch_index.len() as u64,
+                Vec::new(),
+            );
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+            reader
+                .visit_batch_vector_search(&searches, |_| Ok(source))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(batch_results, scalar_results);
+        let scalar_bytes = scalar_tracking.bytes_read.load(Ordering::SeqCst);
+        let batch_bytes = batch_tracking.bytes_read.load(Ordering::SeqCst);
+        assert!(
+            batch_bytes < scalar_bytes,
+            "filtered batch should read a shared probed list once: batch={batch_bytes}, scalar={scalar_bytes}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_homogeneous_batch_reuses_lists_across_previous_boundary() {
+        let previous_batch_boundary = 16;
+        let index = build_ivf_flat_index();
+        let (within_limit_results, within_limit_bytes) =
+            tracked_batch_search(index.clone(), previous_batch_boundary).await;
+        let (over_limit_results, over_limit_bytes) =
+            tracked_batch_search(index, previous_batch_boundary + 1).await;
+
+        assert_eq!(within_limit_results.len(), previous_batch_boundary);
+        assert_eq!(over_limit_results.len(), previous_batch_boundary + 1);
+        assert!(within_limit_results
+            .iter()
+            .all(|result| result == &within_limit_results[0]));
+        assert!(over_limit_results
+            .iter()
+            .all(|result| result == &over_limit_results[0]));
+        assert_eq!(over_limit_results[0], within_limit_results[0]);
+        assert_eq!(
+            over_limit_bytes, within_limit_bytes,
+            "compatible queries should reuse the same probed list across the former 16-query boundary"
         );
     }
 }
