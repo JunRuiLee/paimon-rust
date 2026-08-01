@@ -20,17 +20,63 @@ use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
     VectorIndexMetadata, VectorIndexReader as VIndexReader, VectorSearchParams,
 };
+use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io;
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
 
+trait ErasedSeekRead: Send {
+    fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
+
+    fn try_clone_erased(&self) -> io::Result<Option<Box<dyn ErasedSeekRead>>>;
+
+    fn capabilities_erased(&self) -> SeekReadCapabilities;
+}
+
+impl<T: SeekRead + 'static> ErasedSeekRead for T {
+    fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        SeekRead::pread(self, ranges)
+    }
+
+    fn try_clone_erased(&self) -> io::Result<Option<Box<dyn ErasedSeekRead>>> {
+        Ok(SeekRead::try_clone_reader(self)?
+            .map(|reader| Box::new(reader) as Box<dyn ErasedSeekRead>))
+    }
+
+    fn capabilities_erased(&self) -> SeekReadCapabilities {
+        SeekRead::read_capabilities(self)
+    }
+}
+
+struct VindexInput(Box<dyn ErasedSeekRead>);
+
+impl VindexInput {
+    fn new<S: SeekRead + 'static>(source: S) -> Self {
+        Self(Box::new(source))
+    }
+}
+
+impl SeekRead for VindexInput {
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        self.0.pread_erased(ranges)
+    }
+
+    fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+        Ok(self.0.try_clone_erased()?.map(Self))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        self.0.capabilities_erased()
+    }
+}
+
 pub struct VindexVectorGlobalIndexReader {
     io_meta: GlobalIndexIOMeta,
     options: HashMap<String, String>,
-    reader: Option<VIndexReader<Cursor<Vec<u8>>>>,
+    reader: Option<VIndexReader<VindexInput>>,
     metadata: Option<VectorIndexMetadata>,
 }
 
@@ -44,7 +90,7 @@ impl VindexVectorGlobalIndexReader {
         }
     }
 
-    pub fn visit_vector_search<S: Read + Seek + Send + 'static>(
+    pub fn visit_vector_search<S: SeekRead + 'static>(
         &mut self,
         vector_search: &VectorSearch,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
@@ -53,7 +99,7 @@ impl VindexVectorGlobalIndexReader {
         self.search(vector_search)
     }
 
-    pub fn visit_batch_vector_search<S: Read + Seek + Send + 'static>(
+    pub fn visit_batch_vector_search<S: SeekRead + 'static>(
         &mut self,
         vector_searches: &[VectorSearch],
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
@@ -84,7 +130,7 @@ impl VindexVectorGlobalIndexReader {
         search_vindex(reader, metadata, &self.options, vector_search)
     }
 
-    fn ensure_loaded<S: Read + Seek + Send + 'static>(
+    fn ensure_loaded<S: SeekRead + 'static>(
         &mut self,
         stream_fn: impl FnOnce(&str) -> crate::Result<S>,
     ) -> crate::Result<()> {
@@ -92,26 +138,13 @@ impl VindexVectorGlobalIndexReader {
             return Ok(());
         }
 
-        let mut stream = stream_fn(&self.io_meta.file_path)?;
-        stream
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| crate::Error::UnexpectedError {
-                message: format!("Failed to seek vindex stream to start: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-        let mut bytes = Vec::with_capacity(self.io_meta.file_size as usize);
-        stream
-            .read_to_end(&mut bytes)
-            .map_err(|e| crate::Error::UnexpectedError {
-                message: format!("Failed to read vindex stream: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-
-        let mut reader =
-            VIndexReader::open(Cursor::new(bytes)).map_err(|e| crate::Error::DataInvalid {
+        let source = stream_fn(&self.io_meta.file_path)?;
+        let mut reader = VIndexReader::open(VindexInput::new(source)).map_err(|e| {
+            crate::Error::DataInvalid {
                 message: format!("Failed to open paimon-vindex-core reader: {}", e),
                 source: Some(Box::new(e)),
-            })?;
+            }
+        })?;
         let metadata = reader.metadata();
         reader
             .optimize_for_search()
@@ -127,7 +160,7 @@ impl VindexVectorGlobalIndexReader {
 }
 
 fn search_vindex(
-    reader: &mut VIndexReader<Cursor<Vec<u8>>>,
+    reader: &mut VIndexReader<impl SeekRead>,
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
@@ -266,6 +299,102 @@ fn int_parameter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::FileRead;
+    use crate::vindex::range_reader::VindexFileReader;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexTrainer, VectorIndexWriter};
+    use paimon_vindex_core::io::{PosWriter, SeekReadCapabilities};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const TEST_DIMENSION: usize = 16;
+
+    #[derive(Clone)]
+    struct CloneableSeekRead {
+        capabilities: SeekReadCapabilities,
+    }
+
+    impl SeekRead for CloneableSeekRead {
+        fn pread(&mut self, _ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+            Ok(Some(self.clone()))
+        }
+
+        fn read_capabilities(&self) -> SeekReadCapabilities {
+            self.capabilities
+        }
+    }
+
+    struct TrackingIndexRead {
+        data: Bytes,
+        ranges: Mutex<Vec<Range<u64>>>,
+        bytes_read: AtomicUsize,
+    }
+
+    impl TrackingIndexRead {
+        fn new(data: Bytes) -> Arc<Self> {
+            Arc::new(Self {
+                data,
+                ranges: Mutex::new(Vec::new()),
+                bytes_read: AtomicUsize::new(0),
+            })
+        }
+
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.ranges.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl FileRead for TrackingIndexRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.bytes_read
+                .fetch_add((range.end - range.start) as usize, Ordering::SeqCst);
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    fn build_ivf_flat_index() -> Bytes {
+        let vector_count = 8192usize;
+        let mut vectors = Vec::with_capacity(vector_count * TEST_DIMENSION);
+        for row in 0..vector_count {
+            let cluster = (row % 16) as f32 * 100.0;
+            for dimension in 0..TEST_DIMENSION {
+                vectors.push(cluster + dimension as f32 * 0.01 + row as f32 * 0.000001);
+            }
+        }
+        let ids: Vec<i64> = (0..vector_count as i64).collect();
+        let options = HashMap::from([
+            ("index.type".to_string(), "ivf_flat".to_string()),
+            ("dimension".to_string(), TEST_DIMENSION.to_string()),
+            ("nlist".to_string(), "16".to_string()),
+            ("metric".to_string(), "l2".to_string()),
+        ]);
+        let config = VectorIndexConfig::from_options(&options).unwrap();
+        let training = VectorIndexTrainer::train(config, &vectors, vector_count).unwrap();
+        let mut writer = VectorIndexWriter::new(training);
+        writer.add_vectors(&ids, &vectors, vector_count).unwrap();
+        let mut output = Vec::new();
+        writer.write(&mut PosWriter::new(&mut output)).unwrap();
+        Bytes::from(output)
+    }
+
+    fn query() -> VectorSearch {
+        VectorSearch::new(
+            (0..TEST_DIMENSION)
+                .map(|dimension| dimension as f32 * 0.01)
+                .collect(),
+            10,
+            "embedding".to_string(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_convert_distance_to_score() {
@@ -316,5 +445,59 @@ mod tests {
         );
         options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
         assert!(int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).is_err());
+    }
+
+    #[test]
+    fn erased_input_forwards_clone_and_capabilities() {
+        let capabilities = SeekReadCapabilities {
+            estimated_random_read_latency_nanos: 123,
+            preferred_window_bytes: 64 * 1024,
+            max_ranges_per_pread: 7,
+        };
+        let input = VindexInput::new(CloneableSeekRead { capabilities });
+
+        assert_eq!(input.read_capabilities(), capabilities);
+        let cloned = input.try_clone_reader().unwrap().unwrap();
+        assert_eq!(cloned.read_capabilities(), capabilities);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scalar_search_range_reads_instead_of_loading_the_whole_index() {
+        let index = build_ivf_flat_index();
+        let tracking = TrackingIndexRead::new(index.clone());
+        let source: Arc<dyn FileRead> = tracking.clone();
+        let index_size = index.len();
+        let runtime = tokio::runtime::Handle::current();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let source = VindexFileReader::new(
+                source,
+                runtime,
+                index_size as u64,
+                "scalar.index".to_string(),
+            );
+            let io_meta =
+                GlobalIndexIOMeta::new("scalar.index".to_string(), index_size as u64, Vec::new());
+            let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+            reader.visit_vector_search(&query(), |_| Ok(source))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(result.is_some());
+        let bytes_read = tracking.bytes_read.load(Ordering::SeqCst);
+        assert!(
+            bytes_read < index_size / 2,
+            "nprobe=1 should read substantially less than the full index: read={bytes_read}, file={index_size}"
+        );
+        assert!(
+            tracking
+                .ranges()
+                .iter()
+                .all(|range| range.start != 0 || range.end != index_size as u64),
+            "range search unexpectedly read the entire index"
+        );
     }
 }

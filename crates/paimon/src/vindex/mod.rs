@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod executor;
+pub(crate) mod range_reader;
 pub mod reader;
 
 pub mod pkvector;
