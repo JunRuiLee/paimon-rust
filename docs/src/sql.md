@@ -237,8 +237,10 @@ The following SQL data types are supported in CREATE TABLE and mapped to their c
 | `BIGINT` | BigIntType | |
 | `FLOAT` / `REAL` | FloatType | |
 | `DOUBLE` / `DOUBLE PRECISION` | DoubleType | |
-| `VARCHAR` / `TEXT` / `STRING` / `CHAR` | VarCharType | |
-| `BINARY` / `VARBINARY` / `BYTEA` / `BYTES` | VarBinaryType | |
+| `VARCHAR` / `TEXT` / `STRING` | VarCharType | |
+| `CHAR(n)` | CharType | Fixed-length; defaults to `CHAR(1)` when `n` is omitted |
+| `VARBINARY` / `BYTEA` / `BYTES` | VarBinaryType | |
+| `BINARY(n)` | BinaryType | Fixed-length; defaults to `BINARY(1)` when `n` is omitted |
 | `VARIANT` | VariantType | Semi-structured value encoded as value + metadata binary buffers |
 | `BLOB` | BlobType | Binary large object |
 | `DATE` | DateType | |
@@ -2005,8 +2007,11 @@ the normal physical format without wrapping the writer.
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
-| `'cross-partition-update.enabled' = 'true'` | Allow cross-partition updates |
-| `'changelog-producer' = 'input'` | Changelog producer (PK tables with input mode reject writes) |
+| `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
+
+Cross-partition updates are not configured by an option: a primary-key table is
+in cross-partition update mode when `'bucket' = '-1'` and the primary key does
+not contain every partition field.
 
 ## Full Example
 
