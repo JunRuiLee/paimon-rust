@@ -203,31 +203,17 @@ impl TableSchema {
     /// colliding with a system field (e.g. `_ROW_ID`) is otherwise excluded
     /// from the physical read and silently filled with the system value.
     fn validate_no_reserved_fields(&self) -> crate::Result<()> {
-        // Java SpecialFields.SYSTEM_FIELD_NAMES.
-        const SYSTEM_FIELD_NAMES: [&str; 5] = [
-            SEQUENCE_NUMBER_FIELD_NAME,
-            VALUE_KIND_FIELD_NAME,
-            "_LEVEL",
-            ROW_KIND_FIELD_NAME,
-            ROW_ID_FIELD_NAME,
-        ];
-        const KEY_FIELD_PREFIX: &str = "_KEY_";
         // Java SpecialFields.SYSTEM_FIELD_ID_START = Integer.MAX_VALUE / 2.
         const SYSTEM_FIELD_ID_START: i32 = i32::MAX / 2;
 
+        validate_no_reserved_field_names(&self.fields)?;
+
         for field in &self.fields {
-            let name = field.name();
-            if name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name) {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Field name '{name}' is reserved for system use and cannot be used in a table schema"
-                    ),
-                });
-            }
             if field.id() >= SYSTEM_FIELD_ID_START {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
-                        "Field '{name}' uses reserved system field id {}",
+                        "Field '{}' uses reserved system field id {}",
+                        field.name(),
                         field.id()
                     ),
                     source: None,
@@ -563,6 +549,7 @@ impl TableSchema {
 
         // Re-run create-time validations on the final schema, mirroring Java
         // `SchemaValidation.validateTableSchema` after applying changes.
+        validate_no_reserved_field_names(&new_schema.fields)?;
         Schema::validate_key_field_types(
             &new_schema.fields,
             &new_schema.primary_keys,
@@ -624,6 +611,35 @@ impl TableSchema {
             .map(|f| f.name().to_string())
             .collect()
     }
+}
+
+/// Reject column names reserved for system use, mirroring Java `SpecialFields`:
+/// the five `SYSTEM_FIELD_NAMES` and the `_KEY_` key-field prefix.
+///
+/// A user column colliding with a system field is otherwise excluded from the
+/// physical read and silently filled with the system value.
+fn validate_no_reserved_field_names(fields: &[DataField]) -> crate::Result<()> {
+    // Java SpecialFields.SYSTEM_FIELD_NAMES.
+    const SYSTEM_FIELD_NAMES: [&str; 5] = [
+        SEQUENCE_NUMBER_FIELD_NAME,
+        VALUE_KIND_FIELD_NAME,
+        "_LEVEL",
+        ROW_KIND_FIELD_NAME,
+        ROW_ID_FIELD_NAME,
+    ];
+    const KEY_FIELD_PREFIX: &str = "_KEY_";
+
+    for field in fields {
+        let name = field.name();
+        if name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Field name '{name}' is reserved for system use and cannot be used in a table schema"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Extract the single top-level column name from a `field_names` path.
@@ -1085,6 +1101,7 @@ impl Schema {
         let partition_keys = Self::normalize_partition_keys(&partition_keys, &mut options)?;
         Self::normalize_blob_comment_directives(&mut fields, &mut options)?;
         let fields = Self::normalize_fields(&fields, &partition_keys, &primary_keys, &options)?;
+        validate_no_reserved_field_names(&fields)?;
         Self::validate_key_field_types(&fields, &primary_keys, &options)?;
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         Self::validate_vector_store_fields(&fields, &partition_keys, &options)?;
@@ -3577,6 +3594,99 @@ mod tests {
         );
 
         assert_primary_key_index_column_changes_rejected(&table_schema, "embedding", vector_type);
+    }
+
+    #[test]
+    fn test_create_schema_rejects_reserved_field_names() {
+        // Java `SpecialFields.SYSTEM_FIELD_NAMES` plus the `_KEY_` prefix. A
+        // user column with one of these names is excluded from the physical
+        // read and silently filled with the system value.
+        for name in [
+            "_SEQUENCE_NUMBER",
+            "_VALUE_KIND",
+            "_LEVEL",
+            "rowkind",
+            "_ROW_ID",
+            "_KEY_id",
+        ] {
+            let err = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(name, DataType::Int(IntType::new()))
+                .build()
+                .unwrap_err();
+
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains(name) && message.contains("reserved")),
+                "reserved field name '{name}' should be rejected at create time, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_schema_accepts_names_that_only_look_reserved() {
+        // Guard against over-rejecting: only exact system names and the
+        // `_KEY_` prefix are reserved.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("_sequence_number", DataType::Int(IntType::new()))
+            .column("row_kind", DataType::Int(IntType::new()))
+            .column("_KEY", DataType::Int(IntType::new()))
+            .build();
+
+        assert!(
+            schema.is_ok(),
+            "names that merely resemble system fields should be accepted, got {schema:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_add_reserved_field_name_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "_ROW_ID".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("_ROW_ID") && message.contains("reserved")),
+            "adding a reserved column name should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_rename_to_reserved_field_name_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("v", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::rename_column(
+                "v".to_string(),
+                "_VALUE_KIND".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("_VALUE_KIND") && message.contains("reserved")),
+            "renaming a column to a reserved name should be rejected, got {err:?}"
+        );
     }
 
     #[test]

@@ -1638,24 +1638,33 @@ mod pk_hybrid_tests {
     /// A primary-key hybrid table whose user schema carries an extra column named
     /// `reserved`, used to prove the materialized read rejects a reserved metadata
     /// name arriving via the default (all-columns) projection.
+    ///
+    /// Deserialized from JSON rather than built through `Schema::builder`, because
+    /// `Schema::new` rejects reserved system field names at create time. The read
+    /// guard exists for exactly this case: metadata written by another engine.
     fn pk_hybrid_table_with_reserved_column(reserved: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let mut builder = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column(
-                VECTOR_COLUMN,
-                DataType::Vector(
-                    VectorType::try_new(true, DIM as u32, DataType::Float(FloatType::new()))
-                        .unwrap(),
-                ),
-            )
-            .column(TEXT_COLUMN, DataType::VarChar(VarCharType::string_type()))
-            .column(reserved, DataType::VarChar(VarCharType::string_type()))
-            .primary_key(["id"]);
-        for (k, v) in table_options() {
-            builder = builder.option(k, v);
-        }
-        let schema = TableSchema::new(0, &builder.build().unwrap());
+        let options: HashMap<String, String> = table_options().into_iter().collect();
+        let schema: TableSchema = serde_json::from_value(serde_json::json!({
+            "version": TableSchema::CURRENT_VERSION,
+            "id": 0,
+            "fields": [
+                {"id": 0, "name": "id", "type": "INT NOT NULL"},
+                {
+                    "id": 1,
+                    "name": VECTOR_COLUMN,
+                    "type": {"type": "VECTOR", "element": "FLOAT", "length": DIM},
+                },
+                {"id": 2, "name": TEXT_COLUMN, "type": "STRING"},
+                {"id": 3, "name": reserved, "type": "STRING"},
+            ],
+            "highestFieldId": 3,
+            "partitionKeys": [],
+            "primaryKeys": ["id"],
+            "options": options,
+            "timeMillis": 0,
+        }))
+        .expect("reserved-column schema should deserialize");
         Table::new(
             file_io,
             Identifier::new("default", "pk_hybrid_reserved"),
