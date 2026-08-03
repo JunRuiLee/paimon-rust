@@ -210,16 +210,29 @@ impl DataEvolutionReader {
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
 
-            // The exact residual runs after schema evolution and `_ROW_ID`
-            // attachment, so the nested file reader must not receive data
-            // predicates.
-            let file_reader = DataFileReader::new(
+            // A raw-convertible split consists only of independent files: every
+            // row-id segment has a single column provider, so predicates can be
+            // pushed into its file reader. Keep the exact residual below as a
+            // format-independent backstop.
+            //
+            // Positional `_ROW_ID` attachment needs the unfiltered physical row
+            // stream, and predicates on resolved BLOB/BLOB-view values must run
+            // after that transformation. Both cases deliberately stay on the
+            // residual-only path.
+            let push_down_raw_predicates = !self.predicates.is_empty()
+                && self.row_id_index.is_none()
+                && filter_before_blob_resolution;
+            let raw_file_reader = DataFileReader::new(
                 self.file_io.clone(),
                 self.schema_manager.clone(),
                 self.table_schema_id,
                 self.table_fields.clone(),
                 self.wide_file_read_type.clone(),
-                Vec::new(),
+                if push_down_raw_predicates {
+                    self.predicates.clone()
+                } else {
+                    Vec::new()
+                },
             )
             .with_batch_size(self.batch_size)
             .with_parquet_read_budget(self.parquet_read_budget.clone());
@@ -235,14 +248,13 @@ impl DataEvolutionReader {
                             &file_meta,
                         )
                         .await?;
-                        let data_fields: Option<Vec<DataField>> =
-                            if file_meta.schema_id != self.table_schema_id {
-                                let data_schema =
-                                    self.schema_manager.schema(file_meta.schema_id).await?;
-                                Some(data_schema.fields().to_vec())
-                            } else {
-                                None
-                            };
+                        let data_fields = raw_file_physical_fields(
+                            &self.schema_manager,
+                            self.table_schema_id,
+                            &self.table_fields,
+                            &file_meta,
+                        )
+                        .await?;
 
                         let has_row_id = file_meta.first_row_id.is_some();
                         let effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
@@ -268,7 +280,7 @@ impl DataEvolutionReader {
                         let mut row_id_cursor = file_base_row_id;
                         let mut row_id_offset: usize = 0;
 
-                        let mut stream = file_reader.read_single_file_stream(
+                        let mut stream = raw_file_reader.read_single_file_stream(
                             &split,
                             file_meta,
                             data_fields,
@@ -780,6 +792,52 @@ impl DataEvolutionReader {
         }
         .boxed())
     }
+}
+
+/// Resolve the schema that a raw-convertible file physically stores.
+///
+/// Partial-column files omit fields listed outside `write_cols`; returning only
+/// their physical fields lets `DataFileReader` apply field-id mapping and
+/// all-NULL semantics consistently, with or without predicate pushdown.
+async fn raw_file_physical_fields(
+    schema_manager: &SchemaManager,
+    table_schema_id: i64,
+    table_fields: &[DataField],
+    file: &DataFileMeta,
+) -> crate::Result<Option<Vec<DataField>>> {
+    let schema_fields = if file.schema_id == table_schema_id {
+        None
+    } else {
+        Some(
+            schema_manager
+                .schema(file.schema_id)
+                .await?
+                .fields()
+                .to_vec(),
+        )
+    };
+
+    let Some(write_cols) = file.write_cols.as_ref() else {
+        return Ok(schema_fields);
+    };
+    let fields = schema_fields.as_deref().unwrap_or(table_fields);
+    let written_fields = write_cols
+        .iter()
+        .map(|name| {
+            fields
+                .iter()
+                .find(|field| field.name() == name)
+                .cloned()
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Failed to resolve write column '{}' in raw-convertible file '{}'",
+                        name, file.file_name
+                    ),
+                    source: None,
+                })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(Some(written_fields))
 }
 
 async fn resolve_descriptor_columns(
@@ -6450,6 +6508,71 @@ mod tests {
         )
     }
 
+    /// A positional `.row` file must be decoded with its physical `write_cols`,
+    /// not the full table schema. With BLOB first in the table schema, decoding
+    /// an id-only file as `[payload, id]` reads the id bytes as a BLOB offset and
+    /// either corrupts alignment or runs past the row payload.
+    #[tokio::test]
+    async fn test_raw_row_file_uses_write_cols_when_blob_precedes_projection() {
+        use crate::arrow::format::create_format_writer;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/raw-row-write-cols";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("payload", DataType::Blob(BlobType::new()))
+                .column("id", DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let id_field = table_schema.fields()[1].clone();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "raw_row_write_cols_t"),
+            table_path.to_string(),
+            table_schema,
+            None,
+        );
+
+        let row_schema = build_target_arrow_schema(std::slice::from_ref(&id_field)).unwrap();
+        let batch = RecordBatch::try_new(
+            row_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let output = file_io
+            .new_output(&format!("{bucket_path}/data.row"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, row_schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+
+        let mut file_meta = data_file("data.row", 0, 2, 1, Some(vec!["id"]));
+        file_meta.file_size = file_size;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file_meta])
+            .build()
+            .unwrap();
+
+        let batches = TableRead::new(&table, vec![id_field], Vec::new())
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&batches, "id"), vec![1, 2]);
+    }
+
     /// Raw-convertible branch: a leaf predicate is applied exactly through the
     /// public ReadBuilder -> TableRead -> to_arrow path.
     #[tokio::test]
@@ -6499,6 +6622,77 @@ mod tests {
 
         assert_eq!(collect_int_values(&batches, "id"), vec![2, 3, 4]);
         assert_eq!(collect_int_values(&batches, "value"), vec![20, 30, 40]);
+    }
+
+    /// Multiple non-overlapping, single-file row-id segments may share one
+    /// raw-convertible split. Each file can still receive the predicate
+    /// independently because no column-wise merge is required.
+    #[tokio::test]
+    async fn test_evolution_read_pushes_predicate_to_single_file_row_id_segments() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let first_path = bucket_dir.join("first.parquet");
+        write_int_parquet_file(
+            &first_path,
+            vec![("id", vec![1, 2]), ("value", vec![5, 20])],
+            None,
+        );
+        let second_path = bucket_dir.join("second.parquet");
+        write_int_parquet_file(
+            &second_path,
+            vec![("id", vec![3, 4]), ("value", vec![30, 10])],
+            None,
+        );
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "first.parquet",
+                    0,
+                    2,
+                    1,
+                    first_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id", "value"]),
+                ),
+                data_file_meta_with_path(
+                    "second.parquet",
+                    2,
+                    2,
+                    1,
+                    second_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id", "value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("value", Datum::Int(20))
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder
+            .with_projection(&["id"])
+            .unwrap()
+            .with_filter(predicate);
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(collect_int_values(&batches, "id"), vec![2, 3]);
     }
 
     /// Raw-convertible branch: a compound `Or` predicate referencing a
