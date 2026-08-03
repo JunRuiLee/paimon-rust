@@ -925,7 +925,7 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
     }
 
-    /// Number of buckets for the table. Default is 1.
+    /// Number of buckets for the table. Default is -1 (dynamic bucket).
     pub fn bucket(&self) -> i32 {
         self.options
             .get(BUCKET_OPTION)
@@ -951,7 +951,11 @@ impl<'a> CoreOptions<'a> {
         }
     }
 
-    /// Target file size for data files. Default is 128MB.
+    /// Target file size for data files. Default is 256MB.
+    ///
+    /// Java leaves `target-file-size` without a default and documents 128 MB for
+    /// primary-key tables and 256 MB for append tables; this returns the append
+    /// value for both.
     pub fn target_file_size(&self) -> i64 {
         self.options
             .get("target-file-size")
@@ -1141,7 +1145,7 @@ impl<'a> CoreOptions<'a> {
 
     /// Target row number per bucket for dynamic bucket mode (bucket=-1).
     /// When a bucket reaches this number, a new bucket is created.
-    /// Default is 200,000 (matching Java Paimon).
+    /// Default is 200,000. Java Paimon defaults this to 2,000,000.
     pub fn dynamic_bucket_target_row_num(&self) -> i64 {
         self.options
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
