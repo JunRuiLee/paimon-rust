@@ -39,14 +39,26 @@ rustup show
 # Build the project
 cargo build
 
-# Run all tests
-cargo test
+# Run the unit tests (a bare `cargo test` also builds the Python binding and
+# can fail to link libpython on some platforms)
+cargo test -p paimon --all-targets --features fulltext,vortex
+cargo test -p paimon-rest-server --all-targets
 
 # Format code
-cargo fmt
+cargo fmt --all
 
 # Lint (matches CI)
-cargo clippy --all-targets --workspace -- -D warnings
+cargo clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings
+```
+
+The integration suites read a Paimon warehouse written by Spark, so they need
+Docker rather than `cargo` alone:
+
+```bash
+make docker-up    # writes /tmp/paimon-warehouse
+cargo test -p paimon-integration-tests --all-targets
+cargo test -p paimon-datafusion --all-targets
+make docker-down
 ```
 
 ## Finding Issues

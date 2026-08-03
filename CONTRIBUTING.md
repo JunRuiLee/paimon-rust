@@ -22,13 +22,28 @@
 ## Get Started
 This is a Rust project, so [rustup](https://rustup.rs/) is a great place to start. It provides an easy way to manage your Rust installation and toolchains.
 
-This is a pure Rust project, so only `cargo` is needed. Here are some common commands to get you started:
+Rust and `cargo` are enough for the unit tests and the lint gates. Here are the
+commands CI runs, which are the ones to reproduce locally:
 - `cargo check`: Analyze the current package and report errors. This is a quick way to catch any obvious issues without a full compilation.
-- `cargo fmt`: Format the current code according to the Rust style guidelines. This helps maintain a consistent code style throughout the project.
+- `cargo fmt --all -- --check`: Verify the code matches the Rust style guidelines. `cargo fmt --all` rewrites the files in place.
 - `cargo build`: Compile the current package. This will build the project and generate executable binaries if applicable.
-- `cargo clippy`: Catch common mistakes and improve code quality. Clippy provides a set of lints that can help you write better Rust code.
-- `cargo test`: Run unit tests. This will execute all the tests defined in the project to ensure the functionality is correct.
-- `cargo bench`: Run benchmark tests. This is useful for measuring the performance of specific parts of the code.
+- `cargo clippy --locked --all-targets --workspace --features fulltext,vortex -- -D warnings`: Catch common mistakes and improve code quality. CI denies warnings, so anything clippy reports fails the build.
+- `cargo test -p paimon --all-targets --features fulltext,vortex`: Run the unit tests. Prefer this over a bare `cargo test`, which also builds the Python binding and can fail to link `libpython` on some platforms.
+- `cargo test -p paimon-rest-server --all-targets`: Run the REST server tests.
+
+The integration suites additionally need a Paimon warehouse written by Spark, so
+they are not pure `cargo`:
+
+```bash
+make docker-up    # builds the Spark image and writes /tmp/paimon-warehouse
+cargo test -p paimon-integration-tests --all-targets
+cargo test -p paimon-datafusion --all-targets
+make docker-down  # tear down when finished
+```
+
+Without that warehouse those tests fail with `TableNotExist` rather than being
+skipped. Override the location with `PAIMON_TEST_WAREHOUSE` if you need a
+different path.
 
 ### Setting up the Development Environment
 1. Install Rust using `rustup`. Follow the instructions on the [rustup website](https://rustup.rs/) to install Rust on your system.
@@ -38,7 +53,7 @@ This is a pure Rust project, so only `cargo` is needed. Here are some common com
 ### Making Changes
 1. Create a new branch for your changes. This helps keep your work separate from the main development branch and makes it easier to review and merge your changes.
 2. Make your changes and ensure that the code still compiles and passes all tests. Use the commands mentioned above to check for errors and run tests.
-3. Format your code using `cargo fmt` to ensure consistency with the project's code style.
+3. Format your code using `cargo fmt --all` to ensure consistency with the project's code style.
 
 ### Submitting Changes
 1. Once you are satisfied with your changes, push your branch to the remote repository.
