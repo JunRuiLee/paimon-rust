@@ -372,7 +372,7 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        Ok(Arc::new(PaimonTableScan::new(
+        Ok(Arc::new(PaimonTableScan::try_new(
             projected_schema,
             self.table.clone(),
             read_type,
@@ -383,7 +383,7 @@ impl PaimonScanBuilder<'_> {
             self.scan_trace,
             None,
             self.case_sensitive,
-        )))
+        )?))
     }
 }
 

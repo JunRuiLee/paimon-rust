@@ -248,7 +248,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
                 .as_ref()
                 .is_none_or(|p| read_builder.is_exact_filter_pushdown(p));
 
-        Ok(Some(Arc::new(PaimonTableScan::new(
+        Ok(Some(Arc::new(PaimonTableScan::try_new(
             Arc::clone(&node.arrow_schema),
             node.table.clone(),
             node.read_type.clone(),
@@ -259,7 +259,7 @@ impl ExtensionPlanner for VariantExtractionExtensionPlanner {
             Some(scan_trace),
             Some(node.pushed_variants.clone()),
             case_sensitive,
-        ))))
+        )?)))
     }
 }
 

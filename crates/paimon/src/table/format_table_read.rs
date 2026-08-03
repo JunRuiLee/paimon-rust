@@ -19,8 +19,9 @@
 
 use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
+use super::table_read::configured_parquet_read_budget;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
+use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow, ParquetReadBudget};
 use crate::spec::{extract_datum, BinaryRow, DataField, DataType, Datum, Predicate};
 use crate::{DataSplit, Error};
 use arrow_array::{
@@ -39,6 +40,7 @@ pub(crate) struct FormatTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     limit: Option<usize>,
 }
 
@@ -54,6 +56,7 @@ impl<'a> FormatTableRead<'a> {
             read_type,
             data_predicates,
             row_filter_factory: None,
+            parquet_read_budget: None,
             limit,
         }
     }
@@ -83,6 +86,18 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
+    pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+        self.parquet_read_budget = Some(budget);
+        self
+    }
+
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+        match &self.parquet_read_budget {
+            Some(budget) => Ok(Arc::clone(budget)),
+            None => configured_parquet_read_budget(self.table),
+        }
+    }
+
     pub(crate) fn to_arrow(
         &self,
         data_splits: &[DataSplit],
@@ -105,6 +120,7 @@ impl<'a> FormatTableRead<'a> {
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
         let row_filter_factory = self.row_filter_factory.clone();
+        let parquet_read_budget = Some(self.parquet_read_budget()?);
 
         Ok(try_stream! {
             for split in splits {
@@ -120,7 +136,8 @@ impl<'a> FormatTableRead<'a> {
                     data_read_type.clone(),
                     data_predicates.clone(),
                 )
-                .with_batch_size(batch_size);
+                .with_batch_size(batch_size)
+                .with_parquet_read_budget(parquet_read_budget.clone());
                 if let Some(factory) = &row_filter_factory {
                     reader = reader.with_row_filter_factory(Arc::clone(factory));
                 }

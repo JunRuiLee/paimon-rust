@@ -49,6 +49,7 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use paimon::arrow::ParquetReadBudget;
 use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
@@ -775,9 +776,12 @@ pub struct PaimonTableScan {
     /// Static filters already covered by `pushed_predicate` use Paimon's native
     /// Parquet row filter instead, avoiding duplicate decoder evaluation.
     decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Query-wide budget shared by every DataFusion scan partition.
+    parquet_read_budget: Arc<ParquetReadBudget>,
 }
 
 impl PaimonTableScan {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: ArrowSchemaRef,
@@ -790,6 +794,75 @@ impl PaimonTableScan {
         scan_trace: Option<ScanTrace>,
         pushed_variants: Option<String>,
         case_sensitive: bool,
+    ) -> Self {
+        Self::new_with_parquet_read_budget(
+            schema,
+            table,
+            read_type,
+            pushed_predicate,
+            planned_partitions,
+            limit,
+            filter_exact,
+            scan_trace,
+            pushed_variants,
+            case_sensitive,
+            Arc::new(ParquetReadBudget::default()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        schema: ArrowSchemaRef,
+        table: Table,
+        read_type: Vec<DataField>,
+        pushed_predicate: Option<Predicate>,
+        planned_partitions: Vec<Arc<[DataSplit]>>,
+        limit: Option<usize>,
+        filter_exact: bool,
+        scan_trace: Option<ScanTrace>,
+        pushed_variants: Option<String>,
+        case_sensitive: bool,
+    ) -> DFResult<Self> {
+        let options = table.schema().core_options();
+        let parquet_read_budget = Arc::new(
+            ParquetReadBudget::new(
+                options
+                    .parquet_row_group_parallelism()
+                    .map_err(to_datafusion_error)?,
+                options
+                    .parquet_row_group_max_inflight_bytes()
+                    .map_err(to_datafusion_error)?,
+            )
+            .map_err(to_datafusion_error)?,
+        );
+        Ok(Self::new_with_parquet_read_budget(
+            schema,
+            table,
+            read_type,
+            pushed_predicate,
+            planned_partitions,
+            limit,
+            filter_exact,
+            scan_trace,
+            pushed_variants,
+            case_sensitive,
+            parquet_read_budget,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_parquet_read_budget(
+        schema: ArrowSchemaRef,
+        table: Table,
+        read_type: Vec<DataField>,
+        pushed_predicate: Option<Predicate>,
+        planned_partitions: Vec<Arc<[DataSplit]>>,
+        limit: Option<usize>,
+        filter_exact: bool,
+        scan_trace: Option<ScanTrace>,
+        pushed_variants: Option<String>,
+        case_sensitive: bool,
+        parquet_read_budget: Arc<ParquetReadBudget>,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -810,6 +883,7 @@ impl PaimonTableScan {
             case_sensitive,
             runtime_filters: Vec::new(),
             decoder_filters: Vec::new(),
+            parquet_read_budget,
         }
     }
 
@@ -997,6 +1071,7 @@ impl ExecutionPlan for PaimonTableScan {
         let case_sensitive = self.case_sensitive;
         let runtime_filters = self.runtime_filters.clone();
         let decoder_filters = self.decoder_filters.clone();
+        let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -1013,6 +1088,7 @@ impl ExecutionPlan for PaimonTableScan {
             if !paimon_predicates.is_empty() {
                 read_builder.with_filter(Predicate::and(paimon_predicates));
             }
+            read_builder.with_parquet_read_budget(parquet_read_budget);
 
             let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
             if !runtime_filter_plan.datafusion_filters.is_empty() {

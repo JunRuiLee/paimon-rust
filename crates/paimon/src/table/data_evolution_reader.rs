@@ -22,8 +22,8 @@ use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
     DataFileReader,
 };
-use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::FilePredicates;
+use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
@@ -114,6 +114,7 @@ pub(crate) struct DataEvolutionReader {
     blob_view_rest_env: Option<RESTEnv>,
     blob_read_limiter: BlobReadLimiter,
     batch_size: Option<usize>,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
 
 impl DataEvolutionReader {
@@ -176,11 +177,20 @@ impl DataEvolutionReader {
             blob_view_rest_env,
             blob_read_limiter: BlobReadLimiter::new(),
             batch_size: None,
+            parquet_read_budget: None,
         })
     }
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_parquet_read_budget(
+        mut self,
+        parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    ) -> Self {
+        self.parquet_read_budget = parquet_read_budget;
         self
     }
 
@@ -211,7 +221,8 @@ impl DataEvolutionReader {
                 self.wide_file_read_type.clone(),
                 Vec::new(),
             )
-            .with_batch_size(self.batch_size);
+            .with_batch_size(self.batch_size)
+            .with_parquet_read_budget(self.parquet_read_budget.clone());
 
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
@@ -509,7 +520,8 @@ impl DataEvolutionReader {
             false,
             None,
         )?
-        .with_batch_size(self.batch_size);
+        .with_batch_size(self.batch_size)
+        .with_parquet_read_budget(self.parquet_read_budget.clone());
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
         while let Some(batch) = stream.next().await {
@@ -572,6 +584,7 @@ impl DataEvolutionReader {
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
+        let parquet_read_budget = self.parquet_read_budget.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
         const MERGE_BATCH_SIZE: usize = 1024;
@@ -629,6 +642,17 @@ impl DataEvolutionReader {
                 return;
             }
 
+            // Column evolution advances every active source in lockstep. If
+            // several sources shared the row-group budget, the first source
+            // could occupy every permit while this loop waits for the next
+            // source's initial batch. Use the sequential Parquet path for
+            // multi-source merges; single-source evolution can still prefetch
+            // row groups concurrently.
+            let source_parquet_read_budget = if active_source_indices.len() == 1 {
+                parquet_read_budget.clone()
+            } else {
+                None
+            };
             let mut source_streams: Vec<Option<ArrowRecordBatchStream>> = source_plan
                 .sources
                 .iter()
@@ -646,6 +670,7 @@ impl DataEvolutionReader {
                             table_fields.clone(),
                             batch_size,
                             blob_as_descriptor,
+                            source_parquet_read_budget.clone(),
                             anchor_deletion_vector.as_ref(),
                         )
                         .map(Some)
@@ -1133,6 +1158,7 @@ fn open_source_stream(
     table_fields: Vec<DataField>,
     batch_size: Option<usize>,
     blob_as_descriptor: bool,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let mut row_ranges = row_ranges;
@@ -1196,7 +1222,8 @@ fn open_source_stream(
         Vec::new(),
     )
     .with_batch_size(batch_size)
-    .with_blob_as_descriptor(blob_as_descriptor);
+    .with_blob_as_descriptor(blob_as_descriptor)
+    .with_parquet_read_budget(parquet_read_budget);
 
     match source {
         FieldSource::DataFile {

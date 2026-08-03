@@ -20,10 +20,13 @@
 use super::partition_filter::PartitionFilter;
 use super::read_builder::split_scan_predicates;
 use super::read_builder::{resolve_projected_fields, validate_projection_possible};
+use super::table_read::configured_parquet_read_budget;
 use super::{Table, TableRead, TableScan};
+use crate::arrow::ParquetReadBudget;
 use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::Result;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FormatReadBuilder<'a> {
@@ -37,6 +40,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     data_predicates: Vec<Predicate>,
     limit: Option<usize>,
     case_sensitive: bool,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
 
 impl<'a> FormatReadBuilder<'a> {
@@ -49,6 +53,7 @@ impl<'a> FormatReadBuilder<'a> {
             data_predicates: Vec::new(),
             limit: None,
             case_sensitive: true,
+            parquet_read_budget: None,
         }
     }
 
@@ -102,6 +107,11 @@ impl<'a> FormatReadBuilder<'a> {
         self
     }
 
+    pub(crate) fn with_parquet_read_budget(&mut self, budget: Arc<ParquetReadBudget>) -> &mut Self {
+        self.parquet_read_budget = Some(budget);
+        self
+    }
+
     pub(crate) fn new_scan(&self) -> TableScan<'a> {
         TableScan::new(
             self.table,
@@ -120,12 +130,17 @@ impl<'a> FormatReadBuilder<'a> {
             None => self.table.schema().fields().to_vec(),
             Some(fields) => fields,
         };
+        let parquet_read_budget = match &self.parquet_read_budget {
+            Some(budget) => Arc::clone(budget),
+            None => configured_parquet_read_budget(self.table)?,
+        };
         Ok(TableRead::new_format(
             self.table,
             read_type,
             self.data_predicates.clone(),
             self.limit,
-        ))
+        )
+        .with_parquet_read_budget(parquet_read_budget))
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

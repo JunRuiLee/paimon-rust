@@ -75,6 +75,9 @@ const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
+const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
+const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
+    "read.parquet.row-group.max-inflight-bytes";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
@@ -114,6 +117,8 @@ const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_READ_BATCH_SIZE: usize = 1024;
+const DEFAULT_PARQUET_ROW_GROUP_PARALLELISM: usize = 8;
+const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
@@ -336,6 +341,55 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value as usize)
+    }
+
+    /// Maximum concurrent Parquet row-group reads per scan. Set to `1` to disable.
+    pub fn parquet_row_group_parallelism(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(PARQUET_ROW_GROUP_PARALLELISM_OPTION) else {
+            return Ok(DEFAULT_PARQUET_ROW_GROUP_PARALLELISM);
+        };
+        let value = raw
+            .parse::<usize>()
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{PARQUET_ROW_GROUP_PARALLELISM_OPTION}' must be a positive integer, got: {raw}"
+                ),
+                source: Some(Box::new(error)),
+            })?;
+        if value == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{PARQUET_ROW_GROUP_PARALLELISM_OPTION}' must be greater than 0"
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Scan-wide projected uncompressed bytes for concurrent Parquet row groups.
+    pub fn parquet_row_group_max_inflight_bytes(&self) -> crate::Result<u64> {
+        let value = match self
+            .options
+            .get(PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION)
+        {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION}' must be a valid memory size, got: {raw}"
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES,
+        };
+        u64::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION}' must be greater than 0, got: {value}"
+                ),
+                source: None,
+            })
     }
 
     /// Reject scan options whose semantics the Rust core does not yet implement.
@@ -1287,6 +1341,53 @@ mod tests {
         for value in ["0", "-1", "invalid"] {
             let options = HashMap::from([("read.batch-size".to_string(), value.to_string())]);
             assert!(CoreOptions::new(&options).read_batch_size().is_err());
+        }
+    }
+
+    #[test]
+    fn test_parquet_row_group_read_budget_options() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.parquet_row_group_parallelism().unwrap(), 8);
+        assert_eq!(
+            core.parquet_row_group_max_inflight_bytes().unwrap(),
+            256 * 1024 * 1024
+        );
+
+        let options = HashMap::from([
+            (
+                PARQUET_ROW_GROUP_PARALLELISM_OPTION.to_string(),
+                "3".to_string(),
+            ),
+            (
+                PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION.to_string(),
+                "64 mb".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.parquet_row_group_parallelism().unwrap(), 3);
+        assert_eq!(
+            core.parquet_row_group_max_inflight_bytes().unwrap(),
+            64 * 1024 * 1024
+        );
+
+        for value in ["0", "-1", "invalid"] {
+            let options = HashMap::from([(
+                PARQUET_ROW_GROUP_PARALLELISM_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .parquet_row_group_parallelism()
+                .is_err());
+        }
+        for value in ["0", "-1", "invalid", "9223372036854775807 tb"] {
+            let options = HashMap::from([(
+                PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .parquet_row_group_max_inflight_bytes()
+                .is_err());
         }
     }
 

@@ -28,6 +28,7 @@ mod vortex;
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
+use super::ParquetReadBudget;
 use super::RowFilterFactory;
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
@@ -159,14 +160,28 @@ impl FormatWriteResult {
 }
 
 /// Create a format reader based on the file extension.
+#[cfg(test)]
 pub(crate) fn create_format_reader(
     path: &str,
     blob_as_descriptor: bool,
     read_fields: &[DataField],
 ) -> crate::Result<Box<dyn FormatFileReader>> {
+    create_format_reader_with_budget(path, blob_as_descriptor, read_fields, None)
+}
+
+/// Create a format reader with a scan-shared Parquet resource budget.
+pub(crate) fn create_format_reader_with_budget(
+    path: &str,
+    blob_as_descriptor: bool,
+    read_fields: &[DataField],
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
-        Box::new(parquet::ParquetFormatReader)
+        Box::new(match parquet_read_budget {
+            Some(read_budget) => parquet::ParquetFormatReader::with_read_budget(read_budget),
+            None => parquet::ParquetFormatReader::default(),
+        })
     } else if lower.ends_with(".blob") {
         Box::new(blob::BlobFormatReader::new(
             path.to_string(),

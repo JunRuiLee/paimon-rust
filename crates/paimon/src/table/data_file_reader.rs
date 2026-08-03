@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::format::create_format_reader;
+use crate::arrow::format::create_format_reader_with_budget;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
+use crate::arrow::ParquetReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
@@ -46,6 +47,7 @@ pub(crate) struct DataFileReader {
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     blob_as_descriptor: bool,
     batch_size: Option<usize>,
+    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
 
 impl DataFileReader {
@@ -67,6 +69,7 @@ impl DataFileReader {
             row_filter_factory: None,
             blob_as_descriptor: false,
             batch_size: None,
+            parquet_read_budget: None,
         }
     }
 
@@ -77,6 +80,14 @@ impl DataFileReader {
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_parquet_read_budget(
+        mut self,
+        parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    ) -> Self {
+        self.parquet_read_budget = parquet_read_budget;
         self
     }
 
@@ -279,6 +290,7 @@ impl DataFileReader {
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
+        let parquet_read_budget = self.parquet_read_budget.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -325,8 +337,12 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader =
-                create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
+            let format_reader = create_format_reader_with_budget(
+                &path_to_read,
+                blob_as_descriptor,
+                &format_read_fields,
+                parquet_read_budget,
+            )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
             let local_ranges = row_ranges.as_ref().map(|ranges| {
@@ -485,6 +501,7 @@ impl DataFileReader {
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let parquet_read_budget = self.parquet_read_budget.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -540,8 +557,12 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader =
-                create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
+            let format_reader = create_format_reader_with_budget(
+                &path_to_read,
+                blob_as_descriptor,
+                &format_read_fields,
+                parquet_read_budget,
+            )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
 
