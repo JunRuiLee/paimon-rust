@@ -60,6 +60,7 @@ core-foundation-sys@0.8.7		X									X
 cpufeatures@0.2.17		X									X				
 cpufeatures@0.3.0		X									X				
 crc32fast@1.5.0		X									X				
+crossbeam-channel@0.5.16		X									X				
 crossbeam-deque@0.8.7		X									X				
 crossbeam-epoch@0.9.20		X									X				
 crossbeam-utils@0.8.22		X									X				

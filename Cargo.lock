@@ -4535,6 +4535,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
+ "crossbeam-channel",
  "futures",
  "hex",
  "hmac 0.12.1",

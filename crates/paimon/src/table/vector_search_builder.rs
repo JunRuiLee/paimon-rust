@@ -50,10 +50,14 @@ use crate::table::{
     find_field_id_by_name, merge_row_ranges, ArrowRecordBatchStream, RowRange, Table,
 };
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
+use crate::vindex::executor::{
+    drain_indexed_jobs, ensure_global_index_executor_capacity, execute_global_index,
+};
 use crate::vindex::pkvector::ann::VindexAnnSearcher;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
+use crate::vindex::range_reader::VindexFileReader;
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, VindexVectorIndexOptions};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
@@ -92,6 +96,13 @@ impl VectorIndexBackend {
             Self::Vindex => "vindex",
         }
     }
+}
+
+fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().map_err(|error| crate::Error::UnexpectedError {
+        message: "Vector index range reader requires a Tokio runtime".to_string(),
+        source: Some(Box::new(error)),
+    })
 }
 
 pub struct VectorSearchBuilder<'a> {
@@ -1412,6 +1423,8 @@ async fn evaluate_batch_vector_search(
 
     let mut merged = vec![SearchResult::empty(); vector_searches.len()];
     if !vector_entries.is_empty() {
+        let concurrency = core_options.global_index_thread_num()?;
+        ensure_global_index_executor_capacity(concurrency);
         let futures: Vec<_> = vector_entries
             .into_iter()
             .map(|entry| {
@@ -1440,39 +1453,102 @@ async fn evaluate_batch_vector_search(
                 let input = evaluation.file_io.new_input(&path);
                 async move {
                     let input = input?;
-                    let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                        message: format!(
-                            "Failed to read {} index file '{}': {}",
-                            backend.error_name(),
-                            file_name,
-                            e
-                        ),
-                        source: None,
-                    })?;
-
+                    let query_count = vector_searches.len();
                     let io_meta =
                         GlobalIndexIOMeta::new(file_name.clone(), file_size, index_meta_bytes);
-                    let data = bytes.to_vec();
                     let results = match backend {
                         VectorIndexBackend::Lumina => {
-                            let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options);
-                            reader.visit_batch_vector_search(&vector_searches, |_| {
-                                Ok(Cursor::new(data))
-                            })?
+                            let data = input.read().await.map_err(|e| {
+                                crate::Error::DataInvalid {
+                                    message: format!(
+                                        "Failed to read {} index file '{}': {}",
+                                        backend.error_name(),
+                                        file_name,
+                                        e
+                                    ),
+                                    source: None,
+                                }
+                            })?;
+                            execute_global_index(
+                                "Lumina global-index batch search task failed",
+                                move || {
+                                    let mut reader =
+                                        LuminaVectorGlobalIndexReader::new(io_meta, options);
+                                    reader.visit_batch_vector_search(&vector_searches, |_| {
+                                        Ok(Cursor::new(data))
+                                    })
+                                },
+                            )
+                            .await?
                         }
                         VectorIndexBackend::Vindex => {
-                            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
-                            reader.visit_batch_vector_search(&vector_searches, |_| {
-                                Ok(Cursor::new(data))
-                            })?
+                            if vector_searches.len() > 1 {
+                                let data = input.read().await.map_err(|e| {
+                                    crate::Error::DataInvalid {
+                                        message: format!(
+                                            "Failed to read vindex index file '{}': {}",
+                                            file_name, e
+                                        ),
+                                        source: None,
+                                    }
+                                })?;
+                                execute_global_index(
+                                    "vindex global-index batch search task failed",
+                                    move || {
+                                        let mut reader = VindexVectorGlobalIndexReader::new(
+                                            io_meta, options,
+                                        );
+                                        reader.visit_batch_vector_search(&vector_searches, |_| {
+                                            Ok(Cursor::new(data))
+                                        })
+                                    },
+                                )
+                                .await?
+                            } else {
+                                let file_reader = input.reader().await.map_err(|e| {
+                                    crate::Error::DataInvalid {
+                                        message: format!(
+                                            "Failed to open vindex file '{}' for range reads: {}",
+                                            file_name, e
+                                        ),
+                                        source: None,
+                                    }
+                                })?;
+                                let source = VindexFileReader::new(
+                                    Arc::new(file_reader),
+                                    current_tokio_runtime_handle()?,
+                                    file_size,
+                                    file_name.clone(),
+                                );
+                                execute_global_index(
+                                    "vindex global-index search task failed",
+                                    move || {
+                                        let mut reader = VindexVectorGlobalIndexReader::new(
+                                            io_meta, options,
+                                        );
+                                        reader
+                                            .visit_batch_vector_search(&vector_searches, |_| {
+                                                Ok(source)
+                                            })
+                                            .map_err(|e| crate::Error::DataInvalid {
+                                                message: format!(
+                                                    "Failed to read vindex index file '{}': {}",
+                                                    file_name, e
+                                                ),
+                                                source: Some(Box::new(e)),
+                                            })
+                                    },
+                                )
+                                .await?
+                            }
                         }
                     };
-                    if results.len() != vector_searches.len() {
+                    if results.len() != query_count {
                         return Err(crate::Error::DataInvalid {
                             message: format!(
                                 "Batch vector search backend returned {} results for {} query vectors",
                                 results.len(),
-                                vector_searches.len()
+                                query_count
                             ),
                             source: None,
                         });
@@ -1492,7 +1568,7 @@ async fn evaluate_batch_vector_search(
             })
             .collect();
 
-        let results = futures::future::try_join_all(futures).await?;
+        let results = drain_indexed_jobs(futures.into_iter(), concurrency).await?;
         for per_entry in &results {
             for (query_index, result) in per_entry.iter().enumerate() {
                 merged[query_index] = merged[query_index].or(result);
@@ -3514,6 +3590,41 @@ mod tests {
                 .contains("Failed to read vindex index file 'missing.idx'"),
             "unexpected error: {err}"
         );
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "wrapped vindex read errors should retain their source: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_single_vindex_outside_tokio_returns_error() {
+        futures::executor::block_on(async {
+            let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+            file_io
+                .new_output("memory:///test_table/index/test.idx")
+                .unwrap()
+                .write(bytes::Bytes::from_static(b"index"))
+                .await
+                .unwrap();
+            let fields = vec![make_field(2, "embedding")];
+            let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
+            let options = HashMap::new();
+            let entry = make_lumina_entry("test.idx", IVF_FLAT_IDENTIFIER, FileKind::Add, 2);
+
+            let err = evaluate_vector_search(
+                eval_context(&file_io, &options, &fields, None),
+                &[entry],
+                &vs,
+            )
+            .await
+            .expect_err("vindex range reads outside Tokio should fail without panicking");
+
+            assert!(
+                matches!(err, crate::Error::UnexpectedError { ref message, .. }
+                    if message.contains("requires a Tokio runtime")),
+                "unexpected error: {err:?}"
+            );
+        });
     }
 
     #[tokio::test]
