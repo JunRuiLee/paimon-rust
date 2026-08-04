@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::spec::CoreOptions;
 use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
@@ -27,6 +28,7 @@ use std::io;
 
 const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
+const NATIVE_BATCH_OPERATION_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 
 trait ErasedSeekRead: Send {
     fn pread_erased(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
@@ -76,6 +78,7 @@ impl SeekRead for VindexInput {
 pub struct VindexVectorGlobalIndexReader {
     io_meta: GlobalIndexIOMeta,
     options: HashMap<String, String>,
+    batch_shard_concurrency: Option<usize>,
     reader: Option<VIndexReader<VindexInput>>,
     metadata: Option<VectorIndexMetadata>,
 }
@@ -85,9 +88,15 @@ impl VindexVectorGlobalIndexReader {
         Self {
             io_meta,
             options,
+            batch_shard_concurrency: None,
             reader: None,
             metadata: None,
         }
+    }
+
+    pub(crate) fn with_batch_shard_concurrency(mut self, concurrency: usize) -> Self {
+        self.batch_shard_concurrency = Some(concurrency.max(1));
+        self
     }
 
     pub fn visit_vector_search<S: SeekRead + 'static>(
@@ -129,6 +138,10 @@ impl VindexVectorGlobalIndexReader {
         &mut self,
         vector_searches: &[VectorSearch],
     ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
+        let shard_concurrency = match self.batch_shard_concurrency {
+            Some(concurrency) => concurrency,
+            None => CoreOptions::new(&self.options).global_index_thread_num()?,
+        };
         let reader = self
             .reader
             .as_mut()
@@ -143,7 +156,13 @@ impl VindexVectorGlobalIndexReader {
                 message: "vindex metadata not initialized".to_string(),
                 source: None,
             })?;
-        search_batch_vindex(reader, metadata, &self.options, vector_searches)
+        search_batch_vindex(
+            reader,
+            metadata,
+            &self.options,
+            vector_searches,
+            shard_concurrency,
+        )
     }
 
     fn search(&mut self, vector_search: &VectorSearch) -> crate::Result<Option<HashMap<u64, f32>>> {
@@ -317,6 +336,7 @@ fn search_batch_vindex(
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
+    shard_concurrency: usize,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     let mut results: Vec<Option<HashMap<u64, f32>>> =
         (0..vector_searches.len()).map(|_| None).collect();
@@ -334,63 +354,118 @@ fn search_batch_vindex(
     }
 
     for (prepared, indices) in groups {
-        if indices.len() == 1 {
-            let index = indices[0];
-            let (labels, distances) =
-                execute_scalar_search(reader, &vector_searches[index], &prepared)?;
-            let map = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
-            if !map.is_empty() {
-                results[index] = Some(map);
+        let chunk_size = native_batch_chunk_size(metadata, &prepared, shard_concurrency);
+        for indices in indices.chunks(chunk_size) {
+            if indices.len() == 1 {
+                let index = indices[0];
+                let (labels, distances) =
+                    execute_scalar_search(reader, &vector_searches[index], &prepared)?;
+                let map = collect_results(&labels, &distances, prepared.top_k, metadata.metric);
+                if !map.is_empty() {
+                    results[index] = Some(map);
+                }
+                continue;
             }
-            continue;
-        }
 
-        let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
-        for &index in &indices {
-            queries.extend_from_slice(&vector_searches[index].vector);
-        }
-        let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
-        let (labels, distances) = match &prepared.filter_bytes {
-            Some(filter) => reader
-                .search_batch_with_roaring_filter(&queries, indices.len(), params, filter)
-                .map_err(|e| crate::Error::DataInvalid {
-                    message: format!("paimon-vindex-core filtered batch search failed: {}", e),
-                    source: Some(Box::new(e)),
-                })?,
-            None => reader
-                .search_batch(&queries, indices.len(), params)
-                .map_err(|e| crate::Error::DataInvalid {
-                    message: format!("paimon-vindex-core batch search failed: {}", e),
-                    source: Some(Box::new(e)),
-                })?,
-        };
-        let expected = indices.len() * prepared.top_k;
-        if labels.len() != expected || distances.len() != expected {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "paimon-vindex-core batch search returned labels/distances of length {}/{}, expected {expected}",
-                    labels.len(),
-                    distances.len()
-                ),
-                source: None,
-            });
-        }
-        for (query_index, &result_index) in indices.iter().enumerate() {
-            let start = query_index * prepared.top_k;
-            let end = start + prepared.top_k;
-            let map = collect_results(
-                &labels[start..end],
-                &distances[start..end],
-                prepared.top_k,
-                metadata.metric,
-            );
-            if !map.is_empty() {
-                results[result_index] = Some(map);
+            let mut queries = Vec::with_capacity(indices.len() * metadata.dimension);
+            for &index in indices {
+                queries.extend_from_slice(&vector_searches[index].vector);
+            }
+            let params = VectorSearchParams::new(prepared.top_k, prepared.nprobe);
+            let (labels, distances) = match &prepared.filter_bytes {
+                Some(filter) => reader
+                    .search_batch_with_roaring_filter(&queries, indices.len(), params, filter)
+                    .map_err(|e| crate::Error::DataInvalid {
+                        message: format!("paimon-vindex-core filtered batch search failed: {}", e),
+                        source: Some(Box::new(e)),
+                    })?,
+                None => reader
+                    .search_batch(&queries, indices.len(), params)
+                    .map_err(|e| crate::Error::DataInvalid {
+                        message: format!("paimon-vindex-core batch search failed: {}", e),
+                        source: Some(Box::new(e)),
+                    })?,
+            };
+            let expected = indices.len() * prepared.top_k;
+            if labels.len() != expected || distances.len() != expected {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "paimon-vindex-core batch search returned labels/distances of length {}/{}, expected {expected}",
+                        labels.len(),
+                        distances.len()
+                    ),
+                    source: None,
+                });
+            }
+            for (query_index, &result_index) in indices.iter().enumerate() {
+                let start = query_index * prepared.top_k;
+                let end = start + prepared.top_k;
+                let map = collect_results(
+                    &labels[start..end],
+                    &distances[start..end],
+                    prepared.top_k,
+                    metadata.metric,
+                );
+                if !map.is_empty() {
+                    results[result_index] = Some(map);
+                }
             }
         }
     }
 
     Ok(results)
+}
+
+fn native_batch_chunk_size(
+    metadata: &VectorIndexMetadata,
+    prepared: &PreparedSearch,
+    shard_concurrency: usize,
+) -> usize {
+    let per_shard_budget = NATIVE_BATCH_OPERATION_WORKING_SET_BYTES
+        .checked_div(shard_concurrency.max(1))
+        .unwrap_or(0);
+    let filter_bytes = prepared
+        .filter_bytes
+        .as_ref()
+        .map_or(0, |filter| filter.len().saturating_mul(2));
+    let query_budget = per_shard_budget.saturating_sub(filter_bytes);
+    query_budget
+        .checked_div(native_batch_query_working_set_bytes(metadata, prepared))
+        .unwrap_or(0)
+        .max(1)
+}
+
+fn native_batch_query_working_set_bytes(
+    metadata: &VectorIndexMetadata,
+    prepared: &PreparedSearch,
+) -> usize {
+    let query_vectors = metadata
+        .dimension
+        .saturating_mul(std::mem::size_of::<f32>() * 2);
+    let centroid_products = metadata.nlist.saturating_mul(std::mem::size_of::<f32>());
+    let probe_results = prepared
+        .nprobe
+        .min(metadata.nlist)
+        .saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<f32>());
+    let top_k_results = prepared.top_k.saturating_mul(
+        std::mem::size_of::<i64>() + std::mem::size_of::<f32>() + std::mem::size_of::<(f32, i64)>(),
+    );
+    let pq_tables = match (metadata.pq_m, metadata.pq_bits) {
+        (Some(m), Some(bits)) => 1usize
+            .checked_shl(bits as u32)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(m)
+            .saturating_mul(std::mem::size_of::<f32>()),
+        _ => 0,
+    };
+
+    query_vectors
+        .saturating_add(centroid_products)
+        .saturating_add(probe_results)
+        .saturating_add(top_k_results)
+        .saturating_add(pq_tables)
+        .saturating_add(256)
+        .max(1)
 }
 
 fn collect_results(
@@ -578,6 +653,21 @@ mod tests {
         index: Bytes,
         query_count: usize,
     ) -> (Vec<Option<HashMap<u64, f32>>>, usize) {
+        tracked_batch_search_with_options(
+            index,
+            query_count,
+            HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]),
+            32,
+        )
+        .await
+    }
+
+    async fn tracked_batch_search_with_options(
+        index: Bytes,
+        query_count: usize,
+        options: HashMap<String, String>,
+        shard_concurrency: usize,
+    ) -> (Vec<Option<HashMap<u64, f32>>>, usize) {
         let tracking = TrackingIndexRead::new(index.clone());
         let source: Arc<dyn FileRead> = tracking.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -590,9 +680,9 @@ mod tests {
             );
             let io_meta =
                 GlobalIndexIOMeta::new("batch.index".to_string(), index.len() as u64, Vec::new());
-            let options = HashMap::from([(NPROBE_PARAMETER.to_string(), "1".to_string())]);
             let searches = vec![query(); query_count];
-            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options);
+            let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
+                .with_batch_shard_concurrency(shard_concurrency);
             reader
                 .visit_batch_vector_search(&searches, |_| Ok(source))
                 .unwrap()
@@ -638,6 +728,43 @@ mod tests {
         assert!(result.contains_key(&2));
         assert!(result.contains_key(&0));
         assert!(!result.contains_key(&3));
+    }
+
+    #[test]
+    fn native_batch_chunk_size_tracks_working_set_inputs() {
+        let base_metadata = VectorIndexMetadata {
+            index_type: paimon_vindex_core::index::IndexType::IvfFlat,
+            dimension: 128,
+            nlist: 256,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let base_prepared = PreparedSearch {
+            top_k: 10,
+            nprobe: 16,
+            filter_bytes: None,
+        };
+        let base = native_batch_chunk_size(&base_metadata, &base_prepared, 32);
+
+        let mut larger_index = base_metadata.clone();
+        larger_index.dimension *= 2;
+        larger_index.nlist *= 2;
+        assert!(native_batch_chunk_size(&larger_index, &base_prepared, 32) < base);
+
+        let mut larger_top_k = base_prepared.clone();
+        larger_top_k.top_k *= 4;
+        assert!(native_batch_chunk_size(&base_metadata, &larger_top_k, 32) < base);
+
+        let mut pq_metadata = base_metadata.clone();
+        pq_metadata.pq_m = Some(64);
+        pq_metadata.pq_bits = Some(8);
+        assert!(native_batch_chunk_size(&pq_metadata, &base_prepared, 32) < base);
+
+        assert!(native_batch_chunk_size(&base_metadata, &base_prepared, 64) < base);
     }
 
     #[test]
@@ -951,5 +1078,51 @@ mod tests {
             over_limit_bytes, within_limit_bytes,
             "compatible queries should reuse the same probed list across the former 16-query boundary"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn homogeneous_batch_chunks_at_working_set_boundary() {
+        let shard_concurrency = 4096;
+        let metadata = VectorIndexMetadata {
+            index_type: paimon_vindex_core::index::IndexType::IvfFlat,
+            dimension: TEST_DIMENSION,
+            nlist: 16,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let options = HashMap::from([
+            (NPROBE_PARAMETER.to_string(), "1".to_string()),
+            ("global-index.thread-num".to_string(), "1".to_string()),
+        ]);
+        let prepared = prepare_search(&metadata, &options, &query())
+            .unwrap()
+            .unwrap();
+        let chunk_size = native_batch_chunk_size(&metadata, &prepared, shard_concurrency);
+        assert!(chunk_size > 16);
+
+        let index = build_ivf_flat_index();
+        let (within_results, within_bytes) = tracked_batch_search_with_options(
+            index.clone(),
+            chunk_size,
+            options.clone(),
+            shard_concurrency,
+        )
+        .await;
+        let (over_results, over_bytes) =
+            tracked_batch_search_with_options(index, chunk_size + 1, options, shard_concurrency)
+                .await;
+
+        assert_eq!(within_results.len(), chunk_size);
+        assert_eq!(over_results.len(), chunk_size + 1);
+        assert!(within_results
+            .iter()
+            .all(|result| result == &within_results[0]));
+        assert!(over_results.iter().all(|result| result == &over_results[0]));
+        assert_eq!(over_results[0], within_results[0]);
+        assert!(over_bytes > within_bytes);
     }
 }
