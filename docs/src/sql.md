@@ -1049,7 +1049,9 @@ CALL sys.drop_global_index(
 );
 ```
 
-BTree and bitmap global indexes can be dropped through this procedure currently.
+`index_type` accepts every type the create procedures build: `btree`, `bitmap`,
+`lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat` and `ivf-pq`.
+It defaults to `btree`.
 
 ### create_lumina_index
 
@@ -1976,6 +1978,8 @@ deletion vectors enabled.
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
+| `global-index.thread-num` | `32` | Number of threads used to search global index fields concurrently; must be greater than 0. |
+| `global-index.column-update-action` | `THROW_ERROR` | What a commit does when it updates an indexed column: `THROW_ERROR` rejects the commit, `DROP_PARTITION_INDEX` drops the affected partition index instead. |
 
 ### Variant Shredding Options
 
