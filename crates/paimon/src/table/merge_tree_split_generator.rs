@@ -119,8 +119,9 @@ struct KeyedFile {
     max: DecodedKey,
 }
 
-/// Decode every file's key range up front. Returns `None` if any file lacks
-/// a usable key range, in which case callers must assume full overlap.
+/// Decode every file's key range up front. Returns the original files as `Err`
+/// if any range is missing, undecodable, or inverted, in which case callers
+/// must assume full overlap.
 fn decode_all(
     files: Vec<DataFileMeta>,
     comparator: &KeyComparator,
@@ -158,8 +159,8 @@ fn decode_all(
 /// bound starts a new section. Sections never overlap each other, while files
 /// inside one section all transitively overlap and must be merged together.
 ///
-/// Files with empty or undecodable key ranges collapse everything into one
-/// section: no parallelism, but never a missed merge.
+/// Files with empty, undecodable, or inverted key ranges collapse everything
+/// into one section: no parallelism, but never a missed merge.
 pub(crate) fn interval_partition(
     files: Vec<DataFileMeta>,
     comparator: &KeyComparator,
@@ -216,6 +217,14 @@ pub(crate) fn pack_sorted_runs(
     pack_sorted_runs_by(files, comparator, |file| file)
 }
 
+/// Pack arbitrary payloads into key-sorted runs using `file_meta` to select the
+/// [`DataFileMeta`] that defines each payload's key range.
+///
+/// Files are appended to a run only when the previous maximum key is strictly
+/// less than the next minimum key, so concatenating that run remains monotonic.
+/// Missing, undecodable, or inverted ranges degrade to one item per run. A final
+/// independent range check verifies the concatenation precondition and applies
+/// the same fallback if the constructed runs are not sound.
 pub(crate) fn pack_sorted_runs_by<T, F>(
     items: Vec<T>,
     comparator: &KeyComparator,

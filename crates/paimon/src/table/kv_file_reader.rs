@@ -76,8 +76,9 @@ pub(crate) struct KeyValueReadConfig {
     pub read_batch_size: usize,
     /// Merge files from all supplied splits into one globally key-sorted stream.
     pub merge_splits: bool,
-    /// Optional cap on merge input streams opened by one sort-merge group.
-    pub max_merge_file_streams: Option<usize>,
+    /// Optional cap on sorted-run inputs merged concurrently by one LoserTree.
+    /// This limits merge fan-in, not files: files within a run are opened serially.
+    pub max_merge_input_streams: Option<usize>,
     /// Scan-shared Parquet concurrency and projected-byte budget.
     pub parquet_read_budget: Option<Arc<ParquetReadBudget>>,
 }
@@ -153,14 +154,14 @@ fn widen_partial_update_sequence_group_fields(
     Ok(user_fields)
 }
 
-fn ensure_merge_fan_in_limit(stream_count: usize, limit: Option<usize>) -> crate::Result<()> {
+fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> crate::Result<()> {
     if let Some(limit) = limit {
-        if stream_count <= limit {
+        if input_stream_count <= limit {
             return Ok(());
         }
         return Err(Error::Unsupported {
             message: format!(
-                "KeyValueFileReader refuses to merge {stream_count} merge input streams in one sort-merge group; maximum is {limit}. Compact the table before reading this highly fragmented group"
+                "KeyValueFileReader refuses to merge {input_stream_count} overlapping sorted-run input streams in one sort-merge group; maximum is {limit}. Compact the table before reading this highly fragmented group"
             ),
         });
     }
@@ -177,7 +178,7 @@ struct MergeFile {
 }
 
 fn plan_merge_groups(
-    split_group: &[DataSplit],
+    split_group: &[Arc<DataSplit>],
     comparator: Option<&super::merge_tree_split_generator::KeyComparator>,
     merge_splits: bool,
 ) -> Vec<Vec<MergeRun>> {
@@ -185,11 +186,11 @@ fn plan_merge_groups(
         let runs = split_group
             .iter()
             .flat_map(|split| {
-                let split = Arc::new(split.clone());
                 let files = split.data_files().to_vec();
+                let split = Arc::clone(split);
                 files.into_iter().map(move |file| MergeRun {
                     files: vec![MergeFile {
-                        split: split.clone(),
+                        split: Arc::clone(&split),
                         file,
                     }],
                 })
@@ -206,10 +207,10 @@ fn plan_merge_groups(
         let files = split_group
             .iter()
             .flat_map(|split| {
-                let split = Arc::new(split.clone());
                 let files = split.data_files().to_vec();
+                let split = Arc::clone(split);
                 files.into_iter().map(move |file| MergeFile {
-                    split: split.clone(),
+                    split: Arc::clone(&split),
                     file,
                 })
             })
@@ -231,7 +232,6 @@ fn plan_merge_groups(
 
     let mut groups = Vec::new();
     for split in split_group {
-        let split = Arc::new(split.clone());
         for section in super::merge_tree_split_generator::interval_partition(
             split.data_files().to_vec(),
             comparator,
@@ -242,7 +242,7 @@ fn plan_merge_groups(
                     files: files
                         .into_iter()
                         .map(|file| MergeFile {
-                            split: split.clone(),
+                            split: Arc::clone(split),
                             file,
                         })
                         .collect(),
@@ -488,14 +488,15 @@ impl KeyValueFileReader {
         }
 
         let merge_splits = self.config.merge_splits;
-        let split_groups: Vec<Vec<DataSplit>> = if merge_splits {
-            vec![data_splits.to_vec()]
+        let data_splits = data_splits
+            .iter()
+            .cloned()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        let split_groups: Vec<Vec<Arc<DataSplit>>> = if merge_splits {
+            vec![data_splits]
         } else {
-            data_splits
-                .iter()
-                .cloned()
-                .map(|split| vec![split])
-                .collect()
+            data_splits.into_iter().map(|split| vec![split]).collect()
         };
         let file_io = self.file_io;
         let merge_engine = self.config.merge_engine;
@@ -509,7 +510,7 @@ impl KeyValueFileReader {
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
-        let max_merge_file_streams = self.config.max_merge_file_streams;
+        let max_merge_input_streams = self.config.max_merge_input_streams;
         let parquet_read_budget = self.config.parquet_read_budget;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
@@ -538,13 +539,13 @@ impl KeyValueFileReader {
                     key_comparator.as_ref(),
                     merge_splits,
                 ) {
-                    let stream_count = merge_group.len();
-                    ensure_merge_fan_in_limit(stream_count, max_merge_file_streams)?;
+                    let input_stream_count = merge_group.len();
+                    ensure_merge_input_limit(input_stream_count, max_merge_input_streams)?;
                     // Sort-merge must first obtain one batch from every input
                     // stream. Keep concurrent row-group reads disabled whenever
                     // multiple runs advance in lockstep; one run may still use
                     // the shared budget because its files are opened serially.
-                    let group_parquet_read_budget = if stream_count == 1 {
+                    let group_parquet_read_budget = if input_stream_count == 1 {
                         parquet_read_budget.clone()
                     } else {
                         None
@@ -940,6 +941,29 @@ mod tests {
         file
     }
 
+    fn kv_reader_with_budget(table: &Table, budget: Arc<ParquetReadBudget>) -> KeyValueFileReader {
+        let core_options = table.schema().core_options();
+        KeyValueFileReader::new(
+            table.file_io().clone(),
+            KeyValueReadConfig {
+                table_name: table.identifier().full_name(),
+                table_options: table.schema().options().clone(),
+                schema_manager: table.schema_manager().clone(),
+                table_schema_id: table.schema().id(),
+                table_fields: table.schema().fields().to_vec(),
+                read_type: table.schema().fields().to_vec(),
+                predicates: Vec::new(),
+                primary_keys: table.schema().trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine().unwrap(),
+                sequence_fields: Vec::new(),
+                read_batch_size: core_options.read_batch_size().unwrap(),
+                merge_splits: true,
+                max_merge_input_streams: None,
+                parquet_read_budget: Some(budget),
+            },
+        )
+    }
+
     #[test]
     fn retain_primary_key_conjuncts_semantics() {
         let fields = vec![
@@ -1020,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_merge_rejects_too_many_file_streams_on_read_path() {
+    async fn kv_merge_rejects_too_many_sorted_runs_on_read_path() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_merge_fan_in_limit";
         let table = pk_table(&file_io, table_path, &[]);
@@ -1053,7 +1077,7 @@ mod tests {
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: true,
-                max_merge_file_streams: Some(256),
+                max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
             },
         );
@@ -1065,8 +1089,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Unsupported { message } if message.contains("merge input streams")),
-            "KV merge must fail before opening an unbounded number of merge input streams"
+            matches!(err, Error::Unsupported { message } if message.contains("sorted-run input streams")),
+            "KV merge must fail before opening an unbounded number of sorted-run inputs"
         );
     }
 
@@ -1078,22 +1102,24 @@ mod tests {
             file.max_key = int_key(max);
             file
         };
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("memory:/sorted-run-plan/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![
-                file("a", 1, 10),
-                file("b", 5, 15),
-                file("c", 20, 30),
-                file("d", 25, 35),
-                file("e", 40, 50),
-                file("f", 45, 55),
-            ])
-            .build()
-            .unwrap();
+        let split = Arc::new(
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("memory:/sorted-run-plan/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![
+                    file("a", 1, 10),
+                    file("b", 5, 15),
+                    file("c", 20, 30),
+                    file("d", 25, 35),
+                    file("e", 40, 50),
+                    file("f", 45, 55),
+                ])
+                .build()
+                .unwrap(),
+        );
         let comparator =
             super::super::merge_tree_split_generator::KeyComparator::new(vec![DataType::Int(
                 IntType::new(),
@@ -1103,7 +1129,7 @@ mod tests {
         assert_eq!(grouped.len(), 3);
         assert!(grouped.iter().all(|section| section.len() == 2));
 
-        let fallback = plan_merge_groups(&[split], None, false);
+        let fallback = plan_merge_groups(std::slice::from_ref(&split), None, false);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0].len(), 6);
     }
@@ -1117,15 +1143,17 @@ mod tests {
             file
         };
         let split = |path: &str, files| {
-            DataSplitBuilder::new()
-                .with_snapshot(1)
-                .with_partition(BinaryRow::new(0))
-                .with_bucket(0)
-                .with_bucket_path(path.to_string())
-                .with_total_buckets(1)
-                .with_data_files(files)
-                .build()
-                .unwrap()
+            Arc::new(
+                DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(path.to_string())
+                    .with_total_buckets(1)
+                    .with_data_files(files)
+                    .build()
+                    .unwrap(),
+            )
         };
         let first = split(
             "memory:/sorted-run-plan/first",
@@ -1147,7 +1175,7 @@ mod tests {
         let grouped = plan_merge_groups(&[first, second], Some(&comparator), true);
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].len(), 1, "global overlap depth is one");
-        ensure_merge_fan_in_limit(grouped[0].len(), Some(256)).unwrap();
+        ensure_merge_input_limit(grouped[0].len(), Some(256)).unwrap();
         let files = &grouped[0][0].files;
         assert_eq!(files.len(), 257);
         assert_eq!(
@@ -1215,7 +1243,7 @@ mod tests {
                     .collect(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: false,
-                max_merge_file_streams: None,
+                max_merge_input_streams: None,
                 parquet_read_budget: None,
             },
         )
@@ -1236,7 +1264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_merge_with_shared_budget_does_not_deadlock_between_files() {
+    async fn kv_merge_with_multiple_runs_does_not_deadlock() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_shared_parquet_budget";
         setup_dirs(&file_io, table_path).await;
@@ -1252,15 +1280,24 @@ mod tests {
             write_multi_row_group_kv_file(&file_io, table_path, "first.parquet", 0, 0, 10).await;
         let second =
             write_multi_row_group_kv_file(&file_io, table_path, "second.parquet", 0, 1, 11).await;
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path(format!("{table_path}/bucket-0"))
-            .with_total_buckets(1)
-            .with_data_files(vec![first, second])
-            .build()
-            .unwrap();
+        let split = Arc::new(
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(vec![first, second])
+                .build()
+                .unwrap(),
+        );
+        let comparator =
+            super::super::merge_tree_split_generator::KeyComparator::new(vec![DataType::Int(
+                IntType::new(),
+            )]);
+        let planned = plan_merge_groups(std::slice::from_ref(&split), Some(&comparator), false);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].len(), 2);
         let core_options = table.schema().core_options();
         let reader = KeyValueFileReader::new(
             table.file_io().clone(),
@@ -1277,21 +1314,157 @@ mod tests {
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: false,
-                max_merge_file_streams: None,
+                max_merge_input_streams: None,
                 parquet_read_budget: Some(Arc::new(ParquetReadBudget::new(2, 256 << 20).unwrap())),
             },
         );
         let batches = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reader.read(&[split]).unwrap().try_collect::<Vec<_>>(),
+            reader
+                .read(std::slice::from_ref(split.as_ref()))
+                .unwrap()
+                .try_collect::<Vec<_>>(),
         )
         .await
-        .expect("multi-file sort-merge must not wait forever for a shared Parquet permit")
+        .expect("multiple sorted-run inputs must not deadlock on shared Parquet permits")
         .unwrap();
 
         assert_eq!(
             batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             128
+        );
+    }
+
+    #[tokio::test]
+    async fn single_sorted_run_uses_shared_budget_across_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_single_run_shared_budget";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("read.batch-size", "1"),
+                ("read.parquet.row-group.parallelism", "1"),
+            ],
+        );
+        let low =
+            write_multi_row_group_kv_file(&file_io, table_path, "low.parquet", 0, 0, 10).await;
+        let high =
+            write_multi_row_group_kv_file(&file_io, table_path, "high.parquet", 200, 0, 20).await;
+        let split = Arc::new(
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(vec![high, low])
+                .build()
+                .unwrap(),
+        );
+        let comparator =
+            super::super::merge_tree_split_generator::KeyComparator::new(vec![DataType::Int(
+                IntType::new(),
+            )]);
+        let planned = plan_merge_groups(std::slice::from_ref(&split), Some(&comparator), true);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].len(), 1);
+        assert_eq!(planned[0][0].files.len(), 2);
+
+        let reader = kv_reader_with_budget(
+            &table,
+            Arc::new(ParquetReadBudget::new(1, 256 << 20).unwrap()),
+        );
+        let batches = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader
+                .read(std::slice::from_ref(split.as_ref()))
+                .unwrap()
+                .try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("one sorted run must reuse a single shared Parquet permit across files")
+        .unwrap();
+
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            256
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_single_runs_share_one_parquet_budget() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_concurrent_single_run_budget";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("read.batch-size", "1"),
+                ("read.parquet.row-group.parallelism", "1"),
+            ],
+        );
+        let first_low =
+            write_multi_row_group_kv_file(&file_io, table_path, "first-low.parquet", 0, 0, 10)
+                .await;
+        let first_high =
+            write_multi_row_group_kv_file(&file_io, table_path, "first-high.parquet", 200, 0, 20)
+                .await;
+        let second_low =
+            write_multi_row_group_kv_file(&file_io, table_path, "second-low.parquet", 400, 0, 30)
+                .await;
+        let second_high =
+            write_multi_row_group_kv_file(&file_io, table_path, "second-high.parquet", 600, 0, 40)
+                .await;
+        let split = |files| {
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(format!("{table_path}/bucket-0"))
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .build()
+                .unwrap()
+        };
+        let first_split = split(vec![first_high, first_low]);
+        let second_split = split(vec![second_high, second_low]);
+        let budget = Arc::new(ParquetReadBudget::new(1, 256 << 20).unwrap());
+        let first_reader = kv_reader_with_budget(&table, budget.clone());
+        let second_reader = kv_reader_with_budget(&table, budget);
+
+        let (first_batches, second_batches) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::try_join!(
+                    first_reader
+                        .read(&[first_split])
+                        .unwrap()
+                        .try_collect::<Vec<_>>(),
+                    second_reader
+                        .read(&[second_split])
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                )
+            })
+            .await
+            .expect("concurrent single-run readers must make progress with one shared permit")
+            .unwrap();
+
+        assert_eq!(
+            first_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            256
+        );
+        assert_eq!(
+            second_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            256
         );
     }
 
@@ -1335,7 +1508,7 @@ mod tests {
                     sequence_fields: Vec::new(),
                     read_batch_size: core_options.read_batch_size().unwrap(),
                     merge_splits,
-                    max_merge_file_streams: None,
+                    max_merge_input_streams: None,
                     parquet_read_budget: None,
                 },
             )
@@ -1402,7 +1575,7 @@ mod tests {
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: true,
-                max_merge_file_streams: Some(256),
+                max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
             },
         );

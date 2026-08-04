@@ -511,8 +511,7 @@ fn evaluate_between_predicate(
     };
     // Delegate the two bound comparisons to `evaluate_column_predicate` rather
     // than calling `arrow_gt_eq`/`arrow_lt_eq` directly, so Between inherits the
-    // type-faithful comparison paths (e.g. signed-byte order for Binary). Using
-    // Arrow's kernels here directly would reintroduce unsigned binary ordering.
+    // type-faithful comparison paths (e.g. byte ordering for Binary).
     let lo_mask = evaluate_column_predicate(array, &low_scalar, PredicateOperator::GtEq)?;
     let hi_mask = evaluate_column_predicate(array, &high_scalar, PredicateOperator::LtEq)?;
     let between = arrow_arith::boolean::and_kleene(&lo_mask, &hi_mask)?;
@@ -703,10 +702,9 @@ fn evaluate_column_predicate(
 ) -> Result<BooleanArray, ArrowError> {
     let scalar = string_scalar_for_column(scalar, column.data_type())?;
 
-    // Binary ordering must match Paimon's Datum::Bytes semantics (Java signed-byte
-    // order, 0xFF < 0x00), which Arrow's unsigned byte comparison does not. Route
-    // ordering ops on Binary/VarBinary columns through the signed comparator.
-    // Eq/NotEq are order-independent, so Arrow's kernels are correct for them.
+    // Route Binary/VarBinary ordering through the shared Java-compatible
+    // unsigned-byte comparator so residual filtering and `Datum::Bytes` cannot
+    // drift apart. Eq/NotEq are order-independent and use Arrow's kernels.
     if matches!(
         column.data_type(),
         arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary
@@ -746,7 +744,7 @@ fn evaluate_column_predicate(
 }
 
 /// Evaluate an ordering predicate (`Lt`/`LtEq`/`Gt`/`GtEq`) on a Binary column
-/// using Paimon's Java signed-byte order, matching `Datum::Bytes` semantics.
+/// using Paimon's Java unsigned-byte order, matching `Datum::Bytes` semantics.
 /// `scalar` is a single-element Binary array (the literal). NULL column rows
 /// produce NULL in the mask (later collapsed to `false` by `sanitize_filter_mask`).
 fn evaluate_binary_ordering_predicate(
@@ -769,8 +767,7 @@ fn evaluate_binary_ordering_predicate(
         ));
     };
 
-    // Row-wise comparison via the shared signed-byte comparator (single source of
-    // truth with `Datum` ordering).
+    // Row-wise comparison via the shared unsigned-byte comparator.
     let compare = |bytes: &[u8]| -> bool {
         let ord = crate::spec::java_bytes_cmp(bytes, literal);
         match op {
@@ -1641,10 +1638,9 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_ordering_uses_java_signed_byte_order() {
-        // Paimon Datum::Bytes orders by signed byte (0xFF < 0x00). Arrow's
-        // unsigned comparison would order 0xFF as the largest. Verify the
-        // residual matches Paimon: filter `col > 0x00` must EXCLUDE 0xFF.
+    fn test_binary_ordering_uses_java_unsigned_byte_order() {
+        // Paimon Datum::Bytes and Arrow both order bytes as unsigned values.
+        // Verify the residual keeps 0xFF for `col > 0x00`.
         use crate::spec::BinaryType;
         let col = DataField::new(
             0,
@@ -1659,7 +1655,7 @@ mod tests {
         let values: Vec<Option<&[u8]>> = vec![Some(&[0x00]), Some(&[0x01]), Some(&[0xFF])];
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(BinaryArray::from(values))]).unwrap();
-        // col > 0x00 : signed order -> only 0x01 (0xFF is negative, < 0x00).
+        // col > 0x00 : unsigned order -> 0x01 and 0xFF.
         let pred = leaf(
             0,
             DataType::Binary(BinaryType::new(1).unwrap()),
@@ -1677,18 +1673,15 @@ mod tests {
         let got: Vec<&[u8]> = (0..out_col.len()).map(|i| out_col.value(i)).collect();
         assert_eq!(
             got,
-            vec![&[0x01u8][..]],
-            "0xFF must be excluded (signed < 0x00)"
+            vec![&[0x01u8][..], &[0xFFu8][..]],
+            "0xFF must be included (unsigned > 0x00)"
         );
     }
 
     #[test]
-    fn test_binary_between_uses_java_signed_byte_order() {
-        // Between must inherit the signed-byte order too (regression: it called
-        // Arrow's unsigned gt_eq/lt_eq directly). `b BETWEEN 0xFF AND 0x01` is,
-        // under signed order, the range [-1, 1] -> keeps 0xFF(-1), 0x00(0),
-        // 0x01(1) and excludes 0x7F(127). Under Arrow's unsigned order it would be
-        // [255, 1] = empty, so this distinguishes the two.
+    fn test_binary_between_uses_java_unsigned_byte_order() {
+        // `b BETWEEN 0x01 AND 0xFF` uses unsigned byte ordering, keeping all
+        // values at or above 0x01 through 0xFF and excluding 0x00.
         use crate::spec::BinaryType;
         let col = DataField::new(
             0,
@@ -1708,7 +1701,7 @@ mod tests {
             0,
             DataType::Binary(BinaryType::new(1).unwrap()),
             PredicateOperator::Between,
-            vec![Datum::Bytes(vec![0xFF]), Datum::Bytes(vec![0x01])],
+            vec![Datum::Bytes(vec![0x01]), Datum::Bytes(vec![0xFF])],
         );
         let fp = file_predicates(vec![pred], vec![col.clone()]);
         let out =
@@ -1721,8 +1714,8 @@ mod tests {
         let got: Vec<&[u8]> = (0..out_col.len()).map(|i| out_col.value(i)).collect();
         assert_eq!(
             got,
-            vec![&[0xFFu8][..], &[0x00u8][..], &[0x01u8][..]],
-            "signed range [-1, 1] keeps 0xFF/0x00/0x01, excludes 0x7F"
+            vec![&[0xFFu8][..], &[0x01u8][..], &[0x7Fu8][..]],
+            "unsigned range [0x01, 0xFF] excludes only 0x00"
         );
     }
 

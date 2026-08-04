@@ -892,6 +892,8 @@ impl LoserTree {
 
 /// Configuration for building a [`SortMergeReader`].
 pub(crate) struct SortMergeReaderBuilder {
+    /// Inputs must each be monotonic by primary key. Concatenated files are valid
+    /// only when their key ranges are strictly disjoint and ordered.
     streams: Vec<ArrowRecordBatchStream>,
     /// Full schema of the input streams (key + seq + value_kind + value columns).
     input_schema: SchemaRef,

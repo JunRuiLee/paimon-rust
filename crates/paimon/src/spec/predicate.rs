@@ -210,16 +210,10 @@ fn decimal_cmp(ua: i128, sa: u32, ub: i128, sb: u32) -> Option<Ordering> {
     na.partial_cmp(&nb)
 }
 
-/// Match Java `CompareUtils.compare(byte[], byte[])`, which compares signed
-/// bytes lexicographically.
+/// Match Java `CompareUtils.compare(byte[], byte[])`, which compares bytes as
+/// unsigned values lexicographically.
 pub(crate) fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
-    for (&lhs, &rhs) in a.iter().zip(b.iter()) {
-        let cmp = (lhs as i8).cmp(&(rhs as i8));
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    a.len().cmp(&b.len())
+    a.cmp(b)
 }
 
 /// 10^exp as i128.  Returns i128::MAX for exponents that would overflow.
@@ -2286,8 +2280,8 @@ mod tests {
     }
 
     #[test]
-    fn test_datum_partial_ord_bytes_matches_java_signed_byte_order() {
-        assert!(Datum::Bytes(vec![0xFF]) < Datum::Bytes(vec![0x00]));
+    fn test_datum_partial_ord_bytes_matches_java_unsigned_byte_order() {
+        assert!(Datum::Bytes(vec![0x00]) < Datum::Bytes(vec![0xFF]));
     }
 
     #[test]
