@@ -526,7 +526,7 @@ fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{IntType, VarCharType};
+    use crate::spec::{BinaryType, IntType, VarCharType};
 
     struct MockStats {
         row_count: i64,
@@ -673,6 +673,34 @@ mod tests {
             &dt,
             PredicateOperator::Eq,
             &[Datum::Int(500)],
+            &stats,
+        ));
+    }
+
+    #[test]
+    fn binary_range_pruning_uses_unsigned_byte_order() {
+        let dt = DataType::Binary(BinaryType::new(1).unwrap());
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(0),
+            min: Some(Datum::Bytes(vec![0x80])),
+            max: Some(Datum::Bytes(vec![0xFF])),
+        };
+
+        assert!(data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Gt,
+            &[Datum::Bytes(vec![0x00])],
+            &stats,
+        ));
+        assert!(!data_leaf_may_match(
+            0,
+            &dt,
+            &dt,
+            PredicateOperator::Lt,
+            &[Datum::Bytes(vec![0x00])],
             &stats,
         ));
     }

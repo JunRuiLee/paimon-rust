@@ -684,7 +684,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
-                max_merge_file_streams: Some(256),
+                max_merge_input_streams: Some(256),
                 // Diff primes the before and after streams in sequence. Keeping
                 // a row-group permit across yielded batches can otherwise let
                 // the first side block the second side indefinitely.
@@ -824,7 +824,7 @@ impl<'a> PaimonTableRead<'a> {
                     .collect(),
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: false,
-                max_merge_file_streams: None,
+                max_merge_input_streams: None,
                 parquet_read_budget: Some(self.parquet_read_budget()?),
             },
         );
