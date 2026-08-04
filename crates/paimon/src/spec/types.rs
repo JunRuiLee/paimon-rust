@@ -1105,8 +1105,9 @@ impl FromStr for LocalZonedTimestampType {
                 .trim()
                 .parse::<u32>()
                 .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
-                        .to_string(),
+                    message:
+                        "Invalid LocalZonedTimestamp precision. Unable to parse precision as a u32."
+                            .to_string(),
                 })?;
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
@@ -1242,7 +1243,8 @@ impl FromStr for TimeType {
                 .trim()
                 .parse::<u32>()
                 .map_err(|_| Error::DataTypeInvalid {
-                    message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
+                    message: "Invalid TIME precision. Unable to parse precision as a u32."
+                        .to_string(),
                 })?;
 
         let nullable = !s[close_bracket..].contains("NOT NULL");
