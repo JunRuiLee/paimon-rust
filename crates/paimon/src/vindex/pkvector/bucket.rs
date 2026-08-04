@@ -20,7 +20,6 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::ann::PkVectorAnnSearcher;
@@ -28,7 +27,10 @@ use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
 use crate::deletion_vector::DeletionVector;
-use crate::spec::PrimaryKeyIndexSourceMeta;
+use crate::spec::PrimaryKeyIndexSourceMeta as PkVectorSourceMeta;
+use crate::vindex::executor::{
+    acquire_process_global_search_permit, drain_indexed_jobs, execute_global_index,
+};
 
 /// Search one uncovered data file for its per-query exact Top-K. Returns one
 /// bounded, BEST_FIRST list per query (outer index aligns to the `queries` slice
@@ -43,9 +45,16 @@ pub(crate) type ExactFileSearchFuture<'a> =
 /// segment ordinals back to physical `(data file, position)` and drives live-row
 /// masking; the remaining fields address the segment's index file for the ANN
 /// scorer that reads it.
+///
+/// `Clone` so one segment's search inputs can be moved into a dedicated global-index
+/// executor leaf (the ANN CPU search runs off the async worker). Cloning copies only
+/// the segment's addressing metadata (path, size, `index_meta`, source meta). Each
+/// leaf opens its own segment source lazily and drops it after scoring; vindex
+/// sources stay range-backed instead of holding the full index bytes.
+#[derive(Clone)]
 pub(crate) struct BucketAnnSegment {
-    pub source_meta: PrimaryKeyIndexSourceMeta,
-    /// Resolved index-file path (globally unique; the scorer's preload key).
+    pub source_meta: PkVectorSourceMeta,
+    /// Resolved index-file path (globally unique; the key the loader reads by).
     pub path: String,
     pub file_size: u64,
     pub index_meta: Vec<u8>,
@@ -55,7 +64,7 @@ pub(crate) struct BucketAnnSegment {
 impl BucketAnnSegment {
     /// Build a segment with dummy index-file fields for tests that exercise only
     /// `source_meta`-driven logic.
-    pub(crate) fn for_test(source_meta: PrimaryKeyIndexSourceMeta) -> Self {
+    pub(crate) fn for_test(source_meta: PkVectorSourceMeta) -> Self {
         Self {
             source_meta,
             path: "seg".to_string(),
@@ -205,33 +214,114 @@ pub(crate) fn covered_source_files(
     covered
 }
 
-/// Acquire one slot from the shared global-index search concurrency budget, if a
-/// budget is set. The returned guard holds the slot until it is dropped, so the
-/// caller must keep it alive for the duration of the leaf exact-file I/O it gates.
+/// Concurrency budget for one search's global-index leaf work. Mirrors Java's
+/// two-level shape: a shared process pool with an available-CPU floor, plus a
+/// per-query limit (`per_query`) that keeps a single query from occupying more
+/// than its configured `thread_num` slots.
 ///
-/// A `None` budget means the leaf runs ungated (no cap) — the function does not
-/// require any particular `concurrency` value; the orchestrator simply passes
-/// `None` on the strictly sequential `concurrency <= 1` path (which needs no
-/// gating). A `Some` budget is a single [`Semaphore`] shared across every bucket
-/// and every exact file of one search, so total in-flight exact-file I/O is capped
-/// at N regardless of how many buckets and files fan out — mirroring Java's single
-/// shared `GlobalIndexReadThreadPool`. Only leaf exact-file work acquires a permit;
-/// bucket orchestration never holds one, so it cannot starve leaf work (the async
-/// analogue of Java's "start from the caller" note in
-/// `PrimaryKeyVectorRead.searchBuckets`).
-async fn acquire_search_permit(
-    budget: &Option<Arc<Semaphore>>,
-) -> crate::Result<Option<OwnedSemaphorePermit>> {
-    match budget {
-        Some(semaphore) => {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-                crate::Error::UnexpectedError {
-                    message: "global-index search concurrency budget was closed".to_string(),
-                    source: Some(Box::new(e)),
-                }
-            })?;
-            Ok(Some(permit))
+/// - `production(n)` — the real read path: per-query semaphore of `n` permits AND
+///   the shared process pool. Used even when `n <= 1`; concurrent queries may
+///   share the CPU-sized process pool, matching Java's cached executor plus its
+///   per-caller `SemaphoredDelegatingExecutor`.
+/// - `per_query_only(sem)` / `shared_for_test(sem)` — tests only: an explicit
+///   per-query semaphore with NO process-global gating, so a shared static cannot
+///   pollute a cap assertion.
+///
+/// A `None` budget (passed only by low-level tests that opt out of gating) runs the
+/// leaf ungated; production never passes `None`.
+#[derive(Clone)]
+pub(crate) struct SearchBudget {
+    /// Per-query permit source: caps ONE query's in-flight leaves at `thread_num`.
+    per_query: Option<Arc<Semaphore>>,
+    /// When set, also draw from the process-global semaphore. Its effective size
+    /// is at least the available CPU count and grows with larger requested values,
+    /// matching Java's shared cached executor. `None` skips global gating (tests).
+    process_global_capacity: Option<usize>,
+}
+
+impl SearchBudget {
+    /// The production budget: per-query cap of `concurrency` plus the shared
+    /// process pool. Applied even when `concurrency <= 1`.
+    pub(crate) fn production(concurrency: usize) -> Self {
+        Self {
+            per_query: Some(Arc::new(Semaphore::new(concurrency.max(1)))),
+            process_global_capacity: Some(concurrency.max(1)),
         }
+    }
+
+    /// A per-query-only budget for tests that assert a single query's cap in
+    /// isolation. No process-global gating, so a static initialized by another test
+    /// cannot change the observed peak.
+    #[cfg(test)]
+    pub(crate) fn per_query_only(permits: usize) -> Self {
+        Self {
+            per_query: Some(Arc::new(Semaphore::new(permits))),
+            process_global_capacity: None,
+        }
+    }
+
+    /// A budget backed by an explicit, caller-provided semaphore, with NO
+    /// process-global gating. Two concurrent searches given the SAME `Arc<Semaphore>`
+    /// share one cap deterministically — the "deliberately shared" test seam that
+    /// exercises cross-query capping (what the process-global static does in
+    /// production) without touching the shared static (so tests stay isolated).
+    #[cfg(test)]
+    pub(crate) fn shared_for_test(semaphore: Arc<Semaphore>) -> Self {
+        Self {
+            per_query: Some(semaphore),
+            process_global_capacity: None,
+        }
+    }
+
+    /// Acquire one slot: per-query permit FIRST, then the process-global permit.
+    /// This ordering prevents a job from holding a scarce global permit while it
+    /// merely waits for its own query-local permit. Both guards are returned and
+    /// must be kept alive for the duration of the leaf work (an ANN segment's
+    /// blocking CPU search or an exact file's async I/O).
+    async fn acquire(&self) -> crate::Result<SearchPermit> {
+        let per_query = match &self.per_query {
+            Some(sem) => Some(acquire_owned(sem.clone()).await?),
+            None => None,
+        };
+        let process_global = match self.process_global_capacity {
+            Some(cap) => Some(acquire_process_global_search_permit(cap).await?),
+            None => None,
+        };
+        Ok(SearchPermit {
+            _per_query: per_query,
+            _process_global: process_global,
+        })
+    }
+}
+
+/// Guard holding the acquired permits (per-query and/or process-global) until it is
+/// dropped. Held for the whole leaf, including inside the dedicated executor task
+/// (whose work continues if the awaiting future is dropped), so the budget stays
+/// accurate.
+struct SearchPermit {
+    _per_query: Option<OwnedSemaphorePermit>,
+    _process_global: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+async fn acquire_owned(sem: Arc<Semaphore>) -> crate::Result<OwnedSemaphorePermit> {
+    sem.acquire_owned()
+        .await
+        .map_err(|e| crate::Error::UnexpectedError {
+            message: "global-index search concurrency budget was closed".to_string(),
+            source: Some(Box::new(e)),
+        })
+}
+
+/// Acquire one slot from a search's concurrency budget, if one is set. The returned
+/// guard holds the slot(s) until dropped, so the caller must keep it alive for the
+/// duration of the leaf work it gates. A `None` budget (passed only by low-level
+/// tests) runs the leaf ungated; production always supplies a `SearchBudget`,
+/// including on the `concurrency <= 1` sequential path.
+async fn acquire_search_permit(
+    budget: &Option<SearchBudget>,
+) -> crate::Result<Option<SearchPermit>> {
+    match budget {
+        Some(budget) => Ok(Some(budget.acquire().await?)),
         None => Ok(None),
     }
 }
@@ -243,6 +333,18 @@ async fn acquire_search_permit(
 pub(crate) struct BucketSearchResult {
     pub(crate) indexed: Vec<PkVectorSearchResult>,
     pub(crate) exact: Vec<PkVectorSearchResult>,
+}
+
+/// One completed leaf of the merged per-bucket search: either an ANN segment's
+/// per-query hit lists (fold into the INDEXED heaps) or an uncovered exact file's
+/// per-query hit lists (fold into the EXACT heaps). ANN and exact leaves run in one
+/// combined concurrency window under the shared budget (mirroring Java's single
+/// `allOf` over ANN + exact futures) rather than ANN-fully-then-exact; the tag says
+/// which heap set each result feeds. Both carry one list per query (the single-query
+/// path uses a 1-element outer vec).
+enum BucketLeaf {
+    Indexed(Vec<Vec<PkVectorSearchResult>>),
+    Exact(Vec<Vec<PkVectorSearchResult>>),
 }
 
 /// ANN + exact data-file fallback search for one snapshot bucket. Mirrors Java
@@ -260,7 +362,7 @@ pub(crate) struct BucketSearchResult {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn bucket_search(
-    ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+    ann_searcher: Option<Arc<dyn PkVectorAnnSearcher>>,
     ann_segments: &[BucketAnnSegment],
     active_files: &[BucketActiveFile],
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
@@ -281,7 +383,7 @@ pub(crate) async fn bucket_search(
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     concurrency: usize,
-    search_budget: Option<Arc<Semaphore>>,
+    search_budget: Option<SearchBudget>,
 ) -> crate::Result<BucketSearchResult> {
     if indexed_limit == 0 {
         return Err(data_invalid("vector search limit must be positive"));
@@ -353,9 +455,20 @@ pub(crate) async fn bucket_search(
     // skips them, so the lazy exact-reader factory is never invoked for those files.
     let covered = covered_source_files(ann_segments, active_files);
 
-    // The ANN searcher is synchronous CPU work (no `.await`), so iterating segments
-    // sequentially is intentional: fanning it out would need `spawn_blocking`. Only
-    // the exact-fallback file reads below (which are async I/O) are parallelized.
+    // ANN segment search. Each segment's scorer is synchronous CPU work (the
+    // faiss-like vindex search, which may itself use Rayon), so running it inline
+    // would monopolize the async worker and serialize every segment across the
+    // whole read. Instead each segment is a dedicated-executor leaf gated by the
+    // shared `search_budget`, mirroring Java's single `GlobalIndexReadThreadPool`
+    // where every ANN segment is a pool task. `concurrency <= 1` still goes through
+    // the dedicated executor (so a long CPU search never blocks the runtime) but strictly
+    // one at a time.
+    //
+    // Structural validation of ALL segments happens before any leaf launches, so a
+    // malformed later segment fails loud without half the segments having already
+    // scored. Row-count validation runs BEFORE resolving the searcher so a
+    // corruption diagnostic is not masked by an "ANN search is not configured"
+    // error when both are wrong.
     for segment in ann_segments {
         // An active ANN source with a mismatched row count is corruption (the
         // ordinal-to-position mapping would be wrong). An inactive source (no
@@ -372,34 +485,54 @@ pub(crate) async fn bucket_search(
                 }
             }
         }
-        let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
-        for result in searcher.search(
-            segment,
-            query,
-            metric,
-            indexed_limit,
-            &active_source_files,
-            deletion_vectors,
-            search_options,
-            residual_ranges,
-        )? {
-            add_candidate(&mut indexed_heap, result, indexed_limit);
-        }
     }
+    let searcher = if ann_segments.is_empty() {
+        None
+    } else {
+        Some(
+            ann_searcher
+                .as_ref()
+                .ok_or_else(|| data_invalid("ANN search is not configured"))?
+                .clone(),
+        )
+    };
 
+    // Merged leaf stream: ANN segment searches and uncovered exact-file searches run
+    // in ONE combined concurrency window under the shared budget — mirroring Java's
+    // single `allOf` over the ANN and exact futures — instead of ANN-fully-then-exact.
+    // Leaves are ordered ANN-first (segment order), then exact (active-file order), so
+    // `drain_indexed_jobs` (which awaits ALL leaves and returns the lowest-ordinal
+    // error) yields a deterministic error: first ANN error by segment order, else
+    // first exact error by active-file order. At `concurrency <= 1` the ANN-first
+    // order reproduces sequential ANN-then-exact execution. Each leaf is tagged so its
+    // results fold into the correct heap; heaps are order-independent, so completion
+    // order does not affect the final Top-K.
+    //
+    // Owned exact-query slice (one element for the single-query path) so exact leaves
+    // borrow no locals across the await.
+    let queries: [&[f32]; 1] = [query];
+
+    // ANN leaves: shared owned inputs, one dedicated-executor scorer per segment.
+    let ann_shared = searcher.as_ref().map(|searcher| {
+        (
+            searcher.clone(),
+            residual_ranges.map(|r| Arc::new(r.clone())),
+            Arc::new(active_source_files.clone()),
+            Arc::new(deletion_vectors.clone()),
+            Arc::new(search_options.clone()),
+            Arc::<[f32]>::from(query.to_vec()),
+        )
+    });
+
+    // Eligible uncovered exact files (active-file order) with their exclusion
+    // predicate; a file with no residual-allowed rows is skipped without reading.
+    #[allow(clippy::type_complexity)]
+    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
     if !skip_exact_fallback {
-        // Collect the eligible uncovered files (active-file order preserved) with
-        // their per-position exclusion predicate. A file with no residual-allowed
-        // rows is skipped without reading.
-        #[allow(clippy::type_complexity)]
-        let mut tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
         for file in active_files {
             if covered.contains(&file.file_name) {
                 continue;
             }
-            // Residual allow-list: when present, only rows whose physical position
-            // passes the predicate may produce candidates. A file with no entry (or
-            // an empty entry) has no allowed rows, so it is skipped without reading.
             let residual_allowed: Option<&roaring::RoaringTreemap> = match residual_ranges {
                 Some(ranges) => match ranges.get(&file.file_name) {
                     Some(allowed) if !allowed.is_empty() => Some(allowed),
@@ -408,46 +541,79 @@ pub(crate) async fn bucket_search(
                 None => None,
             };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+            exact_tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
         }
+    }
 
-        // Search each uncovered file for its exact Top-K. The caller passes a
-        // single-query slice and each search returns one per-query list. The
-        // per-file results feed the bounded heap, which is order-independent, so
-        // the merge does not depend on which file finished first. `concurrency == 1`
-        // takes a plain sequential loop so the file visit order is strictly
-        // deterministic; larger values fan the file searches out with
-        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
-        // so total in-flight exact-file I/O across all buckets is capped at N.
-        let queries: [&[f32]; 1] = [query];
-        let per_file: Vec<Vec<PkVectorSearchResult>> = if concurrency <= 1 {
-            let mut out = Vec::with_capacity(tasks.len());
-            for (file, is_excluded) in &tasks {
-                let per_query =
-                    exact_file_search(file, &queries, metric, exact_limit, is_excluded.as_ref())
-                        .await?;
-                out.push(single_query_result(per_query)?);
-            }
-            out
-        } else {
-            stream::iter(tasks.iter().map(|(file, is_excluded)| {
-                let queries = &queries;
-                let budget = search_budget.clone();
-                async move {
-                    let _permit = acquire_search_permit(&budget).await?;
-                    let per_query =
-                        exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
-                            .await?;
-                    single_query_result(per_query)
+    // Build the ANN-first-then-exact leaf futures.
+    let mut leaves: Vec<BoxFuture<'_, crate::Result<BucketLeaf>>> = Vec::new();
+    if let Some((
+        searcher,
+        residual_arc,
+        active_source_files,
+        deletion_vectors,
+        search_options,
+        query_owned,
+    )) = ann_shared
+    {
+        for segment in ann_segments {
+            let searcher = searcher.clone();
+            let segment = segment.clone();
+            let active_source_files = active_source_files.clone();
+            let deletion_vectors = deletion_vectors.clone();
+            let search_options = search_options.clone();
+            let residual_arc = residual_arc.clone();
+            let query_owned = query_owned.clone();
+            let budget = search_budget.clone();
+            leaves.push(Box::pin(async move {
+                // One permit spans BOTH the async load and the dedicated executor
+                // score. `load_segment_source` must not acquire a second permit or
+                // it would deadlock at capacity 1.
+                let permit = acquire_search_permit(&budget).await?;
+                let segment_source = searcher.load_segment_source(&segment).await?;
+                let hits = execute_global_index("ANN segment search task failed", move || {
+                    let _permit = permit;
+                    searcher.search_source(
+                        &segment,
+                        segment_source,
+                        &query_owned,
+                        metric,
+                        indexed_limit,
+                        &active_source_files,
+                        &deletion_vectors,
+                        &search_options,
+                        residual_arc.as_deref(),
+                    )
+                })
+                .await?;
+                Ok(BucketLeaf::Indexed(vec![hits]))
+            }));
+        }
+    }
+    for (file, is_excluded) in &exact_tasks {
+        let queries = &queries;
+        let budget = search_budget.clone();
+        leaves.push(Box::pin(async move {
+            let _permit = acquire_search_permit(&budget).await?;
+            let per_query =
+                exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref()).await?;
+            Ok(BucketLeaf::Exact(vec![single_query_result(per_query)?]))
+        }));
+    }
+
+    // Drive all leaves in one window; drain-all + lowest-ordinal error.
+    let outs = drain_indexed_jobs(leaves.into_iter(), concurrency).await?;
+    for leaf in outs {
+        match leaf {
+            BucketLeaf::Indexed(per_query) => {
+                for result in per_query.into_iter().next().unwrap_or_default() {
+                    add_candidate(&mut indexed_heap, result, indexed_limit);
                 }
-            }))
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<_>>()
-            .await?
-        };
-        for results in per_file {
-            for result in results {
-                add_candidate(&mut exact_heap, result, exact_limit);
+            }
+            BucketLeaf::Exact(per_query) => {
+                for result in per_query.into_iter().next().unwrap_or_default() {
+                    add_candidate(&mut exact_heap, result, exact_limit);
+                }
             }
         }
     }
@@ -473,7 +639,7 @@ pub(crate) async fn bucket_search(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn bucket_search_batch(
-    ann_searcher: Option<&dyn PkVectorAnnSearcher>,
+    ann_searcher: Option<Arc<dyn PkVectorAnnSearcher>>,
     ann_segments: &[BucketAnnSegment],
     active_files: &[BucketActiveFile],
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
@@ -494,7 +660,7 @@ pub(crate) async fn bucket_search_batch(
     skip_exact_fallback: bool,
     residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
     concurrency: usize,
-    search_budget: Option<Arc<Semaphore>>,
+    search_budget: Option<SearchBudget>,
 ) -> crate::Result<Vec<BucketSearchResult>> {
     if queries.is_empty() {
         return Err(data_invalid("vector search requires at least one query"));
@@ -504,7 +670,7 @@ pub(crate) async fn bucket_search_batch(
     // principle differ).
     if queries.len() == 1 {
         let single = bucket_search(
-            ann_searcher,
+            ann_searcher.clone(),
             ann_segments,
             active_files,
             deletion_vectors,
@@ -597,9 +763,15 @@ pub(crate) async fn bucket_search_batch(
         files_by_name.keys().map(|name| name.to_string()).collect();
     let covered = covered_source_files(ann_segments, active_files);
 
-    // The ANN searcher is synchronous CPU work (no `.await`), so iterating segments
-    // sequentially is intentional: fanning it out would need `spawn_blocking`. Only
-    // the exact-fallback file reads below (which are async I/O) are parallelized.
+    // ANN segment search (multi-query). As in the single-query path, each segment's
+    // synchronous scorer runs as a dedicated-executor leaf gated by the shared
+    // `search_budget` so segments across all buckets share one budget and never
+    // monopolize an async worker. All structural validation runs before any leaf
+    // launches. One shared reader per segment searches every query; the per-query
+    // hits fan into their own bounded heaps after the parallel stage.
+    // Row-count validation runs BEFORE resolving the searcher so a corruption
+    // diagnostic is not masked by an "ANN search is not configured" error when both
+    // are wrong (mirrors the single-query path and Java's up-front checks).
     for segment in ann_segments {
         for source in segment.source_meta.source_files() {
             if let Some(active) = files_by_name.get(source.file_name()) {
@@ -611,39 +783,40 @@ pub(crate) async fn bucket_search_batch(
                 }
             }
         }
-        let searcher = ann_searcher.ok_or_else(|| data_invalid("ANN search is not configured"))?;
-        // One shared reader per segment searches all queries; fan the per-query
-        // hits into their own bounded heaps.
-        let per_query = searcher.search_batch(
-            segment,
-            queries,
-            metric,
-            indexed_limit,
-            &active_source_files,
-            deletion_vectors,
-            search_options,
-            residual_ranges,
-        )?;
-        if per_query.len() != queries.len() {
-            return Err(data_invalid(format!(
-                "ANN batch search returned {} result lists for {} queries",
-                per_query.len(),
-                queries.len()
-            )));
-        }
-        for (results, heap) in per_query.into_iter().zip(indexed_heaps.iter_mut()) {
-            for result in results {
-                add_candidate(heap, result, indexed_limit);
-            }
-        }
     }
+    let searcher = if ann_segments.is_empty() {
+        None
+    } else {
+        Some(
+            ann_searcher
+                .as_ref()
+                .ok_or_else(|| data_invalid("ANN search is not configured"))?
+                .clone(),
+        )
+    };
 
+    // Merged leaf stream (see the single-query `bucket_search` for the rationale):
+    // ANN segment searches and uncovered exact-file searches run in ONE combined
+    // concurrency window under the shared budget, ANN-first then exact, drained
+    // together with a deterministic lowest-ordinal error. Each leaf carries one hit
+    // list per query; the fan-in zips per-query results into the per-query heaps.
+    let query_count = queries.len();
+    let ann_shared = searcher.as_ref().map(|searcher| {
+        let queries_owned: Arc<Vec<Vec<f32>>> =
+            Arc::new(queries.iter().map(|q| q.to_vec()).collect());
+        (
+            searcher.clone(),
+            residual_ranges.map(|r| Arc::new(r.clone())),
+            Arc::new(active_source_files.clone()),
+            Arc::new(deletion_vectors.clone()),
+            Arc::new(search_options.clone()),
+            queries_owned,
+        )
+    });
+
+    #[allow(clippy::type_complexity)]
+    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
     if !skip_exact_fallback {
-        // Eligible uncovered files (active-file order preserved) with their
-        // per-position exclusion predicate; a file with no residual-allowed rows is
-        // skipped without reading.
-        #[allow(clippy::type_complexity)]
-        let mut tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
         for file in active_files {
             if covered.contains(&file.file_name) {
                 continue;
@@ -656,44 +829,89 @@ pub(crate) async fn bucket_search_batch(
                 None => None,
             };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+            exact_tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
         }
+    }
 
-        // One shared stream per file scores every query into its own per-query
-        // list. The per-file lists feed per-query bounded heaps (order-independent),
-        // so the fan-in does not depend on which file finished first: collect every
-        // file's per-query result, then merge. `concurrency == 1` uses a strictly
-        // sequential loop; larger values fan the file searches out with
-        // `buffer_unordered`, each acquiring one slot of the shared `search_budget`
-        // so total in-flight exact-file I/O across all buckets is capped at N.
-        let per_file: Vec<Vec<Vec<PkVectorSearchResult>>> = if concurrency <= 1 {
-            let mut out = Vec::with_capacity(tasks.len());
-            for (file, is_excluded) in &tasks {
-                let per_query =
-                    exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
-                        .await?;
-                out.push(validate_per_query_len(per_query, queries.len())?);
-            }
-            out
-        } else {
-            stream::iter(tasks.iter().map(|(file, is_excluded)| {
-                let budget = search_budget.clone();
-                async move {
-                    let _permit = acquire_search_permit(&budget).await?;
-                    let per_query =
-                        exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref())
-                            .await?;
-                    validate_per_query_len(per_query, queries.len())
+    let mut leaves: Vec<BoxFuture<'_, crate::Result<BucketLeaf>>> = Vec::new();
+    if let Some((
+        searcher,
+        residual_arc,
+        active_source_files,
+        deletion_vectors,
+        search_options,
+        queries_owned,
+    )) = ann_shared
+    {
+        for segment in ann_segments {
+            let searcher = searcher.clone();
+            let segment = segment.clone();
+            let active_source_files = active_source_files.clone();
+            let deletion_vectors = deletion_vectors.clone();
+            let search_options = search_options.clone();
+            let residual_arc = residual_arc.clone();
+            let queries_owned = queries_owned.clone();
+            let budget = search_budget.clone();
+            leaves.push(Box::pin(async move {
+                let permit = acquire_search_permit(&budget).await?;
+                let segment_source = searcher.load_segment_source(&segment).await?;
+                let per_query = execute_global_index("ANN segment search task failed", move || {
+                    let _permit = permit;
+                    let query_refs: Vec<&[f32]> =
+                        queries_owned.iter().map(|q| q.as_slice()).collect();
+                    let per_query = searcher.search_batch_source(
+                        &segment,
+                        segment_source,
+                        &query_refs,
+                        metric,
+                        indexed_limit,
+                        &active_source_files,
+                        &deletion_vectors,
+                        &search_options,
+                        residual_arc.as_deref(),
+                    )?;
+                    if per_query.len() != query_count {
+                        return Err(data_invalid(format!(
+                            "ANN batch search returned {} result lists for {} queries",
+                            per_query.len(),
+                            query_count
+                        )));
+                    }
+                    Ok(per_query)
+                })
+                .await?;
+                Ok(BucketLeaf::Indexed(per_query))
+            }));
+        }
+    }
+    for (file, is_excluded) in &exact_tasks {
+        let budget = search_budget.clone();
+        leaves.push(Box::pin(async move {
+            let _permit = acquire_search_permit(&budget).await?;
+            let per_query =
+                exact_file_search(file, queries, metric, exact_limit, is_excluded.as_ref()).await?;
+            Ok(BucketLeaf::Exact(validate_per_query_len(
+                per_query,
+                query_count,
+            )?))
+        }));
+    }
+
+    let outs = drain_indexed_jobs(leaves.into_iter(), concurrency).await?;
+    for leaf in outs {
+        match leaf {
+            BucketLeaf::Indexed(per_query) => {
+                for (results, heap) in per_query.into_iter().zip(indexed_heaps.iter_mut()) {
+                    for result in results {
+                        add_candidate(heap, result, indexed_limit);
+                    }
                 }
-            }))
-            .buffer_unordered(concurrency)
-            .try_collect::<Vec<_>>()
-            .await?
-        };
-        for per_query in per_file {
-            for (results, heap) in per_query.into_iter().zip(exact_heaps.iter_mut()) {
-                for result in results {
-                    add_candidate(heap, result, exact_limit);
+            }
+            BucketLeaf::Exact(per_query) => {
+                for (results, heap) in per_query.into_iter().zip(exact_heaps.iter_mut()) {
+                    for result in results {
+                        add_candidate(heap, result, exact_limit);
+                    }
                 }
             }
         }
@@ -714,18 +932,27 @@ pub(crate) async fn bucket_search_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::PrimaryKeyIndexSourceFile;
+    use crate::spec::PrimaryKeyIndexSourceFile as PkVectorSourceFile;
     use crate::vindex::pkvector::ann::PkVectorAnnSearcher;
     use crate::vindex::pkvector::exact::exact_search;
     use crate::vindex::pkvector::reader::test_support::ArrayReader;
+    use bytes::Bytes;
     use roaring::RoaringBitmap;
 
-    fn meta(files: &[(&str, i64)]) -> PrimaryKeyIndexSourceMeta {
-        PrimaryKeyIndexSourceMeta::new(
+    /// Trivial ANN-segment loader for fakes: returns empty owned bytes (the fakes
+    /// model behavior above physical index decoding and ignore `segment_bytes`).
+    fn empty_ann_loader(
+        _segment: &BucketAnnSegment,
+    ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+        Box::pin(async { Ok(Bytes::new()) })
+    }
+
+    fn meta(files: &[(&str, i64)]) -> PkVectorSourceMeta {
+        PkVectorSourceMeta::new(
             1,
             files
                 .iter()
-                .map(|(n, r)| PrimaryKeyIndexSourceFile::new((*n).into(), *r).unwrap())
+                .map(|(n, r)| PkVectorSourceFile::new((*n).into(), *r).unwrap())
                 .collect(),
         )
         .unwrap()
@@ -826,13 +1053,21 @@ mod tests {
     }
 
     /// Fake ANN searcher returning preset results and recording calls.
+    #[derive(Clone)]
     struct FakeAnnSearcher {
         result: Vec<PkVectorSearchResult>,
     }
     impl PkVectorAnnSearcher for FakeAnnSearcher {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
         fn search_batch(
             &self,
             _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
             queries: &[&[f32]],
             _metric: VectorSearchMetric,
             _limit: usize,
@@ -882,7 +1117,7 @@ mod tests {
         let opts = HashMap::new();
 
         let out = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &active_files,
             &dvs,
@@ -958,7 +1193,7 @@ mod tests {
         };
         let factory = unreachable_search();
         let out = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &[active("data-1", 3)],
             &HashMap::new(),
@@ -1015,7 +1250,7 @@ mod tests {
         };
         let factory = unreachable_search();
         let out = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &[active("data-1", 2)],
             &HashMap::new(),
@@ -1080,7 +1315,7 @@ mod tests {
             },
         );
         let out = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
@@ -1229,7 +1464,7 @@ mod tests {
         let segment = BucketAnnSegment::for_test(meta(&[("data-1", 2)]));
         let factory = unreachable_search();
         let err = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &[active("data-1", 3)],
             &HashMap::new(),
@@ -1279,7 +1514,7 @@ mod tests {
             },
         );
         let out = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &[active("data-1", 2)],
             &HashMap::new(),
@@ -1384,7 +1619,7 @@ mod tests {
         let ann = FakeAnnSearcher { result: vec![] };
         let factory = unreachable_search();
         let err = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[seg1, seg2],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
@@ -1424,7 +1659,7 @@ mod tests {
         let ann = FakeAnnSearcher { result: vec![] };
         let factory = unreachable_search();
         let err = bucket_search(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[seg1, seg2],
             &[active("data-1", 2), active("data-2", 2)],
             &HashMap::new(),
@@ -1827,7 +2062,7 @@ mod tests {
                 Some(vec![8.0, 0.0]),
             ]);
             bucket_search(
-                Some(&ann),
+                Some(Arc::new(ann.clone())),
                 &[BucketAnnSegment::for_test(meta(&[("ann.mosaic", 3)]))],
                 &active_files,
                 &dvs,
@@ -1853,7 +2088,7 @@ mod tests {
         ]);
         let query_ref: &[f32] = &query;
         let batch = bucket_search_batch(
-            Some(&ann),
+            Some(Arc::new(ann.clone())),
             &[segment],
             &active_files,
             &dvs,
@@ -2178,6 +2413,717 @@ mod tests {
         assert_eq!(
             parallel, serial,
             "parallel ranking must equal serial ranking"
+        );
+    }
+
+    /// ANN searcher probe that records the peak number of `search_batch` calls
+    /// running simultaneously. Each call does a real blocking sleep so overlapping
+    /// calls are observable; `peak` is the max concurrent count seen. Mirrors the
+    /// blocking CPU nature of the real vindex scorer.
+    struct PeakProbeAnn {
+        inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl PkVectorAnnSearcher for PeakProbeAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
+        fn search_batch(
+            &self,
+            _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
+            queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let current = self.inflight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(current, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.inflight.fetch_sub(1, SeqCst);
+            Ok(queries.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    /// `n` ANN segments in one bucket, each with a distinct payload path and a
+    /// distinct (covered) source file. Returns the searcher + its peak counter so a
+    /// test can assert how many segment searches ran at once.
+    fn n_segment_bucket(
+        n: usize,
+    ) -> (
+        Vec<BucketAnnSegment>,
+        Vec<BucketActiveFile>,
+        std::sync::Arc<PeakProbeAnn>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let mut segments = Vec::with_capacity(n);
+        let mut actives = Vec::with_capacity(n);
+        for i in 0..n {
+            let src = format!("cov-{i}");
+            segments.push(BucketAnnSegment {
+                source_meta: meta(&[(src.as_str(), 2)]),
+                path: format!("seg-{i}"),
+                file_size: 0,
+                index_meta: Vec::new(),
+            });
+            actives.push(active(&src, 2));
+        }
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = std::sync::Arc::new(PeakProbeAnn {
+            inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: peak.clone(),
+        });
+        (segments, actives, probe, peak)
+    }
+
+    #[tokio::test]
+    async fn ann_segments_search_in_parallel_at_concurrency_above_one() {
+        // Two ANN segments in one bucket. At concurrency 4 their (blocking) searches
+        // must overlap: peak simultaneous ANN calls must exceed 1. A serial ANN loop
+        // yields peak == 1 and fails this assertion.
+        let (segments, active_files, probe, peak) = n_segment_bucket(2);
+        let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
+        let factory = unreachable_search();
+        let out = bucket_search(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap();
+        assert!(out.indexed.is_empty());
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "ANN segment searches must run in parallel at concurrency 4; observed peak {}",
+            peak.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn ann_segments_search_serially_at_concurrency_one() {
+        // At concurrency 1 the ANN segments must NOT overlap: peak simultaneous
+        // calls is exactly 1 (still off the async worker on the dedicated executor,
+        // but one at a time). Guards the one-worker budget without regressing inline.
+        let (segments, active_files, probe, peak) = n_segment_bucket(3);
+        let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
+        let factory = unreachable_search();
+        bucket_search(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrency == 1 must search ANN segments one at a time"
+        );
+    }
+
+    #[tokio::test]
+    async fn ann_segment_search_respects_shared_budget() {
+        // Four ANN segments, shared budget of 2: at most 2 segment searches may run
+        // at once even though concurrency (fan-out width) is 4. Mirrors Java's single
+        // shared pool sized to threadNum capping total in-flight leaf work.
+        let (segments, active_files, probe, peak) = n_segment_bucket(4);
+        let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
+        let factory = unreachable_search();
+        bucket_search(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(2)),
+        )
+        .await
+        .unwrap();
+        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed <= 2,
+            "shared budget must cap concurrent ANN segment searches at 2; observed {observed}"
+        );
+        assert!(
+            observed >= 2,
+            "test must actually exercise ANN overlap; observed {observed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_ann_source_fails_before_any_segment_search_runs() {
+        // A segment whose ANN source row count disagrees with the active file is
+        // corruption. The mismatch must be detected during up-front structural
+        // validation, BEFORE any segment search leaf is spawned — so the probe's
+        // peak stays 0. Guards Codex's "validate all segments before launching any
+        // job" requirement.
+        let (mut segments, _active_files, probe, peak) = n_segment_bucket(2);
+        // Break segment 1's source row count vs the active file (active says 2).
+        segments[1] = BucketAnnSegment {
+            source_meta: meta(&[("cov-1", 99)]),
+            path: "seg-1".to_string(),
+            file_size: 0,
+            index_meta: Vec::new(),
+        };
+        let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
+        let factory = unreachable_search();
+        let err = bucket_search(
+            Some(searcher),
+            &segments,
+            &[active("cov-0", 2), active("cov-1", 2)],
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "expected a row-count mismatch error, got: {err}"
+        );
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no ANN segment search may run when structural validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_ann_segments_search_in_parallel_at_concurrency_above_one() {
+        // Multi-query (2 queries) routes through the `bucket_search_batch` multi-query
+        // path (not the batch-of-one short-circuit), so this covers the batch ANN
+        // parallel loop specifically. Two segments at concurrency 4 must overlap.
+        let (segments, active_files, probe, peak) = n_segment_bucket(2);
+        let searcher: Arc<dyn PkVectorAnnSearcher> = probe;
+        let factory = unreachable_search();
+        let q0: &[f32] = &[0.0, 0.0];
+        let q1: &[f32] = &[1.0, 1.0];
+        let out = bucket_search_batch(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[q0, q1],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 2, "one result list per query");
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "batch ANN segment searches must run in parallel at concurrency 4; observed peak {}",
+            peak.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// ANN searcher whose `search_batch` panics, exercising the dedicated
+    /// executor's panic-to-error mapping.
+    struct PanicAnn;
+    impl PkVectorAnnSearcher for PanicAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
+        fn search_batch(
+            &self,
+            _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
+            _queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            panic!("scorer panic to exercise JoinError mapping");
+        }
+    }
+
+    #[tokio::test]
+    async fn ann_segment_scorer_panic_maps_to_unexpected_error() {
+        // A panic inside the dedicated-executor ANN leaf must surface as a mapped
+        // `UnexpectedError` ("ANN segment search task failed"), not abort the runtime
+        // or hang. Uses the parallel path (concurrency 4).
+        let (segments, active_files, _probe, _peak) = n_segment_bucket(1);
+        let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(PanicAnn);
+        let factory = unreachable_search();
+        let err = bucket_search(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ANN segment search task failed"),
+            "panic must map to UnexpectedError, got: {err}"
+        );
+    }
+
+    /// ANN searcher that counts every completed `search_batch` call and returns an
+    /// `Err` (naming the segment's source file) for any segment whose source file is
+    /// in `fail_files`. A configurable pre-return spin makes the erroring segment
+    /// finish FIRST while the others are still running, so a short-circuiting drain
+    /// would surface a non-deterministic / non-lowest-index error and skip jobs.
+    struct DrainProbeAnn {
+        completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_files: HashSet<String>,
+        slow_files: HashSet<String>,
+    }
+    impl PkVectorAnnSearcher for DrainProbeAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
+        fn search_batch(
+            &self,
+            segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
+            queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            let file = segment.source_meta.source_files()[0]
+                .file_name()
+                .to_string();
+            // Non-failing "slow" segments block so they are still in flight when the
+            // fast-failing segment returns — proving the drain awaits them anyway.
+            if self.slow_files.contains(&file) {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_files.contains(&file) {
+                return Err(data_invalid(format!("boom in {file}")));
+            }
+            Ok(queries.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_awaits_all_jobs_and_returns_lowest_index_error() {
+        // 4 segments (seg-0..seg-3 over cov-0..cov-3). Segments 1 and 2 error; 0 and 3
+        // are slow. The drain must (a) run ALL 4 scorers to completion even though
+        // seg-1 errors early, and (b) surface seg-1's error (lowest index), not seg-2's
+        // and not whichever finished first.
+        let (segments, active_files, _probe, _peak) = n_segment_bucket(4);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(DrainProbeAnn {
+            completed: completed.clone(),
+            fail_files: HashSet::from(["cov-1".to_string(), "cov-2".to_string()]),
+            slow_files: HashSet::from(["cov-0".to_string(), "cov-3".to_string()]),
+        });
+        let factory = unreachable_search();
+        let err = bucket_search(
+            Some(searcher),
+            &segments,
+            &active_files,
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap_err();
+        // (b) lowest-index erroring segment wins, deterministically.
+        assert!(
+            err.to_string().contains("boom in cov-1"),
+            "must surface the lowest-index error (cov-1), got: {err}"
+        );
+        // (a) every segment's scorer ran to completion — no job was skipped by an
+        // early short-circuit.
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "all 4 ANN segment jobs must run to completion before the error returns"
+        );
+    }
+
+    /// ANN searcher that records peak concurrent calls into an EXTERNALLY shared
+    /// counter, so two independent `bucket_search` invocations can observe their
+    /// combined in-flight count. Each call blocks briefly so overlap is observable.
+    struct SharedPeakAnn {
+        inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl PkVectorAnnSearcher for SharedPeakAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
+        fn search_batch(
+            &self,
+            _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
+            queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let current = self.inflight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(current, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            self.inflight.fetch_sub(1, SeqCst);
+            Ok(queries.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_budget_caps_ann_across_concurrent_searches() {
+        // Two independent searches (simulating two concurrent PK-vector queries), each
+        // with 2 ANN segments and concurrency 4, but sharing ONE budget semaphore of
+        // 2 permits (the deliberately-shared test seam). Their COMBINED in-flight ANN
+        // count must never exceed 2 — proving the shared budget caps ANN work ACROSS
+        // queries, which is what the process-global static does in production. Before
+        // the fix, each query built its own Semaphore, so the combined peak could
+        // reach 2 (segments) x 2 (queries) = 4.
+        let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared = Arc::new(Semaphore::new(2));
+
+        let run = |budget: SearchBudget| {
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            async move {
+                let (segments, active_files, _p, _pk) = n_segment_bucket(2);
+                let searcher: Arc<dyn PkVectorAnnSearcher> =
+                    Arc::new(SharedPeakAnn { inflight, peak });
+                let factory = unreachable_search();
+                bucket_search(
+                    Some(searcher),
+                    &segments,
+                    &active_files,
+                    &HashMap::new(),
+                    &factory,
+                    &[0.0, 0.0],
+                    VectorSearchMetric::L2,
+                    8,
+                    8,
+                    &HashMap::new(),
+                    false,
+                    None,
+                    4,
+                    Some(budget),
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        // Both searches share the SAME budget semaphore.
+        let a = run(SearchBudget::shared_for_test(shared.clone()));
+        let b = run(SearchBudget::shared_for_test(shared.clone()));
+        tokio::join!(a, b);
+
+        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed <= 2,
+            "shared budget must cap ANN across concurrent searches at 2; observed {observed}"
+        );
+        assert!(
+            observed >= 2,
+            "test must actually exercise cross-search overlap; observed {observed}"
+        );
+    }
+
+    /// ANN searcher whose score performs a BOUNDED two-way handshake with a matching
+    /// exact-file probe: it signals arrival, then waits (with a timeout) for the
+    /// exact leaf to signal too. If both arrive within the timeout they were in
+    /// flight simultaneously — deterministic overlap detection with no sleeps and no
+    /// unbounded wait. If they cannot overlap (e.g. a two-phase scheduler), the leaf
+    /// that runs first times out waiting for the peer and RETURNS (setting no overlap
+    /// flag), so the test fails cleanly on the assertion rather than hanging forever.
+    struct HandshakeAnn {
+        /// ANN sends here on arrival; the exact side receives it.
+        ann_here: std::sync::mpsc::SyncSender<()>,
+        /// ANN receives the exact side's arrival here.
+        exact_here: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+        overlapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl PkVectorAnnSearcher for HandshakeAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            empty_ann_loader(segment)
+        }
+        fn search_batch(
+            &self,
+            _segment: &BucketAnnSegment,
+            _segment_bytes: Bytes,
+            queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            // Runs on the blocking pool. Announce arrival, then wait (bounded) for the
+            // exact leaf. Both arriving proves overlap; a timeout means no overlap.
+            let _ = self.ann_here.try_send(());
+            let got = self
+                .exact_here
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+            if got.is_ok() {
+                self.overlapped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(queries.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ann_and_exact_leaves_overlap_within_one_bucket() {
+        // One bucket with one ANN segment (covers "cov") AND one uncovered exact file
+        // ("ex"). The ANN leaf (blocking) and the exact leaf (via spawn_blocking) do a
+        // bounded two-way handshake: each signals arrival and waits (5s cap) for the
+        // other. Both arriving proves they overlap. A two-phase scheduler (all ANN,
+        // then all exact) cannot get both in flight, so the leaf that runs first
+        // times out waiting for the peer (which never co-runs) and `overlapped` stays
+        // false — the assertion fails cleanly within ~5s, not by hanging.
+        let (ann_tx, ann_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (exact_tx, exact_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let ann_rx = std::sync::Arc::new(std::sync::Mutex::new(ann_rx));
+        let exact_rx = std::sync::Arc::new(std::sync::Mutex::new(exact_rx));
+        let overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let segment = BucketAnnSegment::for_test(meta(&[("cov", 2)]));
+        let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(HandshakeAnn {
+            ann_here: ann_tx,
+            exact_here: exact_rx.clone(),
+            overlapped: overlapped.clone(),
+        });
+
+        // Exact-file probe: rendezvous on the same channels via `spawn_blocking`
+        // (so it can block-wait alongside the ANN blocking leaf), also bounded.
+        let ex_ann_rx = ann_rx.clone();
+        let factory = as_search(
+            move |file: &BucketActiveFile,
+                  queries: &[&[f32]],
+                  _: VectorSearchMetric,
+                  _: usize,
+                  _: &(dyn Fn(i64) -> bool + Sync)|
+                  -> ExactFileSearchFuture<'_> {
+                let ex_ann_rx = ex_ann_rx.clone();
+                let exact_tx = exact_tx.clone();
+                let n = queries.len();
+                let _ = file;
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let _ = exact_tx.try_send(());
+                        let _ = ex_ann_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(5));
+                    })
+                    .await
+                    .expect("exact handshake task");
+                    Ok(vec![Vec::new(); n])
+                })
+            },
+        );
+
+        let out = bucket_search(
+            Some(searcher),
+            &[segment],
+            &[active("cov", 2), active("ex", 2)],
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false, // NOT fast: exact fallback runs
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap();
+        assert!(out.indexed.is_empty() && out.exact.is_empty());
+        assert!(
+            overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "ANN and exact leaves of one bucket must overlap (both completed the handshake)"
+        );
+    }
+
+    /// ANN searcher whose `load_segment` records which segment paths it loaded and
+    /// hands the loaded bytes through to `search_batch`, which asserts it received
+    /// exactly those bytes. Proves the leaf loads per-segment via the seam (not from
+    /// an up-front map) and that the loaded bytes reach the scorer.
+    struct RecordingLoaderAnn {
+        loaded: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl PkVectorAnnSearcher for RecordingLoaderAnn {
+        fn load_segment(
+            &self,
+            segment: &BucketAnnSegment,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Bytes>> {
+            let loaded = self.loaded.clone();
+            let path = segment.path.clone();
+            // Bytes are the segment path itself, so `search_batch` can verify the
+            // exact bytes from THIS segment's load arrived (not some other segment's).
+            Box::pin(async move {
+                loaded.lock().unwrap().push(path.clone());
+                Ok(Bytes::from(path.into_bytes()))
+            })
+        }
+        fn search_batch(
+            &self,
+            segment: &BucketAnnSegment,
+            segment_bytes: Bytes,
+            queries: &[&[f32]],
+            _metric: VectorSearchMetric,
+            _limit: usize,
+            _active_source_files: &HashSet<String>,
+            _dvs: &HashMap<String, Arc<DeletionVector>>,
+            _opts: &HashMap<String, String>,
+            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
+            // The bytes handed to the scorer must be exactly this segment's loaded
+            // bytes (its path), proving load→score threads the right payload.
+            assert_eq!(segment_bytes.as_ref(), segment.path.as_bytes());
+            Ok(queries.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn ann_segment_bytes_are_loaded_lazily_per_segment_via_the_seam() {
+        // Two ANN segments; the searcher's `load_segment` is invoked once per segment
+        // during the bucket search (lazily, in each leaf), and the bytes it returns
+        // are the ones passed to that segment's scorer. This is the fused
+        // load→score path (no up-front all-segments preload map).
+        let loaded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(RecordingLoaderAnn {
+            loaded: loaded.clone(),
+        });
+        let seg_a = BucketAnnSegment {
+            source_meta: meta(&[("cov-a", 2)]),
+            path: "seg-a".to_string(),
+            file_size: 0,
+            index_meta: Vec::new(),
+        };
+        let seg_b = BucketAnnSegment {
+            source_meta: meta(&[("cov-b", 2)]),
+            path: "seg-b".to_string(),
+            file_size: 0,
+            index_meta: Vec::new(),
+        };
+        let factory = unreachable_search();
+        bucket_search(
+            Some(searcher),
+            &[seg_a, seg_b],
+            &[active("cov-a", 2), active("cov-b", 2)],
+            &HashMap::new(),
+            &factory,
+            &[0.0, 0.0],
+            VectorSearchMetric::L2,
+            8,
+            8,
+            &HashMap::new(),
+            false,
+            None,
+            4,
+            Some(SearchBudget::per_query_only(4)),
+        )
+        .await
+        .unwrap();
+        let mut got = loaded.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["seg-a".to_string(), "seg-b".to_string()],
+            "each ANN segment must be loaded exactly once via load_segment during the search"
         );
     }
 }

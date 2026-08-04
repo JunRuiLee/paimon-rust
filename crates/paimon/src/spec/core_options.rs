@@ -123,6 +123,15 @@ const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-nu
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
+const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
+    let tokio_max = (usize::MAX >> 3) as u64;
+    let i32_max = i32::MAX as u64;
+    if tokio_max < i32_max {
+        tokio_max as i64
+    } else {
+        i32_max as i64
+    }
+};
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
@@ -660,6 +669,15 @@ impl<'a> CoreOptions<'a> {
                 message: format!(
                     "Option '{}' must be greater than 0, got: {}",
                     GLOBAL_INDEX_THREAD_NUM_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        if value > MAX_GLOBAL_INDEX_THREAD_NUM {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must not exceed {}, got: {}",
+                    GLOBAL_INDEX_THREAD_NUM_OPTION, MAX_GLOBAL_INDEX_THREAD_NUM, value
                 ),
                 source: None,
             });
@@ -1576,6 +1594,28 @@ mod tests {
             assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(GLOBAL_INDEX_THREAD_NUM_OPTION)));
         }
+    }
+
+    #[test]
+    fn test_global_index_thread_num_rejects_values_above_max() {
+        assert!(MAX_GLOBAL_INDEX_THREAD_NUM as usize <= tokio::sync::Semaphore::MAX_PERMITS);
+
+        let too_big = (MAX_GLOBAL_INDEX_THREAD_NUM + 1).to_string();
+        let options = HashMap::from([(GLOBAL_INDEX_THREAD_NUM_OPTION.to_string(), too_big)]);
+        let err = CoreOptions::new(&options)
+            .global_index_thread_num()
+            .expect_err("thread-num above maximum should fail");
+        assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                if message.contains("must not exceed")));
+
+        let at_max = HashMap::from([(
+            GLOBAL_INDEX_THREAD_NUM_OPTION.to_string(),
+            MAX_GLOBAL_INDEX_THREAD_NUM.to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&at_max).global_index_thread_num().unwrap(),
+            MAX_GLOBAL_INDEX_THREAD_NUM as usize
+        );
     }
 
     #[test]

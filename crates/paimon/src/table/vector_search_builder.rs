@@ -51,9 +51,10 @@ use crate::table::{
 };
 use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::executor::{
-    drain_indexed_jobs, ensure_global_index_executor_capacity, execute_global_index,
+    acquire_process_global_search_permit, drain_indexed_jobs,
+    ensure_global_index_executor_capacity, execute_global_index_with_guard,
 };
-use crate::vindex::pkvector::ann::VindexAnnSearcher;
+use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, VindexAnnSearcher};
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
@@ -99,20 +100,21 @@ impl VectorIndexBackend {
     }
 }
 
-async fn execute_vindex_searches<S: SeekRead + 'static>(
+async fn execute_vindex_searches<S: SeekRead + 'static, G: Send + 'static>(
     io_meta: GlobalIndexIOMeta,
     options: HashMap<String, String>,
     vector_searches: Vec<VectorSearch>,
     source: S,
     file_name: String,
     shard_concurrency: usize,
+    guard: G,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     let panic_context = if vector_searches.len() > 1 {
         "vindex global-index batch search task failed"
     } else {
         "vindex global-index search task failed"
     };
-    execute_global_index(panic_context, move || {
+    execute_global_index_with_guard(panic_context, guard, move || {
         let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options)
             .with_batch_shard_concurrency(shard_concurrency);
         reader
@@ -123,6 +125,13 @@ async fn execute_vindex_searches<S: SeekRead + 'static>(
             })
     })
     .await
+}
+
+fn current_tokio_runtime_handle() -> crate::Result<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().map_err(|error| crate::Error::UnexpectedError {
+        message: "Vector index range reader requires a Tokio runtime".to_string(),
+        source: Some(Box::new(error)),
+    })
 }
 
 pub struct VectorSearchBuilder<'a> {
@@ -667,7 +676,7 @@ pub(crate) fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Re
 }
 
 /// Batch PK-vector search core shared by the single and batch builders: plan ONE
-/// per-bucket split set, segment preload, ANN scorer, exact-fallback search
+/// per-bucket split set, lazy segment loader, ANN scorer, exact-fallback search
 /// closure, and residual allow-list (all query-independent), then run
 /// `search_candidates_batch` ONCE so N queries share the opened readers. Per
 /// query, the approximate candidates are exact-reranked (when a refine factor is
@@ -732,7 +741,7 @@ async fn plan_and_search_pk_candidates_batch(
     // `primary_key_vector_distance_metric` returns a validated name; re-parse into
     // the enum for the numeric semantics.
     let metric = VectorSearchMetric::parse(&core.primary_key_vector_distance_metric(pk_col)?)?;
-    // Fan-out limit for the per-bucket and per-exact-file search (Java
+    // Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
     // `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
     let concurrency = core.global_index_thread_num()?;
     let index_type = core.primary_key_vector_index_type(pk_col)?;
@@ -824,14 +833,9 @@ async fn plan_and_search_pk_candidates_batch(
         Vec::new(),
     );
 
-    // Real ANN scorer: preload each segment's bytes (keyed by resolved, globally
-    // unique path) and drive the vindex reader from memory. The reader is opened
-    // once per segment and every query in the batch is searched against it,
-    // mirroring the shared-reader batch search.
-    let segment_bytes = preload_segment_bytes(table.file_io(), &plan.splits).await?;
-    // Fail loud on a config/segment metric mismatch before scoring, mirroring Java
-    // `PkVectorAnnSegmentSearcher.search`.
-    verify_pk_vector_segment_metrics(&plan.splits, &segment_bytes, metric, backend)?;
+    // Real ANN scorer + loader. Each segment source is opened lazily inside its
+    // bucket leaf and dropped after scoring. Lumina keeps its buffered-byte path;
+    // vindex remains range-backed and reads only metadata and probed lists.
     let options = {
         let mut o = table.schema().options().clone();
         o.extend(query_options.clone());
@@ -839,34 +843,97 @@ async fn plan_and_search_pk_candidates_batch(
     };
     let search_options = options.clone();
     let field_name = pk_col.to_string();
-    let scorer: crate::vindex::pkvector::ann::BatchScorer = Box::new(
-        move |segment: &BucketAnnSegment, searches: &[VectorSearch]| {
-            let data = segment_bytes
-                .get(&segment.path)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: "missing preloaded ANN bytes for segment".to_string(),
-                    source: None,
-                })?
-                .clone();
+
+    let loader_io = table.file_io().clone();
+    let loader_range_read_permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let loader: crate::vindex::pkvector::ann::SourceSegmentLoader = Box::new(
+        move |segment: &BucketAnnSegment| {
+            let io = loader_io.clone();
+            let range_read_permits = Arc::clone(&loader_range_read_permits);
+            let path = segment.path.clone();
+            let file_size = segment.file_size;
+            Box::pin(async move {
+                let input = io.new_input(&path)?;
+                match backend {
+                    VectorIndexBackend::Lumina => input
+                        .read()
+                        .await
+                        .map(AnnSegmentSource::Buffered)
+                        .map_err(|error| crate::Error::DataInvalid {
+                            message: format!("failed to read ANN index file '{path}': {error}"),
+                            source: None,
+                        }),
+                    VectorIndexBackend::Vindex => {
+                        let file_reader =
+                            input
+                                .reader()
+                                .await
+                                .map_err(|error| crate::Error::DataInvalid {
+                                    message: format!(
+                                        "failed to open ANN index file '{path}' for range reads: {error}"
+                                    ),
+                                    source: None,
+                                })?;
+                        Ok(AnnSegmentSource::Vindex(
+                            VindexFileReader::new_with_permits(
+                                Arc::new(file_reader),
+                                current_tokio_runtime_handle()?,
+                                range_read_permits,
+                                file_size,
+                                path,
+                            ),
+                        ))
+                    }
+                }
+            })
+        },
+    );
+
+    let scorer: crate::vindex::pkvector::ann::SourceBatchScorer = Box::new(
+        move |segment: &BucketAnnSegment, source: AnnSegmentSource, searches: &[VectorSearch]| {
             let io_meta = GlobalIndexIOMeta::new(
                 segment.path.clone(),
                 segment.file_size,
                 segment.index_meta.clone(),
             );
-            match backend {
-                VectorIndexBackend::Lumina => {
+            match (backend, source) {
+                (VectorIndexBackend::Lumina, AnnSegmentSource::Buffered(data)) => {
+                    let lumina_metric =
+                        LuminaIndexMeta::deserialize(&segment.index_meta)?.metric()?;
+                    verify_segment_metric(metric, VectorSearchMetric::from_lumina(lumina_metric))?;
                     let mut reader = LuminaVectorGlobalIndexReader::new(io_meta, options.clone());
                     reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
                 }
-                VectorIndexBackend::Vindex => {
+                (VectorIndexBackend::Vindex, AnnSegmentSource::Vindex(source)) => {
                     let mut reader = VindexVectorGlobalIndexReader::new(io_meta, options.clone())
                         .with_batch_shard_concurrency(concurrency);
-                    reader.visit_batch_vector_search(searches, |_| Ok(Cursor::new(data)))
+                    reader.load_validated(
+                        |_| Ok(source),
+                        |metadata| {
+                            verify_segment_metric(
+                                metric,
+                                VectorSearchMetric::from_vindex(metadata.metric),
+                            )
+                        },
+                    )?;
+                    reader.search_batch(searches)
+                }
+                (VectorIndexBackend::Lumina, AnnSegmentSource::Vindex(_))
+                | (VectorIndexBackend::Vindex, AnnSegmentSource::Buffered(_)) => {
+                    Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "ANN segment '{}' was loaded with the wrong backend source",
+                            segment.path
+                        ),
+                        source: None,
+                    })
                 }
             }
         },
     );
-    let ann_searcher = VindexAnnSearcher::new(field_name, scorer);
+    let ann_searcher: Arc<dyn PkVectorAnnSearcher> = Arc::new(VindexAnnSearcher::new_with_source(
+        field_name, scorer, loader,
+    ));
 
     // Residual (post-recall) filtering: for each candidate file, re-read its
     // physical rows and keep the positions whose rows satisfy the filter. The
@@ -983,7 +1050,7 @@ async fn plan_and_search_pk_candidates_batch(
             metric,
             limit,
             indexed_limit,
-            Some(&ann_searcher),
+            Some(ann_searcher),
             &factory,
             &search_options,
             skip_exact_fallback,
@@ -1253,7 +1320,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
         // Vec.
         let read_type = self.resolve_materialize_read_type()?;
 
-        // One shared plan / segment preload / residual across all N queries; the
+        // One shared plan / lazy segment loader / residual across all N queries; the
         // per-query candidate lists come back in strict input order. Any query
         // error (or a shared-plan error) propagates here, so no partial Vec is
         // returned.
@@ -1484,6 +1551,7 @@ async fn evaluate_batch_vector_search(
                 options.extend(search_options.clone());
                 let input = evaluation.file_io.new_input(&path);
                 async move {
+                    let permit = acquire_process_global_search_permit(concurrency).await?;
                     let input = input?;
                     let query_count = vector_searches.len();
                     let io_meta =
@@ -1501,8 +1569,9 @@ async fn evaluate_batch_vector_search(
                                     source: None,
                                 }
                             })?;
-                            execute_global_index(
+                            execute_global_index_with_guard(
                                 "Lumina global-index batch search task failed",
+                                permit,
                                 move || {
                                     let mut reader =
                                         LuminaVectorGlobalIndexReader::new(io_meta, options);
@@ -1539,6 +1608,7 @@ async fn evaluate_batch_vector_search(
                                         source,
                                         file_name,
                                         concurrency,
+                                        permit,
                                     )
                                     .await?
                                 }
@@ -1559,6 +1629,7 @@ async fn evaluate_batch_vector_search(
                                         Cursor::new(data),
                                         file_name,
                                         concurrency,
+                                        permit,
                                     )
                                     .await?
                                 }
@@ -1752,87 +1823,19 @@ async fn residual_positions_by_file(
     Ok(out)
 }
 
-/// Preload every ANN segment's bytes into a map keyed by the resolved (globally
-/// unique) segment path. The scorer closure reads from this map so the vindex
-/// reader is driven from memory without per-search IO.
-async fn preload_segment_bytes(
-    file_io: &FileIO,
-    splits: &[PkVectorSearchSplit],
-) -> crate::Result<HashMap<String, Vec<u8>>> {
-    let mut out = HashMap::new();
-    for split in splits {
-        for segment in &split.ann_segments {
-            if out.contains_key(&segment.path) {
-                continue;
-            }
-            let input = file_io.new_input(&segment.path)?;
-            let bytes = input.read().await.map_err(|e| crate::Error::DataInvalid {
-                message: format!("failed to read ANN index file '{}': {e}", segment.path),
-                source: None,
-            })?;
-            out.insert(segment.path.clone(), bytes.to_vec());
-        }
-    }
-    Ok(out)
-}
-
-/// Fail loud when an ANN segment was trained with a metric other than the
-/// configured one, mirroring the search-time `checkArgument` in Java
-/// `PkVectorAnnSegmentSearcher.search`. Opens each distinct segment's preloaded
-/// bytes once and compares its trained metric against `configured`.
-fn verify_pk_vector_segment_metrics(
-    splits: &[PkVectorSearchSplit],
-    segment_bytes: &HashMap<String, Vec<u8>>,
+fn verify_segment_metric(
     configured: VectorSearchMetric,
-    backend: VectorIndexBackend,
+    segment_metric: VectorSearchMetric,
 ) -> crate::Result<()> {
-    let mut checked: HashSet<&str> = HashSet::new();
-    for split in splits {
-        for segment in &split.ann_segments {
-            if !checked.insert(segment.path.as_str()) {
-                continue;
-            }
-            let segment_metric = match backend {
-                VectorIndexBackend::Lumina => {
-                    // Lumina records its metric in the serialized index metadata
-                    // (`index_meta`), not in the segment file bytes.
-                    let lumina_metric =
-                        LuminaIndexMeta::deserialize(&segment.index_meta)?.metric()?;
-                    VectorSearchMetric::from_lumina(lumina_metric)
-                }
-                VectorIndexBackend::Vindex => {
-                    let bytes = segment_bytes.get(&segment.path).ok_or_else(|| {
-                        crate::Error::DataInvalid {
-                            message: format!(
-                                "missing preloaded ANN bytes for segment '{}'",
-                                segment.path
-                            ),
-                            source: None,
-                        }
-                    })?;
-                    let reader = VIndexReader::open(Cursor::new(bytes.clone())).map_err(|e| {
-                        crate::Error::DataInvalid {
-                            message: format!(
-                                "failed to open ANN index file '{}' for metric check: {e}",
-                                segment.path
-                            ),
-                            source: Some(Box::new(e)),
-                        }
-                    })?;
-                    VectorSearchMetric::from_vindex(reader.metadata().metric)
-                }
-            };
-            if segment_metric != configured {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "ANN segment metric {} does not match configured metric {}",
-                        segment_metric.as_str(),
-                        configured.as_str()
-                    ),
-                    source: None,
-                });
-            }
-        }
+    if segment_metric != configured {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "ANN segment metric {} does not match configured metric {}",
+                segment_metric.as_str(),
+                configured.as_str()
+            ),
+            source: None,
+        });
     }
     Ok(())
 }
@@ -4430,20 +4433,6 @@ mod tests {
         bytes
     }
 
-    /// A `PkVectorSearchSplit` carrying a single ANN segment addressed by `path`.
-    fn pk_split_with_segment(path: &str) -> PkVectorSearchSplit {
-        let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
-        let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
-            1,
-            vec![crate::spec::PrimaryKeyIndexSourceFile::new("file-a".to_string(), 3).unwrap()],
-        )
-        .unwrap();
-        let mut segment = BucketAnnSegment::for_test(source_meta);
-        segment.path = path.to_string();
-        split.ann_segments = vec![segment];
-        split
-    }
-
     fn pk_split_with_lumina_segment(path: &str, metric: &str) -> PkVectorSearchSplit {
         let mut split = pk_search_split(0, vec![pk_data_file("file-a", 3, Some(0))]);
         let source_meta = crate::spec::PrimaryKeyIndexSourceMeta::new(
@@ -4465,31 +4454,35 @@ mod tests {
     }
 
     #[test]
-    fn verify_pk_vector_segment_metrics_accepts_matching_lumina_metric() {
+    fn verify_segment_metric_accepts_matching_lumina_metric() {
         // Lumina segment metadata says cosine; configured cosine => Ok. No segment
         // file bytes are needed on the Lumina path.
-        let splits = vec![pk_split_with_lumina_segment("seg-lumina", "cosine")];
-        let segment_bytes = HashMap::new();
-        verify_pk_vector_segment_metrics(
-            &splits,
-            &segment_bytes,
+        let split = pk_split_with_lumina_segment("seg-lumina", "cosine");
+        let segment = &split.ann_segments[0];
+        let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
+            .unwrap()
+            .metric()
+            .unwrap();
+        verify_segment_metric(
             VectorSearchMetric::Cosine,
-            VectorIndexBackend::Lumina,
+            VectorSearchMetric::from_lumina(lumina_metric),
         )
         .expect("matching lumina metric must pass");
     }
 
     #[test]
-    fn verify_pk_vector_segment_metrics_rejects_mismatched_lumina_metric() {
+    fn verify_segment_metric_rejects_mismatched_lumina_metric() {
         // Lumina segment metadata says l2; configured inner_product => fail loud,
         // naming both metrics.
-        let splits = vec![pk_split_with_lumina_segment("seg-lumina", "l2")];
-        let segment_bytes = HashMap::new();
-        let err = verify_pk_vector_segment_metrics(
-            &splits,
-            &segment_bytes,
+        let split = pk_split_with_lumina_segment("seg-lumina", "l2");
+        let segment = &split.ann_segments[0];
+        let lumina_metric = LuminaIndexMeta::deserialize(&segment.index_meta)
+            .unwrap()
+            .metric()
+            .unwrap();
+        let err = verify_segment_metric(
             VectorSearchMetric::InnerProduct,
-            VectorIndexBackend::Lumina,
+            VectorSearchMetric::from_lumina(lumina_metric),
         )
         .expect_err("mismatched lumina metric must fail loud");
         assert!(
@@ -4520,31 +4513,25 @@ mod tests {
     }
 
     #[test]
-    fn verify_pk_vector_segment_metrics_accepts_matching_metric() {
+    fn verify_segment_metric_accepts_matching_vindex_metric() {
         // Real IVF segment trained with L2; configured metric L2 => Ok.
-        let bytes = build_vindex_segment_bytes("l2");
-        let splits = vec![pk_split_with_segment("seg-l2")];
-        let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
-        verify_pk_vector_segment_metrics(
-            &splits,
-            &segment_bytes,
+        let bytes = bytes::Bytes::from(build_vindex_segment_bytes("l2"));
+        let reader = VIndexReader::open(Cursor::new(bytes)).unwrap();
+        verify_segment_metric(
             VectorSearchMetric::L2,
-            VectorIndexBackend::Vindex,
+            VectorSearchMetric::from_vindex(reader.metadata().metric),
         )
         .expect("matching metric must pass");
     }
 
     #[test]
-    fn verify_pk_vector_segment_metrics_rejects_mismatched_metric() {
+    fn verify_segment_metric_rejects_mismatched_vindex_metric() {
         // Real IVF segment trained with L2; configured metric Cosine => fail loud.
-        let bytes = build_vindex_segment_bytes("l2");
-        let splits = vec![pk_split_with_segment("seg-l2")];
-        let segment_bytes = HashMap::from([("seg-l2".to_string(), bytes)]);
-        let err = verify_pk_vector_segment_metrics(
-            &splits,
-            &segment_bytes,
+        let bytes = bytes::Bytes::from(build_vindex_segment_bytes("l2"));
+        let reader = VIndexReader::open(Cursor::new(bytes)).unwrap();
+        let err = verify_segment_metric(
             VectorSearchMetric::Cosine,
-            VectorIndexBackend::Vindex,
+            VectorSearchMetric::from_vindex(reader.metadata().metric),
         )
         .expect_err("mismatched metric must fail loud");
         assert!(
