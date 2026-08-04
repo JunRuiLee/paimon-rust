@@ -40,7 +40,8 @@ pub(crate) use partial_update::PartialUpdateConfig;
 
 mod aggregation;
 pub(crate) use aggregation::{
-    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig,
+    remove_field_scoped_options, rename_field_scoped_options,
+    validate_no_aggregation_on_sequence_field, AggregationConfig,
 };
 
 mod data_type_casts;

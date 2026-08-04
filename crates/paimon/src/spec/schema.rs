@@ -22,8 +22,9 @@ use crate::spec::core_options::{
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
-    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, BlobType,
-    ColumnMove, ColumnMoveType, PartialUpdateConfig,
+    remove_field_scoped_options, rename_field_scoped_options,
+    validate_no_aggregation_on_sequence_field, AggregationConfig, BlobType, ColumnMove,
+    ColumnMoveType, PartialUpdateConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -1136,11 +1137,13 @@ impl Schema {
         Self::validate_blob_fields(fields, partition_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
         PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
+        validate_no_aggregation_on_sequence_field(options)?;
         AggregationConfig::new(options).validate_create_mode(primary_keys, fields)?;
         Self::validate_first_row_changelog_producer(options)?;
         Self::validate_rowkind_field(options, primary_keys, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
+        Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
         Self::validate_read_batch_size(options)?;
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
@@ -1645,6 +1648,73 @@ impl Schema {
             .read_batch_size()
             .map(|_| ())
             .map_err(Self::options_error_to_config_invalid)
+    }
+
+    /// Validate the `sequence.field` option against the schema, mirroring four
+    /// of the five checks in Java `SchemaValidation#validateSequenceField`:
+    /// * every listed field must exist in the table schema — otherwise the
+    ///   write path silently falls back to the auto-increment sequence
+    ///   (`TableWrite` resolves sequence fields with a lenient lookup) and
+    ///   merge results would ignore the user's ordering intent;
+    /// * a field must not be listed more than once;
+    /// * `merge-engine=first-row` does not support user-defined sequence
+    ///   fields;
+    /// * cross-partition update tables (primary key constraint not including
+    ///   all partition fields) do not support user-defined sequence fields,
+    ///   because partition migration retracts old rows with generated DELETEs
+    ///   whose ordering a user-provided sequence value could break.
+    ///
+    /// The fifth check — Java's `options.fieldAggFunc(field) == null` — is
+    /// [`validate_no_aggregation_on_sequence_field`], which is keyed only on the
+    /// option map so it applies to every merge engine.
+    fn validate_sequence_field(
+        options: &HashMap<String, String>,
+        fields: &[DataField],
+        partition_keys: &[String],
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        let core = CoreOptions::new(options);
+        let sequence_fields = core.sequence_fields();
+        if sequence_fields.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for name in &sequence_fields {
+            if fields.iter().all(|f| f.name() != *name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Sequence field '{name}' can not be found in table schema."),
+                });
+            }
+            if !seen.insert(name) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Sequence field '{name}' is defined repeatedly."),
+                });
+            }
+        }
+
+        let merge_engine = core
+            .merge_engine()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if merge_engine == MergeEngine::FirstRow {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Do not support use sequence field on FIRST_ROW merge engine.".to_string(),
+            });
+        }
+
+        let cross_partition_update = !primary_keys.is_empty()
+            && !partition_keys.is_empty()
+            && partition_keys.iter().any(|pt| !primary_keys.contains(pt));
+        if cross_partition_update {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "You can not use sequence.field in cross partition update case \
+                     (Primary key constraint '{primary_keys:?}' not include all partition fields '{partition_keys:?}')."
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     fn validate_primary_key_vector_index(
@@ -4383,6 +4453,55 @@ mod tests {
     }
 
     #[test]
+    fn test_create_schema_rejects_aggregation_on_sequence_field_without_agg_engine() {
+        // Java `validateSequenceField` checks `fieldAggFunc(field) == null` for
+        // every merge engine, so the default (deduplicate) engine must reject
+        // this too, not just `merge-engine=aggregation`.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("sequence.field", "ts")
+            .option("fields.ts.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("ts")),
+            "aggregation on a sequence field should be rejected on the default \
+             merge engine, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_set_aggregation_on_sequence_field_rejected_without_agg_engine() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("sequence.field", "ts")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.ts.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("ts")),
+            "alter adding aggregation on a sequence field should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_create_schema_rejects_reserved_field_names() {
         // Java `SpecialFields.SYSTEM_FIELD_NAMES` plus the `_KEY_` prefix. A
         // user column with one of these names is excluded from the physical
@@ -4687,6 +4806,151 @@ mod tests {
             updated.fields()[2].data_type(),
             DataType::BigInt(_)
         ));
+    }
+
+    #[test]
+    fn test_create_schema_rejects_unknown_sequence_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("sequence.field", "no_such_col")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("no_such_col") && message.contains("can not be found")),
+            "sequence.field referencing a missing column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_repeated_sequence_field() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("sequence.field", "ts,ts")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("ts") && message.contains("repeatedly")),
+            "repeated sequence.field should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_sequence_field_with_first_row() {
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("merge-engine", "first-row")
+            .option("sequence.field", "ts")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("FIRST_ROW")),
+            "sequence.field with merge-engine=first-row should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_set_unknown_sequence_field_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "sequence.field".to_string(),
+                "no_such_col".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("no_such_col") && message.contains("can not be found")),
+            "alter setting sequence.field to a missing column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_sequence_field_with_cross_partition_update() {
+        // PK (id) does not include the partition field (pt): cross-partition
+        // update case, where user-defined sequence fields are not supported.
+        let err = Schema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["id"])
+            .option("sequence.field", "ts")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("cross partition update")),
+            "sequence.field with cross-partition update should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_accepts_sequence_field_when_pk_covers_partitions() {
+        // PK includes the partition field: not a cross-partition update case.
+        let schema = Schema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["pt", "id"])
+            .option("sequence.field", "ts")
+            .build();
+
+        assert!(
+            schema.is_ok(),
+            "sequence.field with PK covering partition fields should be accepted, got {schema:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_set_sequence_field_with_cross_partition_update_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("pt", DataType::Int(IntType::new()))
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .partition_keys(["pt"])
+                .primary_key(["id"])
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "sequence.field".to_string(),
+                "ts".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("cross partition update")),
+            "alter setting sequence.field on cross-partition update table should be rejected, got {err:?}"
+        );
     }
 
     #[test]

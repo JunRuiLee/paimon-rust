@@ -185,9 +185,6 @@ impl<'a> AggregationConfig<'a> {
         fields: &[DataField],
         primary_keys: &[String],
     ) -> crate::Result<()> {
-        // Same source as the read path: `sequence.field` parsed by CoreOptions.
-        let core_options = CoreOptions::new(self.options);
-        let sequence_fields = core_options.sequence_fields();
         for (key, value) in self.options {
             let Some((col, kind)) = parse_field_scoped_option_key(key) else {
                 continue;
@@ -204,14 +201,6 @@ impl<'a> AggregationConfig<'a> {
                 });
             };
             if matches!(kind, FieldScopedOptionKind::AggregateFunction) {
-                if sequence_fields.contains(&col) {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: format!(
-                            "Should not define aggregation on sequence field: '{col}'."
-                        ),
-                    });
-                }
-
                 if primary_keys.iter().any(|pk| pk == col) {
                     if !is_known_aggregator_name(value) {
                         return Err(crate::Error::ConfigInvalid {
@@ -460,6 +449,31 @@ pub(crate) fn validate_aggregator_for_type(
     }
 }
 
+/// Reject `fields.<col>.aggregate-function` on a column listed in
+/// `sequence.field`, mirroring Java `SchemaValidation#validateSequenceField`,
+/// which checks `options.fieldAggFunc(field) == null` for every sequence field
+/// regardless of the configured merge engine.
+pub(crate) fn validate_no_aggregation_on_sequence_field(
+    options: &HashMap<String, String>,
+) -> crate::Result<()> {
+    let core_options = CoreOptions::new(options);
+    let sequence_fields = core_options.sequence_fields();
+    if sequence_fields.is_empty() {
+        return Ok(());
+    }
+
+    for field in sequence_fields {
+        let key = format!("{FIELDS_PREFIX}{field}{AGG_FUNCTION_SUFFIX}");
+        if options.contains_key(&key) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("Should not define aggregation on sequence field: '{field}'."),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn is_unsupported_aggregation_option(key: &str) -> bool {
     key == IGNORE_DELETE_OPTION
         || key.ends_with(IGNORE_DELETE_SUFFIX)
@@ -664,22 +678,53 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_create_mode_rejects_aggregation_on_sequence_field() {
-        // Java rejects aggregation definitions on sequence fields during
-        // schema validation; the runtime still forces sequence fields to
-        // last_value when reading old or externally-created metadata.
+    fn test_rejects_aggregation_on_sequence_field_for_every_merge_engine() {
+        // Java rejects aggregation definitions on sequence fields inside
+        // `validateSequenceField`, which runs for every merge engine; the
+        // runtime still forces sequence fields to last_value when reading old
+        // or externally-created metadata.
+        for engine in [
+            None,
+            Some("deduplicate"),
+            Some("first-row"),
+            Some("partial-update"),
+            Some("aggregation"),
+        ] {
+            let mut options = HashMap::from([
+                ("sequence.field".to_string(), "amount".to_string()),
+                (
+                    "fields.amount.aggregate-function".to_string(),
+                    "listagg".to_string(),
+                ),
+            ]);
+            if let Some(engine) = engine {
+                options.insert(MERGE_ENGINE_OPTION.to_string(), engine.to_string());
+            }
+
+            let err = validate_no_aggregation_on_sequence_field(&options).unwrap_err();
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains("sequence field") && message.contains("amount")),
+                "merge-engine={engine:?} should reject aggregation on a sequence field, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_accepts_aggregation_on_a_non_sequence_field() {
+        // Guard against over-rejecting: only the sequence field itself is
+        // off limits, other columns may carry an aggregate function.
         let options = aggregation_options(&[
             ("sequence.field", "amount"),
-            ("fields.amount.aggregate-function", "listagg"),
+            ("fields.price.aggregate-function", "sum"),
         ]);
-        let err = AggregationConfig::new(&options)
-            .validate_create_mode(&pk(), &sample_fields())
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("sequence field") && message.contains("amount")),
-            "expected sequence-field aggregation rejection, got {err:?}"
-        );
+        assert!(validate_no_aggregation_on_sequence_field(&options).is_ok());
+    }
+
+    #[test]
+    fn test_accepts_options_without_a_sequence_field() {
+        let options = aggregation_options(&[("fields.amount.aggregate-function", "sum")]);
+        assert!(validate_no_aggregation_on_sequence_field(&options).is_ok());
     }
 
     #[test]
