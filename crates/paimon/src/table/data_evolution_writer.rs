@@ -980,9 +980,7 @@ impl DataEvolutionPartialWriter {
         fields: &[DataField],
         core_options: &CoreOptions<'_>,
     ) -> Result<Vec<PartialWriteSet>> {
-        let vector_file_format = core_options
-            .vector_file_format()
-            .map(|format| format.trim().to_ascii_lowercase());
+        let vector_file_format = core_options.vector_file_format();
         let mut normal_fields = Vec::new();
         let mut normal_columns = Vec::new();
         let mut normal_indices = Vec::new();

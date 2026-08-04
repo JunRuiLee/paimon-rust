@@ -208,7 +208,7 @@ impl TableWrite {
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
-        let vector_file_format = core_options.vector_file_format().map(str::to_string);
+        let vector_file_format = core_options.vector_file_format();
         let changelog_file_prefix = core_options.changelog_file_prefix().to_string();
         let changelog_file_format = core_options.changelog_file_format().to_string();
         let changelog_file_compression = core_options.changelog_file_compression().to_string();

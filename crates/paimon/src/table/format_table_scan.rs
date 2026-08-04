@@ -65,7 +65,7 @@ impl<'a> FormatTableScan<'a> {
 
     async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {
         let core_options = CoreOptions::new(self.table.schema().options());
-        let format_extension = supported_format_table_extension(core_options.file_format())?;
+        let format_extension = supported_format_table_extension(&core_options.file_format())?;
         let schema_id = self.table.schema().id();
         let table_path = core_options
             .path()
