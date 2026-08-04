@@ -67,16 +67,33 @@ pub(crate) struct VindexFileReader {
 }
 
 impl VindexFileReader {
+    #[cfg(test)]
     pub(crate) fn new(
         reader: Arc<dyn FileRead>,
         runtime: tokio::runtime::Handle,
         file_size: u64,
         path: String,
     ) -> Self {
+        Self::new_with_permits(
+            reader,
+            runtime,
+            Arc::new(tokio::sync::Semaphore::new(RANGE_READ_CONCURRENCY)),
+            file_size,
+            path,
+        )
+    }
+
+    pub(crate) fn new_with_permits(
+        reader: Arc<dyn FileRead>,
+        runtime: tokio::runtime::Handle,
+        permits: Arc<tokio::sync::Semaphore>,
+        file_size: u64,
+        path: String,
+    ) -> Self {
         Self {
             reader,
             runtime,
-            permits: Arc::new(tokio::sync::Semaphore::new(RANGE_READ_CONCURRENCY)),
+            permits,
             file_size,
             path,
             scalar_cache: None,
@@ -288,6 +305,7 @@ mod tests {
     use super::*;
     use crate::io::FileIO;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -324,10 +342,27 @@ mod tests {
         runtime_id: Mutex<Option<tokio::runtime::Id>>,
     }
 
+    struct ConcurrencyTrackingRead {
+        data: Bytes,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
     #[async_trait]
     impl FileRead for RuntimeTrackingRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
             *self.runtime_id.lock().unwrap() = Some(tokio::runtime::Handle::current().id());
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[async_trait]
+    impl FileRead for ConcurrencyTrackingRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(self.data.slice(range.start as usize..range.end as usize))
         }
     }
@@ -555,6 +590,47 @@ mod tests {
         assert_eq!(reader.read_capabilities(), SeekReadCapabilities::default());
         let cloned = reader.try_clone_reader().unwrap().unwrap();
         assert_eq!(cloned.read_capabilities(), SeekReadCapabilities::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_permits_bound_reads_across_independent_readers() {
+        let data = Bytes::from(vec![8u8; 1024]);
+        let tracking = Arc::new(ConcurrencyTrackingRead {
+            data: data.clone(),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let make_reader = |path: &str| {
+            let source: Arc<dyn FileRead> = tracking.clone();
+            VindexFileReader::new_with_permits(
+                source,
+                tokio::runtime::Handle::current(),
+                Arc::clone(&permits),
+                data.len() as u64,
+                path.to_string(),
+            )
+        };
+        let mut first_reader = make_reader("first.index");
+        let mut second_reader = make_reader("second.index");
+        assert!(Arc::ptr_eq(&first_reader.permits, &second_reader.permits));
+
+        let first = tokio::task::spawn_blocking(move || {
+            let mut output = [0u8; 128];
+            first_reader
+                .pread(&mut [ReadRequest::new(0, &mut output)])
+                .unwrap();
+        });
+        let second = tokio::task::spawn_blocking(move || {
+            let mut output = [0u8; 128];
+            second_reader
+                .pread(&mut [ReadRequest::new(128, &mut output)])
+                .unwrap();
+        });
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(tracking.max_active.load(Ordering::SeqCst), 1);
     }
 
     #[test]
