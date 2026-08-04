@@ -25,15 +25,15 @@ Add `paimon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-paimon = "0.2.0"
+paimon = "0.3.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
-By default, the `storage-fs` (local filesystem) and `storage-memory` (in-memory) backends are enabled. To use additional storage backends, enable the corresponding feature flags:
+By default, the `storage-fs` (local filesystem), `storage-memory` (in-memory) and `storage-oss` (Alibaba Cloud OSS) backends are enabled. To use additional storage backends, enable the corresponding feature flags:
 
 ```toml
 [dependencies]
-paimon = { version = "0.2.0", features = ["storage-s3"] }
+paimon = { version = "0.3.0", features = ["storage-s3"] }
 ```
 
 Available storage features:
@@ -44,19 +44,12 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
-| `storage-cos`    | Tencent Cloud COS <sup>[1]</sup> |
-| `storage-azdls`  | Azure Data Lake Storage Gen2 <sup>[1]</sup> |
-| `storage-obs`    | Huawei Cloud OBS <sup>[1]</sup> |
-| `storage-gcs`    | Google Cloud Storage <sup>[1]</sup> |
+| `storage-cos`    | Tencent Cloud COS |
+| `storage-azdls`  | Azure Data Lake Storage Gen2 |
+| `storage-obs`    | Huawei Cloud OBS |
+| `storage-gcs`    | Google Cloud Storage |
 | `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
-
-<sup>[1]</sup> Not in the latest release yet; available on the `main` branch. To use it now, depend on the git repository instead of a published version:
-
-```toml
-[dependencies]
-paimon = { git = "https://github.com/apache/paimon-rust", features = ["storage-cos"] }
-```
 
 ## Mosaic File Format
 
