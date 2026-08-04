@@ -67,6 +67,7 @@ pub(crate) struct VindexFileReader {
 }
 
 impl VindexFileReader {
+    #[cfg(test)]
     pub(crate) fn new(
         reader: Arc<dyn FileRead>,
         runtime: tokio::runtime::Handle,
