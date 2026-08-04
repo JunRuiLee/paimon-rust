@@ -94,12 +94,15 @@ impl KeyComparator {
 /// Compare decoded keys field-by-field. NULL sorts first; fields that
 /// `datum_cmp` cannot order (e.g. float NaN) compare as equal, which forces
 /// the files into the same section — conservative but never incorrect.
+/// Binary keys use unsigned lexicographic order, matching the generated Java
+/// key comparator and the on-disk row order.
 fn compare_decoded(a: &DecodedKey, b: &DecodedKey) -> Ordering {
     for (fa, fb) in a.iter().zip(b.iter()) {
         let ord = match (fa, fb) {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
+            (Some(Datum::Bytes(a)), Some(Datum::Bytes(b))) => a.cmp(b),
             (Some(da), Some(db)) => datum_cmp(da, db).unwrap_or(Ordering::Equal),
         };
         if ord != Ordering::Equal {
@@ -129,11 +132,15 @@ fn decode_all(
             comparator.decode(&file.min_key),
             comparator.decode(&file.max_key),
         ) {
-            (Some(min), Some(max)) if !undecodable => keyed.push(KeyedFile {
-                file: file.clone(),
-                min,
-                max,
-            }),
+            (Some(min), Some(max))
+                if !undecodable && compare_decoded(&min, &max) != Ordering::Greater =>
+            {
+                keyed.push(KeyedFile {
+                    file: file.clone(),
+                    min,
+                    max,
+                })
+            }
             _ => undecodable = true,
         }
     }
@@ -194,6 +201,77 @@ pub(crate) fn interval_partition(
         sections.push(current);
     }
     sections
+}
+
+/// Pack one overlapping section into sorted runs. Files within a run have
+/// strictly disjoint key ranges and can therefore be read by concatenation.
+/// The number of runs equals the section's maximum key-range overlap depth.
+/// Undecodable or inconsistent manifest keys safely degrade to one run per
+/// file, preserving the previous merge fan-in and correctness.
+pub(crate) fn pack_sorted_runs(
+    section: Vec<DataFileMeta>,
+    comparator: &KeyComparator,
+) -> Vec<Vec<DataFileMeta>> {
+    if section.len() <= 1 {
+        return if section.is_empty() {
+            Vec::new()
+        } else {
+            vec![section]
+        };
+    }
+
+    let mut keyed = match decode_all(section, comparator) {
+        Ok(keyed) => keyed,
+        Err(files) => return files.into_iter().map(|file| vec![file]).collect(),
+    };
+    keyed.sort_by(|a, b| {
+        compare_decoded(&a.min, &b.min).then_with(|| compare_decoded(&a.max, &b.max))
+    });
+
+    let mut runs: Vec<Vec<DataFileMeta>> = Vec::new();
+    let mut run_ends: Vec<DecodedKey> = Vec::new();
+    for keyed_file in keyed {
+        let mut best_run = None;
+        for (index, end) in run_ends.iter().enumerate() {
+            if compare_decoded(end, &keyed_file.min) != Ordering::Less {
+                continue;
+            }
+            match best_run {
+                Some(best) if compare_decoded(&run_ends[best], end) != Ordering::Less => {}
+                _ => best_run = Some(index),
+            }
+        }
+
+        match best_run {
+            Some(index) => {
+                runs[index].push(keyed_file.file);
+                run_ends[index] = keyed_file.max;
+            }
+            None => {
+                runs.push(vec![keyed_file.file]);
+                run_ends.push(keyed_file.max);
+            }
+        }
+    }
+
+    let sound = runs.iter().all(|run| {
+        run.windows(2).all(|pair| {
+            match (
+                comparator.decode(&pair[0].max_key),
+                comparator.decode(&pair[1].min_key),
+            ) {
+                (Some(previous_max), Some(next_min)) => {
+                    compare_decoded(&previous_max, &next_min) == Ordering::Less
+                }
+                _ => false,
+            }
+        })
+    });
+    if sound {
+        runs
+    } else {
+        runs.into_iter().flatten().map(|file| vec![file]).collect()
+    }
 }
 
 /// Bin-pack whole sections into splits. A section is atomic: its files
@@ -375,6 +453,146 @@ mod tests {
     }
 
     #[test]
+    fn pack_sorted_runs_collapses_shallow_overlap() {
+        let files = vec![
+            keyed_file("a", 1, 10, 100, 0),
+            keyed_file("b", 5, 15, 100, 0),
+            keyed_file("c", 20, 30, 100, 0),
+            keyed_file("d", 25, 35, 100, 0),
+            keyed_file("e", 40, 50, 100, 0),
+            keyed_file("f", 45, 55, 100, 0),
+        ];
+        let runs = pack_sorted_runs(files, &int_comparator());
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs.iter().map(Vec::len).sum::<usize>(), 6);
+    }
+
+    #[test]
+    fn pack_sorted_runs_chains_disjoint_files_in_key_order() {
+        let files = vec![
+            keyed_file("c", 21, 30, 100, 0),
+            keyed_file("a", 1, 10, 100, 0),
+            keyed_file("b", 11, 20, 100, 0),
+        ];
+        let runs = pack_sorted_runs(files, &int_comparator());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0]
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn pack_sorted_runs_treats_touching_ranges_as_overlapping() {
+        let files = vec![
+            keyed_file("a", 1, 10, 100, 0),
+            keyed_file("b", 10, 20, 100, 0),
+        ];
+        assert_eq!(pack_sorted_runs(files, &int_comparator()).len(), 2);
+    }
+
+    #[test]
+    fn pack_sorted_runs_degrades_when_keys_are_undecodable() {
+        let mut undecodable = keyed_file("a", 1, 10, 100, 0);
+        undecodable.min_key.clear();
+        undecodable.max_key.clear();
+        let files = vec![undecodable, keyed_file("b", 5, 15, 100, 0)];
+        assert_eq!(pack_sorted_runs(files, &int_comparator()).len(), 2);
+    }
+
+    #[test]
+    fn pack_sorted_runs_degrades_when_a_file_range_is_inverted() {
+        let files = vec![
+            keyed_file("invalid", 10, 5, 100, 0),
+            keyed_file("valid", 6, 9, 100, 0),
+        ];
+        assert_eq!(pack_sorted_runs(files, &int_comparator()).len(), 2);
+    }
+
+    #[test]
+    fn pack_sorted_runs_orders_binary_keys_unsigned() {
+        fn bytes_key(value: u8) -> Vec<u8> {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_binary(0, &[value]);
+            builder.build_serialized()
+        }
+
+        fn binary_file(name: &str, min: u8, max: u8) -> DataFileMeta {
+            let mut file = keyed_file(name, 0, 0, 100, 0);
+            file.min_key = bytes_key(min);
+            file.max_key = bytes_key(max);
+            file
+        }
+
+        let comparator = KeyComparator::new(vec![DataType::VarBinary(
+            crate::spec::VarBinaryType::new(16).unwrap(),
+        )]);
+        let runs = pack_sorted_runs(
+            vec![
+                binary_file("high", 0x80, 0xFE),
+                binary_file("low", 0x01, 0x7F),
+            ],
+            &comparator,
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0]
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+    }
+
+    #[test]
+    fn pack_sorted_runs_handles_multi_column_keys() {
+        fn key(first: i32, second: &str) -> Vec<u8> {
+            let mut builder = BinaryRowBuilder::new(2);
+            builder.write_int(0, first);
+            builder.write_string(1, second);
+            builder.build_serialized()
+        }
+
+        fn file(name: &str, min: (i32, &str), max: (i32, &str)) -> DataFileMeta {
+            let mut file = keyed_file(name, 0, 0, 100, 0);
+            file.min_key = key(min.0, min.1);
+            file.max_key = key(max.0, max.1);
+            file
+        }
+
+        let comparator = KeyComparator::new(vec![
+            DataType::Int(IntType::new()),
+            DataType::VarChar(crate::spec::VarCharType::new(16).unwrap()),
+        ]);
+
+        let overlapping = pack_sorted_runs(
+            vec![file("a", (1, "a"), (2, "a")), file("b", (1, "b"), (2, "b"))],
+            &comparator,
+        );
+        assert_eq!(
+            overlapping.len(),
+            2,
+            "second-key overlap must keep files in separate runs"
+        );
+
+        let disjoint = pack_sorted_runs(
+            vec![file("d", (3, "a"), (4, "a")), file("c", (1, "a"), (2, "a"))],
+            &comparator,
+        );
+        assert_eq!(disjoint.len(), 1);
+        assert_eq!(
+            disjoint[0]
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+    }
+
+    #[test]
     fn interval_partition_groups_overlapping_files() {
         let files = vec![
             keyed_file("a", 1, 10, 100, 0),
@@ -429,6 +647,16 @@ mod tests {
         let files = vec![no_key, keyed_file("b", 10, 20, 100, 0)];
         let sections = interval_partition(files, &int_comparator());
         assert_eq!(section_names(&sections), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn interval_partition_inverted_range_degrades_to_single_section() {
+        let files = vec![
+            keyed_file("invalid", 10, 5, 100, 0),
+            keyed_file("valid", 6, 9, 100, 0),
+        ];
+        let sections = interval_partition(files, &int_comparator());
+        assert_eq!(section_names(&sections), vec![vec!["invalid", "valid"]]);
     }
 
     #[test]
