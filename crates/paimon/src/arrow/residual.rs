@@ -702,21 +702,6 @@ fn evaluate_column_predicate(
 ) -> Result<BooleanArray, ArrowError> {
     let scalar = string_scalar_for_column(scalar, column.data_type())?;
 
-    // Route Binary/VarBinary ordering through the shared Java-compatible
-    // unsigned-byte comparator so residual filtering and `Datum::Bytes` cannot
-    // drift apart. Eq/NotEq are order-independent and use Arrow's kernels.
-    if matches!(
-        column.data_type(),
-        arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary
-    ) && matches!(
-        op,
-        PredicateOperator::Lt
-            | PredicateOperator::LtEq
-            | PredicateOperator::Gt
-            | PredicateOperator::GtEq
-    ) {
-        return evaluate_binary_ordering_predicate(column, &scalar, op);
-    }
     match op {
         PredicateOperator::Eq => arrow_eq(column, &scalar),
         PredicateOperator::NotEq => arrow_neq(column, &scalar),
@@ -741,54 +726,6 @@ fn evaluate_column_predicate(
         | PredicateOperator::Between
         | PredicateOperator::NotBetween => Ok(BooleanArray::new_null(column.len())),
     }
-}
-
-/// Evaluate an ordering predicate (`Lt`/`LtEq`/`Gt`/`GtEq`) on a Binary column
-/// using Paimon's Java unsigned-byte order, matching `Datum::Bytes` semantics.
-/// `scalar` is a single-element Binary array (the literal). NULL column rows
-/// produce NULL in the mask (later collapsed to `false` by `sanitize_filter_mask`).
-fn evaluate_binary_ordering_predicate(
-    column: &ArrayRef,
-    scalar: &Scalar<ArrayRef>,
-    op: PredicateOperator,
-) -> Result<BooleanArray, ArrowError> {
-    use arrow_array::cast::AsArray;
-    use std::cmp::Ordering;
-
-    // The scalar wraps a length-1 Binary array holding the literal bytes.
-    let (scalar_array, _) = scalar.get();
-    let literal: &[u8] = if let Some(a) = scalar_array.as_binary_opt::<i32>() {
-        a.value(0)
-    } else if let Some(a) = scalar_array.as_binary_opt::<i64>() {
-        a.value(0)
-    } else {
-        return Err(ArrowError::ComputeError(
-            "binary ordering predicate expects a Binary literal".to_string(),
-        ));
-    };
-
-    // Row-wise comparison via the shared unsigned-byte comparator.
-    let compare = |bytes: &[u8]| -> bool {
-        let ord = crate::spec::java_bytes_cmp(bytes, literal);
-        match op {
-            PredicateOperator::Lt => ord == Ordering::Less,
-            PredicateOperator::LtEq => ord != Ordering::Greater,
-            PredicateOperator::Gt => ord == Ordering::Greater,
-            PredicateOperator::GtEq => ord != Ordering::Less,
-            _ => unreachable!("only ordering ops reach here"),
-        }
-    };
-
-    let mask: BooleanArray = if let Some(a) = column.as_binary_opt::<i32>() {
-        a.iter().map(|v| v.map(compare)).collect()
-    } else if let Some(a) = column.as_binary_opt::<i64>() {
-        a.iter().map(|v| v.map(compare)).collect()
-    } else {
-        return Err(ArrowError::ComputeError(
-            "binary ordering predicate expects a Binary column".to_string(),
-        ));
-    };
-    Ok(mask)
 }
 
 /// Arrow comparison and pattern kernels reject mismatched string types. The

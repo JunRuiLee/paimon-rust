@@ -212,7 +212,7 @@ fn decimal_cmp(ua: i128, sa: u32, ub: i128, sb: u32) -> Option<Ordering> {
 
 /// Match Java `CompareUtils.compare(byte[], byte[])`, which compares bytes as
 /// unsigned values lexicographically.
-pub(crate) fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
+fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 

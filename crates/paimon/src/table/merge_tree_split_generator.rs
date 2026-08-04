@@ -102,7 +102,6 @@ fn compare_decoded(a: &DecodedKey, b: &DecodedKey) -> Ordering {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
-            (Some(Datum::Bytes(a)), Some(Datum::Bytes(b))) => a.cmp(b),
             (Some(da), Some(db)) => datum_cmp(da, db).unwrap_or(Ordering::Equal),
         };
         if ord != Ordering::Equal {
