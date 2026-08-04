@@ -168,8 +168,12 @@ fn ensure_merge_fan_in_limit(stream_count: usize, limit: Option<usize>) -> crate
 }
 
 struct MergeRun {
+    files: Vec<MergeFile>,
+}
+
+struct MergeFile {
     split: Arc<DataSplit>,
-    files: Vec<DataFileMeta>,
+    file: DataFileMeta,
 }
 
 fn plan_merge_groups(
@@ -184,8 +188,10 @@ fn plan_merge_groups(
                 let split = Arc::new(split.clone());
                 let files = split.data_files().to_vec();
                 files.into_iter().map(move |file| MergeRun {
-                    split: split.clone(),
-                    files: vec![file],
+                    files: vec![MergeFile {
+                        split: split.clone(),
+                        file,
+                    }],
                 })
             })
             .collect::<Vec<_>>();
@@ -197,23 +203,25 @@ fn plan_merge_groups(
     };
 
     if merge_splits {
-        let mut runs = Vec::new();
-        for split in split_group {
-            let split = Arc::new(split.clone());
-            for section in super::merge_tree_split_generator::interval_partition(
-                split.data_files().to_vec(),
-                comparator,
-            ) {
-                for files in
-                    super::merge_tree_split_generator::pack_sorted_runs(section, comparator)
-                {
-                    runs.push(MergeRun {
-                        split: split.clone(),
-                        files,
-                    });
-                }
-            }
-        }
+        let files = split_group
+            .iter()
+            .flat_map(|split| {
+                let split = Arc::new(split.clone());
+                let files = split.data_files().to_vec();
+                files.into_iter().map(move |file| MergeFile {
+                    split: split.clone(),
+                    file,
+                })
+            })
+            .collect::<Vec<_>>();
+        let runs = super::merge_tree_split_generator::pack_sorted_runs_by(
+            files,
+            comparator,
+            |merge_file| &merge_file.file,
+        )
+        .into_iter()
+        .map(|files| MergeRun { files })
+        .collect::<Vec<_>>();
         return if runs.is_empty() {
             Vec::new()
         } else {
@@ -231,8 +239,13 @@ fn plan_merge_groups(
             let runs = super::merge_tree_split_generator::pack_sorted_runs(section, comparator)
                 .into_iter()
                 .map(|files| MergeRun {
-                    split: split.clone(),
-                    files,
+                    files: files
+                        .into_iter()
+                        .map(|file| MergeFile {
+                            split: split.clone(),
+                            file,
+                        })
+                        .collect(),
                 })
                 .collect::<Vec<_>>();
             if !runs.is_empty() {
@@ -538,7 +551,7 @@ impl KeyValueFileReader {
                     };
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
-                    for MergeRun { split, files } in merge_group {
+                    for MergeRun { files } in merge_group {
                         let reader = DataFileReader::new(
                             file_io.clone(),
                             schema_manager.clone(),
@@ -551,7 +564,7 @@ impl KeyValueFileReader {
                         .with_parquet_read_budget(group_parquet_read_budget.clone());
                         let run_schema_manager = schema_manager.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
-                            for file_meta in files {
+                            for MergeFile { split, file: file_meta } in files {
                                 let data_fields: Option<Vec<DataField>> =
                                     if file_meta.schema_id != table_schema_id {
                                         let data_schema =
@@ -1093,6 +1106,66 @@ mod tests {
         let fallback = plan_merge_groups(&[split], None, false);
         assert_eq!(fallback.len(), 1);
         assert_eq!(fallback[0].len(), 6);
+    }
+
+    #[test]
+    fn sorted_run_planning_merges_disjoint_sections_across_splits() {
+        let file = |name: String, key: i32| {
+            let mut file = dummy_data_file(name);
+            file.min_key = int_key(key);
+            file.max_key = int_key(key);
+            file
+        };
+        let split = |path: &str, files| {
+            DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(path.to_string())
+                .with_total_buckets(1)
+                .with_data_files(files)
+                .build()
+                .unwrap()
+        };
+        let first = split(
+            "memory:/sorted-run-plan/first",
+            (0..129)
+                .map(|index| file(format!("first-{index}"), index * 4))
+                .collect(),
+        );
+        let second = split(
+            "memory:/sorted-run-plan/second",
+            (0..128)
+                .map(|index| file(format!("second-{index}"), index * 4 + 2))
+                .collect(),
+        );
+        let comparator =
+            super::super::merge_tree_split_generator::KeyComparator::new(vec![DataType::Int(
+                IntType::new(),
+            )]);
+
+        let grouped = plan_merge_groups(&[first, second], Some(&comparator), true);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].len(), 1, "global overlap depth is one");
+        ensure_merge_fan_in_limit(grouped[0].len(), Some(256)).unwrap();
+        let files = &grouped[0][0].files;
+        assert_eq!(files.len(), 257);
+        assert_eq!(
+            files
+                .iter()
+                .take(4)
+                .map(|file| file.file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-0", "second-0", "first-1", "second-1"]
+        );
+        for file in files {
+            let expected_path = if file.file.file_name.starts_with("first-") {
+                "memory:/sorted-run-plan/first"
+            } else {
+                "memory:/sorted-run-plan/second"
+            };
+            assert_eq!(file.split.bucket_path(), expected_path);
+        }
     }
 
     #[tokio::test]

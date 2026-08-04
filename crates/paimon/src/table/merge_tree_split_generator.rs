@@ -203,37 +203,62 @@ pub(crate) fn interval_partition(
     sections
 }
 
-/// Pack one overlapping section into sorted runs. Files within a run have
-/// strictly disjoint key ranges and can therefore be read by concatenation.
-/// The number of runs equals the section's maximum key-range overlap depth.
-/// Undecodable or inconsistent manifest keys safely degrade to one run per
-/// file, preserving the previous merge fan-in and correctness.
+/// Pack files into sorted runs. Files within a run have strictly disjoint key
+/// ranges and can therefore be read by concatenation. The number of runs equals
+/// the maximum key-range overlap depth, even when the input spans multiple
+/// non-overlapping sections. Undecodable or inconsistent manifest keys safely
+/// degrade to one run per file, preserving the previous merge fan-in and
+/// correctness.
 pub(crate) fn pack_sorted_runs(
-    section: Vec<DataFileMeta>,
+    files: Vec<DataFileMeta>,
     comparator: &KeyComparator,
 ) -> Vec<Vec<DataFileMeta>> {
-    if section.len() <= 1 {
-        return if section.is_empty() {
+    pack_sorted_runs_by(files, comparator, |file| file)
+}
+
+pub(crate) fn pack_sorted_runs_by<T, F>(
+    items: Vec<T>,
+    comparator: &KeyComparator,
+    file_meta: F,
+) -> Vec<Vec<T>>
+where
+    F: Fn(&T) -> &DataFileMeta + Copy,
+{
+    if items.len() <= 1 {
+        return if items.is_empty() {
             Vec::new()
         } else {
-            vec![section]
+            vec![items]
         };
     }
 
-    let mut keyed = match decode_all(section, comparator) {
-        Ok(keyed) => keyed,
-        Err(files) => return files.into_iter().map(|file| vec![file]).collect(),
-    };
-    keyed.sort_by(|a, b| {
-        compare_decoded(&a.min, &b.min).then_with(|| compare_decoded(&a.max, &b.max))
-    });
+    let mut decoded_ranges = Vec::with_capacity(items.len());
+    for item in &items {
+        let file = file_meta(item);
+        match (
+            comparator.decode(&file.min_key),
+            comparator.decode(&file.max_key),
+        ) {
+            (Some(min), Some(max)) if compare_decoded(&min, &max) != Ordering::Greater => {
+                decoded_ranges.push((min, max));
+            }
+            _ => return items.into_iter().map(|item| vec![item]).collect(),
+        }
+    }
 
-    let mut runs: Vec<Vec<DataFileMeta>> = Vec::new();
+    let mut keyed = items
+        .into_iter()
+        .zip(decoded_ranges)
+        .map(|(item, (min, max))| (item, min, max))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|a, b| compare_decoded(&a.1, &b.1).then_with(|| compare_decoded(&a.2, &b.2)));
+
+    let mut runs: Vec<Vec<T>> = Vec::new();
     let mut run_ends: Vec<DecodedKey> = Vec::new();
-    for keyed_file in keyed {
+    for (item, min, max) in keyed {
         let mut best_run = None;
         for (index, end) in run_ends.iter().enumerate() {
-            if compare_decoded(end, &keyed_file.min) != Ordering::Less {
+            if compare_decoded(end, &min) != Ordering::Less {
                 continue;
             }
             match best_run {
@@ -244,21 +269,23 @@ pub(crate) fn pack_sorted_runs(
 
         match best_run {
             Some(index) => {
-                runs[index].push(keyed_file.file);
-                run_ends[index] = keyed_file.max;
+                runs[index].push(item);
+                run_ends[index] = max;
             }
             None => {
-                runs.push(vec![keyed_file.file]);
-                run_ends.push(keyed_file.max);
+                runs.push(vec![item]);
+                run_ends.push(max);
             }
         }
     }
 
     let sound = runs.iter().all(|run| {
         run.windows(2).all(|pair| {
+            let previous = file_meta(&pair[0]);
+            let next = file_meta(&pair[1]);
             match (
-                comparator.decode(&pair[0].max_key),
-                comparator.decode(&pair[1].min_key),
+                comparator.decode(&previous.max_key),
+                comparator.decode(&next.min_key),
             ) {
                 (Some(previous_max), Some(next_min)) => {
                     compare_decoded(&previous_max, &next_min) == Ordering::Less
@@ -270,7 +297,7 @@ pub(crate) fn pack_sorted_runs(
     if sound {
         runs
     } else {
-        runs.into_iter().flatten().map(|file| vec![file]).collect()
+        runs.into_iter().flatten().map(|item| vec![item]).collect()
     }
 }
 
