@@ -175,98 +175,99 @@ async fn read_all_manifest_entries(
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
     let shared_cache = SharedSchemaCache::new();
-    let manifest_results: Vec<(Vec<ManifestEntry>, ManifestReadCounters)> =
-        futures::stream::iter(manifest_files)
-            .map(|meta| {
-                let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
-                let cache = shared_cache.clone();
-                async move {
-                    let input_file = file_io.new_input(&path)?;
-                    let content = input_file.read().await?;
+    let (all_entries, mut counters) = futures::stream::iter(manifest_files)
+        .map(|meta| {
+            let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+            let cache = shared_cache.clone();
+            async move {
+                let input_file = file_io.new_input(&path)?;
+                let content = input_file.read().await?;
 
-                    // Per-task bucket cache (few distinct total_buckets values per manifest).
-                    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-                    let mut counters = ManifestReadCounters::default();
+                // Per-task bucket cache (few distinct total_buckets values per manifest).
+                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                let mut counters = ManifestReadCounters::default();
 
-                    let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
-                        &content,
-                        &cache,
-                        &mut |_kind, partition_bytes, bucket, total_buckets| {
-                            counters.entries_read += 1;
-                            // Bucket filter (negative bucket = unassigned)
-                            if has_primary_keys && !scan_all_files && bucket < 0 {
-                                counters.pruned_by_bucket += 1;
-                                return false;
-                            }
-                            if let Some(pred) = bucket_predicate {
-                                let targets =
-                                    bucket_cache.entry(total_buckets).or_insert_with(|| {
-                                        compute_target_buckets(
-                                            pred,
-                                            bucket_key_fields,
-                                            bucket_function_type,
-                                            total_buckets,
-                                        )
-                                    });
-                                if let Some(targets) = targets {
-                                    if !targets.contains(&bucket) {
-                                        counters.pruned_by_bucket += 1;
-                                        return false;
-                                    }
+                let entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
+                    &content,
+                    &cache,
+                    &mut |_kind, partition_bytes, bucket, total_buckets| {
+                        counters.entries_read += 1;
+                        // Bucket filter (negative bucket = unassigned)
+                        if has_primary_keys && !scan_all_files && bucket < 0 {
+                            counters.pruned_by_bucket += 1;
+                            return false;
+                        }
+                        if let Some(pred) = bucket_predicate {
+                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
+                                compute_target_buckets(
+                                    pred,
+                                    bucket_key_fields,
+                                    bucket_function_type,
+                                    total_buckets,
+                                )
+                            });
+                            if let Some(targets) = targets {
+                                if !targets.contains(&bucket) {
+                                    counters.pruned_by_bucket += 1;
+                                    return false;
                                 }
                             }
+                        }
 
-                            // Partition filter
-                            if let Some(pf) = partition_filter {
-                                match pf.matches_entry(partition_bytes) {
-                                    Ok(false) => {
-                                        counters.pruned_by_partition += 1;
-                                        return false;
-                                    }
-                                    Ok(true) => {}
-                                    Err(_) => {}
+                        // Partition filter
+                        if let Some(pf) = partition_filter {
+                            match pf.matches_entry(partition_bytes) {
+                                Ok(false) => {
+                                    counters.pruned_by_partition += 1;
+                                    return false;
                                 }
+                                Ok(true) => {}
+                                Err(_) => {}
                             }
-
-                            true
-                        },
-                    )?;
-                    counters.after_entry_pruning = entries.len();
-
-                    // Post-filter: level-0 and data predicates (need DataFileMeta)
-                    let mut filtered = Vec::with_capacity(entries.len());
-                    for entry in entries {
-                        if skip_level_zero && has_primary_keys && entry.file().level == 0 {
-                            counters.pruned_by_level += 1;
-                            continue;
                         }
-                        if !data_predicates.is_empty()
-                            && !data_file_matches_predicates(
-                                entry.file(),
-                                data_predicates,
-                                current_schema_id,
-                                schema_fields,
-                            )
-                        {
-                            counters.pruned_by_data_stats += 1;
-                            continue;
-                        }
-                        filtered.push(entry);
+
+                        true
+                    },
+                )?;
+                counters.after_entry_pruning = entries.len();
+
+                // Post-filter: level-0 and data predicates (need DataFileMeta)
+                let mut filtered = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    if skip_level_zero && has_primary_keys && entry.file().level == 0 {
+                        counters.pruned_by_level += 1;
+                        continue;
                     }
-                    counters.after_manifest_filters = filtered.len();
-                    Ok::<_, crate::Error>((filtered, counters))
+                    if !data_predicates.is_empty()
+                        && !data_file_matches_predicates(
+                            entry.file(),
+                            data_predicates,
+                            current_schema_id,
+                            schema_fields,
+                        )
+                    {
+                        counters.pruned_by_data_stats += 1;
+                        continue;
+                    }
+                    filtered.push(entry);
                 }
-            })
-            .buffered(64)
-            .try_collect::<Vec<_>>()
-            .await?;
-
-    let mut counters = ManifestReadCounters::default();
-    let mut all_entries = Vec::new();
-    for (entries, manifest_counters) in manifest_results {
-        counters.merge(manifest_counters);
-        all_entries.extend(entries);
-    }
+                counters.after_manifest_filters = filtered.len();
+                Ok::<_, crate::Error>((filtered, counters))
+            }
+        })
+        // Keep manifest read concurrency bounded. `try_fold` releases each
+        // yielded result after merging it, so peak retained results are the
+        // accumulator plus at most this bounded set of in-flight reads.
+        .buffered(64)
+        .try_fold(
+            (Vec::new(), ManifestReadCounters::default()),
+            |(mut all_entries, mut counters), (entries, manifest_counters)| async move {
+                counters.merge(manifest_counters);
+                all_entries.extend(entries);
+                Ok((all_entries, counters))
+            },
+        )
+        .await?;
     let mut all_entries = merge_manifest_entries(all_entries);
     let manifest_entries_after_merge = all_entries.len();
     if let Some(index) = row_range_index {
@@ -458,17 +459,15 @@ fn build_deletion_files_map(
 ///
 /// Collecting deletes first (rather than insert/remove while iterating) makes
 /// the result independent of ADD/DELETE ordering, matching the Java scan path.
-fn merge_manifest_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+fn merge_manifest_entries(mut entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
     use crate::spec::Identifier;
     let deleted: HashSet<Identifier> = entries
         .iter()
         .filter(|e| *e.kind() == FileKind::Delete)
         .map(|e| e.identifier())
         .collect();
+    entries.retain(|e| *e.kind() == FileKind::Add && !deleted.contains(&e.identifier()));
     entries
-        .into_iter()
-        .filter(|e| *e.kind() == FileKind::Add && !deleted.contains(&e.identifier()))
-        .collect()
 }
 
 /// Whether scan-owned pruning still preserves `merged_row_count()` as a safe

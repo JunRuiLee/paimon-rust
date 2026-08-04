@@ -323,7 +323,7 @@ pub(crate) fn bucket_round_robin<T>(items: Vec<T>, num_buckets: usize) -> Vec<Ve
 pub(crate) struct PaimonScanBuilder<'a> {
     pub(crate) table: &'a Table,
     pub(crate) schema: &'a ArrowSchemaRef,
-    pub(crate) plan: &'a paimon::table::Plan,
+    pub(crate) plan: paimon::table::Plan,
     pub(crate) scan_trace: Option<paimon::table::ScanTrace>,
     pub(crate) projection: Option<&'a Vec<usize>>,
     pub(crate) pushed_predicate: Option<paimon::spec::Predicate>,
@@ -361,7 +361,7 @@ impl PaimonScanBuilder<'_> {
             (self.schema.clone(), read_fields)
         };
 
-        let splits = self.plan.splits().to_vec();
+        let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
         } else {
@@ -458,7 +458,7 @@ impl TableProvider for PaimonTableProvider {
         PaimonScanBuilder {
             table: &self.table,
             schema: &self.schema,
-            plan: &plan,
+            plan,
             scan_trace: Some(scan_trace),
             projection,
             pushed_predicate: filter_analysis.pushed_predicate,

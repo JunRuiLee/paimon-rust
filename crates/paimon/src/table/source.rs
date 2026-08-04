@@ -22,6 +22,7 @@
 use crate::spec::{BinaryRow, DataFileMeta};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 fn is_vector_store_file_name(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().contains(".vector.")
@@ -478,19 +479,22 @@ impl PartitionBucket {
 
 /// Input split for reading: partition + bucket + list of data files and optional deletion files.
 ///
+/// The metadata collections use shared storage so cloning a planned split for an
+/// asynchronous reader does not deep-copy every [`DataFileMeta`].
+///
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataSplit {
     snapshot_id: i64,
-    partition: BinaryRow,
+    partition: Arc<BinaryRow>,
     bucket: i32,
-    bucket_path: String,
+    bucket_path: Arc<str>,
     total_buckets: i32,
-    data_files: Vec<DataFileMeta>,
+    data_files: Arc<[DataFileMeta]>,
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
-    data_deletion_files: Option<Vec<Option<DeletionFile>>>,
-    row_ranges: Option<Vec<RowRange>>,
+    data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
+    row_ranges: Option<Arc<[RowRange]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
@@ -696,7 +700,7 @@ impl DataSplit {
         out.extend_from_slice(&0i32.to_be_bytes()); // deprecated beforeFiles count
         out.push(0); // beforeDeletionFiles = null list
         out.extend_from_slice(&(self.data_files.len() as i32).to_be_bytes());
-        for f in &self.data_files {
+        for f in self.data_files.iter() {
             let d = f.to_serialized_row_data()?;
             out.extend_from_slice(&(d.len() as i32).to_be_bytes());
             out.extend_from_slice(&d);
@@ -847,7 +851,7 @@ impl DataSplit {
                 out.extend_from_slice(&INDEXED_SPLIT_VERSION.to_be_bytes());
                 out.extend_from_slice(&self.serialize()?);
                 out.extend_from_slice(&(ranges.len() as i32).to_be_bytes());
-                for r in ranges {
+                for r in ranges.iter() {
                     out.extend_from_slice(&r.from().to_be_bytes());
                     out.extend_from_slice(&r.to().to_be_bytes());
                 }
@@ -921,7 +925,7 @@ impl DataSplit {
                     });
                 }
                 let mut body = body;
-                body.row_ranges = Some(ranges);
+                body.row_ranges = Some(ranges.into());
                 body
             }
             other => {
@@ -1255,13 +1259,13 @@ impl DataSplitBuilder {
         }
         Ok(DataSplit {
             snapshot_id: self.snapshot_id,
-            partition,
+            partition: Arc::new(partition),
             bucket: self.bucket,
-            bucket_path,
+            bucket_path: bucket_path.into(),
             total_buckets: self.total_buckets,
-            data_files,
-            data_deletion_files: self.data_deletion_files,
-            row_ranges: self.row_ranges,
+            data_files: data_files.into(),
+            data_deletion_files: self.data_deletion_files.map(Into::into),
+            row_ranges: self.row_ranges.map(Into::into),
             raw_convertible: self.raw_convertible,
         })
     }
@@ -1289,6 +1293,12 @@ impl Plan {
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
+    }
+
+    /// Consume this plan and return its splits without cloning their file metadata.
+    #[must_use = "consuming a plan without using its splits drops the planned work"]
+    pub fn into_splits(self) -> Vec<DataSplit> {
+        self.splits
     }
 }
 
@@ -1333,6 +1343,51 @@ mod tests {
             .with_raw_convertible(raw_convertible)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn data_split_clone_shares_planned_metadata() {
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("a.parquet", 10, Some(0))])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "file:/tmp/a.dv".to_string(),
+                0,
+                64,
+                Some(1),
+            ))])
+            .with_row_ranges(vec![RowRange::new(0, 9)])
+            .build()
+            .unwrap();
+
+        let cloned = split.clone();
+
+        assert!(Arc::ptr_eq(&split.partition, &cloned.partition));
+        assert!(Arc::ptr_eq(&split.bucket_path, &cloned.bucket_path));
+        assert!(Arc::ptr_eq(&split.data_files, &cloned.data_files));
+        assert!(Arc::ptr_eq(
+            split.data_deletion_files.as_ref().unwrap(),
+            cloned.data_deletion_files.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            split.row_ranges.as_ref().unwrap(),
+            cloned.row_ranges.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn plan_into_splits_preserves_metadata_ownership() {
+        let split = split(vec![file("a.parquet", 10, Some(0))], true);
+        let data_files = Arc::clone(&split.data_files);
+
+        let splits = Plan::new(vec![split]).into_splits();
+
+        assert_eq!(splits.len(), 1);
+        assert!(Arc::ptr_eq(&data_files, &splits[0].data_files));
     }
 
     #[test]

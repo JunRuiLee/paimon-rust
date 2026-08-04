@@ -185,7 +185,7 @@ impl TableProvider for FullTextSearchTableProvider {
         PaimonScanBuilder {
             table,
             schema: &self.schema(),
-            plan: &plan,
+            plan,
             scan_trace: None,
             projection,
             pushed_predicate: None,

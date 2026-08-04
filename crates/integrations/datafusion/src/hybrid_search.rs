@@ -287,7 +287,7 @@ impl TableProvider for HybridSearchTableProvider {
         let input = PaimonScanBuilder {
             table,
             schema: &input_schema,
-            plan: &plan,
+            plan,
             scan_trace: None,
             projection: Some(&input_projection),
             pushed_predicate: None,
