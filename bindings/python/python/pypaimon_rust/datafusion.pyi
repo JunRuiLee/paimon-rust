@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeAlias, Union
+from os import PathLike
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, Union
 
 import pyarrow
 
@@ -185,7 +186,14 @@ def udf(
     ...
 
 class SQLContext:
-    def __init__(self) -> None: ...
+    def __init__(
+        self,
+        *,
+        memory_pool_type: Optional[Literal["fair", "greedy"]] = None,
+        memory_pool_bytes: Optional[int] = None,
+        temp_directory: Optional[Union[str, PathLike[str]]] = None,
+        max_temp_directory_size_bytes: Optional[int] = None,
+    ) -> None: ...
     def register_catalog(
         self, catalog_name: str, catalog_options: Dict[str, str]
     ) -> None: ...
