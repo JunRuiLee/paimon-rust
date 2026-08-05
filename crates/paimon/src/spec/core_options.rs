@@ -83,7 +83,7 @@ pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
     "alter-column-null-to-not-null.disabled";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
-const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
+pub(crate) const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";

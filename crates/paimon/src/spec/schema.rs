@@ -18,7 +18,7 @@
 use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
-    POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
+    CHANGELOG_PRODUCER_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -1140,6 +1140,7 @@ impl Schema {
         validate_no_aggregation_on_sequence_field(options)?;
         AggregationConfig::new(options).validate_create_mode(primary_keys, fields)?;
         Self::validate_first_row_changelog_producer(options)?;
+        Self::validate_changelog_producer_requires_primary_keys(options, primary_keys)?;
         Self::validate_rowkind_field(options, primary_keys, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
@@ -1496,6 +1497,36 @@ impl Schema {
             message: format!(
                 "merge-engine=first-row only supports changelog-producer=none or lookup, but found changelog-producer={}",
                 changelog_producer.as_str()
+            ),
+        })
+    }
+
+    /// Reject a non-`none` `changelog-producer` on a table without primary keys,
+    /// mirroring Java `SchemaValidation#validateTableSchema`.
+    ///
+    /// An append table has no merge step, so no changelog can be produced: the
+    /// option is persisted into the schema and then silently ignored by the
+    /// write path, which decides `input_changelog` from the producer alone and
+    /// never reaches a compaction that could emit changelog files.
+    fn validate_changelog_producer_requires_primary_keys(
+        options: &HashMap<String, String>,
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        if !primary_keys.is_empty() {
+            return Ok(());
+        }
+
+        let changelog_producer = CoreOptions::new(options)
+            .try_changelog_producer()
+            .map_err(Self::options_error_to_config_invalid)?;
+        if changelog_producer == ChangelogProducer::None {
+            return Ok(());
+        }
+
+        Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Can not set {CHANGELOG_PRODUCER_OPTION} on table without primary keys, \
+                 please define primary keys."
             ),
         })
     }
@@ -3011,6 +3042,56 @@ mod tests {
                 expected_message,
             );
         }
+    }
+
+    #[test]
+    fn test_create_schema_rejects_changelog_producer_without_primary_keys() {
+        // Java `validateTableSchema` rejects any non-NONE producer on an append
+        // table: there is no merge step, so no changelog can ever be produced.
+        for producer in ["input", "full-compaction", "lookup"] {
+            assert_config_invalid(
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("changelog-producer", producer)
+                    .build(),
+                "on table without primary keys",
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_schema_accepts_changelog_producer_none_without_primary_keys() {
+        // Only a non-NONE producer is rejected; an append table may still spell
+        // the default out explicitly.
+        for producer in ["none", "NONE"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .option("changelog-producer", producer)
+                .build()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_alter_set_changelog_producer_without_primary_keys_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "changelog-producer".to_string(),
+                "input".to_string(),
+            )]),
+            "on table without primary keys",
+        );
     }
 
     fn cast_test_schema(options: &[(&str, &str)]) -> TableSchema {
