@@ -210,7 +210,8 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set Data Evolution row ID ranges `[from, to]` (inclusive).
+    /// An empty vector selects no rows. Format tables are not supported.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -399,13 +400,9 @@ impl<'a> PaimonReadBuilder<'a> {
         )
     }
 
-    /// Set row ID ranges `[from, to]` (inclusive) for filtering in data evolution mode.
+    /// Set row ID ranges `[from, to]` (inclusive). An empty vector selects no rows.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
-        self.row_ranges = if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        };
+        self.row_ranges = Some(ranges);
         self
     }
 
@@ -778,6 +775,50 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_with_empty_row_ranges_is_preserved() {
+        let table = simple_table();
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+
+        assert_eq!(paimon_builder(&builder).row_ranges, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn test_format_table_rejects_row_ranges() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("type", "format-table")
+            .option("file.format", "parquet")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "format_t"),
+            "memory:/format_t".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let mut builder = table.new_read_builder();
+        builder.with_row_ranges(Vec::new());
+        let error = builder.new_scan().plan().await.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
+
+        let error = table
+            .new_read_builder()
+            .new_scan()
+            .with_row_ranges(Vec::new())
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Unsupported { ref message } if message.contains("format tables"))
+        );
     }
 
     fn dv_pk_table(table_path: &str, merge_engine: &str) -> Table {

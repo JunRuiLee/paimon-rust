@@ -24,7 +24,7 @@ use crate::spec::{
     Datum, PartitionComputer, Predicate, PredicateOperator,
 };
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::source::DataSplitBuilder;
+use crate::table::source::{DataSplitBuilder, RowRange};
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,7 @@ pub(crate) struct FormatTableScan<'a> {
     table: &'a Table,
     partition_filter: Option<PartitionFilter>,
     limit: Option<usize>,
+    row_ranges: Option<Vec<RowRange>>,
 }
 
 impl<'a> FormatTableScan<'a> {
@@ -39,12 +40,19 @@ impl<'a> FormatTableScan<'a> {
         table: &'a Table,
         partition_filter: Option<PartitionFilter>,
         limit: Option<usize>,
+        row_ranges: Option<Vec<RowRange>>,
     ) -> Self {
         Self {
             table,
             partition_filter,
             limit,
+            row_ranges,
         }
+    }
+
+    pub(crate) fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        self.row_ranges = Some(ranges);
+        self
     }
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
@@ -64,6 +72,11 @@ impl<'a> FormatTableScan<'a> {
     }
 
     async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {
+        if self.row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Row ranges are not supported for format tables".to_string(),
+            });
+        }
         let core_options = CoreOptions::new(self.table.schema().options());
         let format_extension = supported_format_table_extension(&core_options.file_format())?;
         let schema_id = self.table.schema().id();

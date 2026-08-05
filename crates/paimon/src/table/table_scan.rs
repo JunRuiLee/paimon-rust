@@ -795,6 +795,7 @@ impl<'a> TableScan<'a> {
                 table,
                 partition_filter,
                 limit,
+                row_ranges,
             )))
         } else {
             Self(TableScanKind::Paimon(PaimonTableScan::new(
@@ -820,7 +821,9 @@ impl<'a> TableScan<'a> {
             TableScanKind::Paimon(scan) => {
                 Self(TableScanKind::Paimon(scan.with_row_ranges(ranges)))
             }
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+            TableScanKind::Format(scan) => {
+                Self(TableScanKind::Format(scan.with_row_ranges(ranges)))
+            }
         }
     }
 
@@ -963,13 +966,9 @@ impl<'a> PaimonTableScan<'a> {
     /// Set row ranges for scan-time filtering.
     ///
     /// This replaces any existing row_ranges. Typically used to inject
-    /// results from global index lookups (e.g. full-text search).
+    /// results from global index lookups. An empty vector selects no rows.
     pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
-        self.row_ranges = if ranges.is_empty() {
-            None
-        } else {
-            Some(ranges)
-        };
+        self.row_ranges = Some(ranges);
         self
     }
 
@@ -2473,6 +2472,15 @@ mod tests {
             table_schema,
             None,
         )
+    }
+
+    #[test]
+    fn test_scan_with_empty_row_ranges_is_preserved() {
+        let table = limit_test_table();
+        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None)
+            .with_row_ranges(Vec::new());
+
+        assert_eq!(scan.row_ranges, Some(Vec::new()));
     }
 
     fn limit_test_split(file_name: &str, row_count: i64) -> DataSplit {
