@@ -97,8 +97,12 @@ const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
 const DIFF_PARALLELISM_OPTION: &str = "diff.parallelism";
 const DEFAULT_DIFF_PARALLELISM: usize = 4;
 const DEFAULT_COMMIT_MAX_RETRIES: u32 = 10;
-const DEFAULT_COMMIT_TIMEOUT_MS: u64 = 120_000;
-const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 1_000;
+/// Java types `commit.timeout` as a duration with no default and treats an
+/// absent value as `Long.MAX_VALUE`, i.e. the retry budget alone bounds the
+/// loop. `u64::MAX` is the equivalent sentinel here: the value is only ever
+/// compared against elapsed time, never used in arithmetic.
+const DEFAULT_COMMIT_TIMEOUT_MS: u64 = u64::MAX;
+const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 10;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
@@ -906,24 +910,32 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRIES)
     }
 
+    /// Commit timeout (`commit.timeout`), in milliseconds.
+    ///
+    /// Defaults to unbounded, matching Java: with no timeout configured, only
+    /// `commit.max-retries` bounds the commit retry loop.
     pub fn commit_timeout_ms(&self) -> u64 {
         self.options
             .get(COMMIT_TIMEOUT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_TIMEOUT_MS)
     }
 
+    /// Initial backoff before the first commit retry (`commit.min-retry-wait`),
+    /// in milliseconds. Doubles per retry up to [`Self::commit_max_retry_wait_ms`].
     pub fn commit_min_retry_wait_ms(&self) -> u64 {
         self.options
             .get(COMMIT_MIN_RETRY_WAIT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_MIN_RETRY_WAIT_MS)
     }
 
+    /// Backoff ceiling between commit retries (`commit.max-retry-wait`), in
+    /// milliseconds.
     pub fn commit_max_retry_wait_ms(&self) -> u64 {
         self.options
             .get(COMMIT_MAX_RETRY_WAIT_OPTION)
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| parse_duration_millis(v))
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRY_WAIT_MS)
     }
 
@@ -1357,6 +1369,40 @@ fn parse_memory_size(value: &str) -> Option<i64> {
         _ => return None,
     };
     num.checked_mul(multiplier)
+}
+
+/// Parse a duration string to milliseconds, mirroring Java Paimon's
+/// `TimeUtils.parseDuration`.
+///
+/// Accepts every unit label Java accepts — `d`/`day(s)`, `h`/`hour(s)`,
+/// `min`/`m`/`minute(s)`, `s`/`sec(s)`/`second(s)`, `ms`/`milli(s)`/
+/// `millisecond(s)`, `µs`/`micro(s)`/`microsecond(s)`, `ns`/`nano(s)`/
+/// `nanosecond(s)` — plus a bare number, which Java reads as milliseconds.
+/// Sub-millisecond units are truncated towards zero, as `Duration.toMillis()`
+/// does. Returns `None` for an empty string, a missing or non-numeric number,
+/// an unrecognized unit, or a value that would overflow `u64`, matching the
+/// inputs on which Java throws.
+fn parse_duration_millis(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let pos = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num_str, unit_str) = value.split_at(pos);
+    let num: u64 = num_str.trim().parse().ok()?;
+    match unit_str.trim().to_ascii_lowercase().as_str() {
+        "d" | "day" | "days" => num.checked_mul(24 * 60 * 60 * 1000),
+        "h" | "hour" | "hours" => num.checked_mul(60 * 60 * 1000),
+        "min" | "m" | "minute" | "minutes" => num.checked_mul(60 * 1000),
+        "s" | "sec" | "secs" | "second" | "seconds" => num.checked_mul(1000),
+        "" | "ms" | "milli" | "millis" | "millisecond" | "milliseconds" => Some(num),
+        "µs" | "micro" | "micros" | "microsecond" | "microseconds" => Some(num / 1_000),
+        "ns" | "nano" | "nanos" | "nanosecond" | "nanoseconds" => Some(num / 1_000_000),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1804,6 +1850,76 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_millis_accepts_every_java_unit_spelling() {
+        // Every label in Java `TimeUtils.TimeUnit`, plus the bare number that
+        // Java reads as milliseconds.
+        for (input, expected) in [
+            ("60000", 60_000),
+            ("2 d", 2 * 24 * 60 * 60 * 1000),
+            ("2 day", 2 * 24 * 60 * 60 * 1000),
+            ("2 days", 2 * 24 * 60 * 60 * 1000),
+            ("3 h", 3 * 60 * 60 * 1000),
+            ("3 hour", 3 * 60 * 60 * 1000),
+            ("3 hours", 3 * 60 * 60 * 1000),
+            ("2 min", 120_000),
+            ("2 m", 120_000),
+            ("2 minute", 120_000),
+            ("2 minutes", 120_000),
+            ("30 s", 30_000),
+            ("30 sec", 30_000),
+            ("30 secs", 30_000),
+            ("30 second", 30_000),
+            ("30 seconds", 30_000),
+            ("500 ms", 500),
+            ("500 milli", 500),
+            ("500 millis", 500),
+            ("500 millisecond", 500),
+            ("500 milliseconds", 500),
+            ("1500 µs", 1),
+            ("1500 micros", 1),
+            ("1500000 ns", 1),
+            ("1500000 nanoseconds", 1),
+        ] {
+            assert_eq!(
+                parse_duration_millis(input),
+                Some(expected),
+                "unexpected result for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_millis_is_case_and_space_insensitive() {
+        // Java lowercases the unit label and trims around it.
+        assert_eq!(parse_duration_millis("2MIN"), Some(120_000));
+        assert_eq!(parse_duration_millis("  30   S  "), Some(30_000));
+    }
+
+    #[test]
+    fn test_parse_duration_millis_rejects_unknown_and_malformed_input() {
+        assert_eq!(parse_duration_millis("2 weeks"), None);
+        assert_eq!(parse_duration_millis("min"), None);
+        assert_eq!(parse_duration_millis(""), None);
+        assert_eq!(parse_duration_millis("-5"), None);
+        // Java raises "numeric overflow" here; `None` lets callers fall back to
+        // their default instead of wrapping.
+        assert_eq!(parse_duration_millis("9223372036854775807 d"), None);
+    }
+
+    #[test]
+    fn test_commit_wait_options_accept_java_duration_strings() {
+        let options = HashMap::from([
+            (COMMIT_TIMEOUT_OPTION.to_string(), "2 min".to_string()),
+            (COMMIT_MIN_RETRY_WAIT_OPTION.to_string(), "1 s".to_string()),
+            (COMMIT_MAX_RETRY_WAIT_OPTION.to_string(), "30 s".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.commit_timeout_ms(), 120_000);
+        assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
+        assert_eq!(core.commit_max_retry_wait_ms(), 30_000);
+    }
+
+    #[test]
     fn test_partition_options_defaults() {
         let options = HashMap::new();
         let core = CoreOptions::new(&options);
@@ -2056,8 +2172,8 @@ mod tests {
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), -1);
         assert_eq!(core.commit_max_retries(), 10);
-        assert_eq!(core.commit_timeout_ms(), 120_000);
-        assert_eq!(core.commit_min_retry_wait_ms(), 1_000);
+        assert_eq!(core.commit_timeout_ms(), u64::MAX);
+        assert_eq!(core.commit_min_retry_wait_ms(), 10);
         assert_eq!(core.commit_max_retry_wait_ms(), 10_000);
         assert!(!core.row_tracking_enabled());
         assert_eq!(core.manifest_compression(), "zstd");
