@@ -3323,6 +3323,21 @@ mod tests {
         );
     }
 
+    fn expected_offset_index_range(data: &Bytes) -> std::ops::Range<u64> {
+        let metadata = load_metadata_with_page_index(data, false);
+        metadata
+            .row_groups()
+            .iter()
+            .flat_map(|row_group| row_group.columns())
+            .filter_map(|column| {
+                let start = u64::try_from(column.offset_index_offset()?).ok()?;
+                let length = u64::try_from(column.offset_index_length()?).ok()?;
+                Some(start..start + length)
+            })
+            .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+            .expect("test parquet file should contain offset indexes")
+    }
+
     #[tokio::test]
     async fn test_metadata_reads_exact_footer_without_fixed_prefetch() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
@@ -3371,6 +3386,33 @@ mod tests {
         assert_eq!(rows, 0);
         let ranges = tracker.ranges();
         assert_exact_metadata_reads(&data, &ranges);
+    }
+
+    #[tokio::test]
+    async fn test_non_empty_row_selection_reads_exact_offset_index_range() {
+        let data = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let file_size = data.len() as u64;
+        let file_read = TrackingFileRead::new(data.clone());
+        let tracker = file_read.clone();
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(file_read),
+                file_size,
+                &fields,
+                None,
+                None,
+                Some(vec![RowRange::new(0, 0)]),
+            )
+            .await
+            .unwrap();
+        drop(stream);
+
+        let ranges = tracker.ranges();
+        assert_eq!(ranges.len(), 3);
+        assert_exact_metadata_reads(&data, &ranges[..2]);
+        assert_eq!(ranges[2..], [expected_offset_index_range(&data)]);
     }
 
     async fn write_nested_multi_page_parquet() -> Vec<u8> {
