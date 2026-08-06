@@ -1732,6 +1732,24 @@ Columns:
 | `create_time` | TIMESTAMP | Tag creation time |
 | `time_retained` | STRING | Retention duration |
 
+### $branches
+
+View all branches of a table:
+
+```sql
+SELECT * FROM paimon.default.my_table$branches;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `branch_name` | STRING | Branch name |
+| `create_time` | TIMESTAMP | Branch creation time |
+
+Unlike the other system tables, `$branches` ignores a `$branch_<name>` prefix and
+always reports the branches of the base table.
+
 ### $manifests
 
 View manifest files of the latest snapshot:
@@ -1753,6 +1771,39 @@ Columns:
 | `max_partition_stats` | STRING | Maximum partition stats, formatted as a Java row cast string |
 | `min_row_id` | BIGINT | Minimum row id covered (when row tracking is enabled) |
 | `max_row_id` | BIGINT | Maximum row id covered (when row tracking is enabled) |
+
+### $files
+
+View the data files of the current snapshot, with per-file statistics:
+
+```sql
+SELECT * FROM paimon.default.my_table$files;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `partition` | STRING | Partition spec, formatted as a Java row cast string; `{}` for unpartitioned tables |
+| `bucket` | INT | Bucket id the file belongs to |
+| `file_path` | STRING | Full data file path, or `external_path` when the file has one |
+| `file_format` | STRING | Data file format, such as `parquet` or `orc` |
+| `schema_id` | BIGINT | Id of the schema the file was written with |
+| `level` | INT | LSM level of the file (`0` for unmerged files) |
+| `record_count` | BIGINT | Number of rows in the file, including deletes |
+| `file_size_in_bytes` | BIGINT | File size in bytes |
+| `min_key` | STRING | Minimum primary key in the file, `NULL` for append tables |
+| `max_key` | STRING | Maximum primary key in the file, `NULL` for append tables |
+| `null_value_counts` | STRING | Per-column null counts, as a `{col=count}` map |
+| `min_value_stats` | STRING | Per-column minimum values, as a `{col=value}` map |
+| `max_value_stats` | STRING | Per-column maximum values, as a `{col=value}` map |
+| `min_sequence_number` | BIGINT | Minimum sequence number in the file |
+| `max_sequence_number` | BIGINT | Maximum sequence number in the file |
+| `creation_time` | TIMESTAMP | File creation time |
+| `delete_row_count` | BIGINT | Number of delete rows in the file |
+| `file_source` | STRING | How the file was produced: `APPEND` or `COMPACT` |
+| `first_row_id` | BIGINT | First row id in the file (when row tracking is enabled) |
+| `write_cols` | ARRAY | Columns actually written, for data-evolution tables |
 
 ### $partitions
 
