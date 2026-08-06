@@ -78,6 +78,8 @@ const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
+pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
+    "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
@@ -462,6 +464,18 @@ impl<'a> CoreOptions<'a> {
     pub fn deletion_vectors_enabled(&self) -> bool {
         self.options
             .get(DELETION_VECTORS_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Whether reads expose the `_SEQUENCE_NUMBER` system column
+    /// (`table-read.sequence-number.enabled`, default `false`).
+    ///
+    /// Only meaningful for primary-key tables: the sequence number lives in the
+    /// merge key, so an append table has no such column to project.
+    pub fn table_read_sequence_number_enabled(&self) -> bool {
+        self.options
+            .get(TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }

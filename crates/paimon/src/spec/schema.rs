@@ -19,6 +19,7 @@ use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
     CHANGELOG_PRODUCER_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
+    TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -1141,6 +1142,7 @@ impl Schema {
         AggregationConfig::new(options).validate_create_mode(primary_keys, fields)?;
         Self::validate_first_row_changelog_producer(options)?;
         Self::validate_changelog_producer_requires_primary_keys(options, primary_keys)?;
+        Self::validate_read_sequence_number_requires_primary_keys(options, primary_keys)?;
         Self::validate_rowkind_field(options, primary_keys, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
@@ -1527,6 +1529,32 @@ impl Schema {
             message: format!(
                 "Can not set {CHANGELOG_PRODUCER_OPTION} on table without primary keys, \
                  please define primary keys."
+            ),
+        })
+    }
+
+    /// Reject `table-read.sequence-number.enabled` on a table without primary keys,
+    /// mirroring Java `SchemaValidation#validateChangelogReadSequenceNumber`.
+    ///
+    /// The sequence number is part of the merge key, so an append table has no such
+    /// column. Enabling the option there is accepted today and the read path then
+    /// projects a field id that no data file carries, so the column comes back
+    /// entirely NULL instead of raising.
+    fn validate_read_sequence_number_requires_primary_keys(
+        options: &HashMap<String, String>,
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        if !primary_keys.is_empty()
+            || !CoreOptions::new(options).table_read_sequence_number_enabled()
+        {
+            return Ok(());
+        }
+
+        Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "Cannot enable '{TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION}' for \
+                 non-primary-key table. Sequence number is only available for \
+                 primary key tables."
             ),
         })
     }
@@ -3091,6 +3119,62 @@ mod tests {
                 "input".to_string(),
             )]),
             "on table without primary keys",
+        );
+    }
+
+    #[test]
+    fn test_create_schema_rejects_read_sequence_number_without_primary_keys() {
+        // Java `validateChangelogReadSequenceNumber`: the sequence number lives in
+        // the merge key, so an append table has no such column to project.
+        for value in ["true", "TRUE"] {
+            assert_config_invalid(
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("value", DataType::Int(IntType::new()))
+                    .option("table-read.sequence-number.enabled", value)
+                    .build(),
+                "non-primary-key table",
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_schema_accepts_read_sequence_number_with_primary_keys() {
+        // Guard against over-rejecting: a primary-key table may enable it, and an
+        // append table may still spell the default out explicitly.
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("table-read.sequence-number.enabled", "true")
+            .build()
+            .unwrap();
+
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("table-read.sequence-number.enabled", "false")
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_alter_set_read_sequence_number_without_primary_keys_rejected() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+
+        assert_config_invalid(
+            table_schema.apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "table-read.sequence-number.enabled".to_string(),
+                "true".to_string(),
+            )]),
+            "non-primary-key table",
         );
     }
 
