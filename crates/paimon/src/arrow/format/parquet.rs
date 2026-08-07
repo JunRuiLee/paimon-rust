@@ -1885,8 +1885,8 @@ fn build_row_ranges_selection(
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
 /// The metadata prefetch policy follows [`FileRead::supports_cheap_range_reads`].
-/// Filesystem, memory, and HDFS readers use exact positioned reads; object-store
-/// readers retain the fixed suffix prefetch to avoid extra network round trips.
+/// Local filesystem, memory, and HDFS readers use exact positioned reads;
+/// other readers retain the fixed suffix prefetch unless they explicitly opt in.
 struct ArrowFileReader {
     file_size: u64,
     r: Arc<dyn FileRead>,
@@ -3360,7 +3360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hdfs_metadata_reads_exact_footer_without_fixed_prefetch() {
+    async fn test_cheap_range_reads_use_exact_footer_without_fixed_prefetch() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
         let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());
@@ -3403,7 +3403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hdfs_empty_row_selection_keeps_footer_only_metadata_path() {
+    async fn test_empty_row_selection_with_cheap_range_reads_keeps_exact_metadata_path() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
         let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());
@@ -3435,7 +3435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hdfs_non_empty_row_selection_reads_exact_offset_index_range() {
+    async fn test_non_empty_row_selection_with_cheap_range_reads_reads_exact_offset_index() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
         let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());

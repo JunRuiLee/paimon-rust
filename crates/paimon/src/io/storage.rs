@@ -192,7 +192,7 @@ impl Storage {
 
     pub(crate) fn supports_cheap_range_reads(&self) -> bool {
         match self {
-            Self::CustomFs { .. } => true,
+            Self::CustomFs { .. } => false,
             #[cfg(feature = "storage-memory")]
             Self::Memory { .. } => true,
             #[cfg(feature = "storage-fs")]
@@ -517,7 +517,9 @@ mod scheme_tests {
     #[test]
     fn cos_scheme_aliases_are_compatible() {
         for scheme in ["cos", "COS", "cosn", "COSN"] {
-            assert!(matches!(build(scheme), Storage::Cos { .. }), "{scheme}");
+            let storage = build(scheme);
+            assert!(matches!(&storage, Storage::Cos { .. }), "{scheme}");
+            assert!(!storage.supports_cheap_range_reads(), "{scheme}");
         }
     }
 
@@ -528,7 +530,9 @@ mod scheme_tests {
             "azdls", "AZDLS", "azdfs", "AZDFS", "abfs", "ABFS", "abfss", "ABFSS", "az", "AZ",
             "azure", "AZURE",
         ] {
-            assert!(matches!(build(scheme), Storage::Azdls { .. }), "{scheme}");
+            let storage = build(scheme);
+            assert!(matches!(&storage, Storage::Azdls { .. }), "{scheme}");
+            assert!(!storage.supports_cheap_range_reads(), "{scheme}");
         }
     }
 
@@ -536,7 +540,9 @@ mod scheme_tests {
     #[test]
     fn obs_scheme_is_case_insensitive() {
         for scheme in ["obs", "OBS"] {
-            assert!(matches!(build(scheme), Storage::Obs { .. }), "{scheme}");
+            let storage = build(scheme);
+            assert!(matches!(&storage, Storage::Obs { .. }), "{scheme}");
+            assert!(!storage.supports_cheap_range_reads(), "{scheme}");
         }
     }
 
@@ -544,7 +550,9 @@ mod scheme_tests {
     #[test]
     fn gcs_scheme_aliases_are_compatible() {
         for scheme in ["gcs", "GCS", "gs", "GS"] {
-            assert!(matches!(build(scheme), Storage::Gcs { .. }), "{scheme}");
+            let storage = build(scheme);
+            assert!(matches!(&storage, Storage::Gcs { .. }), "{scheme}");
+            assert!(!storage.supports_cheap_range_reads(), "{scheme}");
         }
     }
 
@@ -631,6 +639,14 @@ mod tests {
         assert_eq!(relative, "warehouse/db/table");
         let (_, relative) = storage.create("file:/warehouse/db/table").unwrap();
         assert_eq!(relative, "warehouse/db/table");
+    }
+
+    #[test]
+    fn custom_fs_operator_does_not_assume_cheap_range_reads() {
+        let storage = Storage::CustomFs {
+            op: memory_operator(),
+        };
+        assert!(!storage.supports_cheap_range_reads());
     }
 
     /// A scheme'd path would be silently mangled by the filesystem rules

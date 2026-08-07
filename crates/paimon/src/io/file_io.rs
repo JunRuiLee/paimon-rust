@@ -442,6 +442,11 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
+    /// Returns whether small positioned range reads are cheap enough to prefer
+    /// exact metadata reads over fixed-size prefetching.
+    ///
+    /// The conservative default keeps prefetching for custom readers unless
+    /// they explicitly opt in.
     fn supports_cheap_range_reads(&self) -> bool {
         false
     }
@@ -1165,6 +1170,15 @@ mod input_output_test {
         FileIOBuilder::new("file").build().unwrap()
     }
 
+    #[cfg(feature = "storage-memory")]
+    fn setup_custom_fs_file_io() -> FileIO {
+        let operator = Operator::from_config(opendal::services::MemoryConfig::default()).unwrap();
+        FileIOBuilder::new("")
+            .with_fs_operator(operator)
+            .build()
+            .unwrap()
+    }
+
     fn setup_cached_fs_file_io(cache_directory: &std::path::Path) -> FileIO {
         let mut options = Options::new();
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
@@ -1233,6 +1247,34 @@ mod input_output_test {
         let partial_content = reader.read(0..5).await.unwrap(); // read "hello"
 
         assert_eq!(&partial_content[..], b"hello");
+
+        file_io.delete_file(path).await.unwrap();
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_memory_reader_reports_cheap_range_reads() {
+        let file_io = setup_memory_file_io();
+        let path = "memory:/test_memory_reader_range_capability";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from_static(b"test")).await.unwrap();
+
+        let reader = output.to_input_file().reader().await.unwrap();
+        assert!(reader.supports_cheap_range_reads());
+
+        file_io.delete_file(path).await.unwrap();
+    }
+
+    #[cfg(feature = "storage-memory")]
+    #[tokio::test]
+    async fn test_custom_fs_reader_keeps_conservative_range_capability() {
+        let file_io = setup_custom_fs_file_io();
+        let path = "/test_custom_fs_reader_range_capability";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from_static(b"test")).await.unwrap();
+
+        let reader = output.to_input_file().reader().await.unwrap();
+        assert!(!reader.supports_cheap_range_reads());
 
         file_io.delete_file(path).await.unwrap();
     }
