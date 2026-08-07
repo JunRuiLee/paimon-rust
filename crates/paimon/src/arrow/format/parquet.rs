@@ -54,6 +54,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Metadata prefetch hint used when range reads have non-trivial request cost.
+const METADATA_SIZE_HINT: usize = 512 * 1024;
+
 #[derive(Default)]
 pub(crate) struct ParquetFormatReader {
     read_budget: Option<Arc<ParquetReadBudget>>,
@@ -330,8 +333,9 @@ impl FormatFileReader for ParquetFormatReader {
         };
         let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
 
-        // Predicates need both indexes for page-stat pruning. Row selection only
-        // needs OffsetIndex so arrow-rs can avoid fetching unselected pages.
+        // Predicates need both indexes for page-stat pruning. A non-empty row
+        // selection only needs OffsetIndex so arrow-rs can avoid fetching
+        // unselected pages.
         let mut arrow_options = ArrowReaderOptions::new();
         if !preds.is_empty() {
             arrow_options = arrow_options.with_column_index_policy(PageIndexPolicy::Optional);
@@ -1880,18 +1884,13 @@ fn build_row_ranges_selection(
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
-/// # TODO
-///
-/// [ParquetObjectReader](https://docs.rs/parquet/latest/src/parquet/arrow/async_reader/store.rs.html#64)
-/// supports optional metadata prefetch hints. Keep the hint unset so metadata
-/// loading first reads the 8-byte footer and then requests the exact metadata
-/// and page-index ranges, matching parquet-hadoop's seek-based read path.
-///
-/// - `preload_column_index`: Load the Column Index  as part of [`Self::get_metadata`].
-/// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
+/// The metadata prefetch policy follows [`FileRead::supports_cheap_range_reads`].
+/// Filesystem, memory, and HDFS readers use exact positioned reads; object-store
+/// readers retain the fixed suffix prefetch to avoid extra network round trips.
 struct ArrowFileReader {
     file_size: u64,
     r: Arc<dyn FileRead>,
+    metadata_prefetch_hint: Option<usize>,
 }
 
 /// coalesce threshold: 1 MiB.
@@ -1906,7 +1905,13 @@ const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Arc<dyn FileRead>) -> Self {
-        Self { file_size, r }
+        let metadata_prefetch_hint =
+            (!r.supports_cheap_range_reads()).then_some(METADATA_SIZE_HINT);
+        Self {
+            file_size,
+            r,
+            metadata_prefetch_hint,
+        }
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
@@ -2052,9 +2057,12 @@ impl AsyncFileReader for ArrowFileReader {
         // no page index would ever be loaded.
         let column_index_policy = options.map(|o| o.column_index_policy());
         let offset_index_policy = options.map(|o| o.offset_index_policy());
+        let prefetch_hint = self.metadata_prefetch_hint;
         Box::pin(async move {
             let file_size = self.file_size;
-            let mut reader = ParquetMetaDataReader::new().with_metadata_options(metadata_opts);
+            let mut reader = ParquetMetaDataReader::new()
+                .with_prefetch_hint(prefetch_hint)
+                .with_metadata_options(metadata_opts);
             if let Some(policy) = column_index_policy {
                 reader = reader.with_column_index_policy(policy);
             }
@@ -3272,6 +3280,7 @@ mod tests {
     struct TrackingFileRead {
         data: Bytes,
         ranges: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+        supports_cheap_range_reads: bool,
     }
 
     impl TrackingFileRead {
@@ -3279,6 +3288,14 @@ mod tests {
             Self {
                 data,
                 ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+                supports_cheap_range_reads: false,
+            }
+        }
+
+        fn with_cheap_range_reads(data: Bytes) -> Self {
+            Self {
+                supports_cheap_range_reads: true,
+                ..Self::new(data)
             }
         }
 
@@ -3306,9 +3323,13 @@ mod tests {
             self.ranges.lock().unwrap().push(range.clone());
             Ok(self.data.slice(range.start as usize..range.end as usize))
         }
+
+        fn supports_cheap_range_reads(&self) -> bool {
+            self.supports_cheap_range_reads
+        }
     }
 
-    fn assert_exact_metadata_reads(data: &Bytes, ranges: &[std::ops::Range<u64>]) {
+    fn assert_footer_then_exact_metadata_reads(data: &Bytes, ranges: &[std::ops::Range<u64>]) {
         let file_size = data.len() as u64;
         let footer_start = data.len() - 8;
         let metadata_len =
@@ -3339,10 +3360,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metadata_reads_exact_footer_without_fixed_prefetch() {
+    async fn test_hdfs_metadata_reads_exact_footer_without_fixed_prefetch() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
-        let file_read = TrackingFileRead::new(data.clone());
+        let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());
         let tracker = file_read.clone();
         let fields = vec![int_field("id"), int_field("value")];
 
@@ -3353,14 +3374,39 @@ mod tests {
         drop(stream);
 
         let ranges = tracker.ranges();
-        assert_exact_metadata_reads(&data, &ranges);
+        assert_footer_then_exact_metadata_reads(&data, &ranges);
     }
 
     #[tokio::test]
-    async fn test_empty_row_selection_keeps_footer_only_metadata_path() {
+    async fn test_small_object_store_row_selection_uses_single_prefetch_request() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
-        let file_read = TrackingFileRead::new(data.clone());
+        assert!(file_size <= super::METADATA_SIZE_HINT as u64);
+        let file_read = TrackingFileRead::new(data);
+        let tracker = file_read.clone();
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(file_read),
+                file_size,
+                &fields,
+                None,
+                None,
+                Some(vec![RowRange::new(0, 0)]),
+            )
+            .await
+            .unwrap();
+        drop(stream);
+
+        assert_eq!(tracker.ranges(), vec![0..file_size]);
+    }
+
+    #[tokio::test]
+    async fn test_hdfs_empty_row_selection_keeps_footer_only_metadata_path() {
+        let data = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let file_size = data.len() as u64;
+        let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());
         let tracker = file_read.clone();
         let fields = vec![int_field("id"), int_field("value")];
 
@@ -3385,14 +3431,14 @@ mod tests {
 
         assert_eq!(rows, 0);
         let ranges = tracker.ranges();
-        assert_exact_metadata_reads(&data, &ranges);
+        assert_footer_then_exact_metadata_reads(&data, &ranges);
     }
 
     #[tokio::test]
-    async fn test_non_empty_row_selection_reads_exact_offset_index_range() {
+    async fn test_hdfs_non_empty_row_selection_reads_exact_offset_index_range() {
         let data = Bytes::from(write_multi_page_parquet(10, 80).await);
         let file_size = data.len() as u64;
-        let file_read = TrackingFileRead::new(data.clone());
+        let file_read = TrackingFileRead::with_cheap_range_reads(data.clone());
         let tracker = file_read.clone();
         let fields = vec![int_field("id"), int_field("value")];
 
@@ -3411,7 +3457,7 @@ mod tests {
 
         let ranges = tracker.ranges();
         assert_eq!(ranges.len(), 3);
-        assert_exact_metadata_reads(&data, &ranges[..2]);
+        assert_footer_then_exact_metadata_reads(&data, &ranges[..2]);
         assert_eq!(ranges[2..], [expected_offset_index_range(&data)]);
     }
 
