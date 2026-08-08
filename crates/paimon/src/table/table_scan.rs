@@ -51,6 +51,7 @@ use crate::table::source::{
 };
 use crate::table::ScanTrace;
 use futures::{StreamExt, TryStreamExt};
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -542,7 +543,30 @@ impl LimitPushdownAccumulator {
     }
 }
 
-type BucketDataFileGroups = HashMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
+type PartitionDataFileGroups = IndexMap<Vec<u8>, IndexMap<i32, (i32, Vec<DataFileMeta>)>>;
+type BucketDataFileGroup = ((Vec<u8>, i32), (i32, Vec<DataFileMeta>));
+
+fn group_data_files_by_partition_bucket(entries: Vec<ManifestEntry>) -> Vec<BucketDataFileGroup> {
+    let mut partitions = PartitionDataFileGroups::new();
+    for entry in entries {
+        let (partition, bucket, total_buckets, file) = entry.into_parts();
+        partitions
+            .entry(partition)
+            .or_default()
+            .entry(bucket)
+            .or_insert_with(|| (total_buckets, Vec::new()))
+            .1
+            .push(file);
+    }
+
+    let mut groups = Vec::new();
+    for (partition, buckets) in partitions {
+        for (bucket, files) in buckets {
+            groups.push(((partition.clone(), bucket), files));
+        }
+    }
+    groups
+}
 
 #[derive(Clone, Copy)]
 struct GlobalIndexScanSettings {
@@ -1752,14 +1776,7 @@ impl<'a> PaimonTableScan<'a> {
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
-        let mut groups: BucketDataFileGroups = HashMap::with_capacity(entries.len());
-        for e in entries {
-            let (partition, bucket, total_buckets, file) = e.into_parts();
-            let entry = groups
-                .entry((partition, bucket))
-                .or_insert_with(|| (total_buckets, Vec::new()));
-            entry.1.push(file);
-        }
+        let groups = group_data_files_by_partition_bucket(entries);
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
@@ -2005,8 +2022,9 @@ impl<'a> PaimonTableScan<'a> {
 mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
-        manifest_file_overlaps_row_range_index, prune_data_evolution_group_by_read_fields,
-        retain_index_manifest_entry, retain_manifest_entry_row_ranges, retain_manifest_row_ranges,
+        group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
+        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
+        retain_manifest_entry_row_ranges, retain_manifest_row_ranges,
         should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
         PaimonTableScan, RowRangeIndex, TableScan,
     };
@@ -2299,6 +2317,41 @@ mod tests {
 
     fn file_names_from_files(files: &[DataFileMeta]) -> Vec<&str> {
         files.iter().map(|file| file.file_name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_partition_bucket_groups_preserve_manifest_order() {
+        let entry = |partition: &[u8], bucket: i32, name: &str| {
+            ManifestEntry::new(
+                FileKind::Add,
+                partition.to_vec(),
+                bucket,
+                2,
+                make_evo_file(name, 1, 1, 1, None),
+                2,
+            )
+        };
+        let groups = group_data_files_by_partition_bucket(vec![
+            entry(b"b", 1, "b-1.parquet"),
+            entry(b"a", 0, "a.parquet"),
+            entry(b"b", 0, "b-0.parquet"),
+            entry(b"b", 1, "b-1-next.parquet"),
+        ]);
+
+        let ordered = groups
+            .iter()
+            .map(|((partition, bucket), (_, files))| {
+                (partition.as_slice(), *bucket, file_names_from_files(files))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                (b"b".as_slice(), 1, vec!["b-1.parquet", "b-1-next.parquet"]),
+                (b"b".as_slice(), 0, vec!["b-0.parquet"]),
+                (b"a".as_slice(), 0, vec!["a.parquet"]),
+            ]
+        );
     }
 
     #[test]
