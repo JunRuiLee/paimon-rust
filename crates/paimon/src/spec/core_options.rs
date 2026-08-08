@@ -23,6 +23,9 @@ pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
+const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
+const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
+const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
@@ -639,18 +642,36 @@ impl<'a> CoreOptions<'a> {
     }
 
     pub fn global_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
-        match self
-            .options
-            .get(GLOBAL_INDEX_SEARCH_MODE_OPTION)
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref()
-            .unwrap_or("fast")
-        {
+        self.index_search_mode(GLOBAL_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn scalar_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(SCALAR_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn vector_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(VECTOR_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    pub fn full_text_index_search_mode(&self) -> crate::Result<GlobalIndexSearchMode> {
+        self.index_search_mode(FULL_TEXT_INDEX_SEARCH_MODE_OPTION)
+    }
+
+    fn index_search_mode(&self, family_option: &str) -> crate::Result<GlobalIndexSearchMode> {
+        let (option, value) = if let Some(value) = self.options.get(family_option) {
+            (family_option, value)
+        } else if let Some(value) = self.options.get(GLOBAL_INDEX_SEARCH_MODE_OPTION) {
+            (GLOBAL_INDEX_SEARCH_MODE_OPTION, value)
+        } else {
+            return Ok(GlobalIndexSearchMode::Fast);
+        };
+
+        match value.to_ascii_lowercase().as_str() {
             "fast" => Ok(GlobalIndexSearchMode::Fast),
             "full" => Ok(GlobalIndexSearchMode::Full),
             "detail" => Ok(GlobalIndexSearchMode::Detail),
             other => Err(crate::Error::ConfigInvalid {
-                message: format!("Unsupported global-index.search-mode: {other}"),
+                message: format!("Unsupported {option}: {other}"),
             }),
         }
     }
@@ -1580,6 +1601,54 @@ mod tests {
             let core = CoreOptions::new(&options);
             assert_eq!(core.global_index_search_mode().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn test_family_index_search_mode_precedence() {
+        let legacy = HashMap::from([(
+            GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+            "full".to_string(),
+        )]);
+        let legacy_core = CoreOptions::new(&legacy);
+        for actual in [
+            legacy_core.scalar_index_search_mode().unwrap(),
+            legacy_core.vector_index_search_mode().unwrap(),
+            legacy_core.full_text_index_search_mode().unwrap(),
+        ] {
+            assert_eq!(actual, GlobalIndexSearchMode::Full);
+        }
+
+        let family = HashMap::from([
+            (
+                GLOBAL_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "full".to_string(),
+            ),
+            (
+                SCALAR_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "fast".to_string(),
+            ),
+            (
+                VECTOR_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "detail".to_string(),
+            ),
+            (
+                FULL_TEXT_INDEX_SEARCH_MODE_OPTION.to_string(),
+                "fast".to_string(),
+            ),
+        ]);
+        let family_core = CoreOptions::new(&family);
+        assert_eq!(
+            family_core.scalar_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
+        assert_eq!(
+            family_core.vector_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Detail
+        );
+        assert_eq!(
+            family_core.full_text_index_search_mode().unwrap(),
+            GlobalIndexSearchMode::Fast
+        );
     }
 
     #[test]

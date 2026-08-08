@@ -762,7 +762,7 @@ async fn plan_and_search_pk_candidates_batch(
             source: None,
         })?;
 
-    let search_mode = core.global_index_search_mode()?;
+    let search_mode = core.vector_index_search_mode()?;
     let skip_exact_fallback = search_mode == GlobalIndexSearchMode::Fast;
 
     // A non-positive limit is invalid regardless of the plan; reject it before
@@ -1435,7 +1435,7 @@ async fn evaluate_batch_vector_search(
 
     let table_path = evaluation.table_path.trim_end_matches('/');
     let core_options = CoreOptions::new(evaluation.table_options);
-    let search_mode = core_options.global_index_search_mode()?;
+    let search_mode = core_options.vector_index_search_mode()?;
     let field_name = &vector_searches[0].field_name;
     if vector_searches
         .iter()
@@ -3487,7 +3487,7 @@ mod tests {
         let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
         let fields = vec![make_field(2, "embedding")];
         let vs = VectorSearch::new(vec![1.0], 10, "embedding".to_string()).unwrap();
-        let options = HashMap::from([("global-index.search-mode".to_string(), "full".to_string())]);
+        let options = HashMap::from([("vector-index.search-mode".to_string(), "full".to_string())]);
 
         let err = evaluate_vector_search(
             eval_context(&file_io, &options, &fields, Some(10)),
