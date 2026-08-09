@@ -17,7 +17,7 @@
 
 use crate::arrow::schema_evolution::create_index_mapping;
 pub(crate) use crate::predicate_stats::{predicates_may_match_with_schema, StatsAccessor};
-use crate::spec::{DataField, Predicate, PredicateOperator};
+use crate::spec::{is_row_id_column, DataField, Predicate, PredicateOperator};
 
 /// Remap predicates from table-level indices to file-level indices.
 /// Predicates referencing fields not present in the file are resolved based on
@@ -44,6 +44,12 @@ fn remap_predicate(predicate: &Predicate, mapping: &[Option<usize>]) -> Predicat
             op,
             literals,
         } => {
+            // `_ROW_ID` is not a file column and has no per-file position, so
+            // mapping its placeholder index would collapse the leaf to a
+            // constant. Keep it; the residual resolves it by name.
+            if is_row_id_column(column) {
+                return predicate.clone();
+            }
             match mapping.get(*index).copied().flatten() {
                 Some(file_index) => Predicate::Leaf {
                     column: column.clone(),
@@ -133,4 +139,45 @@ fn normalize_field_mapping(mapping: Option<Vec<i32>>, num_fields: usize) -> Vec<
                 .collect()
         })
         .unwrap_or_else(|| identity_field_mapping(num_fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataType, Datum, IntType, PredicateBuilder, PredicateOperator};
+
+    #[test]
+    fn test_a_row_id_leaf_survives_per_file_remapping() {
+        let table_fields = vec![
+            DataField::new(1, "added".to_string(), DataType::Int(IntType::new())),
+            DataField::new(0, "base".to_string(), DataType::Int(IntType::new())),
+        ];
+        let file_fields = vec![table_fields[1].clone()];
+        let leaf = crate::spec::row_id_leaf(PredicateOperator::NotEq, vec![Datum::Long(102)]);
+
+        assert_eq!(
+            remap_predicates_to_file(std::slice::from_ref(&leaf), &table_fields, &file_fields),
+            vec![leaf]
+        );
+    }
+
+    #[test]
+    fn test_a_row_id_branch_can_die_during_per_file_remapping() {
+        let table_fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "added".to_string(), DataType::Int(IntType::new())),
+        ];
+        let file_fields = vec![table_fields[0].clone()];
+        let filter = Predicate::or(vec![
+            PredicateBuilder::new(&table_fields)
+                .is_null("added")
+                .unwrap(),
+            crate::spec::row_id_leaf(PredicateOperator::Eq, vec![Datum::Long(5)]),
+        ]);
+
+        assert_eq!(
+            remap_predicates_to_file(&[filter], &table_fields, &file_fields),
+            vec![Predicate::AlwaysTrue]
+        );
+    }
 }

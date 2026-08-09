@@ -1015,6 +1015,28 @@ pub const VALUE_KIND_FIELD_ID: i32 = i32::MAX - 2;
 
 pub const ROW_KIND_FIELD_NAME: &str = "rowkind";
 
+/// A row's global id. Nullable: a data file lacking `first_row_id` yields nulls.
+pub(crate) fn row_id_data_field() -> DataField {
+    DataField::new(
+        ROW_ID_FIELD_ID,
+        ROW_ID_FIELD_NAME.to_string(),
+        DataType::BigInt(crate::spec::BigIntType::with_nullable(true)),
+    )
+}
+
+/// `_ROW_ID` is synthesized by the reader and is not a table column, so
+/// `PredicateBuilder` cannot resolve it and callers hand-build the leaf with a
+/// placeholder index. Every index-based resolution must recognize it by name
+/// instead, or it binds the predicate to whatever field sits at that index.
+///
+/// The other reserved names are excluded on purpose. `_SEQUENCE_NUMBER` and
+/// `_VALUE_KIND` are physical columns of a KV file and do have a position; none
+/// of them is ever referenced by a predicate. Widening this to every reserved
+/// name would instead break a schema that predates their rejection.
+pub(crate) fn is_row_id_column(name: &str) -> bool {
+    name == ROW_ID_FIELD_NAME
+}
+
 /// Must match Java Paimon's `SpecialFields.ROW_KIND` (Integer.MAX_VALUE - 4).
 pub const ROW_KIND_FIELD_ID: i32 = i32::MAX - 4;
 

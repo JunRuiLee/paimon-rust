@@ -25,8 +25,8 @@ use crate::arrow::{ParquetReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode, Predicate,
-    PredicateOperator,
+    is_row_id_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode,
+    Predicate, PredicateOperator,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -767,11 +767,11 @@ fn build_parquet_arrow_predicate(
     // the union of referenced Parquet roots, ordered exactly as the projected
     // RecordBatch. This preserves OR/NOT semantics; splitting it into leaf
     // RowFilters would incorrectly turn the expression into a conjunction.
-    let mut field_indices = Vec::new();
-    crate::arrow::residual::collect_predicate_field_indices(predicate, &mut field_indices);
-    let mut projected = field_indices
+    let mut leaf_refs = Vec::new();
+    crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut leaf_refs);
+    let mut projected = leaf_refs
         .into_iter()
-        .filter_map(|index| {
+        .filter_map(|(_, index)| {
             let field = file_fields.get(index)?;
             parquet_root_index(parquet_schema, field.name()).map(|root| (root, field.clone()))
         })
@@ -826,11 +826,19 @@ fn parquet_predicate_row_filter_accepted(
     match predicate {
         Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(true),
         Predicate::Leaf {
+            column,
             index,
             op,
             literals,
             ..
-        } => parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields),
+        } => parquet_leaf_row_filter_accepted(
+            parquet_schema,
+            column,
+            *index,
+            *op,
+            literals,
+            file_fields,
+        ),
         Predicate::And(children) | Predicate::Or(children) => {
             for child in children {
                 if !parquet_predicate_row_filter_accepted(parquet_schema, child, file_fields)? {
@@ -853,12 +861,18 @@ fn parquet_predicate_row_filter_accepted(
 /// an unsupported (but well-formed) leaf yields `Ok(false)`.
 fn parquet_leaf_row_filter_accepted(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    column: &str,
     index: usize,
     op: PredicateOperator,
     literals: &[Datum],
     file_fields: &[DataField],
 ) -> crate::Result<bool> {
     if !predicate_supported_for_parquet_row_filter(op) {
+        return Ok(false);
+    }
+    // Not in the file, so the decoder cannot evaluate it. Rejecting the leaf
+    // rejects any enclosing predicate too, leaving it to the post-scan residual.
+    if is_row_id_column(column) {
         return Ok(false);
     }
     let Some(file_field) = file_fields.get(index) else {
@@ -2241,6 +2255,32 @@ mod tests {
             .expect("parquet row filter should build");
 
         assert!(row_filter.is_some());
+    }
+
+    #[test]
+    fn test_row_id_predicate_builds_no_decoder_row_filter() {
+        let fields = test_fields();
+        let schema = test_parquet_schema();
+        assert!(build_parquet_row_filter(
+            &schema,
+            &[crate::spec::row_id_leaf(
+                super::PredicateOperator::Eq,
+                vec![Datum::Long(1)]
+            )],
+            &fields
+        )
+        .expect("row filter should build")
+        .is_none());
+
+        let mixed = Predicate::or(vec![
+            crate::spec::row_id_leaf(super::PredicateOperator::Eq, vec![Datum::Long(1)]),
+            PredicateBuilder::new(&fields)
+                .equal("score", Datum::Int(7))
+                .expect("leaf should build"),
+        ]);
+        assert!(build_parquet_row_filter(&schema, &[mixed], &fields)
+            .expect("row filter should build")
+            .is_none());
     }
 
     // -----------------------------------------------------------------------

@@ -56,6 +56,11 @@ impl FormatFileReader for MosaicFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        // This reader only prunes row groups by stats, and stats cannot decide a
+        // `_ROW_ID` predicate, so nothing would enforce it.
+        if let Some(fp) = predicates {
+            crate::table::row_id_predicate::reject_row_id_filter(&fp.predicates, "mosaic files")?;
+        }
         let handle = tokio::runtime::Handle::try_current().map_err(|e| Error::UnexpectedError {
             message: "Mosaic reader requires a Tokio runtime".to_string(),
             source: Some(Box::new(e)),
@@ -974,6 +979,28 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(4), 5);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_predicate_is_rejected() {
+        let data = write_mosaic(&sample_batch());
+        let fields = data_fields();
+        let predicates = FilePredicates {
+            predicates: vec![crate::spec::row_id_leaf(
+                crate::spec::PredicateOperator::NotEq,
+                vec![Datum::Long(101)],
+            )],
+            row_filter_factory: None,
+            file_fields: fields.clone(),
+        };
+        let err = read_batches_with_predicates(data, &fields, Some(&predicates), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Unsupported { message } if message.contains("_ROW_ID")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]

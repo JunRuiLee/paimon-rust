@@ -23,7 +23,9 @@ use crate::predicate_stats::{
     data_leaf_may_match, data_leaf_must_match, missing_field_may_match, missing_field_must_match,
     predicates_may_match_with_schema, StatsAccessor,
 };
-use crate::spec::{extract_datum, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate};
+use crate::spec::{
+    extract_datum, is_row_id_column, BinaryRow, DataField, DataFileMeta, DataType, Datum, Predicate,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -399,6 +401,8 @@ fn data_evolution_predicate_may_match(
             file_stats,
             row_count,
         ),
+        // `_ROW_ID` has no column stats, so never prune a group on it.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => true,
         Predicate::Leaf {
             index,
             data_type,
@@ -462,6 +466,8 @@ fn data_evolution_predicate_must_match(
             file_stats,
             row_count,
         ),
+        // Stats cannot decide `_ROW_ID`, so it never provably matches.
+        Predicate::Leaf { column, .. } if is_row_id_column(column) => false,
         Predicate::Leaf {
             index,
             data_type,

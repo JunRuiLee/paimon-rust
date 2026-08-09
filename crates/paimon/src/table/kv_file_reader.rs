@@ -315,6 +315,12 @@ impl KeyValueFileReader {
     }
 
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        // A projected `_ROW_ID` is synthesized as all-nulls here, so the residual
+        // would silently drop every row rather than hit its missing-column guard.
+        super::row_id_predicate::reject_row_id_filter(
+            &self.config.predicates,
+            "primary-key tables",
+        )?;
         // Build the internal read type for thin-mode files.
         // Physical file schema: [_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]
         // We need: _SEQ + _VK + union(read_type, primary_keys)
@@ -702,6 +708,77 @@ mod tests {
     use parquet::file::metadata::ParquetMetaDataReader;
     use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_row_id_filter_on_a_primary_key_table_is_rejected() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_row_id_filter";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(&file_io, table_path, &[]);
+
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(10), Some(20), Some(30)]),
+        )
+        .await;
+        write_commit(
+            &table,
+            &int_batch(vec![1, 2, 3], vec![Some(11), Some(21), Some(31)]),
+        )
+        .await;
+
+        let row_id = crate::spec::row_id_leaf(
+            crate::spec::PredicateOperator::NotEq,
+            vec![Datum::Long(102)],
+        );
+        let mut read_builder = table.new_read_builder();
+        read_builder
+            .with_projection(&["id", "value", crate::spec::ROW_ID_FIELD_NAME])
+            .unwrap();
+        read_builder.with_filter(row_id);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let err = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .err()
+            .expect("a _ROW_ID filter must be rejected");
+
+        assert!(
+            matches!(&err, Error::Unsupported { message } if message.contains("_ROW_ID")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_row_id_conjunct_is_not_treated_as_a_primary_key_conjunct() {
+        let fields = vec![
+            DataField::new(0, "k".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "v".to_string(), DataType::Int(IntType::new())),
+        ];
+        let row_id =
+            crate::spec::row_id_leaf(crate::spec::PredicateOperator::Eq, vec![Datum::Long(5)]);
+        let on_key = PredicateBuilder::new(&fields)
+            .equal("k", Datum::Int(1))
+            .unwrap();
+
+        assert_eq!(
+            retain_primary_key_conjuncts(
+                std::slice::from_ref(&row_id),
+                &fields,
+                &["k".to_string()]
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            retain_primary_key_conjuncts(
+                &[Predicate::and(vec![row_id, on_key.clone()])],
+                &fields,
+                &["k".to_string()],
+            ),
+            vec![on_key]
+        );
+    }
 
     fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()

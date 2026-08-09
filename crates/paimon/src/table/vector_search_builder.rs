@@ -23,8 +23,8 @@ use crate::lumina::{
     is_lumina_index_type, LuminaIndexMeta, LuminaVectorIndexOptions, LuminaVectorMetric,
 };
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode, IndexFileMeta,
-    IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    row_id_data_field, CoreOptions, DataField, DataType, FileKind, GlobalIndexSearchMode,
+    IndexFileMeta, IndexManifest, IndexManifestEntry, Predicate, ROW_ID_FIELD_NAME,
 };
 use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::data_file_reader::DataFileReader;
@@ -2146,19 +2146,6 @@ pub(crate) fn reorder_and_strip_position(
             source: None,
         })?;
     Ok(vec![projected])
-}
-
-/// The `_ROW_ID` field to append to a data-evolution read type so the reader
-/// fills each row's global id. Mirrors the field the `DataEvolutionReader`
-/// recognizes (Int64 / `BigInt`, nullable): a data file lacking `first_row_id`
-/// yields nulls here, which `attach_scores_by_row_id` then fails loud on rather
-/// than mis-aligning scores.
-fn row_id_data_field() -> DataField {
-    DataField::new(
-        ROW_ID_FIELD_ID,
-        ROW_ID_FIELD_NAME.to_string(),
-        DataType::BigInt(BigIntType::with_nullable(true)),
-    )
 }
 
 /// Collect materialized DE rows, join each row's `(rank, score)` by its global
