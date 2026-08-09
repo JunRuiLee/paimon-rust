@@ -229,6 +229,18 @@ rb.with_limit(100)
 !!! warning
     `with_limit` is a scan-planning hint, not an exact row cap. When all rows fall within a single split, the entire split is returned regardless of the limit value. Callers should apply application-level limiting if an exact upper bound is required.
 
+## Row Ranges
+
+Use `with_row_ranges` to restrict a Data Evolution scan to inclusive row ID ranges. Each range is a `(from, to)` tuple; `from` must not exceed `to`.
+
+```python
+rb = table.new_read_builder()
+rb.with_row_ranges([(0, 99), (200, 299)])
+```
+
+!!! warning
+    An empty list selects **zero** rows, not all rows. Format tables are not supported and raise `NotImplementedError`.
+
 ## Case Sensitivity
 
 Use `with_case_sensitive` to control whether column-name matching in projections and predicates is case-sensitive. Defaults to `True` (exact match). Set to `False` for case-insensitive matching (ASCII case-folding).
