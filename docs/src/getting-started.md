@@ -85,6 +85,9 @@ options.set(CatalogOptions::WAREHOUSE, "oss://bucket/warehouse");
 options.set("fs.oss.accessKeyId", "your-access-key-id");
 options.set("fs.oss.accessKeySecret", "your-access-key-secret");
 options.set("fs.oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
+// Optional: configure retries for temporary OSS failures.
+options.set("fs.oss.retry.count", "10");
+options.set("fs.oss.retry.interval.millisecond", "500");
 let catalog = CatalogFactory::create(options).await?;
 
 // Tencent Cloud COS
