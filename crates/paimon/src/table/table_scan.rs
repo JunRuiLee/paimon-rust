@@ -400,6 +400,25 @@ fn retain_index_manifest_entry(
             && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some())
 }
 
+fn retain_index_manifest_entry_for_scan(
+    entry: &IndexManifestEntry,
+    global_index_needed: bool,
+    deletion_vectors_needed: bool,
+    partition_filter: Option<&PartitionFilter>,
+) -> crate::Result<bool> {
+    if !retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed) {
+        return Ok(false);
+    }
+    // Deletion vectors are selected by partition and bucket when splits are built.
+    if normalize_sorted_global_index_type(&entry.index_file.index_type).is_none() {
+        return Ok(true);
+    }
+    partition_filter
+        .map(|filter| filter.matches_entry(&entry.partition))
+        .transpose()
+        .map(|matched| matched.unwrap_or(true))
+}
+
 /// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
 /// Only considers ADD entries with index_type "DELETION_VECTORS" and their deletion_vectors_ranges.
 fn build_deletion_files_map(
@@ -1229,13 +1248,17 @@ impl<'a> PaimonTableScan<'a> {
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
-        let entries = IndexManifest::read(self.table.file_io(), &path)
-            .await?
-            .into_iter()
-            .filter(|entry| {
-                retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
-            })
-            .collect();
+        let mut entries = Vec::new();
+        for entry in IndexManifest::read(self.table.file_io(), &path).await? {
+            if retain_index_manifest_entry_for_scan(
+                &entry,
+                global_index_needed,
+                deletion_vectors_needed,
+                self.partition_filter.as_ref(),
+            )? {
+                entries.push(entry);
+            }
+        }
         Ok(Some(entries))
     }
 
@@ -2034,9 +2057,9 @@ mod tests {
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
         prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_manifest_entry_row_ranges, retain_manifest_row_ranges,
-        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
-        PaimonTableScan, RowRangeIndex, TableScan,
+        retain_index_manifest_entry_for_scan, retain_manifest_entry_row_ranges,
+        retain_manifest_row_ranges, should_skip_level_zero_for_scan, split_row_ranges_for_files,
+        LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -3996,6 +4019,61 @@ mod tests {
             retained(true, true),
             vec!["DELETION_VECTORS", "btree", "bitmap"]
         );
+    }
+
+    #[test]
+    fn test_retain_index_manifest_entries_for_selected_partitions() {
+        let partition = |value| {
+            let mut builder = BinaryRowBuilder::new(1);
+            builder.write_int(0, value);
+            builder.build_serialized()
+        };
+        let matching_partition = partition(7);
+        let filter = PartitionFilter::from_partition_set(
+            HashSet::from([matching_partition.clone()]),
+            &[DataField::new(
+                0,
+                "dt".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+        )
+        .unwrap();
+        let entry = |partition, index_type: &str| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition,
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: index_type.to_string(),
+                file_name: "btree.idx".to_string(),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                global_index_meta: None,
+            },
+        };
+
+        assert!(retain_index_manifest_entry_for_scan(
+            &entry(matching_partition, "btree"),
+            true,
+            false,
+            Some(&filter),
+        )
+        .unwrap());
+        assert!(!retain_index_manifest_entry_for_scan(
+            &entry(partition(8), "btree"),
+            true,
+            false,
+            Some(&filter),
+        )
+        .unwrap());
+        assert!(retain_index_manifest_entry_for_scan(
+            &entry(partition(8), "DELETION_VECTORS"),
+            true,
+            true,
+            Some(&filter),
+        )
+        .unwrap());
     }
 
     #[tokio::test]
