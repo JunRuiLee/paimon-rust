@@ -700,8 +700,8 @@ impl<'a> CoreOptions<'a> {
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
     /// search. A value of `1` reproduces strict sequential execution. A
-    /// non-positive value is a misconfiguration and fails loud rather than being
-    /// silently clamped.
+    /// non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`], is a
+    /// misconfiguration and fails loud rather than being silently clamped.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?

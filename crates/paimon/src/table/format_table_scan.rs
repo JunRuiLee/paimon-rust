@@ -615,6 +615,18 @@ fn parse_partition_date(value: &str) -> Option<i32> {
         .ok()
 }
 
+fn supported_format_table_formats() -> Vec<&'static str> {
+    vec![
+        "parquet",
+        "orc",
+        "avro",
+        "row",
+        "mosaic",
+        #[cfg(feature = "vortex")]
+        "vortex",
+    ]
+}
+
 fn supported_format_table_extension(format: &str) -> crate::Result<&'static str> {
     match format.to_ascii_lowercase().as_str() {
         "parquet" => Ok(".parquet"),
@@ -626,7 +638,9 @@ fn supported_format_table_extension(format: &str) -> crate::Result<&'static str>
         "vortex" => Ok(".vortex"),
         other => Err(crate::Error::Unsupported {
             message: format!(
-                "Format table file.format '{other}' is not supported by the Rust reader yet"
+                "Format table file.format '{other}' is not supported by the Rust reader yet, \
+                 expected one of: {}",
+                supported_format_table_formats().join(", ")
             ),
         }),
     }
@@ -654,5 +668,34 @@ fn data_file_meta(file_name: String, file_size: i64, schema_id: i64) -> DataFile
         external_path: None,
         first_row_id: None,
         write_cols: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unsupported_format_lists_the_supported_ones() {
+        let error = supported_format_table_extension("csv").unwrap_err();
+        let crate::Error::Unsupported { message } = error else {
+            panic!("expected Unsupported, got {error:?}");
+        };
+        assert!(message.contains("'csv'"), "{message}");
+        for format in supported_format_table_formats() {
+            assert!(message.contains(format), "{format} missing from {message}");
+        }
+    }
+
+    #[test]
+    fn test_supported_formats_are_accepted_case_insensitively() {
+        for format in supported_format_table_formats() {
+            let expected = format!(".{format}");
+            assert_eq!(supported_format_table_extension(format).unwrap(), expected);
+            assert_eq!(
+                supported_format_table_extension(&format.to_ascii_uppercase()).unwrap(),
+                expected
+            );
+        }
     }
 }
