@@ -1753,8 +1753,8 @@ Columns:
 | `schema_id` | BIGINT | Schema ID |
 | `commit_time` | TIMESTAMP | Commit time |
 | `record_count` | BIGINT | Record count |
-| `create_time` | TIMESTAMP | Tag creation time |
-| `time_retained` | STRING | Retention duration |
+| `create_time` | TIMESTAMP | Always `NULL`: the Rust snapshot does not carry a tag creation time |
+| `time_retained` | STRING | Always `NULL`: the Rust snapshot does not carry a tag retention |
 
 ### $branches
 
@@ -1847,8 +1847,8 @@ Columns:
 | `file_count` | BIGINT | Number of data files |
 | `last_update_time` | TIMESTAMP | Latest data-file creation time |
 | `created_at` | TIMESTAMP | Partition creation time (only available with metastore-tracked catalogs) |
-| `created_by` | STRING | Snapshot id that created the partition (catalog-tracked only) |
-| `updated_by` | STRING | Snapshot id that last updated the partition (catalog-tracked only) |
+| `created_by` | STRING | User who created the partition (catalog-tracked only) |
+| `updated_by` | STRING | User who last updated the partition (catalog-tracked only) |
 | `options` | STRING | Per-partition options as flat JSON (catalog-tracked only) |
 | `total_buckets` | INT | Total bucket count for the partition (0 unless catalog-tracked) |
 | `done` | BOOLEAN | Whether the partition is marked done (false unless catalog-tracked) |
@@ -1866,7 +1866,7 @@ Columns:
 
 | Column | Type | Description |
 |---|---|---|
-| `partition` | STRING | Partition spec for the indexed data, or `NULL` for unpartitioned tables |
+| `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
 | `index_type` | STRING | Index type, such as `btree`, `bitmap`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name under the table index directory |
@@ -1886,7 +1886,7 @@ Files are classified by their table-relative path:
 - `manifest/manifest-*`, `manifest/manifest-list-*`, and `manifest/index-manifest-*` → manifest
 - `statistics/*` → manifest file counters for the current compatible output schema
 - `index/*` → index
-- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth
+- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth, except names starting with `index-`
 - unknown files are ignored by this summary
 
 ```sql
