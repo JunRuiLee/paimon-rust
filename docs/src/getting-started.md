@@ -129,6 +129,29 @@ options.set(CatalogOptions::WAREHOUSE, "my_warehouse");
 let catalog = CatalogFactory::create(options).await?;
 ```
 
+For a DLF REST catalog on ECS, RAM-role credentials can be rotated automatically:
+
+```rust
+let mut options = Options::new();
+options.set(CatalogOptions::METASTORE, "rest");
+options.set(CatalogOptions::URI, "https://your-dlf-endpoint");
+options.set(CatalogOptions::WAREHOUSE, "your_catalog");
+options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
+options.set(CatalogOptions::DLF_TOKEN_LOADER, "ecs");
+options.set(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME, "your-ram-role");
+options.set(CatalogOptions::DATA_TOKEN_ENABLED, "true");
+let catalog = CatalogFactory::create(options).await?;
+```
+
+`dlf.token-loader=ecs` refreshes the credentials used to authenticate DLF
+catalog requests. The role name is optional; when omitted, it is read from the
+ECS metadata service. `data-token.enabled=true` separately enables temporary
+credentials returned by the REST server for table data access. A loaded table
+refreshes those credentials before expiration, so callers do not need to load
+the table again. Static `dlf.access-key-id`, `dlf.access-key-secret`, and
+`dlf.security-token` values are not rotated.
+
 Supported metastore types:
 
 | Metastore Type | Description                      |
