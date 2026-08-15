@@ -155,6 +155,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if commit_messages.is_empty() {
@@ -198,6 +200,8 @@ impl TableCommit {
         expected_snapshot_id: i64,
         commit_identifier: i64,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if commit_messages.is_empty() {
@@ -279,6 +283,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if commit_messages.is_empty() && static_partitions.is_none() {
@@ -528,6 +534,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
@@ -606,6 +614,8 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        // A commit validates against the existing snapshot.
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(
@@ -2916,6 +2926,41 @@ mod tests {
         ManifestList, TableSchema,
     };
     use chrono::{DateTime, Utc};
+
+    #[tokio::test]
+    async fn test_query_auth_table_refuses_commit_paths() {
+        let table = crate::table::query_auth_table();
+        let commit = TableCommit::new(table.clone(), "test-user".to_string());
+
+        let refused = |err: crate::Error, what: &str| {
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "{what} on a query-auth.enabled table must fail closed, got {err:?}"
+            );
+        };
+
+        refused(commit.commit(Vec::new()).await.unwrap_err(), "committing");
+        refused(
+            commit.overwrite(Vec::new(), None).await.unwrap_err(),
+            "overwriting",
+        );
+        refused(
+            commit.truncate_partitions(Vec::new()).await.unwrap_err(),
+            "truncating partitions",
+        );
+        refused(
+            commit.truncate_table().await.unwrap_err(),
+            "truncating the table",
+        );
+
+        refused(
+            crate::table::TableWrite::new(&table, "test-user".to_string())
+                .err()
+                .expect("opening a write must fail closed"),
+            "opening a write",
+        );
+    }
 
     fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()

@@ -130,6 +130,9 @@ pub struct TableWrite {
 
 impl TableWrite {
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
+        // A dynamic-bucket write reads the persisted PK hash index; the rest are
+        // refused too, since their commit is blocked anyway.
+        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
