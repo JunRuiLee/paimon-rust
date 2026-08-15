@@ -751,7 +751,11 @@ impl OutputFile {
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
         let (op, relative_path, cache_path) = self.resolve().await?;
-        let writer: Box<dyn FileWrite> = Box::new(op.writer(&relative_path).await?);
+        let writer: Box<dyn FileWrite> = Box::new(
+            op.writer_with(&relative_path)
+                .chunk(8 * 1024 * 1024)
+                .await?,
+        );
         let Some(cache) = &self.cache else {
             return Ok(writer);
         };
@@ -766,7 +770,8 @@ impl OutputFile {
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
         let (op, relative_path, cache_path) = self.resolve().await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
-            op.writer(&relative_path)
+            op.writer_with(&relative_path)
+                .chunk(8 * 1024 * 1024)
                 .await?
                 .into_futures_async_write()
                 .compat_write(),
