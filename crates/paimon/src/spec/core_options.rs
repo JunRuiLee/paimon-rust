@@ -1902,6 +1902,10 @@ mod tests {
                 "unit '{unit}' should parse case-insensitively with a space"
             );
         }
+
+        for unit in ["kib", "mib", "gib", "tib"] {
+            assert_eq!(parse_memory_size(&format!("3{unit}")), None);
+        }
     }
 
     #[test]

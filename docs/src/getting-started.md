@@ -181,24 +181,24 @@ let catalog = CatalogFactory::create(options).await?;
 | Option | Default | Description |
 |--------|---------|-------------|
 | `local-cache.enabled` | `false` | Enable catalog-scoped local block caching. |
-| `local-cache.dir` | none | Base cache directory; required when caching is enabled. Paimon stores entries in a private versioned child directory. |
-| `local-cache.max-size` | unlimited | Maximum encoded disk usage. Values accept byte units such as `512 MiB` or `20 GiB`. |
+| `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
+| `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
 | `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`. |
 
-The cache is disk-only and is reused after process restarts. Cache keys include
-a catalog-configuration fingerprint and the canonical storage object path, so
-catalogs can safely use the same base directory without reading one another's
-entries. Runtime cache read, write, validation, and eviction failures are
-fail-open: the original storage remains the source of truth. Paimon mutable
-markers and temporary files always bypass the cache; other eligible files rely
-on Paimon's immutable-file convention. Cache managers using the same canonical
-directory in one process share LRU and size accounting; if their configured
-limits differ, the smallest `local-cache.max-size` is used. Restart recovery
-runs on a blocking worker, reads only block headers and file metadata, and
-validates payload CRC lazily on the first hit. Use a separate `local-cache.dir`
-for each worker or process because processes do not share exact LRU or size
-accounting.
+Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
+are reused after process restarts. Cache keys include a catalog-configuration
+fingerprint and the canonical storage object path, so catalogs can safely use
+the same base directory without reading one another's entries. Runtime cache
+read, write, validation, and eviction failures are fail-open: the original
+storage remains the source of truth. Paimon mutable markers and temporary files
+always bypass the cache; other eligible files rely on Paimon's immutable-file
+convention. Cache managers using the same canonical directory in one process
+share LRU, size accounting, and invalidation state; if their configured limits
+differ, the smallest `local-cache.max-size` is used. Restart recovery runs on a
+blocking worker, reads only block headers and file metadata, and validates
+payload CRC lazily on the first hit. Use a separate `local-cache.dir` for each
+worker or process because processes do not share exact LRU or size accounting.
 
 ### Manage Databases
 

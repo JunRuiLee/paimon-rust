@@ -229,14 +229,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_token_file_io_keeps_catalog_local_cache() {
-        let cache_directory = tempfile::tempdir().unwrap();
         let table_directory = tempfile::tempdir().unwrap();
         let (mut options, api, _, server) = token_api().await;
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-        options.set(
-            CatalogOptions::LOCAL_CACHE_DIR,
-            cache_directory.path().to_string_lossy(),
-        );
         let local_cache = create_local_cache(&options).unwrap();
         let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
