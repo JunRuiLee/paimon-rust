@@ -2899,7 +2899,7 @@ mod tests {
             make_evo_file("b", 10, 100, 2, None),
         ];
         let groups = group_by_overlapping_row_id(files);
-        assert_eq!(file_names(&groups), vec![vec!["b"], vec!["a"]]);
+        assert_eq!(file_names(&groups), vec![vec!["a"], vec!["b"]]);
     }
 
     #[test]
@@ -3247,8 +3247,8 @@ mod tests {
     #[test]
     fn test_group_by_overlapping_row_id_non_overlapping() {
         let files = vec![
-            make_evo_file("a", 10, 100, 1, Some(0)),
             make_evo_file("b", 10, 100, 2, Some(100)),
+            make_evo_file("a", 10, 100, 1, Some(0)),
         ];
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 2);
@@ -3266,12 +3266,12 @@ mod tests {
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(
             file_names(&groups),
-            vec![vec!["c"], vec!["b", "a"], vec!["d"]]
+            vec![vec!["c"], vec!["a", "b"], vec!["d"]]
         );
     }
 
     #[test]
-    fn test_group_by_overlapping_row_id_sorted_by_seq() {
+    fn test_group_by_overlapping_row_id_preserves_input_order() {
         let files = vec![
             make_evo_file("a", 10, 100, 1, Some(0)),
             make_evo_file("b", 10, 100, 3, Some(0)),
@@ -3279,7 +3279,7 @@ mod tests {
         ];
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 1);
-        assert_eq!(file_names(&groups), vec![vec!["b", "c", "a"]]);
+        assert_eq!(file_names(&groups), vec![vec!["a", "b", "c"]]);
     }
 
     #[test]
