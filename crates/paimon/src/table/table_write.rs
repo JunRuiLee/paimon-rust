@@ -1083,6 +1083,7 @@ pub(in crate::table) mod tests {
             .column("id", DataType::Int(IntType::new()))
             .column("payload", DataType::Blob(BlobType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
@@ -2239,6 +2240,7 @@ pub(in crate::table) mod tests {
             .column("a", DataType::Int(IntType::new()))
             .column("b", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         let table = Table::new(

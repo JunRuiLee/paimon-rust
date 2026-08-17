@@ -576,6 +576,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
             .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
             .build()
             .unwrap();
         let table = Table::new(

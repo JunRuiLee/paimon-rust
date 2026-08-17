@@ -1233,7 +1233,7 @@ mod tests {
             "the conjunct must stay so the read can reject it"
         );
 
-        for (row_tracking, data_evolution) in [(true, false), (false, true), (true, true)] {
+        for (row_tracking, data_evolution) in [(true, false), (true, true)] {
             let table = row_id_table(row_tracking, data_evolution);
             let mut builder = PaimonReadBuilder::new(&table);
             builder.with_filter(row_id_leaf(PredicateOperator::GtEq, 102));
