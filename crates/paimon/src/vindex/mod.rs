@@ -24,6 +24,9 @@ pub mod pkvector;
 use crate::spec::{DataField, DataType};
 use paimon_vindex_core::index::VectorIndexConfig;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 pub const IVF_FLAT_IDENTIFIER: &str = "ivf-flat";
 pub const IVF_PQ_IDENTIFIER: &str = "ivf-pq";
@@ -34,6 +37,35 @@ const DEFAULT_NLIST: &str = "256";
 const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
 const DEFAULT_TRAIN_SAMPLE_RATIO: f64 = 1.0;
+const VECTOR_SEARCH_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_SEARCH_TIMING";
+
+#[cfg(test)]
+static VECTOR_SEARCH_TIMING_TEST_GUARDS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) struct VectorSearchTimingTestGuard;
+
+#[cfg(test)]
+impl Drop for VectorSearchTimingTestGuard {
+    fn drop(&mut self) {
+        VECTOR_SEARCH_TIMING_TEST_GUARDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn enable_vector_search_timing_for_test() -> VectorSearchTimingTestGuard {
+    VECTOR_SEARCH_TIMING_TEST_GUARDS.fetch_add(1, Ordering::Relaxed);
+    VectorSearchTimingTestGuard
+}
+
+pub(crate) fn vector_search_timing_enabled() -> bool {
+    #[cfg(test)]
+    if VECTOR_SEARCH_TIMING_TEST_GUARDS.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(VECTOR_SEARCH_TIMING_ENV).is_some_and(|v| v == "1"))
+}
 
 pub fn is_vindex_index_type(index_type: &str) -> bool {
     matches!(index_type, IVF_FLAT_IDENTIFIER | IVF_PQ_IDENTIFIER)
