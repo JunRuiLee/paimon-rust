@@ -16,7 +16,10 @@
 // under the License.
 
 use crate::lumina::{is_lumina_index_type, LUMINA_IDENTIFIER};
-use crate::vindex::{is_vindex_index_type, IVF_FLAT_IDENTIFIER, IVF_PQ_IDENTIFIER};
+use crate::vindex::{
+    is_vindex_index_type, DISKANN_IDENTIFIER, IVF_FLAT_IDENTIFIER, IVF_PQ_IDENTIFIER,
+    IVF_RQ_IDENTIFIER, IVF_SQ_IDENTIFIER,
+};
 
 pub(crate) const BTREE_GLOBAL_INDEX_TYPE: &str = "btree";
 pub(crate) const BITMAP_GLOBAL_INDEX_TYPE: &str = "bitmap";
@@ -35,7 +38,7 @@ pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'s
 /// Used verbatim in the unsupported-type error of both the builder and the
 /// DataFusion procedure so the two messages stay in sync.
 pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
-    "btree, bitmap, lumina, lumina-vector-ann, ivf-flat, ivf-pq";
+    "btree, bitmap, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
 /// `None` if unsupported. Case-insensitive. Order: sorted -> lumina -> vindex.
@@ -66,6 +69,9 @@ fn canonical_vindex_identifier(lowered: &str) -> Option<&'static str> {
     match lowered {
         IVF_FLAT_IDENTIFIER => Some(IVF_FLAT_IDENTIFIER),
         IVF_PQ_IDENTIFIER => Some(IVF_PQ_IDENTIFIER),
+        IVF_SQ_IDENTIFIER => Some(IVF_SQ_IDENTIFIER),
+        IVF_RQ_IDENTIFIER => Some(IVF_RQ_IDENTIFIER),
+        DISKANN_IDENTIFIER => Some(DISKANN_IDENTIFIER),
         _ => None,
     }
 }
@@ -108,6 +114,18 @@ mod tests {
         assert_eq!(
             normalize_global_index_type_for_drop("IVF-PQ"),
             Some("ivf-pq")
+        );
+        assert_eq!(
+            normalize_global_index_type_for_drop("IVF-SQ"),
+            Some("ivf-sq")
+        );
+        assert_eq!(
+            normalize_global_index_type_for_drop("IVF-RQ"),
+            Some("ivf-rq")
+        );
+        assert_eq!(
+            normalize_global_index_type_for_drop("DiskANN"),
+            Some("diskann")
         );
     }
 

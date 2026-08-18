@@ -2085,10 +2085,20 @@ fn pk_vector_query_dimension(
                 let dimension = LuminaVectorIndexOptions::new(&merged)?.dimension;
                 Ok(Some(dimension as usize))
             } else {
+                let mut dimension_options = HashMap::new();
+                for key in [
+                    "dimension".to_string(),
+                    format!("{index_type}.dimension"),
+                    format!("fields.{}.dimension", vector_field.name()),
+                ] {
+                    if let Some(value) = query_options.get(&key) {
+                        dimension_options.insert(key, value.clone());
+                    }
+                }
                 Ok(Some(
                     VindexVectorIndexOptions::new(
                         table_options,
-                        query_options,
+                        &dimension_options,
                         index_type,
                         vector_field,
                     )?
@@ -3451,6 +3461,28 @@ mod tests {
         assert_eq!(vindex_index_parallelism(1, 64), 1);
         assert_eq!(vindex_index_parallelism(8, 4), 4);
         assert_eq!(vindex_index_parallelism(4, 8), 4);
+    }
+
+    #[test]
+    fn vindex_array_dimension_accepts_diskann_search_options() {
+        let field = DataField::new(
+            1,
+            "embedding".to_string(),
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        );
+        let query_options = HashMap::from([
+            ("diskann.dimension".to_string(), "8".to_string()),
+            ("diskann.l_search".to_string(), "64".to_string()),
+            (
+                "vindex.reader.memory-budget-bytes".to_string(),
+                "1048576".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            pk_vector_query_dimension(&HashMap::new(), &query_options, "diskann", &field).unwrap(),
+            Some(8)
+        );
     }
 
     fn make_field(id: i32, name: &str) -> DataField {
@@ -4933,8 +4965,12 @@ mod tests {
             VectorIndexBackend::from_index_type("ivf-flat"),
             Some(VectorIndexBackend::Vindex)
         );
-        // `diskann` is Lumina's internal index type, not a top-level index type.
-        assert_eq!(VectorIndexBackend::from_index_type("diskann"), None);
+        for index_type in ["ivf-sq", "ivf-rq", "diskann"] {
+            assert_eq!(
+                VectorIndexBackend::from_index_type(index_type),
+                Some(VectorIndexBackend::Vindex)
+            );
+        }
     }
 
     #[test]

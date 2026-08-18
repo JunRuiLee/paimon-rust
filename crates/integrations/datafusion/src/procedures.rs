@@ -585,7 +585,7 @@ async fn proc_create_global_index(
         // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
             "create_global_index only supports index_type => 'btree', 'bitmap', or vindex types \
-             ('ivf-flat', 'ivf-pq'), got '{index_type_arg}'"
+             ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann'), got '{index_type_arg}'"
         )));
     }
     ok_result(ctx)

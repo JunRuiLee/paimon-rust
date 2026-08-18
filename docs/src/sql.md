@@ -986,8 +986,8 @@ CREATE TABLE paimon.my_db.items (
 );
 ```
 
-For vector indexes backed by vindex, set `index_type` to `ivf-flat` or
-`ivf-pq`:
+For vector indexes backed by vindex, set `index_type` to `ivf-flat`,
+`ivf-pq`, `ivf-sq`, `ivf-rq`, or `diskann`:
 
 ```sql
 CALL sys.create_global_index(
@@ -998,9 +998,41 @@ CALL sys.create_global_index(
 );
 ```
 
+Examples for the additional vindex index types:
+
+```sql
+-- IVF-SQ uses a fixed 8-bit scalar code.
+CALL sys.create_global_index(
+  table => 'paimon.my_db.items',
+  index_column => 'embedding',
+  index_type => 'ivf-sq',
+  options => 'ivf-sq.dimension=4,ivf-sq.nlist=256,ivf-sq.distance.metric=cosine'
+);
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.items',
+  index_column => 'embedding',
+  index_type => 'ivf-rq',
+  options => 'ivf-rq.dimension=4,ivf-rq.nlist=256,ivf-rq.distance.metric=cosine,ivf-rq.rq.bits=4'
+);
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.items',
+  index_column => 'embedding',
+  index_type => 'diskann',
+  options => 'diskann.dimension=4,diskann.distance.metric=cosine,diskann.deployment-profile=local_storage,diskann.build-preset=balanced'
+);
+```
+
+The vindex `diskann` index is separate from the Lumina index whose
+`lumina.index.type` is `diskann`. Use the `diskann.*` options below with
+`index_type => 'diskann'`; use `lumina.*` options only with a Lumina index.
+
 The `options` argument is a comma-separated `key=value` string. User options
 override table options. Use keys prefixed by the selected index type, or set
-field-level table options with `fields.<column>.<option>`:
+field-level table options with `fields.<column>.<option>`. For example,
+`diskann.max-degree` becomes `fields.embedding.max-degree` for an `embedding`
+column:
 
 ```sql
 CREATE TABLE paimon.my_db.image_items (
@@ -1023,13 +1055,40 @@ Supported vindex options:
 |---|---:|---|---|
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
-| `<index-type>.nlist` | `256` | all vindex types | Number of IVF lists. |
+| `<index-type>.nlist` | `256` | all IVF types | Number of IVF lists. DiskANN rejects this option. |
 | `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
+| `ivf-rq.rq.bits` | `4`, or inferred | `ivf-rq` | Residual-quantization width in the range `1` to `8`. When omitted, `ivf-rq.max-bytes-per-vector` can select it. |
+| `ivf-rq.max-bytes-per-vector` | unset | `ivf-rq` | Optional positive persisted-code budget used to infer `rq.bits`. |
 
-Native vindex aliases are also accepted in the `options` string: `dimension`,
-`metric`, `nlist`, `pq.m`, and `use-opq`.
+IVF-SQ has no `sq.bits` option; it always stores one 8-bit scalar code per
+dimension. DiskANN accepts these build options:
+
+| Option | Default | Description |
+|---|---:|---|
+| `diskann.deployment-profile` | `auto` | Intended serving medium: `auto`, `memory`, `local_storage`, `remote_storage`, or `object_store`. |
+| `diskann.target-recall` | unset | Value in `[0, 1]` used to choose a build preset when one is not specified. This is a tuning hint, not a recall guarantee. |
+| `diskann.max-bytes-per-vector` | unset | Optional positive persisted-size budget that guides PQ width and raw-vector encoding. |
+| `diskann.pq.code-ratio` | `0.0625` | Ratio of resident PQ-code bytes to raw `f32` vector bytes; must be in `(0, 0.25]` for 8-bit PQ or `(0, 0.125]` for 4-bit PQ. |
+| `diskann.pq.m` | automatic | Explicit PQ chunk count in `1..=dimension`; overrides `pq.code-ratio`. |
+| `diskann.pq.bits` | `8` | PQ width; must be `4` or `8`. |
+| `diskann.build-preset` | inferred | `fast_build`, `balanced`, or `high_recall`; without `target-recall` or an explicit value, uses `balanced`. |
+| `diskann.seed` | `42` | Reproducible graph-build seed. |
+| `diskann.memory-budget-bytes` | `8589934592` | Positive internal build-state budget. This is not the query Reader budget or a process RSS limit. |
+| `diskann.max-degree` | preset value | Maximum graph out-degree in `1..=1023`. |
+| `diskann.build-search-list-size` | preset value | Candidate-list width used while building the graph; must be at least `max-degree`. |
+| `diskann.alpha` | preset value | Finite robust-pruning threshold at least `1`. |
+| `diskann.storage-layout` | preset value | `auto`, `compact`, or `interleaved`. |
+| `diskann.raw-vector-encoding` | preset value | `auto`, `f32`, or `f16` rerank-vector encoding. |
+| `diskann.build-distance` | preset value | `auto`, `full_precision`, or `product_quantized`. |
+
+For procedure calls, prefer the index-prefixed option names shown above. Native
+vindex aliases are also accepted in the `options` string: `dimension`, `metric`,
+`nlist`, `pq.m`, `use-opq`, `rq.bits`, `max-bytes-per-vector`,
+`deployment-profile`, `target-recall`, `pq.code-ratio`, `pq.bits`, and the
+`diskann.*` build keys listed in the table. Build options for another index
+family are rejected rather than ignored.
 
 Inspect committed index files with the `$table_indexes` system table:
 
@@ -1051,9 +1110,9 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat` and `ivf-pq`.
-It defaults to `btree`, is case-insensitive and surrounding whitespace is
-ignored.
+`lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`, `ivf-pq`,
+`ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is case-insensitive
+and surrounding whitespace is ignored.
 
 ### create_lumina_index
 
@@ -1335,9 +1394,45 @@ The distance metric is configured at index creation time via table options:
 ### Vindex Index Options
 
 For vindex-backed search, build the index with
-`CALL sys.create_global_index` and an index type such as `ivf-flat` or
-`ivf-pq`. See [create_global_index](#create_global_index) for the supported
-index types, table requirements, and option keys.
+`CALL sys.create_global_index` and an index type such as `ivf-flat`, `ivf-sq`,
+`ivf-pq`, `ivf-rq`, or `diskann`. See
+[create_global_index](#create_global_index) for the table requirements and
+build option keys.
+
+With Paimon's `SQLContext`, set query-time vindex options for the session before
+calling `vector_search`, then reset them when they are no longer needed:
+
+```sql
+-- IVF only; defaults to 16.
+SET 'paimon.ivf.nprobe' = '32';
+SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
+RESET 'paimon.ivf.nprobe';
+
+-- DiskANN only; must be at least 1. Omit it to use the automatic search width.
+SET 'paimon.diskann.l_search' = '100';
+SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
+RESET 'paimon.diskann.l_search';
+```
+
+Query options are index-family specific and non-applicable options are ignored:
+IVF readers consume only `ivf.nprobe`, while DiskANN readers consume only
+`diskann.l_search`. Setting both options is allowed; each index uses its own.
+
+`vindex.reader.memory-budget-bytes` sets the per-Reader resident-data and cache
+budget (default 4 GiB). It is distinct from the DiskANN build option
+`diskann.memory-budget-bytes` and from process RSS:
+
+```sql
+SET 'paimon.vindex.reader.memory-budget-bytes' = '4294967296';
+SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
+RESET 'paimon.vindex.reader.memory-budget-bytes';
+```
+
+These `SET`/`RESET` values are provided by Paimon's `SQLContext`; registering
+`vector_search` directly on a raw DataFusion `SessionContext` does not install
+that dynamic-option path. Rust callers can pass the same unprefixed keys, such
+as `diskann.l_search`, through `VectorSearchBuilder::with_options` or
+`BatchVectorSearchBuilder::with_options`.
 
 ### Lumina Index Options
 
