@@ -196,37 +196,65 @@ pub(crate) fn datum_cmp(lhs: &Datum, rhs: &Datum) -> Option<Ordering> {
 
 /// Compare two decimals by mathematical value.
 ///
-/// Normalizes both to the larger scale, then compares unscaled values.
-/// E.g. `(10, scale=1)` vs `(100, scale=2)` → both represent 1.0 → equal.
+/// Compares the sign, decimal exponent, then significant digits. Padding the
+/// shorter significand with trailing zeroes is equivalent to normalizing both
+/// values to the larger scale, without overflowing `i128`.
 fn decimal_cmp(ua: i128, sa: u32, ub: i128, sb: u32) -> Option<Ordering> {
     if sa == sb {
-        return ua.partial_cmp(&ub);
+        return Some(ua.cmp(&ub));
     }
-    let (na, nb) = if sa < sb {
-        (ua.checked_mul(pow10_i128(sb - sa))?, ub)
+    let normalized = if sa < sb {
+        10_i128
+            .checked_pow(sb - sa)
+            .and_then(|factor| ua.checked_mul(factor))
+            .map(|scaled| scaled.cmp(&ub))
     } else {
-        (ua, ub.checked_mul(pow10_i128(sa - sb))?)
+        10_i128
+            .checked_pow(sa - sb)
+            .and_then(|factor| ub.checked_mul(factor))
+            .map(|scaled| ua.cmp(&scaled))
     };
-    na.partial_cmp(&nb)
+    if normalized.is_some() {
+        return normalized;
+    }
+
+    let sign_a = ua.signum();
+    let sign_b = ub.signum();
+    if sign_a != sign_b {
+        return Some(sign_a.cmp(&sign_b));
+    }
+    if sign_a == 0 {
+        return Some(Ordering::Equal);
+    }
+
+    let digits_a = ua.unsigned_abs().to_string();
+    let digits_b = ub.unsigned_abs().to_string();
+    let exponent_a = digits_a.len() as i64 - i64::from(sa);
+    let exponent_b = digits_b.len() as i64 - i64::from(sb);
+    let mut magnitude = exponent_a.cmp(&exponent_b);
+    if magnitude == Ordering::Equal {
+        let a = digits_a.as_bytes();
+        let b = digits_b.as_bytes();
+        for index in 0..a.len().max(b.len()) {
+            let digit_a = a.get(index).copied().unwrap_or(b'0');
+            let digit_b = b.get(index).copied().unwrap_or(b'0');
+            magnitude = digit_a.cmp(&digit_b);
+            if magnitude != Ordering::Equal {
+                break;
+            }
+        }
+    }
+    Some(if sign_a < 0 {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
 }
 
 /// Match Java `CompareUtils.compare(byte[], byte[])`, which compares bytes as
 /// unsigned values lexicographically.
 fn java_bytes_cmp(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
-}
-
-/// 10^exp as i128.  Returns i128::MAX for exponents that would overflow.
-fn pow10_i128(exp: u32) -> i128 {
-    const MAX_EXP: u32 = 38; // 10^38 fits in i128
-    if exp > MAX_EXP {
-        return i128::MAX;
-    }
-    let mut result: i128 = 1;
-    for _ in 0..exp {
-        result = result.saturating_mul(10);
-    }
-    result
 }
 
 // PredicateOperator
@@ -248,6 +276,9 @@ pub enum PredicateOperator {
     StartsWith,
     EndsWith,
     Contains,
+    ArrayContains,
+    ArraysOverlap,
+    ArrayContainsAll,
     Like,
     Between,
     NotBetween,
@@ -269,6 +300,9 @@ impl fmt::Display for PredicateOperator {
             Self::StartsWith => write!(f, "STARTS_WITH"),
             Self::EndsWith => write!(f, "ENDS_WITH"),
             Self::Contains => write!(f, "CONTAINS"),
+            Self::ArrayContains => write!(f, "ARRAY_CONTAINS"),
+            Self::ArraysOverlap => write!(f, "ARRAYS_OVERLAP"),
+            Self::ArrayContainsAll => write!(f, "ARRAY_CONTAINS_ALL"),
             Self::Like => write!(f, "LIKE"),
             Self::Between => write!(f, "BETWEEN"),
             Self::NotBetween => write!(f, "NOT BETWEEN"),
@@ -560,7 +594,10 @@ impl fmt::Display for Predicate {
                 write!(f, "{column} {op}")?;
                 match op {
                     PredicateOperator::IsNull | PredicateOperator::IsNotNull => {}
-                    PredicateOperator::In | PredicateOperator::NotIn => {
+                    PredicateOperator::In
+                    | PredicateOperator::NotIn
+                    | PredicateOperator::ArraysOverlap
+                    | PredicateOperator::ArrayContainsAll => {
                         write!(f, " (")?;
                         for (i, lit) in literals.iter().enumerate() {
                             if i > 0 {
@@ -722,6 +759,17 @@ fn parse_rest_leaf(
         .ok_or_else(|| rest_json_err(format!("unknown field `{field}`")))?;
 
     let function = str_prop(value, "function")?;
+    let literal_data_type = match function {
+        "ARRAY_CONTAINS" | "ARRAYS_OVERLAP" | "ARRAY_CONTAINS_ALL" => match data_type {
+            DataType::Array(array) => array.element_type(),
+            other => {
+                return Err(rest_json_err(format!(
+                    "{function} requires an ARRAY field, got {other:?}"
+                )))
+            }
+        },
+        _ => data_type,
+    };
     // Convert every literal up front (like Java `deserializeLiterals`) so a
     // malformed extra literal fails the parse. JSON null -> `None` (SQL NULL).
     let literals: Vec<Option<Datum>> = value
@@ -731,7 +779,7 @@ fn parse_rest_leaf(
         .iter()
         .map(|v| match v {
             serde_json::Value::Null => Ok(None),
-            v => Ok(Some(json_to_datum(v, data_type)?)),
+            v => Ok(Some(json_to_datum(v, literal_data_type)?)),
         })
         .collect::<Result<Vec<_>>>()?;
     // Binary/ternary leaves test false for every row on a null literal
@@ -788,6 +836,22 @@ fn parse_rest_leaf(
         "STARTS_WITH" => binary(one_literal()?, &|l| builder.starts_with(field, l)),
         "ENDS_WITH" => binary(one_literal()?, &|l| builder.ends_with(field, l)),
         "CONTAINS" => binary(one_literal()?, &|l| builder.contains(field, l)),
+        "ARRAY_CONTAINS" => binary(one_literal()?, &|l| builder.array_contains(field, l)),
+        "ARRAYS_OVERLAP" => {
+            let datums = literals.iter().flatten().cloned().collect::<Vec<_>>();
+            if datums.is_empty() {
+                Ok(Predicate::AlwaysFalse)
+            } else {
+                builder.arrays_overlap(field, datums)
+            }
+        }
+        "ARRAY_CONTAINS_ALL" => {
+            if literals.iter().any(Option::is_none) {
+                Ok(Predicate::AlwaysFalse)
+            } else {
+                builder.array_contains_all(field, literals.iter().flatten().cloned().collect())
+            }
+        }
         "LIKE" => match one_literal()? {
             Some(l) => {
                 if let Datum::String(pattern) = &l {
@@ -1131,6 +1195,25 @@ impl PredicateBuilder {
         self.string_leaf(field, PredicateOperator::Contains, pattern)
     }
 
+    /// Build an element-membership predicate over an ARRAY column.
+    pub fn array_contains(&self, field: &str, element: Datum) -> Result<Predicate> {
+        self.array_leaf(field, PredicateOperator::ArrayContains, vec![element])
+    }
+
+    /// Build an any-element membership predicate over an ARRAY column.
+    pub fn arrays_overlap(&self, field: &str, elements: Vec<Datum>) -> Result<Predicate> {
+        self.array_leaf(field, PredicateOperator::ArraysOverlap, elements)
+    }
+
+    /// Build an all-elements membership predicate over an ARRAY column.
+    ///
+    /// An empty literal list is retained as a leaf: it matches non-null arrays,
+    /// while the multivalue index must fall back because it cannot distinguish
+    /// null arrays from empty arrays.
+    pub fn array_contains_all(&self, field: &str, elements: Vec<Datum>) -> Result<Predicate> {
+        self.array_leaf(field, PredicateOperator::ArrayContainsAll, elements)
+    }
+
     /// `field LIKE '<pattern>'` with optional `escape` character (default `\`).
     /// Mirrors Java `LikeOptimization`: rewrites `prefix%` / `%suffix` /
     /// `%mid%` / no-wildcard patterns into [`PredicateOperator::StartsWith`] /
@@ -1219,6 +1302,31 @@ impl PredicateBuilder {
         self.leaf(field, op, vec![pattern])
     }
 
+    fn array_leaf(
+        &self,
+        field: &str,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Result<Predicate> {
+        let (index, canonical, data_type) = self.resolve_field(field)?;
+        let DataType::Array(array_type) = &data_type else {
+            return Err(Error::ConfigInvalid {
+                message: format!("{op} requires an ARRAY field, got {data_type:?}"),
+            });
+        };
+        Self::validate_literal_count(op, &literals)?;
+        for literal in &literals {
+            validate_datum_matches_type(literal, array_type.element_type())?;
+        }
+        Ok(Predicate::Leaf {
+            column: canonical,
+            index,
+            data_type,
+            op,
+            literals,
+        })
+    }
+
     // -- internal --
 
     /// Resolve field name to index + type, validate literals, and build a leaf predicate.
@@ -1302,6 +1410,7 @@ impl PredicateBuilder {
                     message: format!("{op} expects at least 1 literal, got 0"),
                 });
             }
+            PredicateOperator::ArraysOverlap | PredicateOperator::ArrayContainsAll => return Ok(()),
             PredicateOperator::Between | PredicateOperator::NotBetween => (2, literals.len()),
             _ => (1, literals.len()),
         };
@@ -1562,6 +1671,11 @@ fn eval_leaf(op: PredicateOperator, datum: Option<&Datum>, literals: &[Datum]) -
                 },
                 PredicateOperator::Between => eval_between(val, literals),
                 PredicateOperator::NotBetween => !eval_between(val, literals),
+                PredicateOperator::ArrayContains
+                | PredicateOperator::ArraysOverlap
+                | PredicateOperator::ArrayContainsAll => {
+                    unreachable!("array predicates are evaluated against Arrow list arrays")
+                }
                 // IsNull/IsNotNull are handled in the outer match above.
                 PredicateOperator::IsNull | PredicateOperator::IsNotNull => unreachable!(),
             }
@@ -2326,6 +2440,33 @@ mod tests {
             scale: 5,
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decimal_extreme_scale_comparison_does_not_overflow() {
+        let two = Datum::Decimal {
+            unscaled: 2,
+            precision: 1,
+            scale: 0,
+        };
+        let below_one = Datum::Decimal {
+            unscaled: 10_i128.pow(38) - 1,
+            precision: 38,
+            scale: 38,
+        };
+        assert!(two > below_one);
+
+        let negative_two = Datum::Decimal {
+            unscaled: -2,
+            precision: 1,
+            scale: 0,
+        };
+        let above_negative_one = Datum::Decimal {
+            unscaled: -(10_i128.pow(38) - 1),
+            precision: 38,
+            scale: 38,
+        };
+        assert!(negative_two < above_negative_one);
     }
 
     // ======================== PartialOrd ========================
@@ -3166,6 +3307,87 @@ mod tests {
         // BETWEEN carries two literals.
         let json = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"BETWEEN","literals":[3,7]}"#;
         assert!(Predicate::from_rest_json(json, &fields).is_ok());
+    }
+
+    #[test]
+    fn test_array_predicate_builder_uses_element_literals() {
+        let fields = vec![
+            DataField::new(
+                0,
+                "items".to_string(),
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            ),
+            DataField::new(1, "id".to_string(), DataType::Int(IntType::new())),
+        ];
+        let builder = PredicateBuilder::new(&fields);
+
+        let contains = builder.array_contains("items", Datum::Int(2)).unwrap();
+        assert!(matches!(
+            contains,
+            Predicate::Leaf {
+                op: PredicateOperator::ArrayContains,
+                literals,
+                ..
+            } if literals == vec![Datum::Int(2)]
+        ));
+        let overlap = builder
+            .arrays_overlap("items", vec![Datum::Int(1), Datum::Int(3)])
+            .unwrap();
+        assert!(matches!(
+            overlap,
+            Predicate::Leaf {
+                op: PredicateOperator::ArraysOverlap,
+                literals,
+                ..
+            } if literals == vec![Datum::Int(1), Datum::Int(3)]
+        ));
+        assert!(builder.array_contains_all("items", vec![]).is_ok());
+        assert!(builder.array_contains("id", Datum::Int(2)).is_err());
+        assert!(builder
+            .array_contains("items", Datum::String("2".to_string()))
+            .is_err());
+    }
+
+    #[test]
+    fn test_from_rest_json_parses_java_array_predicates_and_nulls() {
+        let fields = vec![DataField::new(
+            0,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )];
+
+        for (function, literals, expected_op) in [
+            ("ARRAY_CONTAINS", "[2]", PredicateOperator::ArrayContains),
+            ("ARRAYS_OVERLAP", "[1,2]", PredicateOperator::ArraysOverlap),
+            (
+                "ARRAY_CONTAINS_ALL",
+                "[1,2]",
+                PredicateOperator::ArrayContainsAll,
+            ),
+        ] {
+            let parsed = Predicate::from_rest_json(
+                &rest_leaf_json_typed(function, "items", "ARRAY<INT>", literals),
+                &fields,
+            )
+            .unwrap();
+            assert!(matches!(
+                parsed,
+                Predicate::Leaf { op, .. } if op == expected_op
+            ));
+        }
+
+        for (function, literals) in [
+            ("ARRAY_CONTAINS", "[null]"),
+            ("ARRAYS_OVERLAP", "[null]"),
+            ("ARRAY_CONTAINS_ALL", "[1,null]"),
+        ] {
+            let parsed = Predicate::from_rest_json(
+                &rest_leaf_json_typed(function, "items", "ARRAY<INT>", literals),
+                &fields,
+            )
+            .unwrap();
+            assert!(matches!(parsed, Predicate::AlwaysFalse));
+        }
     }
 
     #[test]
