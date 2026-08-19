@@ -19,103 +19,23 @@
 //!
 //! Reference: `org.apache.paimon.globalindex.bitmap.BitmapGlobalIndexFormat`.
 
-use crate::btree::key_serde::KeyComparator;
-use crate::btree::var_len::{decode_var_int, decode_var_long, encode_var_int, encode_var_long};
-use crate::btree::BTreeIndexMeta;
-use crate::btree::{make_key_comparator, serialize_datum, BlockCompressionType};
-use crate::io::{FileRead, FileWrite};
+use super::bitmap_global_index_format::{
+    block_info, is_bitmap_floating_residual_sensitive_op, make_bitmap_key_comparator,
+    serialize_bitmap_datum, BlockInfo, BLOCK_TRAILER_LENGTH, FOOTER_LENGTH, MAGIC, VERSION,
+};
+#[cfg(test)]
+use super::bitmap_global_index_writer::BitmapGlobalIndexWriter;
+use crate::btree::var_len::{decode_var_int, decode_var_long};
+use crate::btree::{compute_crc32, decompress_block, BlockCompressionType};
+use crate::io::FileRead;
 use crate::spec::{like_match, DataType, Datum, PredicateOperator};
+#[cfg(test)]
 use bytes::Bytes;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
-
-const MAGIC: i32 = 0x4247_4958;
-const VERSION: i32 = 1;
-const FOOTER_LENGTH: usize = 48;
-const BLOCK_TRAILER_LENGTH: usize = 5;
-const JAVA_CANONICAL_FLOAT_NAN_BITS: u32 = 0x7fc0_0000;
-const JAVA_CANONICAL_DOUBLE_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
-
-// Bitmap follows current Java's floating-point key contract. Shared BTree key
-// serde intentionally keeps the already-persisted Rust contract.
-pub(crate) fn make_bitmap_key_comparator(data_type: &DataType) -> KeyComparator {
-    match data_type {
-        DataType::Float(_) => Box::new(|left, right| {
-            let left = f32::from_le_bytes(left[..4].try_into().unwrap());
-            let right = f32::from_le_bytes(right[..4].try_into().unwrap());
-            compare_float_like_java(left, right)
-        }),
-        DataType::Double(_) => Box::new(|left, right| {
-            let left = f64::from_le_bytes(left[..8].try_into().unwrap());
-            let right = f64::from_le_bytes(right[..8].try_into().unwrap());
-            compare_double_like_java(left, right)
-        }),
-        _ => make_key_comparator(data_type),
-    }
-}
-
-pub(crate) fn serialize_bitmap_datum(datum: &Datum, data_type: &DataType) -> Vec<u8> {
-    match (datum, data_type) {
-        (Datum::Float(value), DataType::Float(_)) => {
-            let bits = if value.is_nan() {
-                JAVA_CANONICAL_FLOAT_NAN_BITS
-            } else {
-                value.to_bits()
-            };
-            bits.to_le_bytes().to_vec()
-        }
-        (Datum::Double(value), DataType::Double(_)) => {
-            let bits = if value.is_nan() {
-                JAVA_CANONICAL_DOUBLE_NAN_BITS
-            } else {
-                value.to_bits()
-            };
-            bits.to_le_bytes().to_vec()
-        }
-        _ => serialize_datum(datum, data_type),
-    }
-}
-
-pub(crate) fn is_bitmap_floating_residual_sensitive_op(op: PredicateOperator) -> bool {
-    matches!(
-        op,
-        PredicateOperator::NotEq
-            | PredicateOperator::NotIn
-            | PredicateOperator::Lt
-            | PredicateOperator::LtEq
-            | PredicateOperator::Gt
-            | PredicateOperator::GtEq
-            | PredicateOperator::Between
-            | PredicateOperator::NotBetween
-    )
-}
-
-fn compare_float_like_java(left: f32, right: f32) -> Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => left.total_cmp(&right),
-    }
-}
-
-fn compare_double_like_java(left: f64, right: f64) -> Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => left.total_cmp(&right),
-    }
-}
-
-#[derive(Clone, Copy)]
-struct BlockInfo {
-    offset: u64,
-    length: usize,
-}
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct DictionaryBlockMeta {
@@ -123,6 +43,7 @@ struct DictionaryBlockMeta {
     block: BlockInfo,
 }
 
+#[derive(Clone)]
 struct DictionaryEntry {
     key: Vec<u8>,
     bitmap_block: BlockInfo,
@@ -134,122 +55,11 @@ struct Footer {
     index_block: BlockInfo,
 }
 
-/// Result of finishing a Java-compatible bitmap global index write.
-pub(crate) struct BitmapWriteResult {
-    pub(crate) meta: BTreeIndexMeta,
-    pub(crate) row_count: u64,
-}
-
-/// Writer for Java Paimon's `BitmapGlobalIndexFormat`.
-pub(crate) struct BitmapGlobalIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
-    writer: Box<dyn FileWrite>,
-    dictionary_block_size: usize,
-    compression_type: BlockCompressionType,
-    key_comparator: F,
-    bitmaps: BTreeMap<Vec<u8>, RoaringTreemap>,
-    null_rows: RoaringTreemap,
-    non_null_rows: RoaringTreemap,
-    first_key: Option<Vec<u8>>,
-    last_key: Option<Vec<u8>>,
-    row_count: u64,
-}
-
-impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
-    pub(crate) fn new(
-        writer: Box<dyn FileWrite>,
-        dictionary_block_size: usize,
-        compression_type: BlockCompressionType,
-        key_comparator: F,
-    ) -> Self {
-        Self {
-            writer,
-            dictionary_block_size,
-            compression_type,
-            key_comparator,
-            bitmaps: BTreeMap::new(),
-            null_rows: RoaringTreemap::new(),
-            non_null_rows: RoaringTreemap::new(),
-            first_key: None,
-            last_key: None,
-            row_count: 0,
-        }
-    }
-
-    pub(crate) fn write(&mut self, key: Option<&[u8]>, relative_row_id: i64) -> io::Result<()> {
-        if relative_row_id < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Bitmap global index row id must be non-negative: {relative_row_id}"),
-            ));
-        }
-
-        self.row_count += 1;
-        match key {
-            Some(key) => {
-                let row_id = relative_row_id as u64;
-                self.non_null_rows.insert(row_id);
-                self.bitmaps.entry(key.to_vec()).or_default().insert(row_id);
-                self.update_min_max(key);
-            }
-            None => {
-                self.null_rows.insert(relative_row_id as u64);
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn finish(mut self) -> io::Result<BitmapWriteResult> {
-        let mut bitmaps = std::mem::take(&mut self.bitmaps)
-            .into_iter()
-            .collect::<Vec<_>>();
-        bitmaps.sort_by(|(left, _), (right, _)| (self.key_comparator)(left, right));
-
-        let mut bytes = Vec::new();
-        write_bitmap_index_bytes(
-            &mut bytes,
-            &self.null_rows,
-            &self.non_null_rows,
-            &bitmaps,
-            self.dictionary_block_size,
-            self.compression_type,
-        )?;
-        self.writer
-            .write(Bytes::from(bytes))
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        self.writer
-            .close()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(BitmapWriteResult {
-            meta: BTreeIndexMeta::new(self.first_key, self.last_key, !self.null_rows.is_empty()),
-            row_count: self.row_count,
-        })
-    }
-
-    fn update_min_max(&mut self, key: &[u8]) {
-        if self
-            .first_key
-            .as_ref()
-            .is_none_or(|existing| (self.key_comparator)(key, existing).is_lt())
-        {
-            self.first_key = Some(key.to_vec());
-        }
-        if self
-            .last_key
-            .as_ref()
-            .is_none_or(|existing| (self.key_comparator)(key, existing).is_gt())
-        {
-            self.last_key = Some(key.to_vec());
-        }
-    }
-}
-
 pub(crate) struct BitmapGlobalIndexReader {
     reader: Box<dyn FileRead>,
     footer: Footer,
     dictionary_blocks: Vec<DictionaryBlockMeta>,
+    dictionary_block_cache: Mutex<HashMap<BlockInfo, Arc<Vec<DictionaryEntry>>>>,
 }
 
 impl BitmapGlobalIndexReader {
@@ -261,6 +71,7 @@ impl BitmapGlobalIndexReader {
             reader,
             footer,
             dictionary_blocks,
+            dictionary_block_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -274,12 +85,37 @@ impl BitmapGlobalIndexReader {
             return self.is_not_null().await;
         }
         match op {
-            PredicateOperator::ArrayContains
-            | PredicateOperator::ArraysOverlap
-            | PredicateOperator::ArrayContainsAll => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Scalar bitmap index does not support {op}"),
-            )),
+            PredicateOperator::ArrayContains => {
+                let key = serialize_bitmap_datum(&literals[0], data_type);
+                self.equal(&key, data_type).await
+            }
+            PredicateOperator::ArraysOverlap => {
+                let keys = literals
+                    .iter()
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
+                    .collect::<Vec<_>>();
+                self.in_keys(&keys, data_type).await
+            }
+            PredicateOperator::ArrayContainsAll => {
+                let mut keys = literals
+                    .iter()
+                    .map(|literal| serialize_bitmap_datum(literal, data_type))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                let mut result = None;
+                for key in keys {
+                    let current = self.equal(&key, data_type).await?;
+                    result = Some(match result {
+                        None => current,
+                        Some(mut existing) => {
+                            existing &= current;
+                            existing
+                        }
+                    });
+                }
+                Ok(result.unwrap_or_default())
+            }
             PredicateOperator::Eq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
                 self.equal(&key, data_type).await
@@ -481,7 +317,7 @@ impl BitmapGlobalIndexReader {
     ) -> io::Result<RoaringTreemap> {
         let mut result = RoaringTreemap::new();
         for block_meta in &self.dictionary_blocks {
-            for entry in self.read_dictionary_block(block_meta.block).await? {
+            for entry in self.read_dictionary_block(block_meta.block).await?.iter() {
                 if predicate(&entry.key) {
                     result |= self.read_bitmap(entry.bitmap_block).await?;
                 }
@@ -498,7 +334,7 @@ impl BitmapGlobalIndexReader {
         let Some(block_meta) = self.find_dictionary_block_meta(key, logical_cmp) else {
             return Ok(None);
         };
-        for entry in self.read_dictionary_block(block_meta.block).await? {
+        for entry in self.read_dictionary_block(block_meta.block).await?.iter() {
             match logical_cmp(&entry.key, key) {
                 Ordering::Equal => return Ok(Some(entry.bitmap_block)),
                 Ordering::Greater => return Ok(None),
@@ -530,7 +366,20 @@ impl BitmapGlobalIndexReader {
             .and_then(|index| self.dictionary_blocks.get(index))
     }
 
-    async fn read_dictionary_block(&self, block: BlockInfo) -> io::Result<Vec<DictionaryEntry>> {
+    async fn read_dictionary_block(
+        &self,
+        block: BlockInfo,
+    ) -> io::Result<Arc<Vec<DictionaryEntry>>> {
+        if let Some(entries) = self
+            .dictionary_block_cache
+            .lock()
+            .map_err(|_| io::Error::other("Bitmap dictionary block cache lock was poisoned"))?
+            .get(&block)
+            .cloned()
+        {
+            return Ok(entries);
+        }
+
         let bytes = read_compressible_block(self.reader.as_ref(), block).await?;
         let mut cursor = Cursor::new(bytes.as_slice());
         let entry_count = decode_var_int(&mut cursor)?;
@@ -550,7 +399,12 @@ impl BitmapGlobalIndexReader {
                 bitmap_block: block_info(offset, length)?,
             });
         }
-        Ok(entries)
+        let entries = Arc::new(entries);
+        let mut cache = self
+            .dictionary_block_cache
+            .lock()
+            .map_err(|_| io::Error::other("Bitmap dictionary block cache lock was poisoned"))?;
+        Ok(Arc::clone(cache.entry(block).or_insert(entries)))
     }
 
     async fn read_bitmap(&self, block: BlockInfo) -> io::Result<RoaringTreemap> {
@@ -656,107 +510,7 @@ async fn read_compressible_block(reader: &dyn FileRead, block: BlockInfo) -> io:
         ));
     }
 
-    match compression_type {
-        BlockCompressionType::None => Ok(block_bytes.to_vec()),
-        BlockCompressionType::Zstd => {
-            let mut cursor = Cursor::new(block_bytes);
-            let uncompressed_size = decode_uncompressed_size(&mut cursor)?;
-            let compressed_start = cursor.position() as usize;
-            let compressed_data = &block_bytes[compressed_start..];
-            let mut decompressed = vec![0u8; uncompressed_size];
-            let actual = zstd::bulk::decompress_to_buffer(compressed_data, &mut decompressed)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if actual != uncompressed_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Bitmap block decompressed size mismatch: expected {uncompressed_size}, got {actual}"
-                    ),
-                ));
-            }
-            Ok(decompressed)
-        }
-        BlockCompressionType::Lz4 | BlockCompressionType::Lzo => {
-            let mut cursor = Cursor::new(block_bytes);
-            let uncompressed_size = decode_uncompressed_size(&mut cursor)?;
-            let compressed_start = cursor.position() as usize;
-            decompress_java_header_block(
-                &block_bytes[compressed_start..],
-                uncompressed_size,
-                compression_type,
-            )
-        }
-    }
-}
-
-fn decode_uncompressed_size(input: &mut impl Read) -> io::Result<usize> {
-    let size = decode_var_int(input)?;
-    usize::try_from(size).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid bitmap block uncompressed size: {size}"),
-        )
-    })
-}
-
-/// Decode Java's LZ4/LZO block envelope:
-/// `[compressed_len: i32 LE][original_len: i32 LE][raw codec payload]`.
-fn decompress_java_header_block(
-    block: &[u8],
-    expected_size: usize,
-    compression_type: BlockCompressionType,
-) -> io::Result<Vec<u8>> {
-    if block.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Compressed bitmap block is shorter than the Java codec header",
-        ));
-    }
-    let compressed_len = i32::from_le_bytes(block[..4].try_into().unwrap());
-    let original_len = i32::from_le_bytes(block[4..8].try_into().unwrap());
-    let (compressed_len, original_len) = match (
-        usize::try_from(compressed_len),
-        usize::try_from(original_len),
-    ) {
-        (Ok(compressed_len), Ok(original_len))
-            if original_len == expected_size
-                && compressed_len <= block.len().saturating_sub(8)
-                && ((original_len == 0) == (compressed_len == 0)) =>
-        {
-            (compressed_len, original_len)
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid Java LZ4/LZO bitmap block lengths",
-            ))
-        }
-    };
-    let payload = &block[8..8 + compressed_len];
-    let decompressed = match compression_type {
-        BlockCompressionType::Lz4 => lz4_flex::block::decompress(payload, original_len)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        BlockCompressionType::Lzo => lzokay_native::decompress_all(payload, Some(original_len))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        _ => unreachable!("only Java header codecs use this decoder"),
-    };
-    if decompressed.len() != original_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Bitmap block decompressed size mismatch: expected {original_len}, got {}",
-                decompressed.len()
-            ),
-        ));
-    }
-    Ok(decompressed)
-}
-
-fn compute_crc32(data: &[u8], compression_type: BlockCompressionType) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(data);
-    hasher.update(&[compression_type as u8]);
-    hasher.finalize()
+    decompress_block(block_bytes, compression_type)
 }
 
 fn read_key(input: &mut impl Read) -> io::Result<Vec<u8>> {
@@ -770,19 +524,6 @@ fn read_key(input: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut key = vec![0; key_length as usize];
     input.read_exact(&mut key)?;
     Ok(key)
-}
-
-fn block_info(offset: i64, length: i32) -> io::Result<BlockInfo> {
-    if offset < 0 || length < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid bitmap block info: offset={offset}, length={length}"),
-        ));
-    }
-    Ok(BlockInfo {
-        offset: offset as u64,
-        length: length as usize,
-    })
 }
 
 fn read_i64_be(bytes: &[u8], offset: usize) -> io::Result<i64> {
@@ -830,239 +571,12 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-fn write_bitmap_index_bytes(
-    out: &mut Vec<u8>,
-    null_rows: &RoaringTreemap,
-    non_null_rows: &RoaringTreemap,
-    bitmaps: &[(Vec<u8>, RoaringTreemap)],
-    dictionary_block_size: usize,
-    compression_type: BlockCompressionType,
-) -> io::Result<()> {
-    if dictionary_block_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Bitmap dictionary block size must be greater than 0",
-        ));
-    }
-
-    let null_rows_block = write_bitmap_block(out, null_rows)?;
-    let non_null_rows_block = write_bitmap_block(out, non_null_rows)?;
-    let (dictionary_blocks, value_count) =
-        write_dictionary_and_bitmap_blocks(out, bitmaps, dictionary_block_size, compression_type)?;
-    let index_block = write_index_block(out, &dictionary_blocks, compression_type)?;
-
-    out.extend_from_slice(&u64_to_i64(null_rows_block.offset)?.to_be_bytes());
-    out.extend_from_slice(&usize_to_i32(null_rows_block.length)?.to_be_bytes());
-    out.extend_from_slice(&u64_to_i64(non_null_rows_block.offset)?.to_be_bytes());
-    out.extend_from_slice(&usize_to_i32(non_null_rows_block.length)?.to_be_bytes());
-    out.extend_from_slice(&u64_to_i64(index_block.offset)?.to_be_bytes());
-    out.extend_from_slice(&usize_to_i32(index_block.length)?.to_be_bytes());
-    out.extend_from_slice(&usize_to_i32(value_count)?.to_be_bytes());
-    out.extend_from_slice(&VERSION.to_be_bytes());
-    out.extend_from_slice(&MAGIC.to_be_bytes());
-    Ok(())
-}
-
-fn write_bitmap_block(out: &mut Vec<u8>, bitmap: &RoaringTreemap) -> io::Result<BlockInfo> {
-    let offset = out.len() as u64;
-    bitmap.serialize_into(&mut *out)?;
-    Ok(BlockInfo {
-        offset,
-        length: out.len() - offset as usize,
-    })
-}
-
-fn write_dictionary_and_bitmap_blocks(
-    out: &mut Vec<u8>,
-    bitmaps: &[(Vec<u8>, RoaringTreemap)],
-    dictionary_block_size: usize,
-    compression_type: BlockCompressionType,
-) -> io::Result<(Vec<DictionaryBlockMeta>, usize)> {
-    let mut block_metas = Vec::new();
-    let mut current = DictionaryBlockBuilder::default();
-    let mut value_count = 0usize;
-
-    for (key, bitmap) in bitmaps {
-        let bitmap_block = write_bitmap_block(out, bitmap)?;
-        let entry = DictionaryEntry {
-            key: key.clone(),
-            bitmap_block,
-        };
-        if current.has_entries() && current.estimated_size_after(&entry) > dictionary_block_size {
-            block_metas.push(write_dictionary_block(
-                out,
-                &current.entries,
-                compression_type,
-            )?);
-            current = DictionaryBlockBuilder::default();
-        }
-        current.add(entry);
-        value_count += 1;
-    }
-
-    if current.has_entries() {
-        block_metas.push(write_dictionary_block(
-            out,
-            &current.entries,
-            compression_type,
-        )?);
-    }
-    Ok((block_metas, value_count))
-}
-
-fn write_dictionary_block(
-    out: &mut Vec<u8>,
-    entries: &[DictionaryEntry],
-    compression_type: BlockCompressionType,
-) -> io::Result<DictionaryBlockMeta> {
-    let mut bytes = Vec::new();
-    encode_var_int(&mut bytes, usize_to_i32(entries.len())?)?;
-    for entry in entries {
-        encode_var_int(&mut bytes, usize_to_i32(entry.key.len())?)?;
-        bytes.extend_from_slice(&entry.key);
-        encode_var_long(&mut bytes, u64_to_i64(entry.bitmap_block.offset)?)?;
-        encode_var_int(&mut bytes, usize_to_i32(entry.bitmap_block.length)?)?;
-    }
-    let block = write_compressible_block(out, &bytes, compression_type)?;
-    Ok(DictionaryBlockMeta {
-        first_key: entries[0].key.clone(),
-        block,
-    })
-}
-
-fn write_index_block(
-    out: &mut Vec<u8>,
-    blocks: &[DictionaryBlockMeta],
-    compression_type: BlockCompressionType,
-) -> io::Result<BlockInfo> {
-    let mut bytes = Vec::new();
-    encode_var_int(&mut bytes, usize_to_i32(blocks.len())?)?;
-    for block in blocks {
-        encode_var_int(&mut bytes, usize_to_i32(block.first_key.len())?)?;
-        bytes.extend_from_slice(&block.first_key);
-        encode_var_long(&mut bytes, u64_to_i64(block.block.offset)?)?;
-        encode_var_int(&mut bytes, usize_to_i32(block.block.length)?)?;
-    }
-    write_compressible_block(out, &bytes, compression_type)
-}
-
-fn write_compressible_block(
-    out: &mut Vec<u8>,
-    bytes: &[u8],
-    compression_type: BlockCompressionType,
-) -> io::Result<BlockInfo> {
-    let (block_bytes, actual_compression_type) = encode_block(bytes, compression_type)?;
-    let offset = out.len() as u64;
-    out.write_all(&block_bytes)?;
-    let crc = compute_crc32(&block_bytes, actual_compression_type);
-    out.write_all(&[actual_compression_type as u8])?;
-    out.write_all(&crc.to_le_bytes())?;
-    Ok(BlockInfo {
-        offset,
-        length: block_bytes.len(),
-    })
-}
-
-fn encode_block(
-    bytes: &[u8],
-    compression_type: BlockCompressionType,
-) -> io::Result<(Vec<u8>, BlockCompressionType)> {
-    match compression_type {
-        BlockCompressionType::None => Ok((bytes.to_vec(), BlockCompressionType::None)),
-        BlockCompressionType::Zstd => {
-            let compressed = zstd::bulk::compress(bytes, 3)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let mut encoded = Vec::with_capacity(5 + compressed.len());
-            encode_var_int(&mut encoded, usize_to_i32(bytes.len())?)?;
-            encoded.extend_from_slice(&compressed);
-            if encoded.len() < bytes.len() - (bytes.len() / 8) {
-                Ok((encoded, BlockCompressionType::Zstd))
-            } else {
-                Ok((bytes.to_vec(), BlockCompressionType::None))
-            }
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "Bitmap global index compression type {:?} is not supported",
-                compression_type
-            ),
-        )),
-    }
-}
-
-#[derive(Default)]
-struct DictionaryBlockBuilder {
-    entries: Vec<DictionaryEntry>,
-    entries_size: usize,
-}
-
-impl DictionaryBlockBuilder {
-    fn has_entries(&self) -> bool {
-        !self.entries.is_empty()
-    }
-
-    fn estimated_size_after(&self, entry: &DictionaryEntry) -> usize {
-        estimated_var_len_int_size(self.entries.len() + 1)
-            + self.entries_size
-            + entry.estimated_size()
-    }
-
-    fn add(&mut self, entry: DictionaryEntry) {
-        self.entries_size += entry.estimated_size();
-        self.entries.push(entry);
-    }
-}
-
-impl DictionaryEntry {
-    fn estimated_size(&self) -> usize {
-        estimated_var_len_int_size(self.key.len())
-            + self.key.len()
-            + estimated_var_len_long_size(self.bitmap_block.offset)
-            + estimated_var_len_int_size(self.bitmap_block.length)
-    }
-}
-
-fn estimated_var_len_int_size(mut value: usize) -> usize {
-    let mut size = 1;
-    while (value & !0x7f) != 0 {
-        value >>= 7;
-        size += 1;
-    }
-    size
-}
-
-fn estimated_var_len_long_size(mut value: u64) -> usize {
-    let mut size = 1;
-    while (value & !0x7f) != 0 {
-        value >>= 7;
-        size += 1;
-    }
-    size
-}
-
-fn usize_to_i32(value: usize) -> io::Result<i32> {
-    i32::try_from(value).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Bitmap global index value is too large: {value}"),
-        )
-    })
-}
-
-fn u64_to_i64(value: u64) -> io::Result<i64> {
-    i64::try_from(value).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Bitmap global index offset is too large: {value}"),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::compress_block;
     use crate::btree::test_util::{BytesFileRead, VecFileWrite};
+    use crate::btree::var_len::encode_var_int;
     use crate::spec::{DoubleType, FloatType, IntType};
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
@@ -1114,7 +628,14 @@ mod tests {
         .unwrap();
         let mut entries = Vec::new();
         for block in &reader.dictionary_blocks {
-            entries.extend(reader.read_dictionary_block(block.block).await.unwrap());
+            entries.extend(
+                reader
+                    .read_dictionary_block(block.block)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
         }
         (reader, entries)
     }
@@ -1134,13 +655,11 @@ mod tests {
         let original = b"java-compatible multivalue bitmap block".repeat(16);
 
         let lz4 = lz4_flex::block::compress(&original);
+        let mut lz4_block = Vec::new();
+        encode_var_int(&mut lz4_block, i32::try_from(original.len()).unwrap()).unwrap();
+        lz4_block.extend_from_slice(&java_codec_envelope(&lz4, original.len()));
         assert_eq!(
-            decompress_java_header_block(
-                &java_codec_envelope(&lz4, original.len()),
-                original.len(),
-                BlockCompressionType::Lz4,
-            )
-            .unwrap(),
+            decompress_block(&lz4_block, BlockCompressionType::Lz4).unwrap(),
             original
         );
 
@@ -1150,13 +669,11 @@ mod tests {
         let lzo = base64::engine::general_purpose::STANDARD
             .decode("OGphdmEtY29tcGF0aWJsZSBtdWx0aXZhbHVlIGJpdG1hcCBibG9jayAAACWYAAJibG9jaxEAAA==")
             .unwrap();
+        let mut lzo_block = Vec::new();
+        encode_var_int(&mut lzo_block, i32::try_from(original.len()).unwrap()).unwrap();
+        lzo_block.extend_from_slice(&java_codec_envelope(&lzo, original.len()));
         assert_eq!(
-            decompress_java_header_block(
-                &java_codec_envelope(&lzo, original.len()),
-                original.len(),
-                BlockCompressionType::Lzo,
-            )
-            .unwrap(),
+            decompress_block(&lzo_block, BlockCompressionType::Lzo).unwrap(),
             original
         );
 
@@ -1179,6 +696,135 @@ mod tests {
             .unwrap(),
             original
         );
+    }
+
+    #[tokio::test]
+    async fn test_encode_supported_java_bitmap_compressions() {
+        let original = b"java-compatible multivalue bitmap block".repeat(64);
+        for (compression_type, compression_level) in [
+            (BlockCompressionType::Zstd, 7),
+            (BlockCompressionType::Lz4, 1),
+            (BlockCompressionType::Lzo, 1),
+        ] {
+            let (encoded, actual_type) =
+                compress_block(&original, compression_type, compression_level).unwrap();
+            assert_eq!(actual_type, compression_type);
+
+            let block_length = encoded.len();
+            let crc = compute_crc32(encoded.as_ref(), actual_type);
+            let mut stored = encoded.into_owned();
+            stored.push(actual_type as u8);
+            stored.extend_from_slice(&crc.to_le_bytes());
+            let decoded = read_compressible_block(
+                &BytesFileRead(Bytes::from(stored)),
+                BlockInfo {
+                    offset: 0,
+                    length: block_length,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(decoded, original, "{compression_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multivalue_queries_reuse_dictionary_block_reads() {
+        let data_type = DataType::Int(IntType::new());
+        let values = [(Datum::Int(1), 0), (Datum::Int(2), 1), (Datum::Int(3), 2)];
+        let bytes = write_bitmap_bytes(&data_type, &values, 1 << 20).await;
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(TrackingFileRead {
+                bytes: Bytes::from(bytes.clone()),
+                ranges: Arc::clone(&ranges),
+            }),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.dictionary_blocks.len(), 1);
+        let dictionary = reader.dictionary_blocks[0].block;
+        let dictionary_range = dictionary.offset
+            ..dictionary.offset + (dictionary.length + BLOCK_TRAILER_LENGTH) as u64;
+
+        ranges.lock().unwrap().clear();
+        let overlap = reader
+            .query(
+                PredicateOperator::ArraysOverlap,
+                &[Datum::Int(1), Datum::Int(2), Datum::Int(3)],
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(overlap.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|range| **range == dictionary_range)
+                .count(),
+            1,
+            "all overlap literals in the same block should share one dictionary read"
+        );
+
+        ranges.lock().unwrap().clear();
+        let contains_all = reader
+            .query(
+                PredicateOperator::ArrayContainsAll,
+                &[Datum::Int(1), Datum::Int(2), Datum::Int(3)],
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert!(contains_all.is_empty());
+        assert_eq!(
+            ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|range| **range == dictionary_range)
+                .count(),
+            0,
+            "the reader should retain parsed dictionary blocks across predicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multivalue_writer_keeps_empty_source_coverage() {
+        let data_type = DataType::Int(IntType::new());
+        let output = VecFileWrite::new();
+        let captured = output.clone();
+        let writer = BitmapGlobalIndexWriter::new(
+            Box::new(output),
+            1 << 20,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&data_type),
+        );
+
+        let result = writer.finish_with_source_row_count(4).await.unwrap();
+        assert_eq!(result.row_count, 4);
+        assert_eq!(result.meta.first_key, None);
+        assert_eq!(result.meta.last_key, None);
+        assert!(!result.meta.has_nulls);
+
+        let bytes = captured.to_vec();
+        let reader = BitmapGlobalIndexReader::open(
+            Box::new(BytesFileRead(Bytes::from(bytes.clone()))),
+            bytes.len() as u64,
+        )
+        .await
+        .unwrap();
+        let rows = reader
+            .query(
+                PredicateOperator::ArrayContains,
+                &[Datum::Int(10)],
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -1239,8 +885,8 @@ mod tests {
             .read_dictionary_block(reader.dictionary_blocks[0].block)
             .await
             .unwrap()
-            .into_iter()
-            .map(|entry| i32::from_le_bytes(entry.key.try_into().unwrap()))
+            .iter()
+            .map(|entry| i32::from_le_bytes(entry.key.as_slice().try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(keys, vec![-1, 0, 1, 256]);
     }
@@ -1365,6 +1011,11 @@ mod tests {
                 .find_dictionary_block_meta(&key, cmp.as_ref())
                 .unwrap()
                 .block;
+            let was_cached = reader
+                .dictionary_block_cache
+                .lock()
+                .unwrap()
+                .contains_key(&expected_block);
             ranges.lock().unwrap().clear();
 
             let actual = reader
@@ -1376,13 +1027,20 @@ mod tests {
             assert_eq!(actual, expected, "{data_type:?}: {op}");
 
             let actual_ranges = ranges.lock().unwrap().clone();
-            assert_eq!(actual_ranges.len(), 2, "{data_type:?}: {op}");
             assert_eq!(
-                actual_ranges[0],
-                expected_block.offset
-                    ..expected_block.offset + (expected_block.length + BLOCK_TRAILER_LENGTH) as u64,
+                actual_ranges.len(),
+                if was_cached { 1 } else { 2 },
                 "{data_type:?}: {op}"
             );
+            if !was_cached {
+                assert_eq!(
+                    actual_ranges[0],
+                    expected_block.offset
+                        ..expected_block.offset
+                            + (expected_block.length + BLOCK_TRAILER_LENGTH) as u64,
+                    "{data_type:?}: {op}"
+                );
+            }
         }
     }
 

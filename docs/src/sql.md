@@ -954,20 +954,39 @@ Build and commit a global index for a table column:
 CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'id',
-  index_type => 'btree'
+  index_type => 'btree',
+  options => 'btree-index.block-size=64kb,btree-index.compression=zstd,btree-index.compression-level=1'
 );
 
 CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'tag',
-  index_type => 'bitmap'
+  index_type => 'bitmap',
+  options => 'bitmap-index.dictionary-block-size=16kb,bitmap-index.compression=lz4,bitmap-index.compression-level=1'
+);
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'tags',
+  index_type => 'multivalue',
+  options => 'multivalue-index.dictionary-block-size=16kb,multivalue-index.compression=zstd,multivalue-index.compression-level=1'
 );
 ```
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
-whitespace is ignored. BTree and bitmap global indexes support scalar columns
-and do not accept the `options` argument yet. Bitmap global indexes use the same
-on-disk file format as Java Paimon's `BitmapGlobalIndexFormat`.
+whitespace is ignored. BTree and bitmap global indexes support scalar columns.
+Multivalue global indexes support `ARRAY` columns whose element type is supported
+by sorted indexes, and accelerate `array_has`/`array_contains`,
+`array_has_any`/`arrays_overlap`, and `array_has_all` predicates. Null arrays,
+empty arrays, and null elements do not create postings; duplicate elements in a
+row are indexed once. All three sorted index types accept
+`sorted-index.records-per-range` (with the legacy
+`btree-index.records-per-range` fallback). Their Java-compatible writer options
+are `btree-index.block-size`, `bitmap-index.dictionary-block-size`, or
+`multivalue-index.dictionary-block-size`, together with the corresponding
+`*.compression` (`none`, `zstd`, `lz4`, or `lzo`) and `*.compression-level`
+options. Per-call options override table options. Bitmap and multivalue global
+indexes use Java-compatible bitmap files.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1110,9 +1129,9 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`, `ivf-pq`,
-`ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is case-insensitive
-and surrounding whitespace is ignored.
+`multivalue`, `lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`,
+`ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
+case-insensitive and surrounding whitespace is ignored.
 
 ### create_lumina_index
 
@@ -1966,7 +1985,7 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
 | `file_name` | STRING | Index file name under the table index directory |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
@@ -2155,7 +2174,16 @@ deletion vectors enabled.
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
-| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree range. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per sorted global-index range; falls back to legacy `btree-index.records-per-range`. |
+| `btree-index.block-size` | `64kb` | Target BTree data-block size. |
+| `btree-index.compression` | `none` | BTree block compression: `none`, `zstd`, `lz4`, or `lzo`. |
+| `btree-index.compression-level` | `1` | BTree compression level (used by codecs that support levels). |
+| `bitmap-index.dictionary-block-size` | `16kb` | Target bitmap dictionary-block size. |
+| `bitmap-index.compression` | `none` | Bitmap dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
+| `bitmap-index.compression-level` | `1` | Bitmap compression level (used by codecs that support levels). |
+| `multivalue-index.dictionary-block-size` | `16kb` | Target multivalue dictionary-block size. |
+| `multivalue-index.compression` | `none` | Multivalue dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
+| `multivalue-index.compression-level` | `1` | Multivalue compression level (used by codecs that support levels). |
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |

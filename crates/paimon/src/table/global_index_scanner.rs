@@ -20,12 +20,13 @@
 //!
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
-use super::bitmap_global_index_reader::{
+use super::bitmap_global_index_format::{
     is_bitmap_floating_residual_sensitive_op, make_bitmap_key_comparator, serialize_bitmap_datum,
-    BitmapGlobalIndexReader,
 };
+use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+    MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
 use crate::btree::query::{extract_between, BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
@@ -156,6 +157,7 @@ struct GlobalIndexEntry {
 enum GlobalIndexFileKind {
     BTree,
     Bitmap,
+    Multivalue,
 }
 
 fn is_floating_point(data_type: &DataType) -> bool {
@@ -192,11 +194,32 @@ fn bitmap_meta_may_match_between(
     }
 }
 
+fn multivalue_meta_may_match(
+    meta: &BTreeIndexMeta,
+    op: PredicateOperator,
+    serialized_literals: &[Vec<u8>],
+    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+) -> bool {
+    match op {
+        PredicateOperator::ArrayContains => {
+            meta.may_match(PredicateOperator::Eq, serialized_literals, cmp)
+        }
+        PredicateOperator::ArraysOverlap => {
+            meta.may_match(PredicateOperator::In, serialized_literals, cmp)
+        }
+        PredicateOperator::ArrayContainsAll => serialized_literals.iter().all(|literal| {
+            meta.may_match(PredicateOperator::Eq, std::slice::from_ref(literal), cmp)
+        }),
+        _ => false,
+    }
+}
+
 impl GlobalIndexFileKind {
     fn name(self) -> &'static str {
         match self {
             Self::BTree => "BTree",
             Self::Bitmap => "bitmap",
+            Self::Multivalue => "multivalue",
         }
     }
 }
@@ -225,7 +248,7 @@ impl FallbackScanPlan {
     fn allowed(self, kind: GlobalIndexFileKind) -> bool {
         match kind {
             GlobalIndexFileKind::BTree => self.allow_btree,
-            GlobalIndexFileKind::Bitmap => self.allow_bitmap,
+            GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => self.allow_bitmap,
         }
     }
 }
@@ -342,6 +365,7 @@ impl GlobalIndexScanner {
                 index_type: match index_type {
                     BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
                     BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
+                    MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
                     _ => unreachable!("normalized sorted global index type"),
                 },
                 file_size: entry.index_file.file_size,
@@ -413,6 +437,9 @@ impl GlobalIndexScanner {
                         Some(e) => e,
                         None => return Ok(None),
                     };
+                    if !entries_support_predicate(entries, *op, literals) {
+                        return Ok(None);
+                    }
                     self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
                         .await
                         .map(|ranges| {
@@ -439,7 +466,9 @@ impl GlobalIndexScanner {
                         {
                             if is_sorted_global_index_supported_op(*op) {
                                 if let Some(field_id) = self.find_field_id_by_name(column)? {
-                                    if self.entries_for_field(field_id).is_some() {
+                                    if self.entries_for_field(field_id).is_some_and(|entries| {
+                                        entries_support_predicate(entries, *op, literals)
+                                    }) {
                                         leaf_groups.entry(field_id).or_default().push((
                                             *op,
                                             literals.as_slice(),
@@ -536,6 +565,27 @@ impl GlobalIndexScanner {
         entries: &[GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<Vec<RowRange>>> {
+        let normalized_predicates = predicates
+            .iter()
+            .map(|(op, literals, data_type)| {
+                let key_type = if is_multivalue_predicate(*op) {
+                    let DataType::Array(array) = data_type else {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "Array global-index predicate {op} requires an ARRAY field type"
+                            ),
+                            source: None,
+                        });
+                    };
+                    array.element_type()
+                } else {
+                    *data_type
+                };
+                Ok((*op, *literals, key_type))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicates = normalized_predicates.as_slice();
+
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 
@@ -587,6 +637,12 @@ impl GlobalIndexScanner {
                                 bitmap_serialized,
                                 bitmap_cmp.as_ref(),
                             ),
+                            GlobalIndexFileKind::Multivalue => multivalue_meta_may_match(
+                                &entry.meta,
+                                *op,
+                                bitmap_serialized,
+                                bitmap_cmp.as_ref(),
+                            ),
                         })
                         .collect()
                 },
@@ -624,6 +680,7 @@ impl GlobalIndexScanner {
                             &bitmap_to,
                             bitmap_cmp.as_ref(),
                         ),
+                        GlobalIndexFileKind::Multivalue => false,
                     })
                     .collect()
             }
@@ -768,7 +825,9 @@ impl GlobalIndexScanner {
             let between = between.expect("evaluated between query is present");
             let serialize_key = match entry.index_type {
                 GlobalIndexFileKind::BTree => serialize_datum,
-                GlobalIndexFileKind::Bitmap => serialize_bitmap_datum,
+                GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => {
+                    serialize_bitmap_datum
+                }
             };
             let from_key = serialize_key(between.from, between.data_type);
             let to_key = serialize_key(between.to, between.data_type);
@@ -877,6 +936,17 @@ impl GlobalIndexScanner {
                     ),
                     source: Some(Box::new(e)),
                 }),
+            GlobalIndexFileKind::Multivalue => self
+                .open_bitmap_reader(entry)
+                .await
+                .map(OpenedGlobalIndexReader::Bitmap)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to open multivalue global index file: {}",
+                        entry.file_name
+                    ),
+                    source: Some(Box::new(e)),
+                }),
         }
     }
 
@@ -926,6 +996,10 @@ impl GlobalIndexScanner {
                     btree_valid &= add_file_size(&mut btree_total, entry.file_size);
                 }
                 GlobalIndexFileKind::Bitmap => {
+                    plan.selected_bitmap += 1;
+                    bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
+                }
+                GlobalIndexFileKind::Multivalue => {
                     plan.selected_bitmap += 1;
                     bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
                 }
@@ -1050,7 +1124,38 @@ fn is_sorted_global_index_supported_op(op: PredicateOperator) -> bool {
             | PredicateOperator::EndsWith
             | PredicateOperator::Contains
             | PredicateOperator::Like
+            | PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
     )
+}
+
+fn is_multivalue_predicate(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::ArrayContains
+            | PredicateOperator::ArraysOverlap
+            | PredicateOperator::ArrayContainsAll
+    )
+}
+
+fn entries_support_predicate(
+    entries: &[GlobalIndexEntry],
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> bool {
+    if is_multivalue_predicate(op) {
+        if matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty() {
+            return false;
+        }
+        entries
+            .iter()
+            .all(|entry| entry.index_type == GlobalIndexFileKind::Multivalue)
+    } else {
+        entries
+            .iter()
+            .all(|entry| entry.index_type != GlobalIndexFileKind::Multivalue)
+    }
 }
 
 fn requires_fallback_scan(op: PredicateOperator) -> bool {
@@ -1501,7 +1606,7 @@ mod tests {
     use super::*;
     use crate::btree::test_util::VecFileWrite;
     use crate::btree::{BTreeIndexWriter, BlockCompressionType};
-    use crate::table::bitmap_global_index_reader::BitmapGlobalIndexWriter;
+    use crate::table::bitmap_global_index_writer::BitmapGlobalIndexWriter;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
 

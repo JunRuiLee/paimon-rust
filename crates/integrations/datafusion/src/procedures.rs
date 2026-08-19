@@ -26,7 +26,7 @@
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'ivf-pq')`
-//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'lumina', or a vindex type such as 'ivf-pq')
+//! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'lumina', or a vindex type such as 'ivf-pq')
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 //!
 //! The `index_type` argument of the three global index procedures is
@@ -563,16 +563,12 @@ async fn proc_create_global_index(
     let index_type = normalize_index_type(index_type_arg);
     let index_type = index_type.as_str();
     if is_sorted_global_index_type(index_type) {
-        if args.contains_key("options") {
-            return Err(DataFusionError::NotImplemented(
-                "create_global_index options are not supported for sorted global indexes yet"
-                    .to_string(),
-            ));
-        }
-
-        let mut builder = table.new_btree_global_index_build_builder();
+        let mut builder = table.new_sorted_global_index_build_builder();
         builder.with_index_column(index_column);
         builder.with_index_type(index_type);
+        if let Some(options) = args.get("options") {
+            builder.with_options(parse_key_value_options(options)?);
+        }
         builder.execute().await.map_err(to_datafusion_error)?;
     } else if is_vindex_index_type(index_type) {
         let mut builder = table.new_vindex_index_build_builder(index_type);
@@ -584,7 +580,7 @@ async fn proc_create_global_index(
     } else {
         // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
-            "create_global_index only supports index_type => 'btree', 'bitmap', or vindex types \
+            "create_global_index only supports index_type => 'btree', 'bitmap', 'multivalue', or vindex types \
              ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann'), got '{index_type_arg}'"
         )));
     }
@@ -631,7 +627,7 @@ async fn proc_drop_global_index(
 
 /// Precondition: `index_type` is already canonical (see `normalize_index_type`).
 fn is_sorted_global_index_type(index_type: &str) -> bool {
-    index_type == "btree" || index_type == "bitmap"
+    index_type == "btree" || index_type == "bitmap" || index_type == "multivalue"
 }
 
 /// Canonicalize a procedure's `index_type` argument: trim, then lowercase.
@@ -820,6 +816,7 @@ mod tests {
     fn test_sorted_global_index_type_predicate() {
         assert!(is_sorted_global_index_type("btree"));
         assert!(is_sorted_global_index_type("bitmap"));
+        assert!(is_sorted_global_index_type("multivalue"));
         assert!(!is_sorted_global_index_type("ivf-flat"));
         assert!(!is_sorted_global_index_type("lumina"));
         // The predicate requires a canonical input; callers normalize first.

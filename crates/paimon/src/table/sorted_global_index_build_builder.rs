@@ -15,17 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::bitmap_global_index_reader::{
-    make_bitmap_key_comparator, serialize_bitmap_datum, BitmapGlobalIndexWriter, BitmapWriteResult,
-};
+use super::bitmap_global_index_format::{make_bitmap_key_comparator, serialize_bitmap_datum};
+use super::bitmap_global_index_writer::{BitmapGlobalIndexWriter, BitmapWriteResult};
 use super::global_index_types::{
     normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+    MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
+use super::sorted_global_index_options::SortedIndexWriteOptions;
 use crate::btree::key_serde::KeyComparator;
-use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter, BlockCompressionType};
+use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter};
 use crate::spec::{
-    bucket_dir_name, extract_datum_from_arrow, BinaryRow, CoreOptions, DataField, DataFileMeta,
-    DataType, Datum, FileKind, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
+    bucket_dir_name, extract_datum_from_array, extract_datum_from_arrow, BinaryRow, CoreOptions,
+    DataField, DataFileMeta, DataType, Datum, FileKind, GlobalIndexMeta, IndexFileMeta,
+    ROW_ID_FIELD_NAME,
 };
 use crate::table::source::exclude_row_ranges;
 use crate::table::source::is_data_evolution_normal_file;
@@ -34,16 +36,14 @@ use crate::table::{
     CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
 use crate::{Error, Result};
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeListArray, ListArray, RecordBatch};
 use futures::TryStreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 const INDEX_DIR: &str = "index";
-const BTREE_BLOCK_SIZE: usize = 4 * 1024;
-const BITMAP_DICTIONARY_BLOCK_SIZE: usize = 16 * 1024;
 
-type BTreeKeyRow = (Option<Vec<u8>>, i64);
+type SortedIndexKeyRow = (Option<Vec<u8>>, i64);
 type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
 
 fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
@@ -57,18 +57,24 @@ fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparato
     }
 }
 
-pub struct BTreeGlobalIndexBuildBuilder<'a> {
+pub struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
     index_column: Option<String>,
     index_type: String,
+    options: HashMap<String, String>,
 }
 
-impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
+/// Backward-compatible name retained for callers that used the original
+/// BTree-only builder API before it also supported bitmap and multivalue.
+pub type BTreeGlobalIndexBuildBuilder<'a> = SortedGlobalIndexBuildBuilder<'a>;
+
+impl<'a> SortedGlobalIndexBuildBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
         Self {
             table,
             index_column: None,
             index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+            options: HashMap::new(),
         }
     }
 
@@ -82,6 +88,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         self
     }
 
+    pub fn with_options(&mut self, options: HashMap<String, String>) -> &mut Self {
+        self.options = options;
+        self
+    }
+
     pub async fn execute(&self) -> Result<usize> {
         // Building the index scans the table's rows.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
@@ -91,7 +102,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Sorted global index build only supports index_type => 'btree' or 'bitmap', got '{}'",
+                    "Sorted global index build only supports index_type => 'btree', 'bitmap', or 'multivalue', got '{}'",
                     self.index_type
                 ),
             }
@@ -104,12 +115,15 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 source: None,
             })?;
 
-        let core_options = CoreOptions::new(self.table.schema().options());
+        let mut resolved_options = self.table.schema().options().clone();
+        resolved_options.extend(self.options.clone());
+        let core_options = CoreOptions::new(&resolved_options);
         validate_table_options(self.table, &core_options)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
+        let write_options = SortedIndexWriteOptions::from_options(index_type, &resolved_options)?;
 
         let index_field = find_index_field(self.table, index_column)?;
-        validate_btree_field(index_field)?;
+        index_key_type(index_type, index_field)?;
 
         let snapshot_manager = SnapshotManager::new(
             self.table.file_io().clone(),
@@ -139,7 +153,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let shards = plan_btree_shards(
+        let shards = plan_sorted_index_shards(
             self.table.location(),
             self.table.schema().partition_keys(),
             self.table.schema().fields(),
@@ -170,7 +184,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = self
-                .build_index_file(&shard, index_field, index_column)
+                .build_index_file(&shard, index_field, index_column, &write_options)
                 .await?;
             let mut message =
                 CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
@@ -194,22 +208,38 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 
     async fn build_index_file(
         &self,
-        shard: &BTreeGlobalIndexShard,
+        shard: &SortedGlobalIndexShard,
         index_field: &DataField,
         index_column: &str,
+        write_options: &SortedIndexWriteOptions,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Sorted global index build only supports index_type => 'btree' or 'bitmap', got '{}'",
+                    "Sorted global index build only supports index_type => 'btree', 'bitmap', or 'multivalue', got '{}'",
                     self.index_type
                 ),
             }
         })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-        let (cmp, serialize_key) = make_index_key_codec(index_type, index_field.data_type());
-        let mut rows =
-            extract_index_rows(self.table, shard, index_column, index_field, serialize_key).await?;
+        let key_type = index_key_type(index_type, index_field)?;
+        let (cmp, serialize_key) = make_index_key_codec(
+            if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+                BITMAP_GLOBAL_INDEX_TYPE
+            } else {
+                index_type
+            },
+            key_type,
+        );
+        let mut rows = extract_index_rows(
+            self.table,
+            shard,
+            index_column,
+            index_field,
+            index_type,
+            serialize_key,
+        )
+        .await?;
         sort_index_rows(&mut rows, &cmp);
 
         self.table
@@ -229,10 +259,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
         let writer = output.writer().await?;
         let (written_row_count, index_meta) = match index_type {
             BTREE_GLOBAL_INDEX_TYPE => {
-                let mut writer = BTreeIndexWriter::with_comparator(
+                let mut writer = BTreeIndexWriter::with_comparator_and_compression_level(
                     writer,
-                    BTREE_BLOCK_SIZE,
-                    BlockCompressionType::None,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -253,10 +284,11 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 (write_result.row_count, write_result.meta)
             }
             BITMAP_GLOBAL_INDEX_TYPE => {
-                let mut writer = BitmapGlobalIndexWriter::new(
+                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
                     writer,
-                    BITMAP_DICTIONARY_BLOCK_SIZE,
-                    BlockCompressionType::None,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
                     cmp,
                 );
                 for (key, local_row_id) in &rows {
@@ -272,6 +304,38 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
                 let BitmapWriteResult { row_count, meta } =
                     writer.finish().await.map_err(|e| Error::DataInvalid {
                         message: format!("Failed to finish bitmap global index file '{file_name}'"),
+                        source: Some(Box::new(e)),
+                    })?;
+                (row_count, meta)
+            }
+            MULTIVALUE_GLOBAL_INDEX_TYPE => {
+                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
+                    writer,
+                    write_options.block_size,
+                    write_options.compression_type,
+                    write_options.compression_level,
+                    cmp,
+                );
+                for (key, local_row_id) in &rows {
+                    let key = key
+                        .as_deref()
+                        .expect("multivalue extraction skips null keys");
+                    writer
+                        .write_posting(key, *local_row_id)
+                        .map_err(|e| Error::DataInvalid {
+                            message: format!(
+                                "Failed to write multivalue global index file '{file_name}'"
+                            ),
+                            source: Some(Box::new(e)),
+                        })?;
+                }
+                let BitmapWriteResult { row_count, meta } = writer
+                    .finish_with_source_row_count(u64::try_from(row_count).unwrap())
+                    .await
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!(
+                            "Failed to finish multivalue global index file '{file_name}'"
+                        ),
                         source: Some(Box::new(e)),
                     })?;
                 (row_count, meta)
@@ -312,7 +376,7 @@ impl<'a> BTreeGlobalIndexBuildBuilder<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BTreeGlobalIndexShard {
+pub(crate) struct SortedGlobalIndexShard {
     pub partition: BinaryRow,
     pub partition_bytes: Vec<u8>,
     pub files: Vec<DataFileMeta>,
@@ -327,34 +391,34 @@ pub(crate) struct BTreeGlobalIndexShard {
 fn validate_table_options(table: &Table, core_options: &CoreOptions) -> Result<()> {
     if !core_options.row_tracking_enabled() {
         return Err(Error::DataInvalid {
-            message: "BTree global index build requires 'row-tracking.enabled' = 'true'"
+            message: "Sorted global index build requires 'row-tracking.enabled' = 'true'"
                 .to_string(),
             source: None,
         });
     }
     if !core_options.data_evolution_enabled() {
         return Err(Error::DataInvalid {
-            message: "BTree global index build requires 'data-evolution.enabled' = 'true'"
+            message: "Sorted global index build requires 'data-evolution.enabled' = 'true'"
                 .to_string(),
             source: None,
         });
     }
     if !core_options.global_index_enabled() {
         return Err(Error::DataInvalid {
-            message: "BTree global index build requires 'global-index.enabled' = 'true'"
+            message: "Sorted global index build requires 'global-index.enabled' = 'true'"
                 .to_string(),
             source: None,
         });
     }
     if !table.schema().primary_keys().is_empty() {
         return Err(Error::Unsupported {
-            message: "BTree global index build does not support primary-key tables".to_string(),
+            message: "Sorted global index build does not support primary-key tables".to_string(),
         });
     }
     if core_options.deletion_vectors_enabled() {
         return Err(Error::Unsupported {
             message:
-                "BTree global index build does not support tables with deletion-vectors.enabled=true"
+                "Sorted global index build does not support tables with deletion-vectors.enabled=true"
                     .to_string(),
         });
     }
@@ -377,13 +441,40 @@ fn validate_btree_field(field: &DataField) -> Result<()> {
     if !is_btree_supported_data_type(field.data_type()) {
         return Err(Error::Unsupported {
             message: format!(
-                "BTree global index only supports scalar columns, got {:?} for column '{}'",
+                "Sorted global index only supports scalar columns, got {:?} for column '{}'",
                 field.data_type(),
                 field.name()
             ),
         });
     }
     Ok(())
+}
+
+fn index_key_type<'a>(index_type: &str, field: &'a DataField) -> Result<&'a DataType> {
+    if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+        let DataType::Array(array_type) = field.data_type() else {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "Multivalue global index requires an ARRAY column, got {:?} for column '{}'",
+                    field.data_type(),
+                    field.name()
+                ),
+            });
+        };
+        if !is_btree_supported_data_type(array_type.element_type()) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "Multivalue global index does not support array element type {:?} for column '{}'",
+                    array_type.element_type(),
+                    field.name()
+                ),
+            });
+        }
+        Ok(array_type.element_type())
+    } else {
+        validate_btree_field(field)?;
+        Ok(field.data_type())
+    }
 }
 
 fn is_btree_supported_data_type(data_type: &DataType) -> bool {
@@ -407,7 +498,7 @@ fn is_btree_supported_data_type(data_type: &DataType) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_btree_shards(
+fn plan_sorted_index_shards(
     table_location: &str,
     partition_keys: &[String],
     schema_fields: &[DataField],
@@ -416,7 +507,7 @@ fn plan_btree_shards(
     entries: Vec<crate::spec::ManifestEntry>,
     records_per_range: i64,
     indexed: &[RowRange],
-) -> Result<Vec<BTreeGlobalIndexShard>> {
+) -> Result<Vec<SortedGlobalIndexShard>> {
     if records_per_range <= 0 {
         return Err(Error::DataInvalid {
             message: format!(
@@ -434,7 +525,7 @@ fn plan_btree_shards(
         if entry.file().first_row_id.is_none() {
             return Err(Error::DataInvalid {
                 message: format!(
-                    "Data file '{}' is missing first_row_id; cannot build a complete BTree global index",
+                    "Data file '{}' is missing first_row_id; cannot build a complete sorted global index",
                     entry.file().file_name
                 ),
                 source: None,
@@ -477,7 +568,7 @@ fn plan_btree_shards(
                     let range_end = range_start + records_per_range - 1;
                     let row_range_start = seg_start.max(range_start);
                     let row_range_end = seg_end.min(range_end);
-                    result.push(BTreeGlobalIndexShard {
+                    result.push(SortedGlobalIndexShard {
                         partition: partition.clone(),
                         partition_bytes: partition_bytes.clone(),
                         files: group.files.clone(),
@@ -514,7 +605,7 @@ fn group_normal_file_ranges(files: Vec<DataFileMeta>) -> Result<Vec<PlannedFileG
     for file in &files {
         file.row_id_range().ok_or_else(|| Error::DataInvalid {
             message: format!(
-                "Data file '{}' is missing first_row_id; cannot build a complete BTree global index",
+                "Data file '{}' is missing first_row_id; cannot build a complete sorted global index",
                 file.file_name
             ),
             source: None,
@@ -571,7 +662,7 @@ fn normal_coverage_range(files: &[DataFileMeta]) -> Result<(i64, i64)> {
     {
         let (file_start, file_end) = file.row_id_range().ok_or_else(|| Error::DataInvalid {
             message: format!(
-                "Data file '{}' is missing first_row_id; cannot build a complete BTree global index",
+                "Data file '{}' is missing first_row_id; cannot build a complete sorted global index",
                 file.file_name
             ),
             source: None,
@@ -580,7 +671,7 @@ fn normal_coverage_range(files: &[DataFileMeta]) -> Result<(i64, i64)> {
         end = Some(end.map_or(file_end, |value: i64| value.max(file_end)));
     }
     start.zip(end).ok_or_else(|| Error::DataInvalid {
-        message: "BTree global index shard has no normal data files".to_string(),
+        message: "Sorted global index shard has no normal data files".to_string(),
         source: None,
     })
 }
@@ -612,31 +703,47 @@ fn bucket_path(
 
 async fn extract_index_rows(
     table: &Table,
-    shard: &BTreeGlobalIndexShard,
+    shard: &SortedGlobalIndexShard,
     index_column: &str,
     index_field: &DataField,
+    index_type: &str,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<BTreeKeyRow>> {
+) -> Result<Vec<SortedIndexKeyRow>> {
     let splits = build_read_splits_for_shard(shard)?;
 
     let mut read_builder = table.new_read_builder();
     read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
     let read = read_builder.new_read()?;
     let batches = read.to_arrow(&splits)?.try_collect::<Vec<_>>().await?;
-    extract_index_rows_from_batches(
-        &batches,
-        index_column,
-        index_field.data_type(),
+    let expected_row_count = i64::from(checked_row_count(
         shard.row_range_start,
-        i64::from(checked_row_count(
+        shard.row_range_end,
+    )?);
+    if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
+        let DataType::Array(array_type) = index_field.data_type() else {
+            unreachable!("multivalue field was validated before extraction")
+        };
+        extract_multivalue_index_rows_from_batches(
+            &batches,
+            index_column,
+            array_type.element_type(),
             shard.row_range_start,
-            shard.row_range_end,
-        )?),
-        serialize_key,
-    )
+            expected_row_count,
+            serialize_key,
+        )
+    } else {
+        extract_index_rows_from_batches(
+            &batches,
+            index_column,
+            index_field.data_type(),
+            shard.row_range_start,
+            expected_row_count,
+            serialize_key,
+        )
+    }
 }
 
-fn build_read_splits_for_shard(shard: &BTreeGlobalIndexShard) -> Result<Vec<DataSplit>> {
+fn build_read_splits_for_shard(shard: &SortedGlobalIndexShard) -> Result<Vec<DataSplit>> {
     let shard_range = RowRange::new(shard.row_range_start, shard.row_range_end);
     group_by_overlapping_row_id(shard.files.clone())
         .into_iter()
@@ -676,7 +783,7 @@ fn extract_index_rows_from_batches(
     row_range_start: i64,
     expected_row_count: i64,
     serialize_key: SerializeKeyFn,
-) -> Result<Vec<BTreeKeyRow>> {
+) -> Result<Vec<SortedIndexKeyRow>> {
     let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
     let mut rows = Vec::with_capacity(row_count);
     let mut expected_row_id = row_range_start;
@@ -702,14 +809,14 @@ fn extract_index_rows_from_batches(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| Error::DataInvalid {
-                message: "BTree global index build requires non-null Int64 _ROW_ID".to_string(),
+                message: "Sorted global index build requires non-null Int64 _ROW_ID".to_string(),
                 source: None,
             })?;
 
         for row in 0..batch.num_rows() {
             if row_ids.is_null(row) {
                 return Err(Error::DataInvalid {
-                    message: "BTree global index build found null _ROW_ID".to_string(),
+                    message: "Sorted global index build found null _ROW_ID".to_string(),
                     source: None,
                 });
             }
@@ -717,7 +824,7 @@ fn extract_index_rows_from_batches(
             if row_id != expected_row_id {
                 return Err(Error::DataInvalid {
                     message: format!(
-                        "BTree global index build expected _ROW_ID {}, got {}",
+                        "Sorted global index build expected _ROW_ID {}, got {}",
                         expected_row_id, row_id
                     ),
                     source: None,
@@ -734,7 +841,7 @@ fn extract_index_rows_from_batches(
     if actual_row_count != expected_row_count {
         return Err(Error::DataInvalid {
             message: format!(
-                "BTree global index build expected {} rows, got {}",
+                "Sorted global index build expected {} rows, got {}",
                 expected_row_count, actual_row_count
             ),
             source: None,
@@ -743,7 +850,156 @@ fn extract_index_rows_from_batches(
     Ok(rows)
 }
 
-fn sort_index_rows(rows: &mut [BTreeKeyRow], cmp: &dyn Fn(&[u8], &[u8]) -> Ordering) {
+fn extract_multivalue_index_rows_from_batches(
+    batches: &[RecordBatch],
+    index_column: &str,
+    element_type: &DataType,
+    row_range_start: i64,
+    expected_row_count: i64,
+    serialize_key: SerializeKeyFn,
+) -> Result<Vec<SortedIndexKeyRow>> {
+    let mut rows = Vec::new();
+    let mut expected_row_id = row_range_start;
+    for batch in batches {
+        let value_index =
+            batch
+                .schema()
+                .index_of(index_column)
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("Index column '{index_column}' not found in read batch: {e}"),
+                    source: None,
+                })?;
+        let row_id_index =
+            batch
+                .schema()
+                .index_of(ROW_ID_FIELD_NAME)
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("_ROW_ID column not found in read batch: {e}"),
+                    source: None,
+                })?;
+        let row_ids = batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Multivalue global index build requires non-null Int64 _ROW_ID"
+                    .to_string(),
+                source: None,
+            })?;
+
+        #[derive(Clone, Copy)]
+        enum ArrayLayout<'a> {
+            List(&'a ListArray),
+            LargeList(&'a LargeListArray),
+            Fixed(&'a FixedSizeListArray),
+        }
+        let column = batch.column(value_index);
+        let layout = if let Some(array) = column.as_any().downcast_ref::<ListArray>() {
+            ArrayLayout::List(array)
+        } else if let Some(array) = column.as_any().downcast_ref::<LargeListArray>() {
+            ArrayLayout::LargeList(array)
+        } else if let Some(array) = column.as_any().downcast_ref::<FixedSizeListArray>() {
+            ArrayLayout::Fixed(array)
+        } else {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Multivalue global index extraction requires an Arrow list column, got {:?}",
+                    column.data_type()
+                ),
+                source: None,
+            });
+        };
+        let values = match layout {
+            ArrayLayout::List(array) => array.values(),
+            ArrayLayout::LargeList(array) => array.values(),
+            ArrayLayout::Fixed(array) => array.values(),
+        };
+
+        for row in 0..batch.num_rows() {
+            if row_ids.is_null(row) {
+                return Err(Error::DataInvalid {
+                    message: "Multivalue global index build found null _ROW_ID".to_string(),
+                    source: None,
+                });
+            }
+            let row_id = row_ids.value(row);
+            if row_id != expected_row_id {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Multivalue global index build expected _ROW_ID {}, got {}",
+                        expected_row_id, row_id
+                    ),
+                    source: None,
+                });
+            }
+            expected_row_id += 1;
+
+            let is_null = match layout {
+                ArrayLayout::List(array) => array.is_null(row),
+                ArrayLayout::LargeList(array) => array.is_null(row),
+                ArrayLayout::Fixed(array) => array.is_null(row),
+            };
+            if is_null {
+                continue;
+            }
+            let (start, end) = match layout {
+                ArrayLayout::List(array) => {
+                    let offsets = array.value_offsets();
+                    (
+                        usize::try_from(offsets[row]),
+                        usize::try_from(offsets[row + 1]),
+                    )
+                }
+                ArrayLayout::LargeList(array) => {
+                    let offsets = array.value_offsets();
+                    (
+                        usize::try_from(offsets[row]),
+                        usize::try_from(offsets[row + 1]),
+                    )
+                }
+                ArrayLayout::Fixed(array) => {
+                    let start = usize::try_from(array.value_offset(row));
+                    let end = usize::try_from(array.value_offset(row) + array.value_length());
+                    (start, end)
+                }
+            };
+            let (start, end) = match (start, end) {
+                (Ok(start), Ok(end)) => (start, end),
+                _ => {
+                    return Err(Error::DataInvalid {
+                        message: "Multivalue global index found a negative array offset"
+                            .to_string(),
+                        source: None,
+                    })
+                }
+            };
+            for element_index in start..end {
+                if let Some(datum) =
+                    extract_datum_from_array(values, element_index, value_index, element_type)?
+                {
+                    rows.push((
+                        Some(serialize_key(&datum, element_type)),
+                        row_id - row_range_start,
+                    ));
+                }
+            }
+        }
+    }
+
+    let actual_row_count = expected_row_id - row_range_start;
+    if actual_row_count != expected_row_count {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Multivalue global index build expected {} source rows, got {}",
+                expected_row_count, actual_row_count
+            ),
+            source: None,
+        });
+    }
+    Ok(rows)
+}
+
+fn sort_index_rows(rows: &mut [SortedIndexKeyRow], cmp: &dyn Fn(&[u8], &[u8]) -> Ordering) {
     rows.sort_by(|left, right| match (&left.0, &right.0) {
         (None, None) => left.1.cmp(&right.1),
         (None, Some(_)) => Ordering::Less,
@@ -765,14 +1021,14 @@ fn checked_row_count(row_range_start: i64, row_range_end: i64) -> Result<i32> {
     if row_range_end < row_range_start {
         return Err(Error::DataInvalid {
             message: format!(
-                "Invalid BTree global index row range [{row_range_start}, {row_range_end}]"
+                "Invalid sorted global index row range [{row_range_start}, {row_range_end}]"
             ),
             source: None,
         });
     }
     i32::try_from(row_range_end - row_range_start + 1).map_err(|_| Error::DataInvalid {
         message: format!(
-            "BTree global index row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
+            "Sorted global index row count is too large for Rust IndexFileMeta: [{row_range_start}, {row_range_end}]"
         ),
         source: None,
     })
@@ -785,16 +1041,18 @@ fn ranges_overlap(left_start: i64, left_end: i64, right_start: i64, right_end: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::BTreeIndexMeta;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BinaryRowBuilder, BinaryType, DoubleType, FloatType, GlobalIndexSearchMode, IndexManifest,
-        IntType, ManifestEntry, Predicate, PredicateBuilder, Schema, TableSchema, VarBinaryType,
-        VarCharType,
+        ArrayType, BinaryRowBuilder, BinaryType, DoubleType, FloatType, GlobalIndexSearchMode,
+        IndexManifest, IntType, ManifestEntry, Predicate, PredicateBuilder, PredicateOperator,
+        Schema, TableSchema, TimeType, VarBinaryType, VarCharType,
     };
     use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
     use crate::table::{merge_row_ranges, SnapshotManager, TableCommit, TableWrite};
+    use arrow_array::builder::{Int32Builder, ListBuilder, Time32MillisecondBuilder};
     use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::{DateTime, Utc};
@@ -879,13 +1137,32 @@ mod tests {
         )
     }
 
+    fn multivalue_table(table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "items",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .options(table_options("10"))
+            .build()
+            .unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "test_multivalue_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
     fn plan(
         entries: Vec<ManifestEntry>,
         records_per_range: i64,
-    ) -> Result<Vec<BTreeGlobalIndexShard>> {
+    ) -> Result<Vec<SortedGlobalIndexShard>> {
         let table = test_table(table_options(&records_per_range.to_string()));
         let core = CoreOptions::new(table.schema().options());
-        plan_btree_shards(
+        plan_sorted_index_shards(
             table.location(),
             table.schema().partition_keys(),
             table.schema().fields(),
@@ -1099,6 +1376,98 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_multivalue_rows_skips_null_arrays_and_elements() {
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
+        let mut items = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
+        items.values().append_value(10);
+        items.values().append_null();
+        items.values().append_value(10);
+        items.append(true);
+        items.append(true); // empty array
+        items.append(false); // null array
+        items.values().append_value(30);
+        items.append(true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("items", ArrowDataType::List(element), true),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(items.finish()) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(5..9)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let rows = extract_multivalue_index_rows_from_batches(
+            &[batch],
+            "items",
+            &DataType::Int(IntType::new()),
+            5,
+            4,
+            serialize_bitmap_datum,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (Some(10i32.to_le_bytes().to_vec()), 0),
+                (Some(10i32.to_le_bytes().to_vec()), 0),
+                (Some(30i32.to_le_bytes().to_vec()), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_multivalue_time_rows_matches_java_int_serializer() {
+        let element = Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Time32(arrow_schema::TimeUnit::Millisecond),
+            true,
+        ));
+        let mut items =
+            ListBuilder::new(Time32MillisecondBuilder::new()).with_field(element.clone());
+        items.values().append_value(12_345);
+        items.values().append_null();
+        items.append(true);
+        items.values().append_value(86_399_999);
+        items.append(true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("items", ArrowDataType::List(element), true),
+            ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(items.finish()) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(7..9)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let time_type = DataType::Time(TimeType::new(3).unwrap());
+
+        let rows = extract_multivalue_index_rows_from_batches(
+            &[batch],
+            "items",
+            &time_type,
+            7,
+            2,
+            serialize_bitmap_datum,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (Some(12_345i32.to_le_bytes().to_vec()), 0),
+                (Some(86_399_999i32.to_le_bytes().to_vec()), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn test_index_key_codec_scopes_java_nan_semantics_to_bitmap() {
         fn assert_codec(
             data_type: DataType,
@@ -1216,6 +1585,40 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from(ids)) as ArrayRef,
                 Arc::new(StringArray::from(names)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn multivalue_batch() -> RecordBatch {
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
+        let mut items = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
+
+        items.values().append_value(10);
+        items.values().append_null();
+        items.values().append_value(10);
+        items.append(true);
+
+        items.append(true); // empty array
+        items.append(false); // null array
+
+        items.values().append_value(10);
+        items.values().append_value(30);
+        items.append(true);
+
+        items.values().append_value(30);
+        items.values().append_value(40);
+        items.append(true);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("items", ArrowDataType::List(element), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(1..=5)) as ArrayRef,
+                Arc::new(items.finish()) as ArrayRef,
             ],
         )
         .unwrap()
@@ -1739,6 +2142,129 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
+        let table_path = "memory:/test_multivalue_global_index_builder_e2e";
+        let table = multivalue_table(table_path);
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&multivalue_batch())
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let shard_count = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("items")
+            .with_index_type(MULTIVALUE_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(shard_count, 1);
+
+        let snapshot = SnapshotManager::new(table.file_io().clone(), table.location().to_string())
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let index_manifest = snapshot.index_manifest().expect("index manifest");
+        let index_entries = IndexManifest::read(
+            table.file_io(),
+            &format!("{table_path}/manifest/{index_manifest}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(index_entries.len(), 1);
+
+        let index_file = &index_entries[0].index_file;
+        assert_eq!(index_file.index_type, MULTIVALUE_GLOBAL_INDEX_TYPE);
+        assert_eq!(index_file.row_count, 5, "source rows, not postings");
+        let global_meta = index_file.global_index_meta.as_ref().unwrap();
+        let serialized_meta = global_meta.index_meta.as_deref().unwrap();
+        let sorted_meta = BTreeIndexMeta::deserialize(serialized_meta).unwrap();
+        assert_eq!(serialized_meta, sorted_meta.serialize());
+        let element_type = DataType::Int(IntType::new());
+
+        let index_path = format!("{table_path}/index/{}", index_file.file_name);
+        let input = table.file_io().new_input(&index_path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader = input.reader().await.unwrap();
+        let bitmap_reader =
+            crate::table::bitmap_global_index_reader::BitmapGlobalIndexReader::open(
+                Box::new(reader),
+                file_size,
+            )
+            .await
+            .unwrap();
+        let contains = bitmap_reader
+            .query(
+                PredicateOperator::ArrayContains,
+                &[Datum::Int(10)],
+                &element_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(contains.iter().collect::<Vec<_>>(), vec![0, 3]);
+        let overlap = bitmap_reader
+            .query(
+                PredicateOperator::ArraysOverlap,
+                &[Datum::Int(40), Datum::Int(10), Datum::Int(10)],
+                &element_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(overlap.iter().collect::<Vec<_>>(), vec![0, 3, 4]);
+        let contains_all = bitmap_reader
+            .query(
+                PredicateOperator::ArrayContainsAll,
+                &[Datum::Int(10), Datum::Int(30), Datum::Int(10)],
+                &element_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(contains_all.iter().collect::<Vec<_>>(), vec![3]);
+
+        let fields = table.schema().fields();
+        let contains_all_predicate = PredicateBuilder::new(fields)
+            .array_contains_all(
+                "items",
+                vec![Datum::Int(10), Datum::Int(30), Datum::Int(10)],
+            )
+            .unwrap();
+        let ranges = evaluate_global_index(GlobalIndexEvaluation {
+            file_io: table.file_io(),
+            table_path: table.location(),
+            index_entries: &index_entries,
+            predicates: std::slice::from_ref(&contains_all_predicate),
+            schema_fields: fields,
+            search_mode: GlobalIndexSearchMode::Fast,
+            global_index_thread_num: 32,
+            btree_fallback_scan_max_size: i64::MAX,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            next_row_id: snapshot.next_row_id(),
+            data_ranges: &[],
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ranges, vec![RowRange::new(3, 3)]);
+
+        assert_eq!(scan_ids(&table, contains_all_predicate).await, vec![4]);
+        let empty_contains_all = PredicateBuilder::new(fields)
+            .array_contains_all("items", vec![])
+            .unwrap();
+        assert_eq!(
+            scan_ids(&table, empty_contains_all).await,
+            vec![1, 2, 4, 5],
+            "empty contains-all matches every non-null array and must fall back"
+        );
     }
 
     #[tokio::test]
