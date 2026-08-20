@@ -20,7 +20,7 @@ mod blob_fallback;
 use super::blob_resolver::{BlobReadLimiter, BLOB_DESCRIPTOR_READ_CONCURRENCY};
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
-    DataFileReader,
+    DataFileReadTiming, DataFileReader,
 };
 use crate::arrow::format::FilePredicates;
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
@@ -114,6 +114,7 @@ pub(crate) struct DataEvolutionReader {
     blob_read_limiter: BlobReadLimiter,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
 impl DataEvolutionReader {
@@ -191,6 +192,7 @@ impl DataEvolutionReader {
             blob_read_limiter: BlobReadLimiter::new(),
             batch_size: None,
             parquet_read_budget: None,
+            read_timing: None,
         })
     }
 
@@ -204,6 +206,11 @@ impl DataEvolutionReader {
         parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_read_timing(mut self, read_timing: Option<Arc<DataFileReadTiming>>) -> Self {
+        self.read_timing = read_timing;
         self
     }
 
@@ -248,7 +255,8 @@ impl DataEvolutionReader {
                 },
             )
             .with_batch_size(self.batch_size)
-            .with_parquet_read_budget(self.parquet_read_budget.clone());
+            .with_parquet_read_budget(self.parquet_read_budget.clone())
+            .with_read_timing(self.read_timing.clone());
 
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
@@ -611,6 +619,7 @@ impl DataEvolutionReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let read_timing = self.read_timing.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
         const MERGE_BATCH_SIZE: usize = 1024;
@@ -697,6 +706,7 @@ impl DataEvolutionReader {
                             batch_size,
                             blob_as_descriptor,
                             source_parquet_read_budget.clone(),
+                            read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
                         )
                         .map(Some)
@@ -1228,6 +1238,7 @@ fn open_source_stream(
     batch_size: Option<usize>,
     blob_as_descriptor: bool,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let mut row_ranges = row_ranges;
@@ -1292,7 +1303,8 @@ fn open_source_stream(
     )
     .with_batch_size(batch_size)
     .with_blob_as_descriptor(blob_as_descriptor)
-    .with_parquet_read_budget(parquet_read_budget);
+    .with_parquet_read_budget(parquet_read_budget)
+    .with_read_timing(read_timing);
 
     match source {
         FieldSource::DataFile {

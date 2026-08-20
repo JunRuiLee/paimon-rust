@@ -16,7 +16,7 @@
 // under the License.
 
 use super::data_evolution_reader::DataEvolutionReader;
-use super::data_file_reader::DataFileReader;
+use super::data_file_reader::{DataFileReadTiming, DataFileReader};
 use super::format_table_read::FormatTableRead;
 use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
@@ -158,6 +158,15 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    pub(crate) fn with_data_file_read_timing(self, timing: Arc<DataFileReadTiming>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_data_file_read_timing(timing),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.0 {
@@ -216,6 +225,7 @@ struct PaimonTableRead<'a> {
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    data_file_read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -231,6 +241,7 @@ impl<'a> PaimonTableRead<'a> {
             data_predicates,
             row_filter_factory: None,
             parquet_read_budget: None,
+            data_file_read_timing: None,
         }
     }
 
@@ -271,6 +282,11 @@ impl<'a> PaimonTableRead<'a> {
 
     fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
+        self
+    }
+
+    fn with_data_file_read_timing(mut self, timing: Arc<DataFileReadTiming>) -> Self {
+        self.data_file_read_timing = Some(timing);
         self
     }
 
@@ -856,7 +872,8 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
-        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_read_timing(self.data_file_read_timing.clone());
         reader.read(data_splits)
     }
 
@@ -875,7 +892,8 @@ impl<'a> PaimonTableRead<'a> {
             self.data_predicates.clone(),
         )
         .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
-        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_read_timing(self.data_file_read_timing.clone());
         // The engine decoder filter is safe only on the plain append/raw path.
         // This constructor is also used by raw-convertible primary-key splits,
         // where positional merge semantics must remain untouched.

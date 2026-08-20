@@ -20,7 +20,7 @@ use crate::arrow::format::create_format_reader_with_budget;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ParquetReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
-use crate::io::FileIO;
+use crate::io::{FileIO, FileRead};
 use crate::spec::{
     is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
 };
@@ -33,7 +33,51 @@ use arrow_cast::cast;
 
 use async_stream::try_stream;
 use futures::StreamExt;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Default)]
+pub(crate) struct DataFileReadTiming {
+    file_read_nanos: AtomicU64,
+    parquet_decode_nanos: AtomicU64,
+}
+
+impl DataFileReadTiming {
+    fn add_file_read(&self, duration: Duration) {
+        self.file_read_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_parquet_decode(&self, duration: Duration) {
+        self.parquet_decode_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn file_read(&self) -> Duration {
+        Duration::from_nanos(self.file_read_nanos.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn parquet_decode(&self) -> Duration {
+        Duration::from_nanos(self.parquet_decode_nanos.load(Ordering::Relaxed))
+    }
+}
+
+struct TimedFileRead {
+    inner: Box<dyn FileRead>,
+    timing: Arc<DataFileReadTiming>,
+}
+
+#[async_trait::async_trait]
+impl FileRead for TimedFileRead {
+    async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
+        let start = Instant::now();
+        let result = self.inner.read(range).await;
+        self.timing.add_file_read(start.elapsed());
+        result
+    }
+}
 
 /// Reads data from Parquet files.
 #[derive(Clone)]
@@ -48,6 +92,7 @@ pub(crate) struct DataFileReader {
     blob_as_descriptor: bool,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
 impl DataFileReader {
@@ -70,6 +115,7 @@ impl DataFileReader {
             blob_as_descriptor: false,
             batch_size: None,
             parquet_read_budget: None,
+            read_timing: None,
         }
     }
 
@@ -88,6 +134,11 @@ impl DataFileReader {
         parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_read_timing(mut self, read_timing: Option<Arc<DataFileReadTiming>>) -> Self {
+        self.read_timing = read_timing;
         self
     }
 
@@ -291,6 +342,7 @@ impl DataFileReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let read_timing = self.read_timing.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -344,7 +396,19 @@ impl DataFileReader {
                 parquet_read_budget,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
+            let open_start = read_timing.as_ref().map(|_| Instant::now());
             let file_reader = input_file.reader().await?;
+            if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
+                timing.add_file_read(start.elapsed());
+            }
+            let file_reader: Box<dyn FileRead> = match read_timing.as_ref() {
+                Some(timing) => Box::new(TimedFileRead {
+                    inner: Box::new(file_reader),
+                    timing: Arc::clone(timing),
+                }),
+                None => Box::new(file_reader),
+            };
+            let is_parquet = path_to_read.to_ascii_lowercase().ends_with(".parquet");
             let local_ranges = row_ranges.as_ref().map(|ranges| {
                 to_local_row_ranges(ranges, file_meta.first_row_id.unwrap_or(0), file_meta.row_count)
             });
@@ -364,7 +428,7 @@ impl DataFileReader {
             let mut row_id_offset = 0usize;
 
             let mut batch_stream = format_reader.read_batch_stream(
-                Box::new(file_reader),
+                file_reader,
                 file_meta.file_size as u64,
                 &format_read_fields,
                 file_predicates.as_ref(),
@@ -372,7 +436,23 @@ impl DataFileReader {
                 row_selection,
             ).await?;
 
-            while let Some(batch) = batch_stream.next().await {
+            loop {
+                let batch = if is_parquet {
+                    if let Some(timing) = read_timing.as_ref() {
+                        std::future::poll_fn(|cx| {
+                            let start = Instant::now();
+                            let batch = batch_stream.as_mut().poll_next(cx);
+                            timing.add_parquet_decode(start.elapsed());
+                            batch
+                        })
+                        .await
+                    } else {
+                        batch_stream.next().await
+                    }
+                } else {
+                    batch_stream.next().await
+                };
+                let Some(batch) = batch else { break };
                 let batch = batch?;
                 let num_rows = batch.num_rows();
                 let batch_schema = batch.schema();

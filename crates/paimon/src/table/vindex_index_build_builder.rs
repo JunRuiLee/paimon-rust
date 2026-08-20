@@ -19,6 +19,7 @@ use crate::spec::{
     bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, FileKind,
     GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
 };
+use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::source::exclude_row_ranges;
 use crate::table::{
     CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
@@ -28,15 +29,89 @@ use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
+use paimon_vindex_core::autotune::default_training_vector_count;
 use paimon_vindex_core::index::{VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const VECTOR_INDEX_BUILD_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING";
+
+fn vector_index_build_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(VECTOR_INDEX_BUILD_TIMING_ENV).is_some_and(|value| value == "1")
+    })
+}
+
+struct VectorIndexBuildTiming {
+    total_without_commit: Duration,
+    source_batch_wait: Duration,
+    oss_read: Duration,
+    parquet_decode: Duration,
+    raw_temp_write: Duration,
+    train_finish: Duration,
+    raw_temp_reread: Duration,
+    index_add: Duration,
+    serialize_upload: Duration,
+    rows: usize,
+    training_rows_seen: usize,
+    training_rows_retained: usize,
+    batch_count: usize,
+    raw_temp_bytes: usize,
+    index_bytes: u64,
+    data_file_count: usize,
+    file_name: String,
+}
+
+impl VectorIndexBuildTiming {
+    fn log(self, index_type: &str, commit: Duration) {
+        let total = self.total_without_commit.saturating_add(commit);
+        let accounted = self
+            .source_batch_wait
+            .saturating_add(self.raw_temp_write)
+            .saturating_add(self.train_finish)
+            .saturating_add(self.raw_temp_reread)
+            .saturating_add(self.index_add)
+            .saturating_add(self.serialize_upload)
+            .saturating_add(commit);
+        let unattributed = total.saturating_sub(accounted);
+        eprintln!(
+            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
+            index_type,
+            self.file_name,
+            self.rows,
+            self.training_rows_seen,
+            self.training_rows_retained,
+            self.batch_count,
+            self.raw_temp_bytes,
+            self.index_bytes,
+            self.source_batch_wait.as_secs_f64() * 1000.0,
+            self.oss_read.as_secs_f64() * 1000.0,
+            self.parquet_decode.as_secs_f64() * 1000.0,
+            self.raw_temp_write.as_secs_f64() * 1000.0,
+            self.train_finish.as_secs_f64() * 1000.0,
+            self.raw_temp_reread.as_secs_f64() * 1000.0,
+            self.index_add.as_secs_f64() * 1000.0,
+            self.serialize_upload.as_secs_f64() * 1000.0,
+            commit.as_secs_f64() * 1000.0,
+            self.data_file_count,
+            total.as_secs_f64() * 1000.0,
+            unattributed.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+struct BuiltIndexFile {
+    meta: IndexFileMeta,
+    timing: Option<VectorIndexBuildTiming>,
+}
 
 pub struct VindexIndexBuildBuilder<'a> {
     table: &'a Table,
@@ -172,8 +247,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         );
         let shard_count = shards.len();
         let mut messages = Vec::with_capacity(shard_count);
+        let mut timings = Vec::with_capacity(shard_count);
         for shard in shards {
-            let index_file = match self
+            let built = match self
                 .build_index_file(
                     &shard,
                     index_column,
@@ -191,13 +267,23 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
             };
             let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
-            message.new_index_files = vec![index_file];
+            message.new_index_files = vec![built.meta];
             messages.push(message);
+            if let Some(timing) = built.timing {
+                timings.push(timing);
+            }
         }
 
+        let commit_start = vector_index_build_timing_enabled().then(Instant::now);
         commit
             .commit_if_latest_snapshot(messages, snapshot.id())
             .await?;
+        if let Some(commit_start) = commit_start {
+            let commit = commit_start.elapsed();
+            for timing in timings {
+                timing.log(&self.index_type, commit);
+            }
+        }
 
         Ok(shard_count)
     }
@@ -210,7 +296,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         index_field_id: i32,
         options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
-    ) -> Result<IndexFileMeta> {
+    ) -> Result<BuiltIndexFile> {
+        let timing_enabled = vector_index_build_timing_enabled();
+        let total_start = timing_enabled.then(Instant::now);
+        let mut source_batch_wait = Duration::ZERO;
+        let mut raw_temp_write = Duration::ZERO;
+        let read_timing = timing_enabled.then(|| Arc::new(DataFileReadTiming::default()));
+        let mut batch_count = 0usize;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
             message: format!("Invalid vindex row count: {row_count}"),
@@ -252,6 +344,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
         let read = read_builder.new_read()?;
+        let read = match read_timing.as_ref() {
+            Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+            None => read,
+        };
         let mut batches = read.to_arrow(&[split])?;
         let mut expected_row_id = shard.row_range_start;
         let mut rows_seen = 0usize;
@@ -259,7 +355,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut next_training_sample = 0usize;
         let mut training_buffer = Vec::with_capacity(training_buffer_floats);
 
-        while let Some(batch) = batches.try_next().await? {
+        loop {
+            let source_start = timing_enabled.then(Instant::now);
+            let batch = batches.try_next().await?;
+            if let Some(source_start) = source_start {
+                source_batch_wait = source_batch_wait.saturating_add(source_start.elapsed());
+            }
+            let Some(batch) = batch else { break };
+            batch_count += 1;
             let vectors =
                 validate_vector_batch(&batch, index_column, dimension_usize, &mut expected_row_id)?;
             let batch_end =
@@ -306,6 +409,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
             }
 
+            let raw_write_start = timing_enabled.then(Instant::now);
             raw_file
                 .write_all(vectors.bytes)
                 .await
@@ -313,6 +417,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     message: format!("Failed to spill vindex vectors: {e}"),
                     source: Some(Box::new(e)),
                 })?;
+            if let Some(raw_write_start) = raw_write_start {
+                raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
+            }
             bytes_written = bytes_written
                 .checked_add(vectors.bytes.len())
                 .ok_or_else(|| Error::DataInvalid {
@@ -350,10 +457,14 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source: None,
             });
         }
+        let raw_write_start = timing_enabled.then(Instant::now);
         raw_file.flush().await.map_err(|e| Error::UnexpectedError {
             message: format!("Failed to flush temporary vindex vector file: {e}"),
             source: Some(Box::new(e)),
         })?;
+        if let Some(raw_write_start) = raw_write_start {
+            raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
+        }
         let raw_file_len = raw_file
             .metadata()
             .await
@@ -371,42 +482,71 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             });
         }
         let raw_file = raw_file.into_std().await;
+        // Diagnostics only: never fail the build for a timing log field.
+        let training_rows_retained = if timing_enabled {
+            default_training_vector_count(training_vector_count, options.config.nlist())
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
-        let writer = tokio::task::spawn_blocking(move || -> std::io::Result<VectorIndexWriter> {
-            let training = trainer.finish()?;
-            let mut writer = VectorIndexWriter::new(training);
-            let mut raw_file = raw_file;
-            raw_file.seek(SeekFrom::Start(0))?;
-            let batch_rows = training_buffer_rows.min(row_count_usize);
-            let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
-            let mut buffer = MutableBuffer::new(batch_bytes);
-            let mut ids = Vec::with_capacity(batch_rows);
-            let mut rows_added = 0usize;
-            while rows_added < row_count_usize {
-                let rows = batch_rows.min(row_count_usize - rows_added);
-                buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
-                raw_file.read_exact(buffer.as_slice_mut())?;
-                ids.clear();
-                for row in rows_added..rows_added + rows {
-                    ids.push(i64::try_from(row).map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "vindex row id does not fit i64",
-                        )
-                    })?);
+        let (writer, train_finish, raw_temp_reread, index_add) = tokio::task::spawn_blocking(
+            move || -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
+                let train_start = timing_enabled.then(Instant::now);
+                let training = trainer.finish()?;
+                let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
+                let mut writer = VectorIndexWriter::new(training);
+                let mut raw_temp_reread = Duration::ZERO;
+                let mut index_add = Duration::ZERO;
+                let mut raw_file = raw_file;
+                let reread_start = timing_enabled.then(Instant::now);
+                raw_file.seek(SeekFrom::Start(0))?;
+                if let Some(start) = reread_start {
+                    raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
                 }
-                writer.add_vectors(&ids, buffer.typed_data::<f32>(), rows)?;
-                rows_added += rows;
-            }
-            let mut trailing = [0u8; 1];
-            if raw_file.read(&mut trailing)? != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "temporary vindex vector file contains trailing bytes",
-                ));
-            }
-            Ok(writer)
-        })
+                let batch_rows = training_buffer_rows.min(row_count_usize);
+                let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
+                let mut buffer = MutableBuffer::new(batch_bytes);
+                let mut ids = Vec::with_capacity(batch_rows);
+                let mut rows_added = 0usize;
+                while rows_added < row_count_usize {
+                    let rows = batch_rows.min(row_count_usize - rows_added);
+                    buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
+                    let reread_start = timing_enabled.then(Instant::now);
+                    raw_file.read_exact(buffer.as_slice_mut())?;
+                    if let Some(start) = reread_start {
+                        raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
+                    }
+                    ids.clear();
+                    for row in rows_added..rows_added + rows {
+                        ids.push(i64::try_from(row).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "vindex row id does not fit i64",
+                            )
+                        })?);
+                    }
+                    let add_start = timing_enabled.then(Instant::now);
+                    writer.add_vectors(&ids, buffer.typed_data::<f32>(), rows)?;
+                    if let Some(start) = add_start {
+                        index_add = index_add.saturating_add(start.elapsed());
+                    }
+                    rows_added += rows;
+                }
+                let mut trailing = [0u8; 1];
+                let reread_start = timing_enabled.then(Instant::now);
+                if raw_file.read(&mut trailing)? != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "temporary vindex vector file contains trailing bytes",
+                    ));
+                }
+                if let Some(start) = reread_start {
+                    raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
+                }
+                Ok((writer, train_finish, raw_temp_reread, index_add))
+            },
+        )
         .await
         .map_err(|e| Error::UnexpectedError {
             message: format!("vindex training task failed: {e}"),
@@ -417,6 +557,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             source: Some(Box::new(e)),
         })?;
 
+        let serialize_upload_start = timing_enabled.then(Instant::now);
         self.table
             .file_io()
             .mkdirs(&format!(
@@ -466,9 +607,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 return Err(error);
             }
         };
-        Ok(IndexFileMeta {
+        let serialize_upload =
+            serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let meta = IndexFileMeta {
             index_type: self.index_type.clone(),
-            file_name,
+            file_name: file_name.clone(),
             file_size: checked_i64(
                 status.size,
                 "Index file is too large for Rust IndexFileMeta",
@@ -483,7 +626,32 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source_meta: None,
                 index_meta: Some(index_meta),
             }),
-        })
+        };
+        let (oss_read, parquet_decode) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO), |timing| {
+                (timing.file_read(), timing.parquet_decode())
+            });
+        let timing = total_start.map(|start| VectorIndexBuildTiming {
+            total_without_commit: start.elapsed(),
+            source_batch_wait,
+            oss_read,
+            parquet_decode,
+            raw_temp_write,
+            train_finish,
+            raw_temp_reread,
+            index_add,
+            serialize_upload,
+            rows: row_count_usize,
+            training_rows_seen: training_vector_count,
+            training_rows_retained,
+            batch_count,
+            raw_temp_bytes: bytes_written,
+            index_bytes: status.size,
+            data_file_count: shard.files.len(),
+            file_name,
+        });
+        Ok(BuiltIndexFile { meta, timing })
     }
 }
 
