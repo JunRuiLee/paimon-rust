@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -37,6 +38,12 @@ import (
 type row struct {
 	id   int32
 	name string
+}
+
+type partitionedRow struct {
+	id   int32
+	name string
+	dt   string
 }
 
 func testWarehouse() string {
@@ -153,6 +160,40 @@ func makeRecord(t *testing.T, rows []row) arrow.Record {
 	for _, value := range rows {
 		idBuilder.Append(value.id)
 		nameBuilder.Append(value.name)
+	}
+	return builder.NewRecord()
+}
+
+func makePartitionedRecord(t *testing.T, value partitionedRow) arrow.Record {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	builder.Field(0).(*array.Int32Builder).Append(value.id)
+	builder.Field(1).(*array.StringBuilder).Append(value.name)
+	builder.Field(2).(*array.StringBuilder).Append(value.dt)
+	return builder.NewRecord()
+}
+
+func makePartitionedBucketPlan(t *testing.T, partitions []string, totalBuckets int32) arrow.Record {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+	}, nil)
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer builder.Release()
+	partitionBuilder := builder.Field(0).(*array.StringBuilder)
+	countBuilder := builder.Field(1).(*array.Int32Builder)
+	for _, partition := range partitions {
+		partitionBuilder.Append(partition)
+		countBuilder.Append(totalBuckets)
 	}
 	return builder.NewRecord()
 }
@@ -545,6 +586,120 @@ func TestAppendOnlyWriteMergeAndIdempotentCommit(t *testing.T) {
 	for i := range expected {
 		if rows[i] != expected[i] {
 			t.Errorf("Row %d: expected %v, got %v", i, expected[i], rows[i])
+		}
+	}
+}
+
+// TestPostponeFixedBucketTypesAreIsolated pins the compile-time separation
+// between the standard and postpone fixed-bucket handles: neither commit
+// method accepts the other's messages, so the two paths cannot be mixed.
+func TestPostponeFixedBucketTypesAreIsolated(t *testing.T) {
+	standard, ok := reflect.TypeOf(&paimon.TableCommit{}).MethodByName("Commit")
+	if !ok {
+		t.Fatal("TableCommit.Commit not found")
+	}
+	fixed, ok := reflect.TypeOf(&paimon.PostponeFixedBucketTableCommit{}).MethodByName("Commit")
+	if !ok {
+		t.Fatal("PostponeFixedBucketTableCommit.Commit not found")
+	}
+
+	standardMessages := standard.Type.In(1)
+	fixedMessages := fixed.Type.In(1)
+	if standardMessages == fixedMessages {
+		t.Fatalf("Commit message types must stay distinct, both are %s", standardMessages)
+	}
+	if standardMessages != reflect.TypeOf(&paimon.CommitMessages{}) {
+		t.Errorf("TableCommit.Commit takes %s", standardMessages)
+	}
+	if fixedMessages != reflect.TypeOf(&paimon.PostponeFixedBucketCommitMessages{}) {
+		t.Errorf("PostponeFixedBucketTableCommit.Commit takes %s", fixedMessages)
+	}
+}
+
+func TestMultiplePostponeFixedBucketWritersSharePlan(t *testing.T) {
+	table := openCopiedTable(t, "postpone_fixed_bucket_pk_table")
+	const commitUser = "go-postpone-fixed-bucket-write"
+
+	builders := make([]*paimon.PostponeFixedBucketWriteBuilder, 2)
+	for index := range builders {
+		builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser(commitUser)
+		if err != nil {
+			t.Fatalf("Failed to create fixed-bucket builder %d: %v", index, err)
+		}
+		builders[index] = builder
+		defer builder.Close()
+	}
+
+	if _, err := builders[0].NewWrite(); err == nil || !strings.Contains(err.Error(), "bucket plan is required") {
+		t.Fatalf("Expected missing bucket plan error, got: %v", err)
+	}
+	plan := makePartitionedBucketPlan(t, []string{"2026-08-14", "2026-08-15"}, 1)
+	for index, builder := range builders {
+		if err := builder.WithBucketPlan(plan); err != nil {
+			plan.Release()
+			t.Fatalf("Failed to set shared bucket plan on builder %d: %v", index, err)
+		}
+	}
+	plan.Release()
+
+	writeAndPrepare := func(
+		builder *paimon.PostponeFixedBucketWriteBuilder,
+		value partitionedRow,
+	) *paimon.PostponeFixedBucketCommitMessages {
+		write, err := builder.NewWrite()
+		if err != nil {
+			t.Fatalf("Failed to create fixed-bucket writer: %v", err)
+		}
+		defer write.Close()
+
+		record := makePartitionedRecord(t, value)
+		if err := write.WriteArrowBatch(record); err != nil {
+			record.Release()
+			t.Fatalf("Failed to write Arrow record batch: %v", err)
+		}
+		record.Release()
+		messages, err := write.PrepareCommit()
+		if err != nil {
+			t.Fatalf("Failed to prepare fixed-bucket commit: %v", err)
+		}
+		if err := write.WriteArrowBatch(nil); !errors.Is(err, paimon.ErrClosed) {
+			t.Fatalf("Expected consumed writer to reject writes with ErrClosed, got: %v", err)
+		}
+		if _, err := write.PrepareCommit(); !errors.Is(err, paimon.ErrClosed) {
+			t.Fatalf("Expected consumed writer to reject PrepareCommit with ErrClosed, got: %v", err)
+		}
+		return messages
+	}
+
+	messages1 := writeAndPrepare(builders[0], partitionedRow{4, "dave", "2026-08-14"})
+	defer messages1.Close()
+	messages2 := writeAndPrepare(builders[1], partitionedRow{5, "eve", "2026-08-15"})
+	defer messages2.Close()
+	if err := messages1.Merge(nil); err == nil || err.Error() != "paimon: source messages must not be nil" {
+		t.Fatalf("Expected a specific nil source error, got: %v", err)
+	}
+	if err := messages1.Merge(messages2); err != nil {
+		t.Fatalf("Failed to merge fixed-bucket commit messages: %v", err)
+	}
+
+	commit, err := builders[0].NewCommit()
+	if err != nil {
+		t.Fatalf("Failed to create fixed-bucket table commit: %v", err)
+	}
+	defer commit.Close()
+	if err := commit.Commit(messages1); err != nil {
+		t.Fatalf("Failed to commit fixed-bucket write: %v", err)
+	}
+
+	rows := readTableRows(t, table)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	expected := []row{{4, "dave"}, {5, "eve"}}
+	if len(rows) != len(expected) {
+		t.Fatalf("Expected %d rows, got %d: %v", len(expected), len(rows), rows)
+	}
+	for index := range expected {
+		if rows[index] != expected[index] {
+			t.Errorf("Row %d: expected %v, got %v", index, expected[index], rows[index])
 		}
 	}
 }

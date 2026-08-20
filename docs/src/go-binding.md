@@ -125,6 +125,63 @@ process-local and cannot be sent to another process. For primary-key
 fixed-bucket tables, assign each `(partition, bucket)` to one writer before
 writing; merging messages does not establish ownership.
 
+### Postpone Fixed-Bucket Writes
+
+For a `bucket = -2` table, the ordinary builder writes postpone files. To write
+real buckets directly, use the dedicated builder with a plan mapping each
+partition to its bucket count:
+
+```go
+// Plan schema: partition keys in order, then a non-null Int32 total_buckets.
+schema := arrow.NewSchema([]arrow.Field{
+    {Name: "dt", Type: arrow.BinaryTypes.String, Nullable: true},
+    {Name: "total_buckets", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+}, nil)
+rb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+defer rb.Release()
+rb.Field(0).(*array.StringBuilder).AppendValues([]string{"2026-08-14", "2026-08-15"}, nil)
+rb.Field(1).(*array.Int32Builder).AppendValues([]int32{1, 1}, nil)
+plan := rb.NewRecord()
+defer plan.Release()
+
+builder, err := table.NewPostponeFixedBucketWriteBuilderWithCommitUser("job-1")
+if err != nil {
+    log.Fatal(err)
+}
+defer builder.Close()
+if err := builder.WithBucketPlan(plan); err != nil {
+    log.Fatal(err)
+}
+writer, err := builder.NewWrite() // requires WithBucketPlan to be called first
+if err != nil {
+    log.Fatal(err)
+}
+defer writer.Close()
+
+if err := writer.WriteArrowBatch(record); err != nil {
+    log.Fatal(err)
+}
+messages, err := writer.PrepareCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer messages.Close()
+
+commit, err := builder.NewCommit()
+if err != nil {
+    log.Fatal(err)
+}
+defer commit.Close()
+if err := commit.Commit(messages); err != nil {
+    log.Fatal(err)
+}
+```
+
+An unpartitioned plan holds only `total_buckets`. Multiple writers in one process must share the plan
+and commit user and assign each `(partition, bucket)` to one writer. Commit
+messages are process-local. A fixed-bucket writer is single-use; create a new
+writer after `PrepareCommit`.
+
 ## Reading a Table
 
 Paimon Go uses a **scan-then-read** pattern: first scan the table to produce splits, then read data from those splits as Arrow RecordBatches.

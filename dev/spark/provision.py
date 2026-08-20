@@ -989,6 +989,21 @@ def main():
         """
     )
 
+    # Empty postpone table for Go fixed-bucket write tests.
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS postpone_fixed_bucket_pk_table (
+            id INT,
+            name STRING,
+            dt STRING
+        ) USING paimon
+        PARTITIONED BY (dt)
+        TBLPROPERTIES (
+            'primary-key' = 'id,dt',
+            'bucket' = '-2'
+        )
+        """
+    )
 
     # ===== Dynamic bucket PK table (bucket=-1) =====
     # Two commits with overlapping keys to exercise dynamic bucket assignment
