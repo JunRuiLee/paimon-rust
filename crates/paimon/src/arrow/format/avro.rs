@@ -18,7 +18,7 @@
 use super::{FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::FileRead;
-use crate::spec::{DataField, DataType, MapType, RowType};
+use crate::spec::{DataField, DataType, IntType, MapType, RowType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use apache_avro::types::Value;
@@ -26,7 +26,8 @@ use apache_avro::Reader;
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
@@ -321,7 +322,7 @@ fn build_column(
                 .collect();
             Arc::new(arr)
         }
-        DataType::Binary(_) | DataType::VarBinary(_) => {
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
             let values: Vec<Option<&[u8]>> = (0..num_rows)
                 .map(|i| get_field_at(&records[i], idx).and_then(value_as_bytes))
                 .collect();
@@ -330,6 +331,19 @@ fn build_column(
         }
         DataType::Date(_) => {
             let arr: Date32Array = (0..num_rows)
+                .map(|i| {
+                    get_field_at(&records[i], idx)
+                        .and_then(value_as_i64)
+                        .map(|v| v as i32)
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        // Java writes TIME as an int with the `time-millis` logical type and
+        // rejects a precision above 3, so milliseconds is the only width to
+        // decode (`AvroSchemaConverter#convertToSchema`).
+        DataType::Time(_) => {
+            let arr: Time32MillisecondArray = (0..num_rows)
                 .map(|i| {
                     get_field_at(&records[i], idx)
                         .and_then(value_as_i64)
@@ -378,6 +392,19 @@ fn build_column(
             build_array_column(records, name, arr_type.element_type(), num_rows)?
         }
         DataType::Map(map_type) => build_map_column(records, name, map_type, num_rows)?,
+        // Java encodes MULTISET<T> as a map from the element to an INT count,
+        // sharing the MAP path (`AvroSchemaConverter#extractValueTypeToAvroMap`
+        // returns IntType). Unlike MAP, `paimon_type_to_arrow` lets the key here
+        // follow the element's nullability and pins the count non-nullable.
+        DataType::Multiset(multiset_type) => build_map_like_column(
+            records,
+            name,
+            multiset_type.element_type(),
+            &DataType::Int(IntType::new()),
+            multiset_type.element_type().is_nullable(),
+            false,
+            num_rows,
+        )?,
         DataType::Row(row_type) => build_row_column(records, name, row_type, num_rows)?,
         other => {
             return Err(Error::Unsupported {
@@ -467,8 +494,43 @@ fn build_map_column(
     map_type: &MapType,
     num_rows: usize,
 ) -> crate::Result<Arc<dyn arrow_array::Array>> {
-    let arrow_key_type = crate::arrow::paimon_type_to_arrow(map_type.key_type())?;
-    let arrow_value_type = crate::arrow::paimon_type_to_arrow(map_type.value_type())?;
+    build_map_like_column(
+        records,
+        name,
+        map_type.key_type(),
+        map_type.value_type(),
+        // `paimon_type_to_arrow` declares a MAP key non-nullable and lets the
+        // value follow its own type. Mirror that exactly or `RecordBatch::try_new`
+        // rejects the column.
+        false,
+        map_type.value_type().is_nullable(),
+        num_rows,
+    )
+}
+
+/// Build a Map array from either Avro map encoding Paimon can produce.
+///
+/// Avro maps natively support string keys only, so Java writes a map with any
+/// other key type as an array of `{key, value}` records instead
+/// (`AvroSchemaConverter#isArrayMap`). Both shapes decode into the same Arrow
+/// `Map` array here.
+///
+/// The key and value types are passed separately rather than taken from a
+/// `MapType` so `MULTISET<T>` can reuse this with an implicit `INT` count as the
+/// value. The two nullability flags must match what `paimon_type_to_arrow`
+/// declares for the same type -- MAP and MULTISET differ here -- or
+/// `RecordBatch::try_new` rejects the column.
+fn build_map_like_column(
+    records: &[Value],
+    name: &str,
+    key_type: &DataType,
+    value_type: &DataType,
+    key_nullable: bool,
+    value_nullable: bool,
+    num_rows: usize,
+) -> crate::Result<Arc<dyn arrow_array::Array>> {
+    let arrow_key_type = crate::arrow::paimon_type_to_arrow(key_type)?;
+    let arrow_value_type = crate::arrow::paimon_type_to_arrow(value_type)?;
 
     let idx = field_index(records, name);
     let mut offsets = vec![0i32];
@@ -487,27 +549,45 @@ fn build_map_column(
                 }
                 offsets.push(offsets.last().unwrap() + map.len() as i32);
             }
+            // Non-string key: an array of two-field records, written by Java's
+            // array-map encoding. Entries missing either field are skipped so a
+            // malformed row cannot shift the remaining offsets.
+            Some(Value::Array(entries)) => {
+                let mut kept = 0i32;
+                for entry in entries {
+                    let Some(Value::Record(pairs)) = unwrap_value(entry) else {
+                        continue;
+                    };
+                    let key = pairs.iter().find(|(field, _)| field == "key");
+                    let value = pairs.iter().find(|(field, _)| field == "value");
+                    if let (Some((_, k)), Some((_, v))) = (key, value) {
+                        key_records.push(Value::Record(vec![("key".to_string(), k.clone())]));
+                        value_records.push(Value::Record(vec![("value".to_string(), v.clone())]));
+                        kept += 1;
+                    }
+                }
+                offsets.push(offsets.last().unwrap() + kept);
+            }
             _ => {
                 offsets.push(*offsets.last().unwrap());
             }
         }
     }
 
-    let key_col = build_column(&key_records, "key", map_type.key_type(), key_records.len())?;
-    let value_col = build_column(
-        &value_records,
-        "value",
-        map_type.value_type(),
-        value_records.len(),
-    )?;
+    let key_col = build_column(&key_records, "key", key_type, key_records.len())?;
+    let value_col = build_column(&value_records, "value", value_type, value_records.len())?;
 
     let struct_arr = StructArray::try_new(
         vec![
-            Arc::new(arrow_schema::Field::new("key", arrow_key_type, false)),
+            Arc::new(arrow_schema::Field::new(
+                "key",
+                arrow_key_type,
+                key_nullable,
+            )),
             Arc::new(arrow_schema::Field::new(
                 "value",
                 arrow_value_type.clone(),
-                map_type.value_type().is_nullable(),
+                value_nullable,
             )),
         ]
         .into(),
@@ -628,8 +708,8 @@ fn bytes_to_i128_be(bytes: &[u8]) -> i128 {
 mod tests {
     use super::*;
     use crate::spec::{
-        BigIntType, BooleanType, DataField, DataType, DecimalType, DoubleType, FloatType, IntType,
-        SmallIntType, TinyIntType, VarBinaryType, VarCharType,
+        BigIntType, BlobType, BooleanType, DataField, DataType, DecimalType, DoubleType, FloatType,
+        IntType, MultisetType, SmallIntType, TimeType, TinyIntType, VarBinaryType, VarCharType,
     };
     use arrow_array::Array;
 
@@ -927,6 +1007,212 @@ mod tests {
         // First row has 2 entries, second row is null.
         assert!(!arr.is_null(0));
         assert!(arr.is_null(1));
+    }
+
+    /// Java writes a map with a non-string key as an array of `{key, value}`
+    /// records. Before this was handled, such a row decoded to a non-null map
+    /// with zero entries -- the data was dropped silently.
+    #[test]
+    fn test_build_column_map_with_non_string_key() {
+        let entry = |k: i32, v: &str| {
+            Value::Record(vec![
+                ("key".to_string(), Value::Int(k)),
+                ("value".to_string(), av_str(v)),
+            ])
+        };
+        let records = vec![
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Array(vec![entry(1, "a"), entry(2, "b")]),
+            )]),
+            Value::Record(vec![("m".to_string(), Value::Array(vec![entry(7, "c")]))]),
+        ];
+        let map_type = MapType::new(
+            DataType::Int(IntType::new()),
+            DataType::VarChar(VarCharType::new(10).unwrap()),
+        );
+        let col = build_map_column(&records, "m", &map_type, 2).unwrap();
+        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.value(0).len(), 2, "entries must not be dropped");
+        assert_eq!(arr.value(1).len(), 1);
+
+        let keys = arr.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(keys.values(), &[1, 2, 7]);
+        let values = arr.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.value(0), "a");
+        assert_eq!(values.value(2), "c");
+    }
+
+    /// A malformed array-map entry is skipped without shifting the offsets of
+    /// the rows that follow.
+    #[test]
+    fn test_build_column_array_map_skips_malformed_entries() {
+        let records = vec![
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Array(vec![
+                    Value::Record(vec![
+                        ("key".to_string(), Value::Int(1)),
+                        ("value".to_string(), av_str("a")),
+                    ]),
+                    // Missing "value" -- skipped.
+                    Value::Record(vec![("key".to_string(), Value::Int(2))]),
+                    // Not a record at all -- skipped.
+                    Value::Int(9),
+                ]),
+            )]),
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Array(vec![Value::Record(vec![
+                    ("key".to_string(), Value::Int(3)),
+                    ("value".to_string(), av_str("c")),
+                ])]),
+            )]),
+        ];
+        let map_type = MapType::new(
+            DataType::Int(IntType::new()),
+            DataType::VarChar(VarCharType::new(10).unwrap()),
+        );
+        let col = build_map_column(&records, "m", &map_type, 2).unwrap();
+        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(arr.value(0).len(), 1);
+        assert_eq!(arr.value(1).len(), 1);
+        let keys = arr.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(keys.values(), &[1, 3]);
+    }
+
+    /// TIME arrives as an int with the `time-millis` logical type.
+    #[test]
+    fn test_build_column_time_millis() {
+        let records = vec![
+            Value::Record(vec![("t".to_string(), Value::TimeMillis(3_661_000))]),
+            Value::Record(vec![("t".to_string(), av_null())]),
+            // Plain ints appear when the writer omits the logical type.
+            Value::Record(vec![("t".to_string(), Value::Int(1))]),
+        ];
+        let col =
+            build_column(&records, "t", &DataType::Time(TimeType::new(3).unwrap()), 3).unwrap();
+        let arr = col
+            .as_any()
+            .downcast_ref::<Time32MillisecondArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), 3_661_000);
+        assert!(arr.is_null(1));
+        assert_eq!(arr.value(2), 1);
+    }
+
+    /// BLOB maps to Avro bytes, exactly like BINARY and VARBINARY.
+    #[test]
+    fn test_build_column_blob() {
+        let records = make_records(vec![
+            vec![("b", av_bytes(&[0xDE, 0xAD]))],
+            vec![("b", av_null())],
+        ]);
+        let col = build_column(&records, "b", &DataType::Blob(BlobType::new()), 2).unwrap();
+        let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(arr.value(0), &[0xDE, 0xAD]);
+        assert!(arr.is_null(1));
+    }
+
+    /// MULTISET<T> is an Avro map from the element to an INT count. A string
+    /// element uses the native map encoding.
+    #[test]
+    fn test_build_column_multiset_string_element() {
+        use std::collections::HashMap;
+        let mut counts = HashMap::new();
+        counts.insert("a".to_string(), Value::Int(2));
+        let records = vec![Value::Record(vec![("ms".to_string(), Value::Map(counts))])];
+        let multiset = DataType::Multiset(MultisetType::new(DataType::VarChar(
+            VarCharType::new(10).unwrap(),
+        )));
+        let col = build_column(&records, "ms", &multiset, 1).unwrap();
+        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(arr.value(0).len(), 1);
+        let values = arr.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.value(0), 2);
+    }
+
+    /// A non-string element makes Java fall back to the array-map encoding here
+    /// too, so the count still has to survive.
+    #[test]
+    fn test_build_column_multiset_int_element() {
+        let records = vec![Value::Record(vec![(
+            "ms".to_string(),
+            Value::Array(vec![Value::Record(vec![
+                ("key".to_string(), Value::Int(5)),
+                ("value".to_string(), Value::Int(3)),
+            ])]),
+        )])];
+        let multiset = DataType::Multiset(MultisetType::new(DataType::Int(IntType::new())));
+        let col = build_column(&records, "ms", &multiset, 1).unwrap();
+        let arr = col.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(arr.value(0).len(), 1);
+        let keys = arr.keys().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(keys.value(0), 5);
+        let values = arr.values().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.value(0), 3);
+    }
+
+    /// Going through `build_target_arrow_schema` is what catches a field-level
+    /// nullability mismatch: `RecordBatch::try_new` rejects a column whose
+    /// declared schema differs from the target, which a bare `build_column`
+    /// assertion would not notice.
+    #[test]
+    fn test_records_to_batch_with_time_blob_and_multiset() {
+        let fields = vec![
+            DataField::new(
+                0,
+                "t".to_string(),
+                DataType::Time(TimeType::new(3).unwrap()),
+            ),
+            DataField::new(1, "b".to_string(), DataType::Blob(BlobType::new())),
+            DataField::new(
+                2,
+                "ms".to_string(),
+                DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
+            ),
+        ];
+        let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        let records = vec![Value::Record(vec![
+            ("t".to_string(), Value::TimeMillis(120_000)),
+            ("b".to_string(), av_bytes(&[0x01])),
+            (
+                "ms".to_string(),
+                Value::Array(vec![Value::Record(vec![
+                    ("key".to_string(), Value::Int(4)),
+                    ("value".to_string(), Value::Int(1)),
+                ])]),
+            ),
+        ])];
+        let batch = records_to_batch(&records, &fields, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 3);
+    }
+
+    /// MAP and MULTISET declare key nullability differently, so pin MAP through
+    /// the schema path as well.
+    #[test]
+    fn test_records_to_batch_with_non_string_key_map() {
+        let fields = vec![DataField::new(
+            0,
+            "m".to_string(),
+            DataType::Map(MapType::new(
+                DataType::Int(IntType::new()),
+                DataType::VarChar(VarCharType::new(10).unwrap()),
+            )),
+        )];
+        let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        let records = vec![Value::Record(vec![(
+            "m".to_string(),
+            Value::Array(vec![Value::Record(vec![
+                ("key".to_string(), Value::Int(8)),
+                ("value".to_string(), av_str("x")),
+            ])]),
+        )])];
+        let batch = records_to_batch(&records, &fields, &schema).unwrap();
+        let arr = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(arr.value(0).len(), 1);
     }
 
     #[test]
