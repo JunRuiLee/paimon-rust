@@ -1870,8 +1870,8 @@ Columns:
 | `schema_id` | BIGINT | Schema ID |
 | `commit_time` | TIMESTAMP | Commit time |
 | `record_count` | BIGINT | Record count |
-| `create_time` | TIMESTAMP | Always `NULL`: the Rust snapshot does not carry a tag creation time |
-| `time_retained` | STRING | Always `NULL`: the Rust snapshot does not carry a tag retention |
+| `create_time` | TIMESTAMP | Tag creation time; `NULL` for tags written without one |
+| `time_retained` | STRING | Tag retention as an ISO-8601 duration (for example `PT72H`); `NULL` for tags written without one |
 
 ### $branches
 

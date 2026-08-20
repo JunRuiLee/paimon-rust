@@ -95,6 +95,64 @@ impl TagManager {
         Ok(Some(snapshot))
     }
 
+    /// Get a tag's snapshot together with the two tag-only fields Java writes
+    /// alongside it: the creation time as epoch millis and the retention as
+    /// seconds. Returns `None` when the tag file does not exist; either metadata
+    /// field is `None` when absent or unparsable.
+    pub async fn get_with_metadata(
+        &self,
+        tag_name: &str,
+    ) -> crate::Result<Option<(Snapshot, Option<i64>, Option<f64>)>> {
+        let path = self.tag_path(tag_name);
+        let input = self.file_io.new_input(&path)?;
+        let bytes = match input.read().await {
+            Ok(b) => b,
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
+                message: format!("tag '{tag_name}' JSON invalid: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        let snapshot: Snapshot =
+            serde_json::from_value(value.clone()).map_err(|e| crate::Error::DataInvalid {
+                message: format!("tag '{tag_name}' JSON invalid: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        let create_time = value
+            .get(FIELD_TAG_CREATE_TIME)
+            .and_then(parse_tag_create_time_millis);
+        let time_retained = value
+            .get(FIELD_TAG_TIME_RETAINED)
+            .and_then(serde_json::Value::as_f64);
+        Ok(Some((snapshot, create_time, time_retained)))
+    }
+
+    /// Like [`Self::list_all`], but each row also carries the tag creation time
+    /// in epoch millis and the retention in seconds.
+    #[allow(clippy::type_complexity)]
+    pub async fn list_all_with_metadata(
+        &self,
+    ) -> crate::Result<Vec<(String, Snapshot, Option<i64>, Option<f64>)>> {
+        let names = self.list_all_names().await?;
+        try_join_all(names.into_iter().map(|name| async move {
+            let (snap, create_time, retained) =
+                self.get_with_metadata(&name)
+                    .await?
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("tag '{name}' disappeared during listing"),
+                        source: None,
+                    })?;
+            Ok::<_, crate::Error>((name, snap, create_time, retained))
+        }))
+        .await
+    }
+
     /// List all tag names sorted ascending. Returns an empty vector when the
     /// tag directory does not exist.
     pub async fn list_all_names(&self) -> crate::Result<Vec<String>> {
@@ -155,6 +213,43 @@ impl TagManager {
     }
 }
 
+/// Java `Tag` adds these two fields on top of the snapshot schema.
+const FIELD_TAG_CREATE_TIME: &str = "tagCreateTime";
+const FIELD_TAG_TIME_RETAINED: &str = "tagTimeRetained";
+
+/// Decode a Jackson-serialized `LocalDateTime` into epoch millis, treating the
+/// wall-clock value as UTC.
+///
+/// Jackson's `LocalDateTimeSerializer` emits
+/// `[year, month, day, hour, minute, second, nanoOfSecond]` and omits trailing
+/// zero components, so the array may hold as few as five items. Anything that is
+/// not such an array -- or that does not describe a real instant -- yields
+/// `None` so one odd tag file cannot fail the whole listing.
+fn parse_tag_create_time_millis(value: &serde_json::Value) -> Option<i64> {
+    let items = value.as_array()?;
+    if items.len() < 5 || items.len() > 7 {
+        return None;
+    }
+    let mut parts = [0i64; 7];
+    for (slot, item) in parts.iter_mut().zip(items) {
+        *slot = item.as_i64()?;
+    }
+    let [year, month, day, hour, minute, second, nano] = parts;
+
+    let date = chrono::NaiveDate::from_ymd_opt(
+        i32::try_from(year).ok()?,
+        u32::try_from(month).ok()?,
+        u32::try_from(day).ok()?,
+    )?;
+    let time = chrono::NaiveTime::from_hms_nano_opt(
+        u32::try_from(hour).ok()?,
+        u32::try_from(minute).ok()?,
+        u32::try_from(second).ok()?,
+        u32::try_from(nano).ok()?,
+    )?;
+    Some(date.and_time(time).and_utc().timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +300,156 @@ mod tests {
             write_tag(&file_io, &tm, name, &test_snapshot(1)).await;
         }
         assert_eq!(tm.list_all_names().await.unwrap(), vec!["v1", "v2", "v3"]);
+    }
+
+    /// Write a raw tag JSON built from a snapshot plus the two Java-only
+    /// fields, so the on-disk shape matches what Flink/Spark produce.
+    async fn write_tag_json(
+        file_io: &FileIO,
+        tm: &TagManager,
+        name: &str,
+        snapshot: &Snapshot,
+        extra: &[(&str, serde_json::Value)],
+    ) {
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        let map = value.as_object_mut().unwrap();
+        for (key, v) in extra {
+            map.insert((*key).to_string(), v.clone());
+        }
+        let output = file_io.new_output(&tm.tag_path(name)).unwrap();
+        output
+            .write(Bytes::from(serde_json::to_vec(&value).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_with_metadata_reads_java_fields() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_meta".to_string();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path);
+
+        // Jackson writes LocalDateTime as [y, mo, d, h, mi, s, nano] and omits
+        // trailing zero components; Duration is decimal seconds.
+        write_tag_json(
+            &file_io,
+            &tm,
+            "full",
+            &test_snapshot(1),
+            &[
+                (
+                    "tagCreateTime",
+                    serde_json::json!([2024, 1, 2, 3, 4, 5, 123_000_000]),
+                ),
+                ("tagTimeRetained", serde_json::json!(259_200.0)),
+            ],
+        )
+        .await;
+
+        let (snap, create_time, retained) = tm.get_with_metadata("full").await.unwrap().unwrap();
+        assert_eq!(snap.id(), 1);
+        // 2024-01-02T03:04:05.123 UTC
+        assert_eq!(create_time, Some(1_704_164_645_123));
+        assert_eq!(retained, Some(259_200.0));
+    }
+
+    #[tokio::test]
+    async fn test_get_with_metadata_pads_truncated_time_array() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_meta_short".to_string();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path);
+
+        // Jackson drops the trailing zero second and nano, leaving five items.
+        write_tag_json(
+            &file_io,
+            &tm,
+            "short",
+            &test_snapshot(2),
+            &[("tagCreateTime", serde_json::json!([2024, 1, 2, 3, 4]))],
+        )
+        .await;
+
+        let (_, create_time, retained) = tm.get_with_metadata("short").await.unwrap().unwrap();
+        // 2024-01-02T03:04:00 UTC
+        assert_eq!(create_time, Some(1_704_164_640_000));
+        assert_eq!(retained, None, "absent retention stays absent");
+    }
+
+    #[tokio::test]
+    async fn test_get_with_metadata_absent_fields_are_none() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_meta_absent".to_string();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path);
+        write_tag(&file_io, &tm, "plain", &test_snapshot(3)).await;
+
+        let (snap, create_time, retained) = tm.get_with_metadata("plain").await.unwrap().unwrap();
+        assert_eq!(snap.id(), 3);
+        assert_eq!(create_time, None);
+        assert_eq!(retained, None);
+    }
+
+    /// A malformed shape must not fail the whole read: the snapshot still loads
+    /// and the unparsable field is reported as absent.
+    #[tokio::test]
+    async fn test_get_with_metadata_tolerates_bad_shapes() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_meta_bad".to_string();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path);
+
+        for (name, extra) in [
+            (
+                "iso_string",
+                vec![("tagCreateTime", serde_json::json!("2024-01-02T03:04:05"))],
+            ),
+            (
+                "too_short",
+                vec![("tagCreateTime", serde_json::json!([2024, 1]))],
+            ),
+            (
+                "impossible_date",
+                vec![("tagCreateTime", serde_json::json!([2024, 13, 40, 3, 4]))],
+            ),
+            (
+                "retained_string",
+                vec![("tagTimeRetained", serde_json::json!("PT72H"))],
+            ),
+        ] {
+            write_tag_json(&file_io, &tm, name, &test_snapshot(4), &extra).await;
+            let (snap, create_time, retained) = tm.get_with_metadata(name).await.unwrap().unwrap();
+            assert_eq!(snap.id(), 4, "{name}: snapshot must still load");
+            assert!(
+                create_time.is_none() && retained.is_none(),
+                "{name}: unparsable metadata must be reported as absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_all_with_metadata_keeps_order() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_tag_meta_list".to_string();
+        file_io.mkdirs(&format!("{table_path}/tag/")).await.unwrap();
+        let tm = TagManager::new(file_io.clone(), table_path);
+
+        write_tag_json(
+            &file_io,
+            &tm,
+            "a",
+            &test_snapshot(1),
+            &[("tagTimeRetained", serde_json::json!(60.0))],
+        )
+        .await;
+        write_tag(&file_io, &tm, "b", &test_snapshot(2)).await;
+
+        let rows = tm.list_all_with_metadata().await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(rows[0].3, Some(60.0));
+        assert_eq!(rows[1].3, None);
     }
 
     #[tokio::test]

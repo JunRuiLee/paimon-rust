@@ -22,7 +22,7 @@ mod common;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray,
+    Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -670,6 +670,86 @@ async fn test_tags_system_table_with_seeded_tags() {
     assert_eq!(names, sorted_names, "tag_name should be ascending");
     assert_eq!(names, vec!["v1".to_string(), "v2".to_string()]);
     assert_eq!(snap_ids, vec![earliest.id(), earliest.id()]);
+}
+
+/// A tag file written by Java carries `tagCreateTime` and `tagTimeRetained`
+/// alongside the snapshot fields; both columns must surface those values instead
+/// of NULL. The retention is rendered as ISO-8601, matching Java's
+/// `Duration.toString()`.
+#[tokio::test]
+async fn test_tags_system_table_surfaces_create_time_and_retention() {
+    let (ctx, catalog, tmp) = create_context().await;
+
+    let identifier = Identifier::new("default".to_string(), FIXTURE_TABLE.to_string());
+    let table = catalog.get_table(&identifier).await.unwrap();
+    let sm =
+        paimon::table::SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let earliest = sm.list_all().await.unwrap().into_iter().next().unwrap();
+
+    let table_dir = tmp.path().join("default.db").join(FIXTURE_TABLE);
+    let tag_dir = table_dir.join("tag");
+    std::fs::create_dir_all(&tag_dir).expect("create tag dir");
+    let src = table_dir
+        .join("snapshot")
+        .join(format!("snapshot-{}", earliest.id()));
+    let snapshot_json = std::fs::read_to_string(&src).unwrap();
+
+    // Jackson emits LocalDateTime as an array and Duration as decimal seconds.
+    let mut with_meta: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+    let map = with_meta.as_object_mut().unwrap();
+    map.insert(
+        "tagCreateTime".to_string(),
+        serde_json::json!([2024, 1, 2, 3, 4, 5]),
+    );
+    map.insert("tagTimeRetained".to_string(), serde_json::json!(259_200.0));
+    std::fs::write(
+        tag_dir.join("tag-with-meta"),
+        serde_json::to_string(&with_meta).unwrap(),
+    )
+    .unwrap();
+    // A tag without the fields keeps both columns NULL.
+    std::fs::copy(&src, tag_dir.join("tag-plain")).unwrap();
+
+    let sql = format!(
+        "SELECT tag_name, create_time, time_retained \
+         FROM paimon.default.{FIXTURE_TABLE}$tags ORDER BY tag_name"
+    );
+    let batches = run_sql(&ctx, &sql).await;
+
+    let mut rows: Vec<(String, Option<i64>, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("tag_name is Utf8");
+        let created = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("create_time is Timestamp(ms)");
+        let retained = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("time_retained is Utf8");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                names.value(i).to_string(),
+                (!created.is_null(i)).then(|| created.value(i)),
+                (!retained.is_null(i)).then(|| retained.value(i).to_string()),
+            ));
+        }
+    }
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "plain");
+    assert_eq!(rows[0].1, None, "a tag without the field stays NULL");
+    assert_eq!(rows[0].2, None);
+    assert_eq!(rows[1].0, "with-meta");
+    // 2024-01-02T03:04:05 UTC
+    assert_eq!(rows[1].1, Some(1_704_164_645_000));
+    assert_eq!(rows[1].2.as_deref(), Some("PT72H"));
 }
 
 #[tokio::test]
