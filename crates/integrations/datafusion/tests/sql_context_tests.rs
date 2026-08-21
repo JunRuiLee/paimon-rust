@@ -2834,3 +2834,31 @@ async fn test_show_create_table_rejects_non_round_trippable_types() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_vector_search_plans_vector_column_without_show_create_support() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    let identifier = Identifier::new("default", "vector_t");
+    let schema = paimon::spec::Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "embedding",
+            DataType::Vector(VectorType::new(2, DataType::Float(FloatType::new())).unwrap()),
+        )
+        .build()
+        .unwrap();
+
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+
+    sql_context
+        .sql(
+            "SELECT * FROM vector_search(\
+             'paimon.default.vector_t', 'embedding', '[1.0, 2.0]', 1)",
+        )
+        .await
+        .expect("vector_search should plan without requiring SHOW CREATE TABLE support");
+}

@@ -113,8 +113,8 @@ impl PaimonTableProvider {
     ///
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
-        let table_definition = build_table_definition(&table)?;
-        Self::try_new_with_table_definition(table, Some(table_definition))
+        let table_definition = build_table_definition(&table).ok();
+        Self::try_new_with_table_definition(table, table_definition)
     }
 
     fn try_new_with_table_definition(
