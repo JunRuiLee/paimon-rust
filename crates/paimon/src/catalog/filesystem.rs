@@ -26,7 +26,7 @@ use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::create_local_cache;
 use crate::io::FileIO;
-use crate::spec::{Schema, TableSchema};
+use crate::spec::{CoreOptions, Schema, TableSchema, TableType, TABLE_TYPE_OPTION};
 use crate::table::{SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -170,6 +170,61 @@ impl FileSystemCatalog {
         Ok(dirs)
     }
 
+    /// Fetch the stored path and schema of an existing table, bypassing the
+    /// engine-type guard in [`Self::build_table`]: routing and catalog servers
+    /// need the declared type before deciding anything.
+    pub async fn fetch_table_schema(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<(String, TableSchema)> {
+        identifier.validate()?;
+
+        let table_path = self.table_path(identifier);
+
+        if !self.table_exists(identifier).await? {
+            return Err(Error::TableNotExist {
+                full_name: identifier.full_name(),
+            });
+        }
+
+        let schema = self
+            .load_latest_table_schema(&table_path)
+            .await?
+            .ok_or_else(|| Error::TableNotExist {
+                full_name: identifier.full_name(),
+            })?;
+
+        Ok((table_path, schema))
+    }
+
+    fn build_table(
+        &self,
+        identifier: &Identifier,
+        table_path: String,
+        schema: TableSchema,
+    ) -> Result<Table> {
+        // Fail closed: constructed as Paimon, raw `get_table` paths (writes,
+        // procedures, time travel) would misread it.
+        let declared = CoreOptions::new(schema.options()).table_type()?;
+        if declared.requires_table_engine() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{}' is declared '{declared}' and cannot be read as a Paimon \
+                     table; only plain reads through a registered table engine are supported",
+                    identifier.full_name()
+                ),
+            });
+        }
+
+        Ok(Table::new(
+            self.file_io.clone(),
+            identifier.clone(),
+            table_path,
+            schema,
+            None,
+        ))
+    }
+
     /// Load the latest schema for a table (highest schema-{version} file under table_path/schema).
     async fn load_latest_table_schema(&self, table_path: &str) -> Result<Option<TableSchema>> {
         let manager = SchemaManager::new(self.file_io.clone(), table_path.to_string());
@@ -297,30 +352,23 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
-        identifier.validate()?;
+        let (table_path, schema) = self.fetch_table_schema(identifier).await?;
+        self.build_table(identifier, table_path, schema)
+    }
 
-        let table_path = self.table_path(identifier);
-
-        if !self.table_exists(identifier).await? {
-            return Err(Error::TableNotExist {
-                full_name: identifier.full_name(),
-            });
+    async fn load_table(&self, identifier: &Identifier) -> Result<crate::catalog::LoadedTable> {
+        let (table_path, schema) = self.fetch_table_schema(identifier).await?;
+        let options = CoreOptions::new(schema.options());
+        let declared = options.table_type()?;
+        if declared.requires_table_engine() {
+            return crate::catalog::LoadedTable::external(
+                declared,
+                &options,
+                &identifier.full_name(),
+            );
         }
-
-        let schema = self
-            .load_latest_table_schema(&table_path)
-            .await?
-            .ok_or_else(|| Error::TableNotExist {
-                full_name: identifier.full_name(),
-            })?;
-
-        Ok(Table::new(
-            self.file_io.clone(),
-            identifier.clone(),
-            table_path,
-            schema,
-            None,
-        ))
+        self.build_table(identifier, table_path, schema)
+            .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
@@ -351,6 +399,8 @@ impl Catalog for FileSystemCatalog {
         ignore_if_exists: bool,
     ) -> Result<()> {
         identifier.validate()?;
+        // Never persist a type nothing can load.
+        CoreOptions::new(creation.options()).table_type()?;
 
         let table_path = self.table_path(identifier);
 
@@ -458,11 +508,46 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
+        reject_table_type_changes(current.options(), &changes)?;
+
         let new_schema = current
             .apply_changes(changes)
             .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
     }
+}
+
+/// The declared type picks the reader, so it is fixed at creation: flipping
+/// it strands a populated table behind a reader that cannot see its data.
+/// Only case-insensitive no-ops pass, matching Java `SchemaManager`.
+fn reject_table_type_changes(
+    current_options: &HashMap<String, String>,
+    changes: &[crate::spec::SchemaChange],
+) -> Result<()> {
+    let current_type = current_options
+        .get(TABLE_TYPE_OPTION)
+        .map(String::as_str)
+        .unwrap_or_else(|| TableType::default().as_str());
+    for change in changes {
+        match change {
+            crate::spec::SchemaChange::SetOption { key, value }
+                if key == TABLE_TYPE_OPTION && !value.eq_ignore_ascii_case(current_type) =>
+            {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "changing '{TABLE_TYPE_OPTION}' from '{current_type}' to '{value}' is not supported"
+                    ),
+                });
+            }
+            crate::spec::SchemaChange::RemoveOption { key } if key == TABLE_TYPE_OPTION => {
+                return Err(Error::Unsupported {
+                    message: format!("removing '{TABLE_TYPE_OPTION}' is not supported"),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// `TableSchema::apply_changes` returns column errors without a table name;
@@ -663,6 +748,234 @@ mod tests {
 
         assert!(matches!(result, Err(Error::IdentifierInvalid { .. })));
         assert!(escaped_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_cannot_change_the_declared_type() {
+        use crate::spec::SchemaChange;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        for change in [
+            SchemaChange::set_option("type".to_string(), "iceberg-table".to_string()),
+            SchemaChange::set_option("type".to_string(), "delta-table".to_string()),
+            SchemaChange::remove_option("type".to_string()),
+        ] {
+            let err = catalog
+                .alter_table(&identifier, vec![change], false)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+        }
+        assert!(catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    "type".to_string(),
+                    "TABLE".to_string(),
+                )],
+                false,
+            )
+            .await
+            .is_ok());
+        catalog.get_table(&identifier).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_table_rejects_an_unknown_type() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let valid = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .build()
+            .unwrap();
+        let mut payload = serde_json::to_value(&valid).unwrap();
+        payload["options"] = serde_json::json!({ "type": "delta-table" });
+        let schema: Schema = serde_json::from_value(payload).unwrap();
+        let identifier = Identifier::new("db1", "delta_t");
+
+        let err = catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { ref message } if message.contains("delta-table")),
+            "{err:?}"
+        );
+        assert!(!catalog.table_exists(&identifier).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_stored_scan_selectors_block_routing() {
+        use crate::catalog::LoadedTable;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+
+        for (name, key, value) in [
+            ("ice_v", "scan.version", "1"),
+            ("ice_s", "scan.snapshot-id", "1"),
+            ("ice_i", "incremental-between", "1,5"),
+        ] {
+            let schema = Schema::builder()
+                .column(
+                    "id",
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                )
+                .option("type", "iceberg-table")
+                .option(key, value)
+                .build()
+                .unwrap();
+            let identifier = Identifier::new("db1", name);
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+
+            let err = catalog.load_table(&identifier).await.unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{key}: {err:?}");
+        }
+
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "ice_plain");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+        let routed = catalog.load_table(&identifier).await.unwrap();
+        assert!(matches!(routed, LoadedTable::External(_)), "{routed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_routing_cannot_skip_the_read_guards() {
+        use crate::catalog::LoadedTable;
+        use crate::spec::CoreOptions;
+
+        // The only constructor of the `Engine` variant, so a third-party
+        // catalog cannot route past these guards either.
+        for (key, value) in [
+            ("query-auth.enabled", "true"),
+            ("scan.version", "1"),
+            ("incremental-between", "1,5"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            let err = LoadedTable::external(
+                TableType::IcebergTable,
+                &CoreOptions::new(&options),
+                "db1.t",
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported { .. }), "{key}: {err:?}");
+        }
+
+        let options = HashMap::new();
+        assert!(LoadedTable::external(
+            TableType::IcebergTable,
+            &CoreOptions::new(&options),
+            "db1.t",
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_types_without_a_paimon_reader_fail_closed() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+
+        for (name, declared) in [("obj_t", "object-table"), ("lance_t", "lance-table")] {
+            let schema = Schema::builder()
+                .column(
+                    "id",
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                )
+                .option("type", declared)
+                .build()
+                .unwrap();
+            let identifier = Identifier::new("db1", name);
+            catalog
+                .create_table(&identifier, schema, false)
+                .await
+                .unwrap();
+
+            let err = catalog.get_table(&identifier).await.unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported { ref message }
+                    if message.contains("cannot be read as a Paimon table")),
+                "{declared}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_declared_engine_type_routes_and_fails_closed() {
+        use crate::catalog::LoadedTable;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "ice_t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        let routed = catalog.load_table(&identifier).await.unwrap();
+        assert!(
+            matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
+            "{routed:?}"
+        );
+
+        let err = catalog.get_table(&identifier).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { ref message }
+                if message.contains("cannot be read as a Paimon table")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

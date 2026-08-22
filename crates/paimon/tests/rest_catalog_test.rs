@@ -1501,3 +1501,140 @@ async fn test_catalog_maps_unsupported_view_and_function_endpoints() {
         paimon::Error::Unsupported { .. }
     ));
 }
+
+#[tokio::test]
+async fn test_load_table_returns_external_for_declared_type() {
+    use paimon::catalog::LoadedTable;
+    use paimon::spec::TableType;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "ice_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "ice_t");
+    let routed = ctx.catalog.load_table(&identifier).await.unwrap();
+    assert!(
+        matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
+        "{routed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_fails_closed_on_query_auth() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "authed_ice_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "authed_ice_t");
+    let err = ctx.catalog.load_table(&identifier).await.unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message } if message.contains("query-auth")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_constructs_paimon_for_undeclared_type() {
+    use paimon::catalog::LoadedTable;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "plain_t", schema, "file:///unused");
+
+    let identifier = Identifier::new("default", "plain_t");
+    let routed = ctx.catalog.load_table(&identifier).await.unwrap();
+    match routed {
+        LoadedTable::Paimon(table) => {
+            assert_eq!(table.identifier().full_name(), "default.plain_t");
+        }
+        other => panic!("expected a constructed Paimon table, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_get_table_fails_closed_on_iceberg_table() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "iceberg-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "raw_ice_t", schema, "file:///unused");
+
+    let err = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "raw_ice_t"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("cannot be read as a Paimon table")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_parses_declared_type_case_insensitively() {
+    use paimon::catalog::LoadedTable;
+    use paimon::spec::TableType;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "ICEBERG-TABLE")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "upper_ice_t", schema, "file:///unused");
+
+    let routed = ctx
+        .catalog
+        .load_table(&Identifier::new("default", "upper_ice_t"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(routed, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
+        "{routed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_rejects_unknown_declared_type() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let valid = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .build()
+        .unwrap();
+    let mut payload = serde_json::to_value(&valid).unwrap();
+    payload["options"] = serde_json::json!({ "type": "delta-table" });
+    let schema: Schema = serde_json::from_value(payload).unwrap();
+    ctx.server
+        .add_table_with_schema("default", "delta_t", schema, "file:///unused");
+
+    let err = ctx
+        .catalog
+        .load_table(&Identifier::new("default", "delta_t"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("unknown table type")),
+        "{err:?}"
+    );
+}

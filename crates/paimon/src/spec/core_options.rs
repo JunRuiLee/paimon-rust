@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::spec::TableType;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -73,7 +75,7 @@ const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
-pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
+
 pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
@@ -624,11 +626,17 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// The declared [`TableType`], defaulting to [`TableType::Table`].
+    /// Fails on a value this client does not know.
+    pub fn table_type(&self) -> crate::Result<TableType> {
+        match self.options.get(TABLE_TYPE_OPTION) {
+            Some(value) => value.parse(),
+            None => Ok(TableType::default()),
+        }
+    }
+
     pub fn is_format_table(&self) -> bool {
-        self.options
-            .get(TABLE_TYPE_OPTION)
-            .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
-            .unwrap_or(false)
+        matches!(self.table_type(), Ok(TableType::FormatTable))
     }
 
     pub fn path(&self) -> Option<&str> {
@@ -917,6 +925,33 @@ impl<'a> CoreOptions<'a> {
     ///
     /// This is the semantic owner for selector mutual exclusion and strict
     /// numeric parsing.
+    /// Fails when these options forbid the read outright, or ask for
+    /// something a table engine cannot honor: a scan option this client does
+    /// not support, or a historical state. Dropping any of them would answer
+    /// with unfiltered or current data instead.
+    ///
+    /// Both the table's stored options and a session's options go through
+    /// here, so neither source can skip a check the other applies.
+    pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
+        self.ensure_read_authorized()?;
+        self.validate_scan_options()?;
+        if self.has_time_travel_selector() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "time travel is not supported for engine-served table '{full_name}'"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether these options ask for a historical state of the table. A
+    /// malformed selector counts too, so callers that cannot honor time
+    /// travel reject rather than answer from the current state.
+    pub fn has_time_travel_selector(&self) -> bool {
+        !matches!(self.try_time_travel_selector(), Ok(None))
+    }
+
     pub(crate) fn try_time_travel_selector(&self) -> crate::Result<Option<TimeTravelSelector<'a>>> {
         let selectors = self.configured_time_travel_selectors();
         if selectors.len() > 1 {

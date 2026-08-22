@@ -262,8 +262,56 @@ impl fmt::Debug for Identifier {
 use async_trait::async_trait;
 
 use crate::api::PagedList;
-use crate::spec::{Partition, Schema, SchemaChange};
+use crate::spec::{Partition, Schema, SchemaChange, TableType};
 use crate::table::Table;
+
+/// Outcome of [`Catalog::load_table`].
+#[derive(Debug)]
+pub enum LoadedTable {
+    /// A constructed Paimon table (boxed: far larger than the other variant).
+    Paimon(Box<Table>),
+    /// A table this reader cannot construct.
+    External(ExternalTableMetadata),
+}
+
+/// What a caller needs to pick an engine for a table Paimon cannot construct.
+/// Only [`LoadedTable::external`] can build one, so the stored-metadata checks
+/// always run before a caller sees it.
+#[derive(Debug)]
+pub struct ExternalTableMetadata {
+    declared: TableType,
+}
+
+impl ExternalTableMetadata {
+    /// The type the table's metadata declares.
+    pub fn declared(&self) -> TableType {
+        self.declared
+    }
+}
+
+impl LoadedTable {
+    /// Classify `full_name` as external, refusing options no engine can honor
+    /// and reads this client cannot authorize.
+    ///
+    /// Errors if [`TableType::requires_table_engine`] rejects `declared`:
+    /// classifying a Paimon-served type as external would skip the reader that
+    /// can actually construct it.
+    pub fn external(
+        declared: TableType,
+        options: &crate::spec::CoreOptions<'_>,
+        full_name: &str,
+    ) -> Result<Self> {
+        if !declared.requires_table_engine() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{full_name}' is declared '{declared}', which the Paimon reader serves"
+                ),
+            });
+        }
+        options.ensure_engine_can_serve(full_name)?;
+        Ok(Self::External(ExternalTableMetadata { declared }))
+    }
+}
 
 /// Catalog API for reading and writing metadata (databases, tables) in Paimon.
 ///
@@ -322,6 +370,20 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::DatabaseNotExist`] - database in identifier does not exist.
     /// * [`crate::Error::TableNotExist`] - table does not exist.
     async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
+
+    /// Load a table, or classify it as [`LoadedTable::External`] when this
+    /// reader cannot construct it. One metadata round-trip either way, and the
+    /// outcome depends only on the table's own metadata. The default
+    /// implementation always constructs, for catalogs without a table-type
+    /// concept.
+    ///
+    /// # Errors
+    /// Same as [`Catalog::get_table`].
+    async fn load_table(&self, identifier: &Identifier) -> Result<LoadedTable> {
+        Ok(LoadedTable::Paimon(Box::new(
+            self.get_table(identifier).await?,
+        )))
+    }
 
     /// List table names in a database. System tables are not listed.
     ///

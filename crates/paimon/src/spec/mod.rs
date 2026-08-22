@@ -31,6 +31,9 @@ pub use blob_view_struct::BlobViewStruct;
 mod data_file;
 pub use data_file::*;
 
+mod table_type;
+pub use table_type::*;
+
 mod core_options;
 pub(crate) use core_options::TimeTravelSelector;
 pub use core_options::*;

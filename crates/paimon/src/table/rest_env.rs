@@ -106,11 +106,38 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
-        let response = api
-            .get_table(identifier)
-            .await
-            .map_err(|e| map_rest_error_for_table(e, identifier))?;
+        let response = Self::fetch_table_response(identifier, &api).await?;
+        Self::build_table(
+            identifier,
+            response,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+        )
+        .await
+    }
 
+    /// Fetch the raw table metadata, mapping REST errors to catalog errors.
+    pub(crate) async fn fetch_table_response(
+        identifier: &Identifier,
+        api: &RESTApi,
+    ) -> Result<crate::api::GetTableResponse> {
+        api.get_table(identifier)
+            .await
+            .map_err(|e| map_rest_error_for_table(e, identifier))
+    }
+
+    /// Build a Table from an already-fetched response, so routing can
+    /// inspect the declared type first.
+    pub(crate) async fn build_table(
+        identifier: &Identifier,
+        response: crate::api::GetTableResponse,
+        api: Arc<RESTApi>,
+        options: Options,
+        data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Result<Table> {
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -128,6 +155,19 @@ impl RESTEnv {
             ),
             source: None,
         })?;
+        // Fail closed: constructed as Paimon, raw `get_table` paths (writes,
+        // procedures, time travel) would misread it.
+        let declared = CoreOptions::new(schema.options()).table_type()?;
+        if declared.requires_table_engine() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "table '{}' is declared '{declared}' and cannot be read as a Paimon \
+                     table; only plain reads through a registered table engine are supported",
+                    identifier.full_name()
+                ),
+            });
+        }
+
         let mut table_schema = TableSchema::new(schema_id, &schema);
         if CoreOptions::new(table_schema.options()).is_format_table() {
             table_schema = table_schema.copy_with_options(std::collections::HashMap::from([(

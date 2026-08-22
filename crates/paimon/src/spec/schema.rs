@@ -1155,6 +1155,8 @@ impl Schema {
         primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
+        // Create and alter share this, so an unparsable type never lands.
+        CoreOptions::new(options).table_type()?;
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, primary_keys, options)?;
         Self::validate_row_tracking(primary_keys, options)?;

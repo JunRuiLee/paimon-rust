@@ -74,7 +74,10 @@ pub(crate) type DynamicOptions = Arc<RwLock<HashMap<String, String>>>;
 
 pub use blob_reader::BlobReaderRegistry;
 pub use blob_view::register_blob_view;
-pub use catalog::{PaimonCatalogProvider, PaimonSchemaProvider};
+pub use catalog::{
+    register_catalog_table_engine, EngineTableRequest, PaimonCatalogProvider, PaimonSchemaProvider,
+    TableEngineResolver,
+};
 pub use error::to_datafusion_error;
 #[cfg(feature = "fulltext")]
 pub use full_text_search::{register_full_text_search, FullTextSearchFunction};

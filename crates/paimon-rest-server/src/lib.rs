@@ -416,12 +416,13 @@ async fn create_table(
 async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
     let table = path.get("table");
     let identifier = Identifier::new(path.get("db"), table.clone());
-    let resolved = match state.catalog.get_table(&identifier).await {
-        Ok(t) => t,
+    // Raw metadata, not a constructed table: engine-served types must stay
+    // describable so clients can route them.
+    let (location, loaded_schema) = match state.catalog.fetch_table_schema(&identifier).await {
+        Ok(loaded) => loaded,
         Err(e) => return error_response(e),
     };
-
-    let table_schema = resolved.schema();
+    let table_schema = &loaded_schema;
     // Convert the stored `TableSchema` into the DDL `Schema` the response
     // carries. `Schema` is a field subset of `TableSchema` (both camelCase),
     // and serde ignores the extra keys, preserving field ids exactly.
@@ -441,7 +442,7 @@ async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -
         // that satisfies the client's RESTEnv requirement.
         Some(identifier.full_name()),
         Some(table),
-        Some(resolved.location().to_string()),
+        Some(location),
         Some(false),
         Some(table_schema.id()),
         Some(schema),
