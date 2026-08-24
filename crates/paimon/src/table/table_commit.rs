@@ -2870,7 +2870,7 @@ impl TableCommit {
                         msg.bucket,
                         msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
-                        0,
+                        2,
                     )
                 })
             })
@@ -3142,6 +3142,7 @@ mod tests {
         BinaryRowBuilder, DataFileMeta, DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta,
         ManifestList, TableSchema, POSTPONE_BUCKET,
     };
+    use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
 
     #[tokio::test]
@@ -5366,6 +5367,45 @@ mod tests {
         assert_eq!(snapshot.changelog_record_count(), Some(3));
         assert!(snapshot.changelog_manifest_list().is_some());
         assert!(snapshot.changelog_manifest_list_size().unwrap() > 0);
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let changelog_manifest_list = snapshot.changelog_manifest_list().unwrap();
+        let changelog_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{changelog_manifest_list}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changelog_metas.len(), 1);
+
+        let manifest_bytes = file_io
+            .new_input(&format!(
+                "{manifest_dir}/{}",
+                changelog_metas[0].file_name()
+            ))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let values = apache_avro::Reader::new(manifest_bytes.as_ref())
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values.len(), 1);
+
+        let value = match &values[0] {
+            Value::Union(_, value) => value.as_ref(),
+            value => value,
+        };
+        let Value::Record(fields) = value else {
+            panic!("manifest entry must be an Avro record");
+        };
+        let version = fields
+            .iter()
+            .find(|(name, _)| name == "_VERSION")
+            .map(|(_, value)| value)
+            .expect("manifest entry format identifier");
+        assert_eq!(version, &Value::Int(2));
     }
 
     #[tokio::test]

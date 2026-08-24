@@ -55,6 +55,10 @@ impl Hash for Identifier {
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestEntry.java>
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
+    // Java's VersionedObjectSerializer requires the version field at position 0.
+    #[serde(rename = "_VERSION")]
+    version: i32,
+
     #[serde(rename = "_KIND")]
     kind: FileKind,
 
@@ -69,9 +73,6 @@ pub struct ManifestEntry {
 
     #[serde(rename = "_FILE")]
     pub(crate) file: DataFileMeta,
-
-    #[serde(rename = "_VERSION")]
-    version: i32,
 }
 
 #[allow(dead_code)]
@@ -151,12 +152,12 @@ impl ManifestEntry {
         version: i32,
     ) -> Self {
         ManifestEntry {
+            version,
             kind,
             partition,
             bucket,
             total_buckets,
             file,
-            version,
         }
     }
 
@@ -186,6 +187,7 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
     "name": "record",
     "namespace": "org.apache.paimon.avro.generated",
     "fields": [
+        {"name": "_VERSION", "type": "int"},
         {"name": "_KIND", "type": "int"},
         {"name": "_PARTITION", "type": "bytes"},
         {"name": "_BUCKET", "type": "int"},
@@ -231,15 +233,37 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
                 {"name": "_FIRST_ROW_ID", "type": ["null", "long"], "default": null},
                 {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null}
             ]
-        }], "default": null},
-        {"name": "_VERSION", "type": "int"}
+        }], "default": null}
     ]
 }]"#;
 
 #[cfg(test)]
 mod tests {
-    use super::Identifier;
+    use super::{Identifier, MANIFEST_ENTRY_SCHEMA};
+    use crate::spec::avro::schema::WriterSchema;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_manifest_entry_schema_matches_java_field_order() {
+        let schema = WriterSchema::parse(MANIFEST_ENTRY_SCHEMA).unwrap();
+        let field_names = schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            field_names,
+            vec![
+                "_VERSION",
+                "_KIND",
+                "_PARTITION",
+                "_BUCKET",
+                "_TOTAL_BUCKETS",
+                "_FILE"
+            ]
+        );
+    }
 
     fn ident(file_name: &str, level: i32) -> Identifier {
         Identifier {
