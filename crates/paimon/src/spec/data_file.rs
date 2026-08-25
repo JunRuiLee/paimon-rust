@@ -347,8 +347,8 @@ impl DataFileMeta {
     /// as `writeInt(len) + data`. Fields, order and nullability mirror Java
     /// `DataFileMetaSerializer#toRow`.
     ///
-    /// Only the current layout is written; older layouts are read-only, exactly as Java
-    /// keeps its legacy serializers deserialize-only.
+    /// Only the current layout is written. Reading an older one stays supported because a
+    /// `DataSplit` on disk or on the wire may still carry it.
     pub fn to_serialized_row_data(&self) -> crate::Result<Vec<u8>> {
         let mut b = BinaryRowBuilder::new(DataFileMetaRowLayout::CURRENT.arity() as i32);
         b.write_bytes(0, self.file_name.as_bytes());
@@ -403,6 +403,14 @@ impl DataFileMeta {
         layout: DataFileMetaRowLayout,
     ) -> crate::Result<DataFileMeta> {
         use crate::spec::deserialize_binary_array_str;
+        let fixed_part = BinaryRow::cal_fix_part_size_in_bytes(layout.arity() as i32) as usize;
+        if data.len() < fixed_part {
+            return Err(data_file_err(&format!(
+                "DataFileMeta row of {} bytes is shorter than the {fixed_part}-byte fixed part \
+                 of the {layout:?} layout",
+                data.len()
+            )));
+        }
         let row = BinaryRow::from_bytes(layout.arity() as i32, data.to_vec());
 
         let file_name = String::from_utf8(row.get_binary(0)?.to_vec())
@@ -702,8 +710,45 @@ mod tests {
         assert_eq!(back, meta);
     }
 
+    #[test]
+    fn empty_column_max_sequence_numbers_round_trips() {
+        let mut meta = sample_full_data_file_meta();
+        meta.column_max_sequence_numbers = Some(Vec::new());
+        let bytes = meta.to_serialized_row_data().unwrap();
+        let back =
+            DataFileMeta::from_serialized_row_data(&bytes, DataFileMetaRowLayout::CURRENT).unwrap();
+        // An empty array must stay distinguishable from an absent one.
+        assert_eq!(back.column_max_sequence_numbers, Some(Vec::new()));
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn row_shorter_than_the_layout_fixed_part_is_rejected() {
+        let meta = sample_full_data_file_meta();
+        let bytes = meta.to_serialized_row_data().unwrap();
+        let fixed_part =
+            BinaryRow::cal_fix_part_size_in_bytes(DataFileMetaRowLayout::CURRENT.arity() as i32)
+                as usize;
+
+        for truncated in [0, fixed_part - 1] {
+            assert!(
+                DataFileMeta::from_serialized_row_data(
+                    &bytes[..truncated],
+                    DataFileMetaRowLayout::CURRENT
+                )
+                .is_err(),
+                "a {truncated}-byte row must not decode as the current layout"
+            );
+        }
+        assert!(
+            DataFileMeta::from_serialized_row_data(&bytes, DataFileMetaRowLayout::CURRENT).is_ok()
+        );
+    }
+
     /// The legacy layout has no slot for the field, so decoding a row as `WriteCols`
-    /// yields `None` rather than reading past the fields that layout declares.
+    /// yields `None` rather than reading past the fields that layout declares. Java does
+    /// the same: `DataFileMetaSerializerTest#testLegacySerializerDropsColumnSequences`
+    /// round-trips through the legacy serializer and expects the field back as null.
     #[test]
     fn legacy_layout_decodes_without_column_max_sequence_numbers() {
         let mut meta = sample_full_data_file_meta();
@@ -818,6 +863,7 @@ mod tests {
             "externalPath=Some(\"s3://bucket/data-1.parquet\")",
             "firstRowId=Some(100)",
             "writeCols=Some([\"k\", \"v\"])",
+            "columnMaxSequenceNumbers=None",
         ] {
             assert!(
                 display.contains(expected),

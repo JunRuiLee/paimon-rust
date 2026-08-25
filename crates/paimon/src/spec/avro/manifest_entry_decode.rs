@@ -330,7 +330,10 @@ fn decode_long_array(cursor: &mut AvroCursor) -> crate::Result<Vec<i64>> {
         } else {
             count as usize
         };
-        result.reserve(count);
+        // A zigzag long is at least one byte, so the remaining input bounds how many
+        // elements can really follow. Reserving the declared count instead would let a
+        // corrupt manifest ask for an arbitrary allocation before the first read fails.
+        result.reserve(count.min(cursor.remaining()));
         for _ in 0..count {
             result.push(cursor.read_long()?);
         }
@@ -343,9 +346,18 @@ fn decode_nullable_long_array(
     nullable: bool,
 ) -> crate::Result<Option<Vec<i64>>> {
     if nullable {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Ok(None);
+        // A two-branch `["null", array]` union only ever encodes 0 or 1. Anything else
+        // means the stream is not where the schema says it is, so stop rather than read
+        // the following bytes as an array.
+        match cursor.read_union_index()? {
+            0 => return Ok(None),
+            1 => {}
+            other => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("invalid union index {other} for _WRITE_COLS_SEQUENCES"),
+                    source: None,
+                })
+            }
         }
     }
     Ok(Some(decode_long_array(cursor)?))
