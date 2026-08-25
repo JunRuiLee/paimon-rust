@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_manifest_entry_with_legacy_rust_field_order() {
+    fn test_read_manifest_entry_with_legacy_rust_schema() {
         let mut schema: serde_json::Value = serde_json::from_str(MANIFEST_ENTRY_SCHEMA).unwrap();
         let fields = schema.as_array_mut().unwrap()[1]
             .as_object_mut()
@@ -199,6 +199,16 @@ mod tests {
             .unwrap()
             .as_array_mut()
             .unwrap();
+        let file = fields
+            .iter_mut()
+            .find(|field| field.get("name").and_then(|name| name.as_str()) == Some("_FILE"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        let file_type = file.remove("type").unwrap();
+        file.insert("type".to_string(), serde_json::json!(["null", file_type]));
+        file.insert("default".to_string(), serde_json::Value::Null);
+
         let version = fields.remove(0);
         fields.push(version);
         let legacy_schema = serde_json::to_string(&schema).unwrap();

@@ -192,7 +192,7 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
         {"name": "_PARTITION", "type": "bytes"},
         {"name": "_BUCKET", "type": "int"},
         {"name": "_TOTAL_BUCKETS", "type": "int"},
-        {"name": "_FILE", "type": ["null", {
+        {"name": "_FILE", "type": {
             "type": "record",
             "name": "record__FILE",
             "fields": [
@@ -233,14 +233,14 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
                 {"name": "_FIRST_ROW_ID", "type": ["null", "long"], "default": null},
                 {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null}
             ]
-        }], "default": null}
+        }}
     ]
 }]"#;
 
 #[cfg(test)]
 mod tests {
     use super::{Identifier, MANIFEST_ENTRY_SCHEMA};
-    use crate::spec::avro::schema::WriterSchema;
+    use crate::spec::avro::schema::{FieldSchema, WriterSchema};
     use std::collections::HashSet;
 
     #[test]
@@ -263,6 +263,22 @@ mod tests {
                 "_FILE"
             ]
         );
+    }
+
+    #[test]
+    fn test_manifest_entry_file_schema_matches_java_record_type() {
+        let schema = WriterSchema::parse(MANIFEST_ENTRY_SCHEMA).unwrap();
+        let file = schema
+            .fields
+            .iter()
+            .find(|field| field.name == "_FILE")
+            .unwrap();
+
+        assert!(
+            !file.nullable,
+            "Java ManifestAvroReader requires _FILE to be a RECORD, not a nullable UNION"
+        );
+        assert!(matches!(file.schema, FieldSchema::Record(_)));
     }
 
     fn ident(file_name: &str, level: i32) -> Identifier {
