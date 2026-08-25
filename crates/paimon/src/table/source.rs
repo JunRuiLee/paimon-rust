@@ -19,7 +19,7 @@
 //!
 //! Reference: [org.apache.paimon.table.source](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/source/).
 
-use crate::spec::{BinaryRow, DataFileMeta};
+use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -211,6 +211,7 @@ mod row_range_tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -682,8 +683,8 @@ impl DataSplit {
         DataSplitBuilder::new()
     }
 
-    /// Serialize the DataSplit fields to Java `DataSplit#serialize` (version 8) binary.
-    /// Byte-compatible with `compatibility/datasplit-v8`. Row ranges are not part of the v8
+    /// Serialize the DataSplit fields to Java `DataSplit#serialize` (version 9) binary.
+    /// Byte-compatible with `compatibility/datasplit-v9`. Row ranges are not part of the
     /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -711,11 +712,12 @@ impl DataSplit {
         Ok(out)
     }
 
-    /// Reverse of [`DataSplit::serialize`]: parse a raw v8 `DataSplit#serialize` body.
+    /// Reverse of [`DataSplit::serialize`]: parse a raw `DataSplit#serialize` body.
+    /// Both the current version and the legacy v8 layout are accepted.
     /// Consumes the entire buffer; trailing bytes are an error.
     pub fn deserialize(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
-        let split = Self::read_v8_body(&mut cur)?;
+        let split = Self::read_body(&mut cur)?;
         if !cur.is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: format!("{} trailing bytes after DataSplit", cur.len()),
@@ -725,9 +727,9 @@ impl DataSplit {
         Ok(split)
     }
 
-    /// Read a v8 `DataSplit` body from the cursor, leaving it positioned after the body
+    /// Read a `DataSplit` body from the cursor, leaving it positioned after the body
     /// (used both by `deserialize` and the SPLIT_V1 frame reader).
-    fn read_v8_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+    fn read_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
         let magic = read_i64(cur)?;
         if magic != SPLIT_MAGIC {
             return Err(crate::Error::DataInvalid {
@@ -736,17 +738,27 @@ impl DataSplit {
             });
         }
         match read_i32(cur)? {
-            SPLIT_VERSION => Self::read_v8_body_after_version(cur),
+            SPLIT_VERSION => {
+                Self::read_body_after_version(cur, DataFileMetaRowLayout::WriteColsSequences)
+            }
+            SPLIT_VERSION_LEGACY_WRITE_COLS => {
+                Self::read_body_after_version(cur, DataFileMetaRowLayout::WriteCols)
+            }
             version => Err(crate::Error::Unsupported {
                 message: format!(
-                    "DataSplit version {version} not supported (only v{SPLIT_VERSION})"
+                    "DataSplit version {version} not supported \
+                     (only v{SPLIT_VERSION_LEGACY_WRITE_COLS} and v{SPLIT_VERSION})"
                 ),
             }),
         }
     }
 
-    /// Read the fields following the magic + version header of a v8 `DataSplit` body.
-    fn read_v8_body_after_version(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+    /// Read the fields following the magic + version header of a `DataSplit` body. Only the
+    /// per-file `DataFileMeta` row layout varies between the supported versions.
+    fn read_body_after_version(
+        cur: &mut &[u8],
+        file_layout: DataFileMetaRowLayout,
+    ) -> crate::Result<DataSplit> {
         let snapshot_id = read_i64(cur)?;
 
         let part_len = read_i32(cur)?;
@@ -803,7 +815,7 @@ impl DataSplit {
                 });
             }
             let row = take(cur, len as usize)?;
-            data_files.push(DataFileMeta::from_serialized_row_data(row)?);
+            data_files.push(DataFileMeta::from_serialized_row_data(row, file_layout)?);
         }
 
         let data_deletion_files = read_deletion_list(cur)?;
@@ -881,7 +893,7 @@ impl DataSplit {
         }
         let type_id = read_i32(&mut cur)?;
         let split = match type_id {
-            SPLIT_SER_TYPE_DATA_SPLIT => Self::read_v8_body(&mut cur)?,
+            SPLIT_SER_TYPE_DATA_SPLIT => Self::read_body(&mut cur)?,
             SPLIT_SER_TYPE_INDEXED_SPLIT => {
                 let im = read_i64(&mut cur)?;
                 if im != INDEXED_SPLIT_MAGIC {
@@ -896,7 +908,7 @@ impl DataSplit {
                         message: format!("IndexedSplit version {iv} not supported"),
                     });
                 }
-                let body = Self::read_v8_body(&mut cur)?;
+                let body = Self::read_body(&mut cur)?;
                 let ranges_n = read_i32(&mut cur)?;
                 if ranges_n < 0 {
                     return Err(crate::Error::DataInvalid {
@@ -946,7 +958,11 @@ impl DataSplit {
 
 /// Java `DataSplit#MAGIC` / `VERSION` for the serialize format.
 const SPLIT_MAGIC: i64 = -2394839472490812314;
-const SPLIT_VERSION: i32 = 8;
+const SPLIT_VERSION: i32 = 9;
+/// Java bumped `DataSplit#VERSION` to 9 when it appended `_WRITE_COLS_SEQUENCES` to
+/// `DataFileMeta.SCHEMA`. The split body is unchanged; only the per-file row grew, so
+/// v8 bodies stay readable by decoding their files with the older row layout.
+const SPLIT_VERSION_LEGACY_WRITE_COLS: i32 = 8;
 
 /// Java `SplitSerializer` frame: magic "SPLIT_V1", version, and the `DataSplit` type id.
 const SPLIT_SER_MAGIC: i64 = 0x53504C49545F5631; // "SPLIT_V1"
@@ -1343,6 +1359,7 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -1444,7 +1461,11 @@ mod tests {
         // Generated by Apache Paimon Java 1.4.2 using BinaryRow.EMPTY_ROW and
         // DataSplit#serialize. The partition field is length 12: arity=0 plus
         // the 8-byte fixed part initialized by Java's BinaryRow static block.
-        let java_golden = [
+        //
+        // The split carries no data files, so the only byte that the later version bump
+        // moved is the version int itself -- which makes this golden a check of the split
+        // body rather than of the per-file row layout.
+        let java_golden_v8 = [
             0xde, 0xc3, 0xd2, 0x30, 0x2c, 0x19, 0xec, 0x66, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
@@ -1462,8 +1483,14 @@ mod tests {
             .build()
             .unwrap();
 
+        let mut expected = java_golden_v8;
+        expected[8..12].copy_from_slice(&SPLIT_VERSION.to_be_bytes());
+
         let bytes = split.serialize().expect("serialize");
-        assert_eq!(bytes, java_golden);
+        assert_eq!(bytes, expected);
+        // A legacy body still reads, and re-serializing it normalizes to the current version.
+        let from_v8 = DataSplit::deserialize(&java_golden_v8).expect("deserialize v8");
+        assert_eq!(from_v8.serialize().expect("reserialize v8"), expected);
         let restored = DataSplit::deserialize(&bytes).expect("deserialize");
         assert_eq!(restored.snapshot_id(), split.snapshot_id());
         assert_eq!(restored.partition().arity(), 0);
@@ -1747,16 +1774,17 @@ mod tests {
     }
 
     #[test]
-    fn serialize_matches_datasplit_v8() {
+    fn serialize_matches_datasplit_v9() {
         // Golden generated by Java (paimon-core DataSplitCompatibleTest) for cross-language parity.
-        let expected = include_bytes!("goldens/datasplit_v8.bin");
-        let split = sample_v8_split();
+        let expected = include_bytes!("goldens/datasplit_v9.bin");
+        let split = sample_v9_split();
         assert_eq!(split.serialize().unwrap().as_slice(), &expected[..]);
     }
 
-    /// The fixture split whose Java-generated bytes live in `goldens/datasplit_v8.bin`.
-    /// Shared by the serialize and deserialize golden tests.
-    fn sample_v8_split() -> DataSplit {
+    /// The fixture split behind the Java-generated `goldens/datasplit_v*.bin`. The two
+    /// goldens describe the same split; only `_WRITE_COLS_SEQUENCES` differs, matching
+    /// Java's `testSerializerCompatibleV8` / `testSerializerCompatibleV9`.
+    fn sample_split(column_max_sequence_numbers: Option<Vec<i64>>) -> DataSplit {
         use chrono::DateTime;
 
         let mut pb = crate::spec::BinaryRowBuilder::new(1);
@@ -1796,6 +1824,7 @@ mod tests {
                     .map(|s| s.to_string())
                     .collect(),
             ),
+            column_max_sequence_numbers,
         };
 
         DataSplitBuilder::new()
@@ -1816,6 +1845,18 @@ mod tests {
             .unwrap()
     }
 
+    /// The v8 golden's split: its file predates `_WRITE_COLS_SEQUENCES`.
+    fn sample_v8_split() -> DataSplit {
+        sample_split(None)
+    }
+
+    /// The v9 golden's split: the same file, carrying per-column maximum sequence numbers.
+    fn sample_v9_split() -> DataSplit {
+        sample_split(Some(vec![15, 100, 150, 200]))
+    }
+
+    /// A v8 body stays readable: the split is identical apart from the field that
+    /// layout has no slot for.
     #[test]
     fn deserialize_matches_datasplit_v8_golden() {
         let golden = include_bytes!("goldens/datasplit_v8.bin");
@@ -1824,8 +1865,22 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_matches_datasplit_v9_golden() {
+        let golden = include_bytes!("goldens/datasplit_v9.bin");
+        let split = DataSplit::deserialize(golden).unwrap();
+        assert_eq!(split, sample_v9_split());
+    }
+
+    #[test]
+    fn deserialize_rejects_unsupported_version() {
+        let mut bytes = sample_v9_split().serialize().unwrap();
+        bytes[8..12].copy_from_slice(&7i32.to_be_bytes());
+        assert!(DataSplit::deserialize(&bytes).is_err());
+    }
+
+    #[test]
     fn deserialize_round_trips_serialize() {
-        let split = sample_v8_split();
+        let split = sample_v9_split();
         assert_eq!(
             DataSplit::deserialize(&split.serialize().unwrap()).unwrap(),
             split
@@ -1834,7 +1889,7 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_trailing_bytes() {
-        let mut bytes = sample_v8_split().serialize().unwrap();
+        let mut bytes = sample_v9_split().serialize().unwrap();
         bytes.push(0xFF);
         assert!(DataSplit::deserialize(&bytes).is_err());
     }
@@ -2114,6 +2169,7 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 

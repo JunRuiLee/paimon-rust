@@ -17,7 +17,8 @@
 
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    extract_datum, serialize_binary_array_str, BinaryRow, BinaryRowBuilder, DataField, Datum,
+    extract_datum, serialize_binary_array_long, serialize_binary_array_str, BinaryRow,
+    BinaryRowBuilder, DataField, Datum,
 };
 use chrono::serde::ts_milliseconds_option::deserialize as from_millis_opt;
 use chrono::serde::ts_milliseconds_option::serialize as to_millis_opt;
@@ -122,6 +123,16 @@ pub struct DataFileMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub write_cols: Option<Vec<String>>,
+
+    /// Per-column maximum sequence numbers, positionally aligned with
+    /// [`Self::write_cols`] (used in data evolution mode). Absent on files
+    /// written before this field existed.
+    #[serde(
+        rename = "_WRITE_COLS_SEQUENCES",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub column_max_sequence_numbers: Option<Vec<i64>>,
 }
 
 impl Display for DataFileMeta {
@@ -132,7 +143,8 @@ impl Display for DataFileMeta {
              minKey={:?}, maxKey={:?}, keyStats={:?}, valueStats={:?}, \
              minSequenceNumber={}, maxSequenceNumber={}, schemaId={}, level={}, \
              extraFiles={:?}, creationTime={:?}, deleteRowCount={:?}, fileSource={:?}, \
-             valueStatsCols={:?}, externalPath={:?}, firstRowId={:?}, writeCols={:?}}}",
+             valueStatsCols={:?}, externalPath={:?}, firstRowId={:?}, writeCols={:?}, \
+             columnMaxSequenceNumbers={:?}}}",
             self.file_name,
             self.file_size,
             self.row_count,
@@ -153,7 +165,35 @@ impl Display for DataFileMeta {
             self.external_path,
             self.first_row_id,
             self.write_cols,
+            self.column_max_sequence_numbers,
         )
+    }
+}
+
+/// Which `DataFileMeta.SCHEMA` revision a serialized `BinaryRow` follows.
+///
+/// The schema only ever grows by appending nullable fields, so the two layouts
+/// share slots 0..=19 and differ solely in arity. Which one a `DataSplit` body
+/// carries is decided by the split's own version, not by the row bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFileMetaRowLayout {
+    /// 20 fields, ending at `_WRITE_COLS`. Mirrors Java
+    /// `DataFileMetaWriteColsLegacySerializer`.
+    WriteCols,
+    /// 21 fields, ending at `_WRITE_COLS_SEQUENCES`. Mirrors Java
+    /// `DataFileMetaSerializer`, and is what this crate writes.
+    WriteColsSequences,
+}
+
+impl DataFileMetaRowLayout {
+    /// The layout this crate serializes to, matching current Java.
+    pub const CURRENT: Self = Self::WriteColsSequences;
+
+    fn arity(self) -> usize {
+        match self {
+            Self::WriteCols => 20,
+            Self::WriteColsSequences => 21,
+        }
     }
 }
 
@@ -162,6 +202,26 @@ fn opt_long(b: &mut BinaryRowBuilder, pos: usize, v: Option<i64>) {
         Some(x) => b.write_long(pos, x),
         None => b.set_null_at(pos),
     }
+}
+
+/// Write an `array<bigint not null>` field, or a null at `pos`.
+fn opt_long_array(b: &mut BinaryRowBuilder, pos: usize, v: &Option<Vec<i64>>) {
+    match v {
+        Some(a) => {
+            let elements: Vec<Option<i64>> = a.iter().copied().map(Some).collect();
+            b.write_bytes(pos, &serialize_binary_array_long(&elements));
+        }
+        None => b.set_null_at(pos),
+    }
+}
+
+/// Read an `array<bigint not null>` field. Java declares the elements non-null, so a
+/// null element is malformed rather than something to silently map to a placeholder.
+fn read_non_null_long_array(row: &BinaryRow, pos: usize) -> crate::Result<Vec<i64>> {
+    crate::spec::deserialize_binary_array_long(row.get_binary(pos)?)?
+        .into_iter()
+        .map(|v| v.ok_or_else(|| data_file_err("array<bigint not null> has a null element")))
+        .collect()
 }
 
 fn opt_str_array(b: &mut BinaryRowBuilder, pos: usize, v: &Option<Vec<String>>) {
@@ -282,11 +342,15 @@ impl DataFileMeta {
         Some((from, to))
     }
 
-    /// Serialize as a `DataFileMeta.SCHEMA` (version 8) BinaryRow, raw data without the
-    /// arity prefix -- the form `DataSplit#serialize` writes per file as `writeInt(len) + data`.
-    /// Fields, order and nullability mirror Java `DataFileMetaSerializer#toRow`.
+    /// Serialize as a [`DataFileMetaRowLayout::CURRENT`] `DataFileMeta.SCHEMA` BinaryRow,
+    /// raw data without the arity prefix -- the form `DataSplit#serialize` writes per file
+    /// as `writeInt(len) + data`. Fields, order and nullability mirror Java
+    /// `DataFileMetaSerializer#toRow`.
+    ///
+    /// Only the current layout is written; older layouts are read-only, exactly as Java
+    /// keeps its legacy serializers deserialize-only.
     pub fn to_serialized_row_data(&self) -> crate::Result<Vec<u8>> {
-        let mut b = BinaryRowBuilder::new(20);
+        let mut b = BinaryRowBuilder::new(DataFileMetaRowLayout::CURRENT.arity() as i32);
         b.write_bytes(0, self.file_name.as_bytes());
         b.write_long(1, self.file_size);
         b.write_long(2, self.row_count);
@@ -325,14 +389,21 @@ impl DataFileMeta {
         }
         opt_long(&mut b, 18, self.first_row_id);
         opt_str_array(&mut b, 19, &self.write_cols);
+        opt_long_array(&mut b, 20, &self.column_max_sequence_numbers);
         Ok(b.build_row_data())
     }
 
-    /// Reverse of [`DataFileMeta::to_serialized_row_data`]: decode the fixed
-    /// 20-field `DataFileMeta` BinaryRow (version 8 layout).
-    pub fn from_serialized_row_data(data: &[u8]) -> crate::Result<DataFileMeta> {
+    /// Reverse of [`DataFileMeta::to_serialized_row_data`]: decode a `DataFileMeta`
+    /// BinaryRow written in `layout`.
+    ///
+    /// The row bytes carry no arity of their own, so the caller must supply the layout
+    /// that the enclosing container declared.
+    pub fn from_serialized_row_data(
+        data: &[u8],
+        layout: DataFileMetaRowLayout,
+    ) -> crate::Result<DataFileMeta> {
         use crate::spec::deserialize_binary_array_str;
-        let row = BinaryRow::from_bytes(20, data.to_vec());
+        let row = BinaryRow::from_bytes(layout.arity() as i32, data.to_vec());
 
         let file_name = String::from_utf8(row.get_binary(0)?.to_vec())
             .map_err(|_| data_file_err("file_name is not valid UTF-8"))?;
@@ -390,6 +461,11 @@ impl DataFileMeta {
         } else {
             Some(deserialize_binary_array_str(row.get_binary(19)?)?)
         };
+        let column_max_sequence_numbers = match layout {
+            DataFileMetaRowLayout::WriteCols => None,
+            DataFileMetaRowLayout::WriteColsSequences if row.is_null_at(20) => None,
+            DataFileMetaRowLayout::WriteColsSequences => Some(read_non_null_long_array(&row, 20)?),
+        };
 
         Ok(DataFileMeta {
             file_name,
@@ -412,6 +488,7 @@ impl DataFileMeta {
             external_path,
             first_row_id,
             write_cols,
+            column_max_sequence_numbers,
         })
     }
 
@@ -524,6 +601,7 @@ mod tests {
             external_path: None,
             first_row_id: Some(100),
             write_cols: Some(vec!["k".to_string(), "v".to_string()]),
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -565,6 +643,7 @@ mod tests {
             external_path: Some("s3://bucket/data-full.parquet".to_string()),
             first_row_id: Some(1_000),
             write_cols: Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -591,6 +670,7 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -601,9 +681,40 @@ mod tests {
             sample_minimal_data_file_meta(),
         ] {
             let bytes = meta.to_serialized_row_data().unwrap();
-            let back = DataFileMeta::from_serialized_row_data(&bytes).unwrap();
+            let back =
+                DataFileMeta::from_serialized_row_data(&bytes, DataFileMetaRowLayout::CURRENT)
+                    .unwrap();
             assert_eq!(back, meta);
         }
+    }
+
+    #[test]
+    fn column_max_sequence_numbers_round_trip() {
+        let mut meta = sample_full_data_file_meta();
+        meta.column_max_sequence_numbers = Some(vec![15, 100, 150, 200]);
+        let bytes = meta.to_serialized_row_data().unwrap();
+        let back =
+            DataFileMeta::from_serialized_row_data(&bytes, DataFileMetaRowLayout::CURRENT).unwrap();
+        assert_eq!(
+            back.column_max_sequence_numbers,
+            Some(vec![15, 100, 150, 200])
+        );
+        assert_eq!(back, meta);
+    }
+
+    /// The legacy layout has no slot for the field, so decoding a row as `WriteCols`
+    /// yields `None` rather than reading past the fields that layout declares.
+    #[test]
+    fn legacy_layout_decodes_without_column_max_sequence_numbers() {
+        let mut meta = sample_full_data_file_meta();
+        meta.column_max_sequence_numbers = Some(vec![7]);
+        let bytes = meta.to_serialized_row_data().unwrap();
+
+        let back = DataFileMeta::from_serialized_row_data(&bytes, DataFileMetaRowLayout::WriteCols)
+            .unwrap();
+        assert_eq!(back.column_max_sequence_numbers, None);
+        meta.column_max_sequence_numbers = None;
+        assert_eq!(back, meta);
     }
 
     #[test]

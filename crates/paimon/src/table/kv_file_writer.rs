@@ -533,6 +533,7 @@ impl KeyValueFileWriter {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         })
     }
 

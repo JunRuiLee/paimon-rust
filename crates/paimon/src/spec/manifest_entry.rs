@@ -231,7 +231,8 @@ pub const MANIFEST_ENTRY_SCHEMA: &str = r#"["null", {
                 {"name": "_VALUE_STATS_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null},
                 {"name": "_EXTERNAL_PATH", "type": ["null", "string"], "default": null},
                 {"name": "_FIRST_ROW_ID", "type": ["null", "long"], "default": null},
-                {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null}
+                {"name": "_WRITE_COLS", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+                {"name": "_WRITE_COLS_SEQUENCES", "type": ["null", {"type": "array", "items": "long"}], "default": null}
             ]
         }}
     ]
