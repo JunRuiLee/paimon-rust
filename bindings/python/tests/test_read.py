@@ -736,10 +736,10 @@ def test_split_serialize_produces_split_v1_binary():
         version, type_id = struct.unpack_from(">ii", data, 8)
         assert version == 1
         assert type_id == 1
-        # DataSplit v8 body follows: MAGIC + VERSION(8)
+        # DataSplit body follows: MAGIC + VERSION
         magic, body_version = struct.unpack_from(">qi", data, 16)
         assert magic == -2394839472490812314
-        assert body_version == 8
+        assert body_version == 9
         assert splits[0].serialize() == data  # deterministic
 
 
