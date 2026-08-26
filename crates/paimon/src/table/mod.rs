@@ -68,6 +68,7 @@ mod pk_full_text_read;
 mod pk_full_text_scan;
 mod pk_search_position;
 mod pk_search_ranker;
+mod pk_vector_bucket_split;
 mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
@@ -126,6 +127,7 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use partition_stat::PartitionStat;
+pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
 pub use postpone_fixed_bucket_write::{
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,
