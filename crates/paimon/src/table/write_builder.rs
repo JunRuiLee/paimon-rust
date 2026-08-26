@@ -205,6 +205,16 @@ impl<'a> PaimonWriteBuilder<'a> {
 }
 
 pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
+    let options = crate::spec::CoreOptions::new(table.schema().options());
+    let declared = options.table_type()?;
+    if declared.requires_table_engine() {
+        return Err(crate::Error::Unsupported {
+            message: format!(
+                "table '{}' is declared '{declared}' and cannot be written as a Paimon table",
+                table.identifier().full_name()
+            ),
+        });
+    }
     table.ensure_not_branch_reference_for_write()?;
     // A time-travel table may carry a historical schema.
     let selector =

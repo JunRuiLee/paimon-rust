@@ -276,10 +276,7 @@ async fn get_table(
 ) -> DFResult<Table> {
     let table_str = require_arg(args, "table")?;
     let identifier = resolve_table_identifier(table_str, catalog_name)?;
-    catalog
-        .get_table(&identifier)
-        .await
-        .map_err(to_datafusion_error)
+    crate::table_loader::get_paimon_table(catalog, &identifier).await
 }
 
 fn managers(table: &Table) -> (SnapshotManager, TagManager) {

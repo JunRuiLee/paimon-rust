@@ -1173,6 +1173,7 @@ impl SQLContext {
             Err(paimon::Error::TableNotExist { .. }) => return self.ctx.sql(sql).await,
             Err(e) => return Err(to_datafusion_error(e)),
         };
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let definition = crate::table::build_table_definition(&table)?;
 
         let schema = Arc::new(Schema::new(vec![

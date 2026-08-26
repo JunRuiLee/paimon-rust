@@ -700,6 +700,8 @@ impl TableCommit {
     /// files or storage errors are ignored so abort cleanup never masks the
     /// original write failure.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
+        CoreOptions::new(self.table.schema().options())
+            .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         for message in commit_messages {
@@ -3135,6 +3137,13 @@ fn rand_f64() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abort_still_cleans_up_for_a_query_auth_table() {
+        let table = crate::table::query_auth_table();
+        let commit = crate::table::WriteBuilder::new(&table).new_commit();
+        commit.abort(&[]).await.unwrap();
+    }
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;

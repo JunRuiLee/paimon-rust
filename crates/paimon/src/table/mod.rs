@@ -452,6 +452,9 @@ impl Table {
         extra: HashMap<String, String>,
         strict: bool,
     ) -> Result<Self> {
+        // Resolution reads Paimon snapshot paths, so refuse before any IO.
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
@@ -482,6 +485,10 @@ impl Table {
     }
 
     pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
+        // The branch schema replaces this one wholesale and could drop the
+        // declared type, so refuse before any branch I/O.
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
         let branch = if branch_name.trim().is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: "Branch name cannot be empty.".to_string(),

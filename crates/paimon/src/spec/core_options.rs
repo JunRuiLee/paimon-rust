@@ -519,10 +519,39 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
-    /// Fail closed when `query-auth.enabled` is set: this client can't enforce the row
-    /// filter / column masking, so refuse to read. Call at every read boundary (build,
-    /// plan, materialize) so no binding fast-path can bypass it.
+    /// Fail closed at every storage boundary (build, plan, materialize): refuses a
+    /// `query-auth.enabled` table — this client can't enforce its row filter / column
+    /// masking — and a table whose declared type needs an engine of its own, which
+    /// this client would misread as Paimon.
     pub fn ensure_read_authorized(&self) -> crate::Result<()> {
+        self.ensure_query_auth_absent()?;
+        let declared = self.table_type()?;
+        if declared.requires_table_engine() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "a table declared '{declared}' cannot be served as a Paimon table"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Type-only half of [`Self::ensure_read_authorized`], for paths that must
+    /// not touch an engine-served table's storage but stay usable under
+    /// `query-auth` (e.g. best-effort cleanup).
+    pub(crate) fn ensure_type_paimon_served(&self, full_name: &str) -> crate::Result<()> {
+        let declared = self.table_type()?;
+        if declared.requires_table_engine() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "table '{full_name}' is declared '{declared}' and cannot be served as a Paimon table"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_query_auth_absent(&self) -> crate::Result<()> {
         if self.query_auth_enabled() {
             return Err(crate::Error::Unsupported {
                 message: "reading a table with 'query-auth.enabled' = true is not supported: \
@@ -933,7 +962,7 @@ impl<'a> CoreOptions<'a> {
     /// Both the table's stored options and a session's options go through
     /// here, so neither source can skip a check the other applies.
     pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
-        self.ensure_read_authorized()?;
+        self.ensure_query_auth_absent()?;
         self.validate_scan_options()?;
         if self.has_time_travel_selector() {
             return Err(crate::Error::Unsupported {

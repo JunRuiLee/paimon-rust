@@ -373,16 +373,26 @@ pub trait Catalog: Send + Sync {
 
     /// Load a table, or classify it as [`LoadedTable::External`] when this
     /// reader cannot construct it. One metadata round-trip either way, and the
-    /// outcome depends only on the table's own metadata. The default
-    /// implementation always constructs, for catalogs without a table-type
-    /// concept.
+    /// outcome depends only on the table's own metadata.
+    ///
+    /// The default implementation classifies from the constructed table, so a
+    /// catalog that only implements [`Catalog::get_table`] still fails closed.
+    /// Override it to classify before construction and skip the token and
+    /// FileIO work an external table does not need.
     ///
     /// # Errors
-    /// Same as [`Catalog::get_table`].
+    /// Everything [`Catalog::get_table`] returns, plus
+    /// [`crate::Error::Unsupported`] for an unknown declared type, or for an
+    /// external table whose stored options no engine can honor (query
+    /// authorization, unsupported scan options, time travel).
     async fn load_table(&self, identifier: &Identifier) -> Result<LoadedTable> {
-        Ok(LoadedTable::Paimon(Box::new(
-            self.get_table(identifier).await?,
-        )))
+        let table = self.get_table(identifier).await?;
+        let options = crate::spec::CoreOptions::new(table.schema().options());
+        let declared = options.table_type()?;
+        if declared.requires_table_engine() {
+            return LoadedTable::external(declared, &options, &identifier.full_name());
+        }
+        Ok(LoadedTable::Paimon(Box::new(table)))
     }
 
     /// List table names in a database. System tables are not listed.
@@ -514,8 +524,16 @@ pub trait Catalog: Send + Sync {
     /// `AbstractCatalog.listPartitions`. Catalogs with metastore-tracked
     /// partitions (e.g. `RESTCatalog`) override to return audit fields too.
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
-        let table = self.get_table(identifier).await?;
-        list_partitions_from_file_system(&table).await
+        match self.load_table(identifier).await? {
+            LoadedTable::Paimon(table) => list_partitions_from_file_system(&table).await,
+            LoadedTable::External(external) => Err(Error::Unsupported {
+                message: format!(
+                    "table '{}' is declared '{}', so it has no Paimon partitions to list",
+                    identifier.full_name(),
+                    external.declared()
+                ),
+            }),
+        }
     }
 
     /// Like [`Self::list_partitions`] but paged. Default impl ignores

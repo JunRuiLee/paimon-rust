@@ -151,6 +151,102 @@ impl Catalog for TypedTestCatalog {
 }
 
 #[derive(Debug)]
+struct LegacyTestCatalog {
+    inner: Arc<FileSystemCatalog>,
+}
+
+#[async_trait]
+impl Catalog for LegacyTestCatalog {
+    async fn list_databases(&self) -> PaimonResult<Vec<String>> {
+        self.inner.list_databases().await
+    }
+
+    async fn create_database(
+        &self,
+        name: &str,
+        ignore_if_exists: bool,
+        properties: HashMap<String, String>,
+    ) -> PaimonResult<()> {
+        self.inner
+            .create_database(name, ignore_if_exists, properties)
+            .await
+    }
+
+    async fn get_database(&self, name: &str) -> PaimonResult<Database> {
+        self.inner.get_database(name).await
+    }
+
+    async fn drop_database(
+        &self,
+        name: &str,
+        ignore_if_not_exists: bool,
+        cascade: bool,
+    ) -> PaimonResult<()> {
+        self.inner
+            .drop_database(name, ignore_if_not_exists, cascade)
+            .await
+    }
+
+    async fn get_table(&self, identifier: &Identifier) -> PaimonResult<Table> {
+        let (location, schema) = self.inner.fetch_table_schema(identifier).await?;
+        Ok(Table::new(
+            self.inner.file_io().clone(),
+            identifier.clone(),
+            location,
+            schema,
+            None,
+        ))
+    }
+
+    async fn list_tables(&self, database_name: &str) -> PaimonResult<Vec<String>> {
+        self.inner.list_tables(database_name).await
+    }
+
+    async fn create_table(
+        &self,
+        identifier: &Identifier,
+        creation: PaimonSchema,
+        ignore_if_exists: bool,
+    ) -> PaimonResult<()> {
+        self.inner
+            .create_table(identifier, creation, ignore_if_exists)
+            .await
+    }
+
+    async fn drop_table(
+        &self,
+        identifier: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> PaimonResult<()> {
+        self.inner
+            .drop_table(identifier, ignore_if_not_exists)
+            .await
+    }
+
+    async fn rename_table(
+        &self,
+        from: &Identifier,
+        to: &Identifier,
+        ignore_if_not_exists: bool,
+    ) -> PaimonResult<()> {
+        self.inner
+            .rename_table(from, to, ignore_if_not_exists)
+            .await
+    }
+
+    async fn alter_table(
+        &self,
+        identifier: &Identifier,
+        changes: Vec<SchemaChange>,
+        ignore_if_not_exists: bool,
+    ) -> PaimonResult<()> {
+        self.inner
+            .alter_table(identifier, changes, ignore_if_not_exists)
+            .await
+    }
+}
+
+#[derive(Debug)]
 struct FakeEngineResolver;
 
 #[async_trait]
@@ -777,4 +873,272 @@ async fn an_external_type_without_an_engine_says_so() {
     let msg = err.to_string();
     assert!(msg.contains("no table engine is registered"), "{msg}");
     assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+async fn legacy_catalog_with_iceberg_table() -> (TempDir, Arc<LegacyTestCatalog>) {
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
+    let schema = PaimonSchema::builder()
+        .column(
+            "id",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .column(
+            "pt",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .partition_keys(["pt"])
+        .option("type", "iceberg-table")
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_table(&Identifier::new(DB, "it"), schema, false)
+        .await
+        .unwrap();
+    (
+        paimon_dir,
+        Arc::new(LegacyTestCatalog { inner: fs_catalog }),
+    )
+}
+
+#[tokio::test]
+async fn the_default_load_table_classifies_for_a_catalog_that_only_has_get_table() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+
+    let loaded = catalog
+        .load_table(&Identifier::new(DB, "it"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(loaded, LoadedTable::External(ref e) if e.declared() == TableType::IcebergTable),
+        "{loaded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_cannot_serve_an_external_table_as_paimon() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog(CATALOG, catalog).await.unwrap();
+
+    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.it")).await else {
+        panic!("a legacy catalog must not serve an iceberg table as Paimon");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("no table engine is registered"), "{msg}");
+    assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_hand_built_external_table_is_rejected_by_the_provider() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+    let Err(err) = paimon_datafusion::PaimonTableProvider::try_new(table) else {
+        panic!("a table declared iceberg-table must not become a Paimon provider");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("cannot be read as a Paimon table"), "{msg}");
+    assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+async fn legacy_sql_context() -> (TempDir, SQLContext) {
+    let (dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog(CATALOG, catalog).await.unwrap();
+    (dir, ctx)
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_every_destructive_statement() {
+    let (_dir, ctx) = legacy_sql_context().await;
+
+    for sql in [
+        format!("INSERT INTO {CATALOG}.{DB}.it VALUES (1)"),
+        format!("INSERT OVERWRITE {CATALOG}.{DB}.it PARTITION (pt = 1) VALUES (1)"),
+        format!("UPDATE {CATALOG}.{DB}.it SET id = 2"),
+        format!("DELETE FROM {CATALOG}.{DB}.it"),
+        format!("TRUNCATE TABLE {CATALOG}.{DB}.it"),
+        format!("CALL {CATALOG}.sys.create_tag(table => '{DB}.it', tag => 't1')"),
+    ] {
+        let outcome = match ctx.sql(&sql).await {
+            Err(err) => Err(err),
+            Ok(df) => df.collect().await.map(|_| ()),
+        };
+        let Err(err) = outcome else {
+            panic!("must not run against an iceberg-table: {sql}");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("iceberg-table") || msg.contains("no table engine is registered"),
+            "{sql} -> {msg}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_system_tables() {
+    let (_dir, ctx) = legacy_sql_context().await;
+
+    let outcome = match ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.\"it$snapshots\""))
+        .await
+    {
+        Err(err) => Err(err),
+        Ok(df) => df.collect().await.map(|_| ()),
+    };
+    let Err(err) = outcome else {
+        panic!("a system table on an iceberg-table must not resolve");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_paimon_reads_and_writes_in_core() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+
+    let read = table.new_read_builder().new_read();
+    assert!(read.is_err(), "core read must be refused");
+
+    let write = paimon::table::WriteBuilder::new(&table).new_write();
+    assert!(write.is_err(), "core write must be refused");
+
+    let commit = paimon::table::WriteBuilder::new(&table).new_commit();
+    assert!(
+        commit.commit(Vec::new()).await.is_err(),
+        "core commit must be refused"
+    );
+    assert!(
+        commit.truncate_table_with_identifier(1).await.is_err(),
+        "core truncate must be refused"
+    );
+    assert!(
+        commit.abort(&[]).await.is_err(),
+        "core abort must be refused"
+    );
+
+    let incremental = table
+        .new_read_builder()
+        .new_incremental_scan(paimon::table::IncrementalScanMode::Delta, 0, 1)
+        .plan()
+        .await;
+    assert!(
+        incremental.is_err(),
+        "core incremental scan must be refused"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_scan_planning_rather_than_reporting_empty() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+
+    let plan = table.new_read_builder().new_scan().plan().await;
+    assert!(
+        plan.is_err(),
+        "planning must be refused, not answered with an empty plan"
+    );
+
+    let stats = table.partition_stats().await;
+    assert!(stats.is_err(), "partition stats must be refused");
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_the_infallible_commit_path() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+
+    let commit = paimon::table::WriteBuilder::new(&table).new_commit();
+    assert!(
+        commit.truncate_table().await.is_err(),
+        "truncate must not write Paimon metadata over foreign data"
+    );
+}
+
+#[tokio::test]
+async fn a_dynamic_copy_cannot_launder_the_declared_type() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+
+    let copied =
+        table.copy_with_options(HashMap::from([("type".to_string(), "table".to_string())]));
+    assert!(
+        copied.new_read_builder().new_read().is_err(),
+        "an override of 'type' must not re-route foreign data through the Paimon reader"
+    );
+    assert!(
+        paimon::table::WriteBuilder::new(&copied)
+            .new_write()
+            .is_err(),
+        "an override of 'type' must not open a Paimon write on foreign data"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_catalog_refuses_show_create() {
+    let (_dir, ctx) = legacy_sql_context().await;
+
+    let outcome = match ctx
+        .sql(&format!("SHOW CREATE TABLE {CATALOG}.{DB}.it"))
+        .await
+    {
+        Err(err) => Err(err),
+        Ok(df) => df.collect().await.map(|_| ()),
+    };
+    let Err(err) = outcome else {
+        panic!("SHOW CREATE must not emit Paimon DDL for an iceberg-table");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_branch_copy_cannot_launder_the_declared_type() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+
+    assert!(
+        table.copy_with_branch("b1").await.is_err(),
+        "a branch copy must not shed the declared type"
+    );
+    assert!(
+        table
+            .copy_with_time_travel(HashMap::from([(
+                "scan.snapshot-id".to_string(),
+                "1".to_string(),
+            )]))
+            .await
+            .is_err(),
+        "time travel must not read Paimon snapshot paths of foreign data"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_external_table_does_not_pollute_the_blob_registry() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let table = catalog.get_table(&Identifier::new(DB, "it")).await.unwrap();
+    let location = table.location().to_string();
+
+    let registry = paimon_datafusion::BlobReaderRegistry::default();
+    let built = paimon_datafusion::PaimonTableProvider::try_new_with_blob_reader_registry(
+        table,
+        registry.clone(),
+    );
+    assert!(
+        built.is_err(),
+        "an iceberg-table must not become a provider"
+    );
+    assert!(
+        registry.resolve(&format!("{location}/blob/x")).is_none(),
+        "a rejected table must leave no registration behind"
+    );
 }

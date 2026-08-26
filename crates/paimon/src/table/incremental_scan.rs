@@ -244,6 +244,7 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
+        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();
         self.validate_snapshot_range(mode).await?;
         if self.start_exclusive == self.end_inclusive {

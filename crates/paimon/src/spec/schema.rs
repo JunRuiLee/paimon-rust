@@ -19,7 +19,7 @@ use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
     CHANGELOG_PRODUCER_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
-    TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
+    TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION, TABLE_TYPE_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -144,11 +144,17 @@ impl TableSchema {
 
     /// Create a copy of this schema with extra options merged in.
     ///
-    /// A stored `query-auth.enabled = true` can't be turned off by a dynamic override.
+    /// A stored `query-auth.enabled = true` can't be turned off by a dynamic
+    /// override, and the declared `type` can't be changed by one: an override
+    /// could re-route foreign data through the Paimon reader.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
         if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
         }
+        match self.options.get(TABLE_TYPE_OPTION) {
+            Some(declared) => extra.insert(TABLE_TYPE_OPTION.to_string(), declared.clone()),
+            None => extra.remove(TABLE_TYPE_OPTION),
+        };
         let mut new_schema = self.clone();
         new_schema.options.extend(extra);
         new_schema

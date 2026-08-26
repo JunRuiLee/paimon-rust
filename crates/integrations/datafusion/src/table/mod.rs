@@ -121,6 +121,8 @@ impl PaimonTableProvider {
         table: Table,
         table_definition: Option<String>,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let fields = datafusion_read_fields(&table);
         let schema = datafusion_arrow_schema(&fields, true)?;
         Ok(Self {
@@ -134,6 +136,8 @@ impl PaimonTableProvider {
         table: Table,
         blob_reader_registry: BlobReaderRegistry,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new(table)
@@ -144,6 +148,8 @@ impl PaimonTableProvider {
         blob_reader_registry: BlobReaderRegistry,
         table_definition: Option<String>,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)
