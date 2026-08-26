@@ -911,6 +911,7 @@ mod tests {
             external_path: Some("s3://bucket/external/data-0.row".to_string()),
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         };
 
         assert_eq!(
@@ -968,6 +969,7 @@ mod tests {
             external_path: Some(format!("{external_dir}/data-0.row")),
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         };
         let entry = ManifestEntry::new(FileKind::Add, vec![0u8; 12], 0, 1, data_file, 0);
         Manifest::write(&file_io, &manifest_path, &[entry])
@@ -1248,6 +1250,7 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         };
         let entry = ManifestEntry::new(FileKind::Add, vec![0u8; 12], 0, 1, data_file, 2);
         Manifest::write(&file_io, &manifest_path, &[entry])

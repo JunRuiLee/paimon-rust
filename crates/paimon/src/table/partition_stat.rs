@@ -242,6 +242,7 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         };
         ManifestEntry::new(kind, partition, 0, 1, file, 2)
     }

@@ -1102,6 +1102,7 @@ mod row_tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -1543,6 +1544,7 @@ mod tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -1994,6 +1996,7 @@ mod vector_parquet_tests {
             external_path: None,
             first_row_id: None,
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 

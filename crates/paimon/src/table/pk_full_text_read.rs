@@ -719,6 +719,7 @@ mod read_tests {
             external_path: None,
             first_row_id: Some(0),
             write_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 

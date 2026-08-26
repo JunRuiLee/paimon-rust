@@ -221,6 +221,7 @@ fn decode_data_file_meta(
     let mut external_path: Option<String> = None;
     let mut first_row_id: Option<i64> = None;
     let mut write_cols: Option<Vec<String>> = None;
+    let mut column_max_sequence_numbers: Option<Vec<i64>> = None;
 
     for field in &writer_schema.fields {
         match field.name.as_str() {
@@ -260,6 +261,9 @@ fn decode_data_file_meta(
             "_EXTERNAL_PATH" => external_path = decode_nullable_string(cursor, field.nullable)?,
             "_FIRST_ROW_ID" => first_row_id = decode_nullable_long(cursor, field.nullable)?,
             "_WRITE_COLS" => write_cols = decode_nullable_string_array(cursor, field.nullable)?,
+            "_WRITE_COLS_SEQUENCES" => {
+                column_max_sequence_numbers = decode_nullable_long_array(cursor, field.nullable)?
+            }
             _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
         }
     }
@@ -285,6 +289,7 @@ fn decode_data_file_meta(
         external_path,
         first_row_id,
         write_cols,
+        column_max_sequence_numbers,
     })
 }
 
@@ -307,6 +312,55 @@ fn decode_string_array(cursor: &mut AvroCursor) -> crate::Result<Vec<String>> {
         }
     }
     Ok(result)
+}
+
+/// Decode an Avro `array<long>` whose items are plain (non-union) longs, mirroring
+/// [`decode_string_array`]. Paimon declares `_WRITE_COLS_SEQUENCES` as
+/// `array<bigint not null>`, so items carry no per-element union index.
+fn decode_long_array(cursor: &mut AvroCursor) -> crate::Result<Vec<i64>> {
+    let mut result = Vec::new();
+    loop {
+        let count = cursor.read_long()?;
+        if count == 0 {
+            break;
+        }
+        let count = if count < 0 {
+            cursor.skip_long()?;
+            neg_count_to_usize(count)?
+        } else {
+            count as usize
+        };
+        // A zigzag long is at least one byte, so the remaining input bounds how many
+        // elements can really follow. Reserving the declared count instead would let a
+        // corrupt manifest ask for an arbitrary allocation before the first read fails.
+        result.reserve(count.min(cursor.remaining()));
+        for _ in 0..count {
+            result.push(cursor.read_long()?);
+        }
+    }
+    Ok(result)
+}
+
+fn decode_nullable_long_array(
+    cursor: &mut AvroCursor,
+    nullable: bool,
+) -> crate::Result<Option<Vec<i64>>> {
+    if nullable {
+        // A two-branch `["null", array]` union only ever encodes 0 or 1. Anything else
+        // means the stream is not where the schema says it is, so stop rather than read
+        // the following bytes as an array.
+        match cursor.read_union_index()? {
+            0 => return Ok(None),
+            1 => {}
+            other => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("invalid union index {other} for _WRITE_COLS_SEQUENCES"),
+                    source: None,
+                })
+            }
+        }
+    }
+    Ok(Some(decode_long_array(cursor)?))
 }
 
 fn decode_nullable_long(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<i64>> {
@@ -406,5 +460,6 @@ fn default_data_file_meta() -> DataFileMeta {
         external_path: None,
         first_row_id: None,
         write_cols: None,
+        column_max_sequence_numbers: None,
     }
 }
