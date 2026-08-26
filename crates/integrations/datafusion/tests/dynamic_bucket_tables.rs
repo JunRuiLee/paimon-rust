@@ -1000,10 +1000,7 @@ async fn test_pk_dynamic_bucket_partitioned_insert_overwrite() {
     }
 
     // Total hash count: partition 'b' had 2 keys, partition 'a' now has 1 key
-    let total_hashes: i64 = entries_after
-        .iter()
-        .map(|e| e.index_file.row_count as i64)
-        .sum();
+    let total_hashes: i64 = entries_after.iter().map(|e| e.index_file.row_count).sum();
     assert_eq!(
         total_hashes, 3,
         "Total hash entries should be 3 (2 from 'b' + 1 from 'a'), got {total_hashes}"

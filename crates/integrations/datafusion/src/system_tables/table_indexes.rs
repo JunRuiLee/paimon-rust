@@ -132,7 +132,7 @@ impl TableProvider for TableIndexesTable {
             index_types.push(index_file.index_type.as_str());
             file_names.push(index_file.file_name.as_str());
             file_sizes.push(index_file.file_size);
-            row_counts.push(i64::from(index_file.row_count));
+            row_counts.push(index_file.row_count);
             append_dv_ranges(
                 &mut dv_ranges,
                 index_file
