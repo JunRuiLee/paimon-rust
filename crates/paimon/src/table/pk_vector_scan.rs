@@ -20,18 +20,55 @@
 //! search split per bucket. Mirror of Java `PrimaryKeyVectorScan` and
 //! `PrimaryKeyIndexSourcePolicy`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use indexmap::IndexMap;
+
+use roaring::RoaringTreemap;
 
 use crate::spec::{
     should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest,
     Predicate, PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
 };
+use crate::table::bucket_filter::split_partition_and_data_predicates;
+use crate::table::partition_filter::PartitionFilter;
+use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
-use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
+use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, RowRange};
 use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
 
 const INDEX_DIR: &str = "index";
+
+/// A bucket's identity across planning inputs: the partition's serialized bytes
+/// (`BinaryRow` is not hashable) paired with the bucket number.
+type BucketKey = (Vec<u8>, i32);
+
+/// Expand inclusive row ranges into the positions they allow.
+#[cfg_attr(not(test), allow(dead_code))]
+fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
+    let mut positions = RoaringTreemap::new();
+    for range in ranges {
+        let from = u64::try_from(range.from())
+            .map_err(|_| data_invalid("row range bound must not be negative"))?;
+        let to = u64::try_from(range.to())
+            .map_err(|_| data_invalid("row range bound must not be negative"))?;
+        positions.insert_range(from..=to);
+    }
+    Ok(positions)
+}
+
+/// Every position in a file, for a file the message left unrestricted.
+#[cfg_attr(not(test), allow(dead_code))]
+fn positions_in_whole_file(row_count: i64) -> crate::Result<RoaringTreemap> {
+    let rows = u64::try_from(row_count)
+        .map_err(|_| data_invalid("data file row count must not be negative"))?;
+    let mut positions = RoaringTreemap::new();
+    if rows > 0 {
+        positions.insert_range(0..=rows - 1);
+    }
+    Ok(positions)
+}
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -197,6 +234,14 @@ pub(crate) struct PkVectorScanPlan {
     // at all (never written), which also yields empty `splits`.
     pub snapshot_id: i64,
     pub splits: Vec<PkVectorSearchSplit>,
+    // Per-split allow-list of physical row positions, indexed parallel to `splits`:
+    // only the positions listed for a data file may produce candidates from it.
+    // Populated when the plan was built from engine-supplied bucket splits, which
+    // carry row ranges the engine's own planner already resolved. `None` for a plan
+    // read from this table's index manifest, which places no positional restriction
+    // of its own -- distinct from `Some` of an empty allow-list, which permits
+    // nothing.
+    pub physical_row_ranges_by_split: Option<Vec<HashMap<String, RoaringTreemap>>>,
 }
 
 pub(crate) struct PkVectorScan<'a> {
@@ -262,6 +307,7 @@ impl<'a> PkVectorScan<'a> {
             return Ok(PkVectorScanPlan {
                 snapshot_id: 0,
                 splits: Vec::new(),
+                physical_row_ranges_by_split: None,
             });
         };
         let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
@@ -313,8 +359,226 @@ impl<'a> PkVectorScan<'a> {
         Ok(PkVectorScanPlan {
             snapshot_id,
             splits,
+            physical_row_ranges_by_split: None,
         })
     }
+
+    /// Build a plan from bucket splits an engine planned elsewhere, instead of from
+    /// this table's index manifest.
+    ///
+    /// The splits are the planning input and are taken as authoritative: their
+    /// payload files, their per-file row ranges, and the snapshot they pin are used
+    /// as given, and no index manifest is read. Only the partition conjuncts of this
+    /// scan's filter are re-applied, because a caller may narrow the query further
+    /// than the planner that produced the splits.
+    ///
+    /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
+    /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
+    /// the split allows.
+    /// Build a plan from bucket splits an engine planned elsewhere, instead of from
+    /// this table's index manifest.
+    ///
+    /// The splits are the planning input and are taken as authoritative: their
+    /// payload files, their per-file row ranges, and the snapshot they pin are used
+    /// as given, and no index manifest is read. Only the partition conjuncts of this
+    /// scan's filter are re-applied, because a caller may narrow the query further
+    /// than the planner that produced the splits.
+    ///
+    /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
+    /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
+    /// the split allows.
+    // Entry point for engine-supplied splits; no in-tree caller reads a plan from
+    // them yet, and the tests drive `plan_from_bucket_splits` directly.
+    #[allow(dead_code)]
+    pub(crate) fn plan_for_bucket_vector_splits(
+        &self,
+        splits: Vec<BucketVectorSearchSplit>,
+    ) -> crate::Result<PkVectorScanPlan> {
+        // Partition conjuncts only. Data conjuncts stay a per-row residual applied
+        // during the search: pruning a whole bucket on them would drop rows that
+        // still match.
+        let partition_filter = self.filter.as_ref().and_then(|filter| {
+            let (partition_predicate, _data_predicates) = split_partition_and_data_predicates(
+                filter.clone(),
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+            );
+            partition_predicate.map(|predicate| {
+                PartitionFilter::from_predicate(predicate, &self.table.schema().partition_fields())
+            })
+        });
+        plan_from_bucket_splits(
+            &self.index_type,
+            self.vector_field_id,
+            partition_filter.as_ref(),
+            self.table.location().trim_end_matches('/'),
+            self.table
+                .schema()
+                .core_options()
+                .index_file_in_data_file_dir(),
+            splits,
+        )
+    }
+}
+
+/// The `Table`-independent core of [`PkVectorScan::plan_for_bucket_vector_splits`],
+/// so planning from engine-supplied splits is testable the same way planning from a
+/// manifest is.
+#[cfg_attr(not(test), allow(dead_code))]
+fn plan_from_bucket_splits(
+    index_type: &str,
+    vector_field_id: i32,
+    partition_filter: Option<&PartitionFilter>,
+    table_path: &str,
+    index_file_in_data_file_dir: bool,
+    splits: Vec<BucketVectorSearchSplit>,
+) -> crate::Result<PkVectorScanPlan> {
+    // A plan's snapshot id stays authoritative even when nothing is searchable, and
+    // empty input pins no snapshot to report. Reject rather than invent one.
+    if splits.is_empty() {
+        return Err(data_invalid(
+            "bucket-split planning requires at least one bucket split",
+        ));
+    }
+
+    let mut snapshot_id: Option<i64> = None;
+    let mut seen_buckets: HashSet<BucketKey> = HashSet::new();
+    let mut data_splits: Vec<DataSplit> = Vec::with_capacity(splits.len());
+    let mut index_entries: Vec<(BinaryRow, i32, GlobalIndexMeta, String, u64, String)> = Vec::new();
+    let mut listed_ranges: HashMap<BucketKey, IndexMap<String, Vec<RowRange>>> = HashMap::new();
+
+    for split in splits {
+        let (data_split, payload_files, row_ranges_by_file) = split.into_parts();
+
+        // Row ranges belong to the bucket form, one list per data file. A nested
+        // split carrying its own would be a second authority over which physical
+        // rows are readable, free to disagree with the first. Java's planner
+        // builds the nested split without them.
+        if data_split.row_ranges().is_some() {
+            return Err(data_invalid(
+                "a bucket split's nested data split must not carry row ranges",
+            ));
+        }
+
+        // One snapshot across every split: candidates found under different
+        // snapshots cannot be merged into a single Top-K. Checked before pruning,
+        // so a mismatch is reported even when the offending split would have been
+        // pruned away and the inconsistency left no trace.
+        match snapshot_id {
+            None => snapshot_id = Some(data_split.snapshot_id()),
+            Some(pinned) if pinned != data_split.snapshot_id() => {
+                return Err(data_invalid(format!(
+                    "bucket splits pin different snapshots: {} and {}",
+                    pinned,
+                    data_split.snapshot_id()
+                )));
+            }
+            Some(_) => {}
+        }
+
+        // Java emits exactly one split per (partition, bucket). Buffers decoded
+        // independently cannot enforce that between them, and two splits for one
+        // bucket would search its rows twice.
+        let key: BucketKey = (
+            data_split.partition().to_serialized_bytes(),
+            data_split.bucket(),
+        );
+        if !seen_buckets.insert(key.clone()) {
+            return Err(data_invalid(format!(
+                "bucket splits repeat bucket {} of one partition",
+                data_split.bucket()
+            )));
+        }
+
+        if let Some(filter) = partition_filter {
+            if !filter.matches_entry(&key.0)? {
+                continue;
+            }
+        }
+
+        for payload in payload_files {
+            let parts = payload.into_parts();
+            // The same three filters the manifest route applies: this column's
+            // index type, this column's field id, and a payload that carries the
+            // source metadata a search needs to map ordinals back to rows.
+            if parts.index_type != index_type
+                || parts.global_index_meta.index_field_id != vector_field_id
+                || parts.global_index_meta.source_meta.is_none()
+            {
+                continue;
+            }
+            // Java writes the size as a signed long, so the wire allows a
+            // negative value the segment addressing cannot represent.
+            let file_size = u64::try_from(parts.file_size)
+                .map_err(|_| data_invalid("index file size must not be negative"))?;
+            // Java records an external path only for an index stored outside the
+            // table, so an ordinary bucket-local payload carries none and is
+            // resolved against the bucket directory the engine serialized when the
+            // table keeps index files there, and the table `index/` directory
+            // otherwise. Mirrors `IndexInDataFileDirPathFactory.toPath`.
+            let path = match parts.external_path {
+                Some(external) => external,
+                None if index_file_in_data_file_dir => {
+                    format!("{}/{}", data_split.bucket_path(), parts.file_name)
+                }
+                None => format!("{table_path}/{INDEX_DIR}/{}", parts.file_name),
+            };
+            index_entries.push((
+                data_split.partition().clone(),
+                data_split.bucket(),
+                parts.global_index_meta,
+                path,
+                file_size,
+                parts.file_name,
+            ));
+        }
+
+        listed_ranges.insert(key, row_ranges_by_file);
+        data_splits.push(data_split);
+    }
+
+    // Non-empty input always pins one: the first split sets it and a mismatch
+    // returns early.
+    let snapshot_id = snapshot_id.expect("non-empty bucket-split input pins a snapshot");
+
+    let splits = plan_from_inputs(snapshot_id, data_splits, index_entries)?;
+
+    // Normalize the row ranges against the planned splits, which are grouped by
+    // bucket and so may be ordered differently from the input.
+    //
+    // A file the message lists is restricted to the positions it lists. A file it
+    // omits is unrestricted: Java records ranges only for the files its own
+    // pre-filter narrowed, and leaves the rest out. The search kernel reads a
+    // missing entry as "no rows allowed", the opposite meaning, so the omission
+    // has to be turned into an explicit full-file range here rather than passed
+    // through.
+    let physical_row_ranges_by_split = splits
+        .iter()
+        .map(|split| {
+            let listed = listed_ranges.get(&(
+                split.data_split.partition().to_serialized_bytes(),
+                split.data_split.bucket(),
+            ));
+            split
+                .data_split
+                .data_files()
+                .iter()
+                .map(|file| {
+                    let allowed = match listed.and_then(|ranges| ranges.get(&file.file_name)) {
+                        Some(ranges) => positions_in_ranges(ranges)?,
+                        None => positions_in_whole_file(file.row_count)?,
+                    };
+                    Ok((file.file_name.clone(), allowed))
+                })
+                .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    Ok(PkVectorScanPlan {
+        snapshot_id,
+        splits,
+        physical_row_ranges_by_split: Some(physical_row_ranges_by_split),
+    })
 }
 
 /// Pure planning core, drivable without a live snapshot: group ANN payloads and
@@ -390,6 +654,8 @@ mod tests {
     use super::*;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{BinaryRow, DataFileMeta, GlobalIndexMeta};
+    use crate::spec::{DataField, DeletionVectorMeta};
+    use crate::table::pk_vector_bucket_split::BucketVectorPayload;
     use crate::table::source::{DataSplitBuilder, DeletionFile};
 
     fn dfm(name: &str, rows: i64, level: i32, file_source: Option<i32>) -> DataFileMeta {
@@ -899,5 +1165,409 @@ mod tests {
                 "non-pk predicate stats-excludes the file under deletion vectors"
             );
         }
+    }
+
+    // ---- planning from engine-supplied bucket splits ----
+
+    const BUCKET_SPLIT_GOLDEN: &[u8] = include_bytes!("goldens/bucket_vector_search_split_v1.bin");
+
+    fn int_partition(value: i32) -> BinaryRow {
+        let mut builder = crate::spec::BinaryRowBuilder::new(1);
+        builder.write_int(0, value);
+        BinaryRow::from_serialized_bytes(&builder.build_serialized()).unwrap()
+    }
+
+    /// A bucket split as an engine would hand one over. Its data files are COMPACT
+    /// above level 0, so they are exact-fallback eligible, and the caller's payload
+    /// metadata is expected to name exactly that level's source set.
+    fn engine_split(
+        snapshot: i64,
+        bucket: i32,
+        partition: BinaryRow,
+        files: Vec<DataFileMeta>,
+        payloads: Vec<BucketVectorPayload>,
+        ranges: &[(&str, &[(i64, i64)])],
+    ) -> BucketVectorSearchSplit {
+        let data_split = DataSplitBuilder::new()
+            .with_snapshot(snapshot)
+            .with_partition(partition)
+            .with_bucket(bucket)
+            .with_bucket_path(format!("bucket-{bucket}"))
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .build()
+            .unwrap();
+        BucketVectorSearchSplit::new_for_test(
+            data_split,
+            payloads,
+            ranges
+                .iter()
+                .map(|(name, bounds)| {
+                    (
+                        (*name).to_string(),
+                        bounds
+                            .iter()
+                            .map(|(from, to)| RowRange::new(*from, *to))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn engine_payload(meta: GlobalIndexMeta) -> BucketVectorPayload {
+        BucketVectorPayload::new_for_test("ivf-pq", "seg0", 1, 4, None, None, meta)
+    }
+
+    /// One bucket holding `d0`, with a payload whose source set matches it.
+    fn one_file_split(
+        snapshot: i64,
+        bucket: i32,
+        ranges: &[(&str, &[(i64, i64)])],
+    ) -> BucketVectorSearchSplit {
+        engine_split(
+            snapshot,
+            bucket,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1))],
+            vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
+            ranges,
+        )
+    }
+
+    fn allowed(map: &HashMap<String, RoaringTreemap>, file: &str) -> Vec<u64> {
+        map.get(file)
+            .map(|positions| positions.iter().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn plans_the_java_golden_bucket_split() {
+        let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_GOLDEN).unwrap();
+        let plan = plan_from_bucket_splits("ivf-pq", 7, None, "/tbl", false, vec![split]).unwrap();
+
+        // The snapshot the split pins, not one re-resolved from the table.
+        assert_eq!(plan.snapshot_id, 11);
+        assert_eq!(plan.splits.len(), 1);
+        let planned = &plan.splits[0];
+
+        // The payload's own external path wins over both directory layouts.
+        assert_eq!(planned.ann_segments.len(), 1);
+        assert_eq!(planned.ann_segments[0].path, "s3://vector-bucket/ann-0.idx");
+        assert_eq!(planned.ann_segments[0].file_size, 5_000_000_000);
+        assert_eq!(planned.ann_segments[0].source_meta.data_level(), 1);
+
+        // `data-1.orc` is COMPACT above level 0, so exact fallback may read it.
+        assert_eq!(planned.active_files.len(), 1);
+        assert_eq!(planned.active_files[0].file_name, "data-1.orc");
+
+        // The message allows rows 0-1 and 4-5 of a six-row file.
+        let ranges = plan
+            .physical_row_ranges_by_split
+            .expect("a split-driven plan restricts positions");
+        assert_eq!(allowed(&ranges[0], "data-1.orc"), vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn manifest_planning_leaves_positions_unrestricted() {
+        // The manifest route must keep reporting `None`, which means "no positional
+        // restriction" -- not an empty allow-list, which would permit nothing.
+        let entries = vec![(
+            BinaryRow::new(0),
+            0,
+            gim(2, 5, &[("d0", 3)]),
+            "idx/seg0".to_string(),
+            10u64,
+            "seg0".to_string(),
+        )];
+        let data = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/t/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
+            .build()
+            .unwrap();
+        let splits = plan_from_inputs(1, vec![data], entries).unwrap();
+        assert_eq!(splits.len(), 1);
+    }
+
+    #[test]
+    fn rejects_empty_bucket_split_input() {
+        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, Vec::new())
+            .map(|_| ())
+            .expect_err("empty input pins no snapshot to report");
+        assert!(
+            error.to_string().contains("at least one bucket split"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_bucket_splits_pinning_different_snapshots() {
+        let error = plan_from_bucket_splits(
+            "ivf-pq",
+            2,
+            None,
+            "/tbl",
+            false,
+            vec![one_file_split(11, 0, &[]), one_file_split(12, 1, &[])],
+        )
+        .map(|_| ())
+        .expect_err("candidates from two snapshots cannot merge into one Top-K");
+        assert!(
+            error.to_string().contains("pin different snapshots"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_two_splits_for_one_bucket() {
+        let error = plan_from_bucket_splits(
+            "ivf-pq",
+            2,
+            None,
+            "/tbl",
+            false,
+            vec![one_file_split(11, 0, &[]), one_file_split(11, 0, &[])],
+        )
+        .map(|_| ())
+        .expect_err("one bucket twice would search its rows twice");
+        assert!(error.to_string().contains("repeat bucket 0"), "{error}");
+    }
+
+    #[test]
+    fn rejects_nested_data_split_carrying_row_ranges() {
+        let data_split = DataSplitBuilder::new()
+            .with_snapshot(11)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![dfm("d0", 4, 5, Some(1))])
+            .with_row_ranges(vec![RowRange::new(0, 1)])
+            .build()
+            .unwrap();
+        let split = BucketVectorSearchSplit::new_for_test(
+            data_split,
+            vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
+            IndexMap::new(),
+        );
+        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
+            .map(|_| ())
+            .expect_err("two row-range authorities may disagree");
+        assert!(
+            error.to_string().contains("must not carry row ranges"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unlisted_file_is_unrestricted_and_an_empty_list_excludes_one() {
+        // Java records ranges only for the files its own pre-filter narrowed, so an
+        // omitted file means "all rows". An explicitly empty list means "no rows",
+        // and the two must not collapse into each other.
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1)), dfm("d1", 3, 5, Some(1))],
+            vec![engine_payload(gim(2, 5, &[("d0", 4), ("d1", 3)]))],
+            &[("d0", &[])],
+        );
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let ranges = plan
+            .physical_row_ranges_by_split
+            .expect("split-driven plan");
+
+        assert!(allowed(&ranges[0], "d0").is_empty());
+        assert_eq!(allowed(&ranges[0], "d1"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn rejects_negative_payload_file_size() {
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1))],
+            vec![BucketVectorPayload::new_for_test(
+                "ivf-pq",
+                "seg0",
+                -1,
+                4,
+                None,
+                None,
+                gim(2, 5, &[("d0", 4)]),
+            )],
+            &[],
+        );
+        let error = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
+            .map(|_| ())
+            .expect_err("a signed wire size can be negative, segment addressing cannot");
+        assert!(
+            error.to_string().contains("must not be negative"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ignores_payload_deletion_vector_ranges() {
+        // The field belongs to deletion-vector index files. Java builds a vector
+        // payload through the overload that leaves it null, and a read takes its
+        // deletion vectors from the bucket's data split, so a value here describes
+        // something this payload is not.
+        let mut dv = IndexMap::new();
+        dv.insert(
+            "d0".to_string(),
+            DeletionVectorMeta {
+                offset: 0,
+                length: 8,
+                cardinality: Some(1),
+            },
+        );
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1))],
+            vec![BucketVectorPayload::new_for_test(
+                "ivf-pq",
+                "seg0",
+                1,
+                4,
+                Some(dv),
+                None,
+                gim(2, 5, &[("d0", 4)]),
+            )],
+            &[],
+        );
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        assert_eq!(plan.splits.len(), 1);
+        assert_eq!(plan.splits[0].ann_segments.len(), 1);
+        let ranges = plan
+            .physical_row_ranges_by_split
+            .expect("split-driven plan");
+        // Unaffected: the whole file stays readable.
+        assert_eq!(allowed(&ranges[0], "d0"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn skips_payloads_for_another_column_or_index_type() {
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", 4, 5, Some(1))],
+            vec![
+                // Another column's vector index.
+                engine_payload(gim(99, 5, &[("d0", 4)])),
+                // This column, but another index type.
+                BucketVectorPayload::new_for_test(
+                    "flat",
+                    "seg1",
+                    1,
+                    4,
+                    None,
+                    None,
+                    gim(2, 5, &[("d0", 4)]),
+                ),
+            ],
+            &[],
+        );
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        assert_eq!(plan.splits.len(), 1);
+        assert!(plan.splits[0].ann_segments.is_empty());
+        // Still exact-fallback eligible: no ANN segment covers the file.
+        assert_eq!(plan.splits[0].active_files.len(), 1);
+    }
+
+    fn partition_filter_on_dt(keep: i32) -> PartitionFilter {
+        let fields = vec![DataField::new(
+            0,
+            "dt".to_string(),
+            crate::spec::DataType::Int(crate::spec::IntType::new()),
+        )];
+        let builder = crate::spec::PredicateBuilder::new(&fields);
+        let predicate = builder.equal("dt", crate::spec::Datum::Int(keep)).unwrap();
+        PartitionFilter::from_predicate(predicate, &fields)
+    }
+
+    #[test]
+    fn snapshot_mismatch_is_rejected_before_partition_pruning() {
+        // Both splits are pruned by this filter. The mismatch must still be reported:
+        // pruning first would hide an inconsistent input behind an empty plan.
+        let filter = partition_filter_on_dt(3);
+        let error = plan_from_bucket_splits(
+            "ivf-pq",
+            2,
+            Some(&filter),
+            "/tbl",
+            false,
+            vec![
+                engine_split(
+                    11,
+                    0,
+                    int_partition(1),
+                    vec![dfm("d0", 4, 5, Some(1))],
+                    vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
+                    &[],
+                ),
+                engine_split(
+                    12,
+                    1,
+                    int_partition(2),
+                    vec![dfm("d0", 4, 5, Some(1))],
+                    vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
+                    &[],
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("a snapshot mismatch outranks pruning");
+        assert!(
+            error.to_string().contains("pin different snapshots"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn pruning_every_split_keeps_the_pinned_snapshot() {
+        let filter = partition_filter_on_dt(3);
+        let plan = plan_from_bucket_splits(
+            "ivf-pq",
+            2,
+            Some(&filter),
+            "/tbl",
+            false,
+            vec![engine_split(
+                11,
+                0,
+                int_partition(1),
+                vec![dfm("d0", 4, 5, Some(1))],
+                vec![engine_payload(gim(2, 5, &[("d0", 4)]))],
+                &[],
+            )],
+        )
+        .unwrap();
+        assert!(plan.splits.is_empty());
+        // Still authoritative with nothing left to search.
+        assert_eq!(plan.snapshot_id, 11);
+        assert_eq!(
+            plan.physical_row_ranges_by_split.as_deref(),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn resolves_a_payload_without_an_external_path_into_the_bucket_directory() {
+        let split = one_file_split(11, 0, &[]);
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", true, vec![split]).unwrap();
+        assert_eq!(plan.splits[0].ann_segments[0].path, "bucket-0/seg0");
+
+        let split = one_file_split(11, 0, &[]);
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        assert_eq!(plan.splits[0].ann_segments[0].path, "/tbl/index/seg0");
     }
 }

@@ -882,6 +882,62 @@ fn resolve_pk_vector_search_params(
 /// and the range-read bound — is derived here from the plan that is actually being
 /// searched, so a narrowed plan can never be searched under limits computed for a
 /// wider one.
+/// Combine the two per-split row allow-lists a search can be handed: the physical
+/// positions an engine-supplied plan restricts each file to, and the positions a
+/// residual data predicate leaves behind.
+///
+/// Both sides list what is permitted, and both read a file's absence as "no rows
+/// allowed", so combining them intersects files as well as positions. Either side
+/// alone passes through unchanged; neither side means no positional restriction.
+fn intersect_row_allow_lists(
+    physical: Option<&[HashMap<String, RoaringTreemap>]>,
+    residual: Option<Vec<HashMap<String, RoaringTreemap>>>,
+    split_count: usize,
+) -> crate::Result<Option<Vec<HashMap<String, RoaringTreemap>>>> {
+    if let Some(maps) = physical {
+        if maps.len() != split_count {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "plan carries {} physical row allow-lists for {split_count} splits",
+                    maps.len()
+                ),
+                source: None,
+            });
+        }
+    }
+    match (physical, residual) {
+        (None, residual) => Ok(residual),
+        (Some(physical), None) => Ok(Some(physical.to_vec())),
+        (Some(physical), Some(residual)) => {
+            if residual.len() != split_count {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "residual carries {} row allow-lists for {split_count} splits",
+                        residual.len()
+                    ),
+                    source: None,
+                });
+            }
+            Ok(Some(
+                physical
+                    .iter()
+                    .zip(residual)
+                    .map(|(physical, residual)| {
+                        physical
+                            .iter()
+                            .filter_map(|(file, allowed)| {
+                                residual
+                                    .get(file)
+                                    .map(|kept| (file.clone(), allowed & kept))
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            ))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_raw_candidates_batch_with_plan(
     table: &Table,
@@ -1119,6 +1175,15 @@ async fn search_pk_raw_candidates_batch_with_plan(
         }
         None => None,
     };
+    // Fold the plan's own positional restriction into the same allow-list. A plan
+    // built from engine-supplied bucket splits carries the physical positions each
+    // file is limited to; a plan read from the index manifest carries none. Both
+    // sides list what is permitted, so combining them is an intersection.
+    let residual_by_split = intersect_row_allow_lists(
+        plan.physical_row_ranges_by_split.as_deref(),
+        residual_by_split,
+        plan.splits.len(),
+    )?;
 
     // Build the exact-fallback search on demand: the kernel calls this only for a
     // file it actually searches (uncovered by ANN, residual-allowed, and only when
@@ -7383,5 +7448,69 @@ mod residual_positions_tests {
             row_count: 3,
         }];
         (reader, split, active)
+    }
+
+    // ---- combining the plan's positional restriction with the residual ----
+
+    fn allow_list(entries: &[(&str, &[u64])]) -> HashMap<String, RoaringTreemap> {
+        entries
+            .iter()
+            .map(|(file, positions)| ((*file).to_string(), positions.iter().copied().collect()))
+            .collect()
+    }
+
+    fn listed(map: &HashMap<String, RoaringTreemap>, file: &str) -> Vec<u64> {
+        map.get(file)
+            .map(|positions| positions.iter().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn no_restriction_on_either_side_stays_unrestricted() {
+        assert!(intersect_row_allow_lists(None, None, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn one_side_alone_passes_through() {
+        let physical = vec![allow_list(&[("d0", &[1, 2])])];
+        let only_physical = intersect_row_allow_lists(Some(&physical), None, 1)
+            .unwrap()
+            .expect("a plan restriction survives on its own");
+        assert_eq!(listed(&only_physical[0], "d0"), vec![1, 2]);
+
+        let residual = vec![allow_list(&[("d0", &[3])])];
+        let only_residual = intersect_row_allow_lists(None, Some(residual), 1)
+            .unwrap()
+            .expect("a residual survives on its own");
+        assert_eq!(listed(&only_residual[0], "d0"), vec![3]);
+    }
+
+    #[test]
+    fn both_sides_intersect_and_a_file_either_omits_is_dropped() {
+        // `d0`: both list positions, so only the shared ones survive. `d1`: the
+        // residual kept nothing there, and its absence means "no rows", so the file
+        // must not come back unrestricted from the plan side.
+        let physical = vec![allow_list(&[("d0", &[1, 2, 3]), ("d1", &[0, 1])])];
+        let residual = vec![allow_list(&[("d0", &[2, 3, 4])])];
+        let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
+            .unwrap()
+            .expect("both sides restrict");
+        assert_eq!(listed(&combined[0], "d0"), vec![2, 3]);
+        assert!(!combined[0].contains_key("d1"));
+    }
+
+    #[test]
+    fn rejects_allow_lists_that_do_not_cover_every_split() {
+        let physical = vec![allow_list(&[("d0", &[1])])];
+        let error = intersect_row_allow_lists(Some(&physical), None, 2)
+            .map(|_| ())
+            .expect_err("an allow-list per split is what makes the index meaningful");
+        assert!(error.to_string().contains("for 2 splits"), "{error}");
+
+        let residual = vec![allow_list(&[("d0", &[1])])];
+        let error = intersect_row_allow_lists(Some(&physical), Some(residual), 2)
+            .map(|_| ())
+            .expect_err("the residual must cover every split too");
+        assert!(error.to_string().contains("for 2 splits"), "{error}");
     }
 }
