@@ -1385,7 +1385,7 @@ mod pk_hybrid_tests {
             index_type: VECTOR_INDEX_TYPE.to_string(),
             file_name: vector_index_name,
             file_size: i64::try_from(vector_index_size).unwrap(),
-            row_count: i32::try_from(row_count).unwrap(),
+            row_count,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
@@ -1418,7 +1418,7 @@ mod pk_hybrid_tests {
             index_type: PK_FULL_TEXT_INDEX_TYPE.to_string(),
             file_name: ft_index_name,
             file_size: 1,
-            row_count: i32::try_from(row_count).unwrap(),
+            row_count,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,

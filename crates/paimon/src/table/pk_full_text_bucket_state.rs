@@ -66,7 +66,7 @@ fn payload_matches_source(
             None => return false, // overflow → stale
         }
     }
-    i64::from(payload.row_count) == total
+    payload.row_count == total
         && global_meta.row_range_start == 0
         && global_meta.row_range_end == total - 1
 }
@@ -297,7 +297,7 @@ mod tests {
     fn payload(
         file_name: &str,
         index_type: &str,
-        row_count: i32,
+        row_count: i64,
         global_index_meta: Option<GlobalIndexMeta>,
     ) -> IndexFileMeta {
         IndexFileMeta {

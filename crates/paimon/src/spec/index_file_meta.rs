@@ -66,7 +66,7 @@ pub struct IndexFileMeta {
     pub file_size: i64,
 
     #[serde(rename = "_ROW_COUNT")]
-    pub row_count: i32,
+    pub row_count: i64,
 
     // use Indexmap to ensure the order of deletion_vectors_ranges is consistent.
     #[serde(

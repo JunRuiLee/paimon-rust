@@ -287,10 +287,7 @@ async fn test_table_indexes_system_table() {
         assert_eq!(index_types.value(row), expected.index_file.index_type);
         assert_eq!(file_names.value(row), expected.index_file.file_name);
         assert_eq!(file_sizes.value(row), expected.index_file.file_size);
-        assert_eq!(
-            row_counts.value(row),
-            i64::from(expected.index_file.row_count)
-        );
+        assert_eq!(row_counts.value(row), expected.index_file.row_count);
         assert_eq!(
             dv_ranges.is_null(row),
             expected.index_file.deletion_vectors_ranges.is_none()
