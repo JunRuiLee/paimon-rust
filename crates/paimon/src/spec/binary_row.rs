@@ -804,6 +804,97 @@ pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Read a `BinaryArray` of non-null `int` (Java `array<int>`): 4-byte element
+/// slots after the header, so the layout differs from the 8-byte slots the
+/// `bigint` and pointer forms use.
+pub(crate) fn deserialize_binary_array_int(data: &[u8]) -> crate::Result<Vec<i32>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // Bound the count against the buffer before multiplying it, so a forged one
+    // cannot wrap the offset arithmetic below -- the reason
+    // `check_binary_array_fits` is written the way it is, which this cannot use
+    // because it assumes the 8-byte slot width.
+    if n > data.len().saturating_sub(header) / 4 {
+        return Err(bin_arr_err(
+            "int array element region exceeds buffer length",
+        ));
+    }
+    // An int array has no variable-length part, so the writer's own size is the
+    // fixed region rounded up to a word -- exactly, not at least. Requiring the
+    // equality rejects both an unpadded region and trailing bytes, neither of
+    // which the writer can emit.
+    if round_to_word(header + n * 4) != data.len() {
+        return Err(bin_arr_err(
+            "int array size is not its word-padded fixed region",
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        if data.get(4 + k / 8).is_some_and(|b| b & (1 << (k % 8)) != 0) {
+            return Err(bin_arr_err("int element must not be null"));
+        }
+        let eo = header + k * 4;
+        let slot = data
+            .get(eo..eo + 4)
+            .ok_or_else(|| bin_arr_err("int element slot out of range"))?;
+        out.push(i32::from_le_bytes(slot.try_into().unwrap()));
+    }
+    Ok(out)
+}
+
+/// Read a `BinaryArray` whose elements are rows, returning each element's raw
+/// bytes. Rows are addressed the way variable-length fields are, by a packed
+/// offset and length, so the caller decodes each slice with the arity its own
+/// schema fixes.
+pub(crate) fn deserialize_binary_array_rows(data: &[u8]) -> crate::Result<Vec<&[u8]>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // Bounds the count before `n * 8` is computed, so a forged one cannot wrap it.
+    check_binary_array_fits(n, header, data.len())?;
+    let fixed_part = round_to_word(header + n * 8);
+    if fixed_part > data.len() {
+        return Err(bin_arr_err(
+            "row array element region exceeds buffer length",
+        ));
+    }
+    // The writer appends each row after the last, word-padded, so an element body
+    // starts exactly where the previous one ended and the last ends at the array's
+    // own end. Requiring that leaves no layout the writer cannot emit: no gap, no
+    // trailing bytes, and no two elements sharing a body -- which would let a
+    // small array drive a decode many times its own size.
+    let mut next = fixed_part;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        if data.get(4 + k / 8).is_some_and(|b| b & (1 << (k % 8)) != 0) {
+            return Err(bin_arr_err("row element must not be null"));
+        }
+        let eo = header + k * 8;
+        let slot = data
+            .get(eo..eo + 8)
+            .ok_or_else(|| bin_arr_err("row element slot out of range"))?;
+        let encoded = u64::from_le_bytes(slot.try_into().unwrap());
+        let offset = (encoded >> 32) as usize;
+        let length = (encoded & 0xFFFF_FFFF) as usize;
+        if offset != next {
+            return Err(bin_arr_err(
+                "row element body must start where the previous element ended",
+            ));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| bin_arr_err("row element bytes out of range"))?;
+        out.push(
+            data.get(offset..end)
+                .ok_or_else(|| bin_arr_err("row element bytes out of range"))?,
+        );
+        next = round_to_word(end);
+    }
+    if next != data.len() {
+        return Err(bin_arr_err("row array has bytes after its last element"));
+    }
+    Ok(out)
+}
+
 /// Reverse of [`serialize_binary_array_long`].
 pub fn deserialize_binary_array_long(data: &[u8]) -> crate::Result<Vec<Option<i64>>> {
     let n = read_binary_array_len(data)?;
@@ -1575,6 +1666,163 @@ pub fn batch_hash_codes(
 mod tests {
     use super::*;
     use crate::variant::GenericVariant;
+
+    /// Java writes `array<int>` with 4-byte element slots, so the layout differs
+    /// from the 8-byte forms; build one by hand and read it back.
+    #[test]
+    fn deserialize_binary_array_int_reads_four_byte_slots() {
+        let values: [i32; 3] = [3, 5, -9];
+        // count + one null-bitset word. The writer rounds the fixed region up to
+        // a word, so three 4-byte slots occupy 16 bytes, not 12.
+        let header = 4 + 4;
+        let mut data = vec![0u8; round_to_word(header + values.len() * 4)];
+        data[0..4].copy_from_slice(&(values.len() as i32).to_le_bytes());
+        for (k, v) in values.iter().enumerate() {
+            let offset = header + k * 4;
+            data[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(
+            deserialize_binary_array_int(&data).unwrap(),
+            values.to_vec()
+        );
+    }
+
+    /// A fixed region the writer would have padded is not a layout it can emit.
+    #[test]
+    fn deserialize_binary_array_int_rejects_an_unpadded_fixed_region() {
+        let header = 4 + 4;
+        let mut data = vec![0u8; header + 3 * 4];
+        data[0..4].copy_from_slice(&3i32.to_le_bytes());
+        assert!(deserialize_binary_array_int(&data).is_err());
+    }
+
+    #[test]
+    fn deserialize_binary_array_int_rejects_a_null_element() {
+        let header = 4 + 4;
+        let mut data = vec![0u8; round_to_word(header + 4)];
+        data[0..4].copy_from_slice(&1i32.to_le_bytes());
+        data[4] = 1; // element 0 is null
+        let error = deserialize_binary_array_int(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("int element must not be null"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn deserialize_binary_array_int_rejects_a_count_past_the_buffer() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(deserialize_binary_array_int(&data).is_err());
+    }
+
+    /// Row elements are addressed like variable-length fields, by a packed offset
+    /// and length, and the writer appends each body after the last, word-padded.
+    fn binary_array_of_rows(bodies: &[&[u8]], alias_all_at: Option<usize>) -> Vec<u8> {
+        let header = 4 + 4;
+        let mut data = vec![0u8; round_to_word(header + bodies.len() * 8)];
+        data[0..4].copy_from_slice(&(bodies.len() as i32).to_le_bytes());
+        let mut offsets = Vec::new();
+        for body in bodies {
+            offsets.push(data.len());
+            data.extend_from_slice(body);
+            let pad = (8 - (body.len() % 8)) % 8;
+            data.extend(std::iter::repeat_n(0u8, pad));
+        }
+        for (k, body) in bodies.iter().enumerate() {
+            let (offset, length) = match alias_all_at {
+                Some(shared) => (shared, bodies[0].len()),
+                None => (offsets[k], body.len()),
+            };
+            let encoded = ((offset as u64) << 32) | (length as u64);
+            let slot = header + k * 8;
+            data[slot..slot + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn deserialize_binary_array_rows_returns_element_slices() {
+        let data = binary_array_of_rows(&[&[0xAA; 3], &[0xBB; 5]], None);
+        let elements = deserialize_binary_array_rows(&data).unwrap();
+        assert_eq!(
+            elements,
+            vec![[0xAAu8; 3].as_slice(), [0xBBu8; 5].as_slice()]
+        );
+    }
+
+    /// The writer never points two elements at one body. Accepting it would let a
+    /// small array drive a decode many times its own size.
+    #[test]
+    fn deserialize_binary_array_rows_rejects_aliased_elements() {
+        let bodies: [&[u8]; 3] = [&[0xAA; 8], &[0xBB; 8], &[0xCC; 8]];
+        let first_body = round_to_word(4 + 4 + bodies.len() * 8);
+        let data = binary_array_of_rows(&bodies, Some(first_body));
+        let error = deserialize_binary_array_rows(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("must start where the previous"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The writer leaves no gap between bodies either, so a body one word late is
+    /// as much a forgery as one that overlaps.
+    #[test]
+    fn deserialize_binary_array_rows_rejects_a_gap_before_an_element() {
+        let header = 4 + 4;
+        let fixed_part = round_to_word(header + 8);
+        // One word of gap, then a body that is itself inside the buffer, so this
+        // can only fail on the gap.
+        let mut data = vec![0u8; fixed_part + 8 + 8];
+        data[0..4].copy_from_slice(&1i32.to_le_bytes());
+        let encoded = (((fixed_part + 8) as u64) << 32) | 8;
+        data[header..header + 8].copy_from_slice(&encoded.to_le_bytes());
+        let error = deserialize_binary_array_rows(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("must start where the previous"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The array ends where its last element ends, so trailing bytes are a layout
+    /// the writer cannot emit.
+    #[test]
+    fn deserialize_binary_array_rows_rejects_trailing_bytes() {
+        let mut data = binary_array_of_rows(&[&[0xAA; 8]], None);
+        data.push(0);
+        let error = deserialize_binary_array_rows(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("after its last element"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Counterpart to the int reader's test: a forged count must be rejected
+    /// before it reserves anything.
+    #[test]
+    fn deserialize_binary_array_rows_rejects_a_count_past_the_buffer() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(deserialize_binary_array_rows(&data).is_err());
+    }
+
+    /// An element body inside the fixed part is likewise not a layout the writer
+    /// can emit.
+    #[test]
+    fn deserialize_binary_array_rows_rejects_a_body_in_the_fixed_part() {
+        let data = binary_array_of_rows(&[&[0xAA; 8]], Some(0));
+        assert!(deserialize_binary_array_rows(&data).is_err());
+    }
+
+    #[test]
+    fn deserialize_binary_array_rows_rejects_an_element_past_the_buffer() {
+        let header = 4 + 4;
+        let mut data = vec![0u8; header + 8];
+        data[0..4].copy_from_slice(&1i32.to_le_bytes());
+        let encoded = ((data.len() as u64) << 32) | 16;
+        data[header..header + 8].copy_from_slice(&encoded.to_le_bytes());
+        assert!(deserialize_binary_array_rows(&data).is_err());
+    }
 
     #[test]
     fn test_empty_binary_row() {

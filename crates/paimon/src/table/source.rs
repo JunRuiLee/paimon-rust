@@ -729,7 +729,7 @@ impl DataSplit {
 
     /// Read a `DataSplit` body from the cursor, leaving it positioned after the body
     /// (used both by `deserialize` and the SPLIT_V1 frame reader).
-    fn read_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
+    pub(super) fn read_body(cur: &mut &[u8]) -> crate::Result<DataSplit> {
         let magic = read_i64(cur)?;
         if magic != SPLIT_MAGIC {
             return Err(crate::Error::DataInvalid {
@@ -1041,10 +1041,10 @@ fn write_deletion_list(
 }
 
 /// Advances `cur` by `n` bytes, returning the consumed slice. Errors on underrun.
-fn take<'a>(cur: &mut &'a [u8], n: usize) -> crate::Result<&'a [u8]> {
+pub(super) fn take<'a>(cur: &mut &'a [u8], n: usize) -> crate::Result<&'a [u8]> {
     if cur.len() < n {
         return Err(crate::Error::DataInvalid {
-            message: format!("split buffer underrun: need {n}, have {}", cur.len()),
+            message: format!("buffer underrun: need {n}, have {}", cur.len()),
             source: None,
         });
     }
@@ -1061,11 +1061,11 @@ fn read_i16(cur: &mut &[u8]) -> crate::Result<i16> {
     Ok(i16::from_be_bytes(take(cur, 2)?.try_into().unwrap()))
 }
 
-fn read_i32(cur: &mut &[u8]) -> crate::Result<i32> {
+pub(super) fn read_i32(cur: &mut &[u8]) -> crate::Result<i32> {
     Ok(i32::from_be_bytes(take(cur, 4)?.try_into().unwrap()))
 }
 
-fn read_i64(cur: &mut &[u8]) -> crate::Result<i64> {
+pub(super) fn read_i64(cur: &mut &[u8]) -> crate::Result<i64> {
     Ok(i64::from_be_bytes(take(cur, 8)?.try_into().unwrap()))
 }
 
@@ -1079,7 +1079,7 @@ fn utf_err() -> crate::Error {
 /// Reverse of [`write_java_utf`]: `u16` byte-length prefix + modified UTF-8. Each UTF-16 code
 /// unit is encoded independently, so a supplementary char arrives as two 3-byte surrogate units;
 /// collect the raw `u16` units and let [`String::from_utf16`] pair the surrogates.
-fn read_java_utf(cur: &mut &[u8]) -> crate::Result<String> {
+pub(super) fn read_java_utf(cur: &mut &[u8]) -> crate::Result<String> {
     let len = read_i16(cur)? as u16 as usize;
     let bytes = take(cur, len)?;
     let mut units: Vec<u16> = Vec::new();
