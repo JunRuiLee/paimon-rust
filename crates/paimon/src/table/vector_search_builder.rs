@@ -734,7 +734,26 @@ pub(crate) fn ensure_no_reserved_read_columns(fields: &[DataField]) -> crate::Re
 /// vector, so it is computed once and the SAME slice is shared across all queries.
 /// Rerank stays per-query (each query reranks its own indexed list).
 #[allow(clippy::too_many_arguments)]
-async fn plan_and_search_pk_candidates_batch(
+/// Query-level parameters for a primary-key vector search: everything resolvable
+/// from the table schema, the options and the queries alone, independent of which
+/// splits planning yields. Resolved before planning so a malformed query or option
+/// fails loud even when the plan turns out empty.
+struct PkVectorSearchParams {
+    metric: VectorSearchMetric,
+    /// Fan-out limit for bucket orchestration plus ANN and exact-file leaves (Java
+    /// `GLOBAL_INDEX_THREAD_NUM`); `1` reproduces strictly sequential execution.
+    concurrency: usize,
+    index_type: String,
+    field_id: i32,
+    vector_field: DataField,
+    skip_exact_fallback: bool,
+    refine_factor: usize,
+    indexed_limit: usize,
+}
+
+/// Resolve the query-level parameters and reject a query the search cannot answer
+/// correctly, before any planning or read happens.
+fn resolve_pk_vector_search_params(
     table: &Table,
     query_options: &HashMap<String, String>,
     filter: Option<&Predicate>,
@@ -742,11 +761,7 @@ async fn plan_and_search_pk_candidates_batch(
     pk_col: &str,
     queries: &[&[f32]],
     limit: usize,
-) -> crate::Result<(
-    Vec<Vec<PkVectorCandidate>>,
-    PkVectorScanPlan,
-    VectorSearchMetric,
-)> {
+) -> crate::Result<PkVectorSearchParams> {
     // Residual pre-filter guard, mirroring Java `PrimaryKeyVectorScan`. A DATA
     // predicate set via `with_filter` is applied post-recall by re-reading each
     // candidate file's physical rows (see below). That physical-position filtering
@@ -848,12 +863,55 @@ async fn plan_and_search_pk_candidates_batch(
         }
     }
 
-    let plan = PkVectorScan::new(table, field_id, index_type.clone(), filter.cloned())
-        .plan()
-        .await?;
+    Ok(PkVectorSearchParams {
+        metric,
+        concurrency,
+        index_type,
+        field_id,
+        vector_field,
+        skip_exact_fallback,
+        refine_factor,
+        indexed_limit,
+    })
+}
+
+/// Search an already-resolved plan across every query and return each query's raw
+/// indexed and exact candidate lists, before any rerank or merge.
+///
+/// Plan-dependent concurrency — the vindex segment count, batch-index parallelism
+/// and the range-read bound — is derived here from the plan that is actually being
+/// searched, so a narrowed plan can never be searched under limits computed for a
+/// wider one.
+#[allow(clippy::too_many_arguments)]
+async fn search_pk_raw_candidates_batch_with_plan(
+    table: &Table,
+    query_options: &HashMap<String, String>,
+    filter: Option<&Predicate>,
+    core: &CoreOptions<'_>,
+    pk_col: &str,
+    queries: &[&[f32]],
+    limit: usize,
+    plan: &PkVectorScanPlan,
+    params: &PkVectorSearchParams,
+) -> crate::Result<Vec<OrchestratorSearchResult>> {
+    // An empty plan has nothing to search. Returned before the backend is resolved
+    // so a table with no searchable data never errors on an unrecognized index type.
     if plan.splits.is_empty() {
-        return Ok((vec![Vec::new(); queries.len()], plan, metric));
+        return Ok(queries
+            .iter()
+            .map(|_| OrchestratorSearchResult {
+                indexed: Vec::new(),
+                exact: Vec::new(),
+            })
+            .collect());
     }
+
+    let metric = params.metric;
+    let concurrency = params.concurrency;
+    let index_type = params.index_type.clone();
+    let vector_field = params.vector_field.clone();
+    let skip_exact_fallback = params.skip_exact_fallback;
+    let indexed_limit = params.indexed_limit;
 
     // Resolve the vector index backend from the single configured index type.
     // Java enforces one index type per PK table and Rust filters segments to it,
@@ -1122,6 +1180,41 @@ async fn plan_and_search_pk_candidates_batch(
         )
         .await?;
 
+    Ok(searches)
+}
+
+/// Search an already-resolved plan and return one merged, best-first candidate list
+/// per query: the raw layer above, followed by the optional exact rerank of the
+/// approximate candidates and the merge with the exact-fallback candidates.
+#[allow(clippy::too_many_arguments)]
+async fn search_pk_candidates_batch_with_plan(
+    table: &Table,
+    query_options: &HashMap<String, String>,
+    filter: Option<&Predicate>,
+    core: &CoreOptions<'_>,
+    pk_col: &str,
+    queries: &[&[f32]],
+    limit: usize,
+    plan: &PkVectorScanPlan,
+    params: &PkVectorSearchParams,
+) -> crate::Result<Vec<Vec<PkVectorCandidate>>> {
+    let searches = search_pk_raw_candidates_batch_with_plan(
+        table,
+        query_options,
+        filter,
+        core,
+        pk_col,
+        queries,
+        limit,
+        plan,
+        params,
+    )
+    .await?;
+
+    let metric = params.metric;
+    let refine_factor = params.refine_factor;
+    let vector_field = params.vector_field.clone();
+
     // Per query: exact rerank of the approximate candidates when a refine factor is
     // set (exact-fallback candidates are already exact and are not reranked), then
     // merge the (possibly reranked) indexed list with the exact list into one
@@ -1158,7 +1251,56 @@ async fn plan_and_search_pk_candidates_batch(
         per_query_candidates.push(merge_candidates(indexed, search.exact, limit));
     }
 
-    Ok((per_query_candidates, plan, metric))
+    Ok(per_query_candidates)
+}
+
+/// Plan the whole table and search it: resolve the query parameters, read the index
+/// manifest into a plan, then search that plan. The plan and metric are returned
+/// alongside the candidates because callers re-associate hits through the plan.
+async fn plan_and_search_pk_candidates_batch(
+    table: &Table,
+    query_options: &HashMap<String, String>,
+    filter: Option<&Predicate>,
+    core: &CoreOptions<'_>,
+    pk_col: &str,
+    queries: &[&[f32]],
+    limit: usize,
+) -> crate::Result<(
+    Vec<Vec<PkVectorCandidate>>,
+    PkVectorScanPlan,
+    VectorSearchMetric,
+)> {
+    let params = resolve_pk_vector_search_params(
+        table,
+        query_options,
+        filter,
+        core,
+        pk_col,
+        queries,
+        limit,
+    )?;
+    let plan = PkVectorScan::new(
+        table,
+        params.field_id,
+        params.index_type.clone(),
+        filter.cloned(),
+    )
+    .plan()
+    .await?;
+    let metric = params.metric;
+    let candidates = search_pk_candidates_batch_with_plan(
+        table,
+        query_options,
+        filter,
+        core,
+        pk_col,
+        queries,
+        limit,
+        &plan,
+        &params,
+    )
+    .await?;
+    Ok((candidates, plan, metric))
 }
 
 impl<'a> BatchVectorSearchBuilder<'a> {
