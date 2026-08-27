@@ -465,8 +465,8 @@ impl FormatFileReader for ParquetFormatReader {
             combined_selection =
                 intersect_optional_row_selections(combined_selection, Some(range_selection));
         }
-        if let Some(sel) = combined_selection {
-            batch_stream_builder = batch_stream_builder.with_row_selection(sel);
+        if let Some(ref selection) = combined_selection {
+            batch_stream_builder = batch_stream_builder.with_row_selection(selection.clone());
         }
         if let Some(size) = batch_size {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
@@ -490,29 +490,46 @@ impl FormatFileReader for ParquetFormatReader {
         // preserving positional `_ROW_ID`, sort order, and batch backpressure. Reads
         // with predicates or an explicit row selection retain the original
         // single-stream path until their selections are split per row group.
-        let row_group_parallelism = self
-            .read_budget
-            .as_ref()
-            .filter(|_| preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none())
+        let read_budget = self.read_budget.as_ref().filter(|_| {
+            preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none()
+        });
+        let row_group_parallelism = read_budget
             .map(|budget| {
                 budget
                     .parallelism()
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
+        let projected_bytes = self
+            .read_budget
+            .as_ref()
+            .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
+            .map(|budget| {
+                let mut diagnostic_selection = combined_selection;
+                let projected_bytes = batch_stream_builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .filter(|row_group| {
+                        diagnostic_selection.as_mut().is_none_or(|selection| {
+                            selection
+                                .split_off(row_group.num_rows() as usize)
+                                .selects_any()
+                        })
+                    })
+                    .map(|row_group| projected_row_group_bytes(row_group, &mask))
+                    .collect::<Vec<_>>();
+                budget.record_projected_row_groups(&projected_bytes);
+                projected_bytes
+            });
         if row_group_parallelism > 1 {
             let row_group_count = batch_stream_builder.metadata().num_row_groups();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
                 ArrowReaderOptions::new(),
             )?;
-            let projected_bytes = batch_stream_builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|row_group| projected_row_group_bytes(row_group, &mask))
-                .collect::<Vec<_>>();
-            let read_budget = Arc::clone(self.read_budget.as_ref().expect("checked above"));
+            let projected_bytes = projected_bytes.expect("parallel row-group reads need sizes");
+            let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
             tokio::spawn(async move {
                 for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
@@ -2883,6 +2900,35 @@ mod tests {
             observed, 2,
             "two readers must share the same row-group budget"
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_diagnostics_include_reads_with_row_selection() {
+        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
+        let budget = Arc::new(ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap());
+        budget.enable_diagnostics();
+        let file_size = data.len() as u64;
+        let fields = vec![int_field("id")];
+        let batches = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(Bytes::from(data))),
+                file_size,
+                &fields,
+                None,
+                Some(32),
+                Some(vec![RowRange::new(0, 9)]),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        let diagnostics = budget.diagnostics();
+        assert_eq!(diagnostics.row_group_count, 1);
+        assert!(diagnostics.projected_bytes_total > 0);
+        assert_eq!(diagnostics.peak_inflight, 0);
     }
 
     #[tokio::test]

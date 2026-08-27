@@ -772,6 +772,7 @@ impl OutputFile {
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
+                .concurrent(1)
                 .await?
                 .into_futures_async_write()
                 .compat_write(),

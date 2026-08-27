@@ -21,6 +21,7 @@ use crate::spec::{
 };
 use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::source::exclude_row_ranges;
+use crate::table::table_read::configured_parquet_read_budget;
 use crate::table::{
     CommitMessage, DataSplit, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
 };
@@ -55,6 +56,14 @@ struct VectorIndexBuildTiming {
     source_batch_wait: Duration,
     oss_read: Duration,
     parquet_decode: Duration,
+    file_schema_open: Duration,
+    first_batch_wait: Duration,
+    remaining_batch_wait: Duration,
+    parquet_row_group_count: u64,
+    parquet_projected_bytes_min: u64,
+    parquet_projected_bytes_max: u64,
+    parquet_projected_bytes_total: u64,
+    parquet_peak_inflight_row_groups: usize,
     raw_temp_write: Duration,
     train_finish: Duration,
     raw_temp_reread: Duration,
@@ -83,7 +92,7 @@ impl VectorIndexBuildTiming {
             .saturating_add(commit);
         let unattributed = total.saturating_sub(accounted);
         eprintln!(
-            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
+            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} file_schema_open_ms={:.3} first_batch_wait_ms={:.3} remaining_batch_wait_ms={:.3} parquet_row_group_count={} parquet_projected_bytes_min={} parquet_projected_bytes_max={} parquet_projected_bytes_total={} parquet_peak_inflight_row_groups={} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
             index_type,
             self.file_name,
             self.rows,
@@ -95,6 +104,14 @@ impl VectorIndexBuildTiming {
             self.source_batch_wait.as_secs_f64() * 1000.0,
             self.oss_read.as_secs_f64() * 1000.0,
             self.parquet_decode.as_secs_f64() * 1000.0,
+            self.file_schema_open.as_secs_f64() * 1000.0,
+            self.first_batch_wait.as_secs_f64() * 1000.0,
+            self.remaining_batch_wait.as_secs_f64() * 1000.0,
+            self.parquet_row_group_count,
+            self.parquet_projected_bytes_min,
+            self.parquet_projected_bytes_max,
+            self.parquet_projected_bytes_total,
+            self.parquet_peak_inflight_row_groups,
             self.raw_temp_write.as_secs_f64() * 1000.0,
             self.train_finish.as_secs_f64() * 1000.0,
             self.raw_temp_reread.as_secs_f64() * 1000.0,
@@ -302,6 +319,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut source_batch_wait = Duration::ZERO;
         let mut raw_temp_write = Duration::ZERO;
         let read_timing = timing_enabled.then(|| Arc::new(DataFileReadTiming::default()));
+        let parquet_read_budget = if timing_enabled {
+            let budget = configured_parquet_read_budget(self.table)?;
+            budget.enable_diagnostics();
+            Some(budget)
+        } else {
+            None
+        };
         let mut batch_count = 0usize;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
@@ -346,6 +370,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let read = read_builder.new_read()?;
         let read = match read_timing.as_ref() {
             Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+            None => read,
+        };
+        let read = match parquet_read_budget.as_ref() {
+            Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
             None => read,
         };
         let mut batches = read.to_arrow(&[split])?;
@@ -632,11 +660,27 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .map_or((Duration::ZERO, Duration::ZERO), |timing| {
                 (timing.file_read(), timing.parquet_decode())
             });
+        let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
+                timing.file_waits()
+            });
+        let parquet_diagnostics = parquet_read_budget
+            .as_ref()
+            .map_or_else(Default::default, |budget| budget.diagnostics());
         let timing = total_start.map(|start| VectorIndexBuildTiming {
             total_without_commit: start.elapsed(),
             source_batch_wait,
             oss_read,
             parquet_decode,
+            file_schema_open,
+            first_batch_wait,
+            remaining_batch_wait,
+            parquet_row_group_count: parquet_diagnostics.row_group_count,
+            parquet_projected_bytes_min: parquet_diagnostics.projected_bytes_min,
+            parquet_projected_bytes_max: parquet_diagnostics.projected_bytes_max,
+            parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
+            parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
             raw_temp_write,
             train_finish,
             raw_temp_reread,
