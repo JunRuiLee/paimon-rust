@@ -60,8 +60,8 @@ pub fn hash_by_words(data: &[u8]) -> i32 {
         data.len()
     );
     let mut h1 = DEFAULT_SEED;
-    for chunk in data.chunks_exact(4) {
-        let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in data.as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(*chunk);
         let k1 = mix_k1(word);
         h1 = mix_h1(h1, k1);
     }

@@ -3786,8 +3786,8 @@ mod tests {
                 metric,
             )
             .unwrap();
-            for (row_index, stored_vector) in stored.chunks_exact(2).enumerate() {
-                for (query_index, query) in queries.chunks_exact(2).enumerate() {
+            for (row_index, stored_vector) in stored.as_chunks::<2>().0.iter().enumerate() {
+                for (query_index, query) in queries.as_chunks::<2>().0.iter().enumerate() {
                     let expected = compute_raw_vector_score(query, stored_vector, metric);
                     let actual = matrix_scores[query_index * 3 + row_index];
                     assert!(

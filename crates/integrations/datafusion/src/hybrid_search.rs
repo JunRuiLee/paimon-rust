@@ -535,7 +535,7 @@ fn extract_named_struct_fields<'a>(
     }
 
     let mut fields = Vec::with_capacity(function.args.len() / 2);
-    for pair in function.args.chunks_exact(2) {
+    for pair in function.args.as_chunks::<2>().0 {
         let key = extract_string_literal(FUNCTION_NAME, &pair[0], "route field name")?;
         fields.push((key, &pair[1]));
     }
@@ -862,7 +862,9 @@ fn extract_options(expr: &Expr) -> DFResult<HashMap<String, String>> {
 
     function
         .args
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             Ok((
                 extract_string_literal(FUNCTION_NAME, &pair[0], "options key")?,
