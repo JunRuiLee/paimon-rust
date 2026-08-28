@@ -263,14 +263,17 @@ use async_trait::async_trait;
 
 use crate::api::PagedList;
 use crate::spec::{Partition, Schema, SchemaChange, TableType};
-use crate::table::Table;
+use crate::table::{ObjectTable, Table};
 
 /// Outcome of [`Catalog::load_table`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoadedTable {
     /// A constructed Paimon table (boxed: far larger than the other variant).
     Paimon(Box<Table>),
-    /// A table this reader cannot construct.
+    /// A native read-only object table.
+    Object(ObjectTable),
+    /// A table that needs a registered external engine.
     External(ExternalTableMetadata),
 }
 
@@ -371,9 +374,10 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::TableNotExist`] - table does not exist.
     async fn get_table(&self, identifier: &Identifier) -> Result<Table>;
 
-    /// Load a table, or classify it as [`LoadedTable::External`] when this
-    /// reader cannot construct it. One metadata round-trip either way, and the
-    /// outcome depends only on the table's own metadata.
+    /// Load a Paimon or native object table, or classify it as
+    /// [`LoadedTable::External`] when this reader cannot construct it. One
+    /// metadata round-trip either way, and the outcome depends only on the
+    /// table's own metadata.
     ///
     /// The default implementation classifies from the constructed table, so a
     /// catalog that only implements [`Catalog::get_table`] still fails closed.
@@ -389,6 +393,14 @@ pub trait Catalog: Send + Sync {
         let table = self.get_table(identifier).await?;
         let options = crate::spec::CoreOptions::new(table.schema().options());
         let declared = options.table_type()?;
+        if declared == TableType::ObjectTable {
+            return ObjectTable::try_new(
+                table.file_io().clone(),
+                identifier.clone(),
+                table.schema(),
+            )
+            .map(LoadedTable::Object);
+        }
         if declared.requires_table_engine() {
             return LoadedTable::external(declared, &options, &identifier.full_name());
         }
@@ -526,6 +538,7 @@ pub trait Catalog: Send + Sync {
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.load_table(identifier).await? {
             LoadedTable::Paimon(table) => list_partitions_from_file_system(&table).await,
+            LoadedTable::Object(_) => Ok(Vec::new()),
             LoadedTable::External(external) => Err(Error::Unsupported {
                 message: format!(
                     "table '{}' is declared '{}', so it has no Paimon partitions to list",

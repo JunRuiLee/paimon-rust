@@ -1525,6 +1525,45 @@ async fn test_load_table_returns_external_for_declared_type() {
 }
 
 #[tokio::test]
+async fn test_load_table_constructs_native_object_table() {
+    use paimon::catalog::LoadedTable;
+
+    let object_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(object_dir.path().join("object.txt"), b"object").unwrap();
+    let object_location = format!("file://{}", object_dir.path().display());
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let schema = Schema::builder()
+        .column("ignored", DataType::BigInt(BigIntType::new()))
+        .option("type", "object-table")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "objects", schema, &object_location);
+
+    let loaded = ctx
+        .catalog
+        .load_table(&Identifier::new("default", "objects"))
+        .await
+        .unwrap();
+    let LoadedTable::Object(table) = loaded else {
+        panic!("expected a native object table, got {loaded:?}");
+    };
+    assert_eq!(table.location(), object_location);
+    #[cfg(not(windows))]
+    assert_eq!(
+        table
+            .list_objects()
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>(),
+        vec!["object.txt"]
+    );
+}
+
+#[tokio::test]
 async fn test_load_table_fails_closed_on_query_auth() {
     let ctx = setup_catalog(vec!["default"]).await;
     let schema = Schema::builder()

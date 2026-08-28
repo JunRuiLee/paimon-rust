@@ -24,10 +24,10 @@ use std::collections::HashMap;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
-use crate::io::cache::create_local_cache;
+use crate::io::cache::{create_local_cache, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, Schema, TableSchema, TableType, TABLE_TYPE_OPTION};
-use crate::table::{SchemaManager, Table};
+use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opendal::raw::get_basename;
@@ -66,6 +66,8 @@ fn make_path(parent: &str, child: &str) -> String {
 pub struct FileSystemCatalog {
     file_io: FileIO,
     warehouse: String,
+    options: Options,
+    local_cache: Option<std::sync::Arc<LocalCache>>,
 }
 
 impl FileSystemCatalog {
@@ -105,12 +107,17 @@ impl FileSystemCatalog {
         let local_cache = create_local_cache(&options)?;
         let mut file_io_builder =
             FileIO::from_path(&warehouse)?.with_props(options.to_map().iter());
-        if let Some(local_cache) = local_cache {
-            file_io_builder = file_io_builder.with_local_cache(local_cache);
+        if let Some(local_cache) = &local_cache {
+            file_io_builder = file_io_builder.with_local_cache(local_cache.clone());
         }
         let file_io = file_io_builder.build()?;
 
-        Ok(Self { file_io, warehouse })
+        Ok(Self {
+            file_io,
+            warehouse,
+            options,
+            local_cache,
+        })
     }
 
     /// Get the warehouse path.
@@ -121,6 +128,14 @@ impl FileSystemCatalog {
     /// Get the FileIO instance.
     pub fn file_io(&self) -> &FileIO {
         &self.file_io
+    }
+
+    fn build_file_io(&self, path: &str) -> Result<FileIO> {
+        let mut builder = FileIO::from_path(path)?.with_props(self.options.to_map().iter());
+        if let Some(local_cache) = &self.local_cache {
+            builder = builder.with_local_cache(local_cache.clone());
+        }
+        builder.build()
     }
 
     /// Get the path for a database (warehouse / `name` + [DB_SUFFIX]).
@@ -360,6 +375,19 @@ impl Catalog for FileSystemCatalog {
         let (table_path, schema) = self.fetch_table_schema(identifier).await?;
         let options = CoreOptions::new(schema.options());
         let declared = options.table_type()?;
+        if declared == crate::spec::TableType::ObjectTable {
+            let object_path = options
+                .path()
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or(&table_path);
+            return crate::table::ObjectTable::try_new_with_default_location(
+                self.build_file_io(object_path)?,
+                identifier.clone(),
+                &schema,
+                Some(&table_path),
+            )
+            .map(crate::catalog::LoadedTable::Object);
+        }
         if declared.requires_table_engine() {
             return crate::catalog::LoadedTable::external(
                 declared,
@@ -395,14 +423,17 @@ impl Catalog for FileSystemCatalog {
     async fn create_table(
         &self,
         identifier: &Identifier,
-        creation: Schema,
+        mut creation: Schema,
         ignore_if_exists: bool,
     ) -> Result<()> {
         identifier.validate()?;
         // Never persist a type nothing can load.
-        CoreOptions::new(creation.options()).table_type()?;
+        let declared = CoreOptions::new(creation.options()).table_type()?;
 
         let table_path = self.table_path(identifier);
+        if declared == TableType::ObjectTable {
+            creation = ObjectTable::normalize_creation(&creation, &table_path)?;
+        }
 
         let table_exists = self.table_exists(identifier).await?;
 
@@ -825,6 +856,111 @@ mod tests {
             "{err:?}"
         );
         assert!(!catalog.table_exists(&identifier).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_object_table_uses_fixed_schema_and_default_path() {
+        use crate::catalog::LoadedTable;
+        use crate::table::ObjectTable;
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "objects");
+        let schema = Schema::builder()
+            .column(
+                "ignored",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "object-table")
+            .build()
+            .unwrap();
+
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        let expected_path = "memory:/warehouse/db1.db/objects";
+        let (_, stored) = catalog.fetch_table_schema(&identifier).await.unwrap();
+        assert_eq!(stored.fields(), ObjectTable::fields());
+        assert_eq!(
+            stored.options().get(crate::spec::PATH_OPTION),
+            Some(&expected_path.to_string())
+        );
+
+        let loaded = catalog.load_table(&identifier).await.unwrap();
+        let LoadedTable::Object(table) = loaded else {
+            panic!("expected a native object table, got {loaded:?}");
+        };
+        assert_eq!(table.location(), expected_path);
+
+        let explicit_identifier = Identifier::new("db1", "explicit_objects");
+        let explicit_path = "memory:/external/objects";
+        let explicit_schema = Schema::builder()
+            .column(
+                "also_ignored",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "object-table")
+            .option(crate::spec::PATH_OPTION, explicit_path)
+            .build()
+            .unwrap();
+        catalog
+            .create_table(&explicit_identifier, explicit_schema, false)
+            .await
+            .unwrap();
+        let (_, stored) = catalog
+            .fetch_table_schema(&explicit_identifier)
+            .await
+            .unwrap();
+        assert_eq!(stored.fields(), ObjectTable::fields());
+        assert_eq!(
+            stored
+                .options()
+                .get(crate::spec::PATH_OPTION)
+                .map(String::as_str),
+            Some(explicit_path)
+        );
+        let loaded = catalog.load_table(&explicit_identifier).await.unwrap();
+        let LoadedTable::Object(table) = loaded else {
+            panic!("expected a native object table, got {loaded:?}");
+        };
+        assert_eq!(table.location(), explicit_path);
+    }
+
+    #[tokio::test]
+    async fn test_load_legacy_object_table_without_path_uses_table_directory() {
+        use crate::catalog::LoadedTable;
+
+        let catalog = create_memory_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "legacy_objects");
+        let table_path = catalog.table_path(&identifier);
+        catalog.file_io.mkdirs(&table_path).await.unwrap();
+        let legacy = Schema::builder()
+            .column(
+                "ignored",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "object-table")
+            .build()
+            .unwrap();
+        catalog
+            .save_table_schema(&table_path, &TableSchema::new(0, &legacy))
+            .await
+            .unwrap();
+
+        let loaded = catalog.load_table(&identifier).await.unwrap();
+        let LoadedTable::Object(table) = loaded else {
+            panic!("expected a native object table, got {loaded:?}");
+        };
+        assert_eq!(table.location(), table_path);
     }
 
     #[tokio::test]

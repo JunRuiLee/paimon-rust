@@ -46,6 +46,9 @@ use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
 use crate::physical_plan::PaimonTableScan;
 use crate::runtime::await_with_runtime;
 
+mod object;
+pub(crate) use object::ObjectTableProvider;
+
 const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 pub(crate) fn datafusion_read_fields(table: &Table) -> Vec<DataField> {

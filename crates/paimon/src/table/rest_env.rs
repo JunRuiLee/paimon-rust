@@ -26,7 +26,7 @@ use crate::io::cache::LocalCache;
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
-use crate::table::Table;
+use crate::table::{ObjectTable, Table};
 use crate::Result;
 use std::sync::Arc;
 
@@ -192,24 +192,16 @@ impl RESTEnv {
             source: None,
         })?;
 
-        let file_io = if data_token_enabled && !is_external {
-            Arc::new(RESTTokenFileIO::new(
-                identifier.clone(),
-                table_path.clone(),
-                options.clone(),
-                api.clone(),
-                local_cache.clone(),
-            ))
-            .build_file_io()
-            .await?
-        } else {
-            let mut builder = FileIO::from_path(&table_path)?;
-            builder = builder.with_props(options.to_map());
-            if let Some(local_cache) = &local_cache {
-                builder = builder.with_local_cache(local_cache.clone());
-            }
-            builder.build()?
-        };
+        let file_io = Self::build_file_io(
+            identifier,
+            &table_path,
+            api.clone(),
+            &options,
+            data_token_enabled,
+            is_external,
+            local_cache.clone(),
+        )
+        .await?;
 
         let rest_env = RESTEnv::new(
             identifier.clone(),
@@ -227,6 +219,89 @@ impl RESTEnv {
             table_schema,
             Some(rest_env),
         ))
+    }
+
+    pub(crate) async fn build_object_table(
+        identifier: &Identifier,
+        response: crate::api::GetTableResponse,
+        api: Arc<RESTApi>,
+        options: Options,
+        data_token_enabled: bool,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Result<ObjectTable> {
+        let schema = response.schema.ok_or_else(|| Error::DataInvalid {
+            message: format!("Table {} response missing schema", identifier.full_name()),
+            source: None,
+        })?;
+        let schema_id = response.schema_id.ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Table {} response missing schema_id",
+                identifier.full_name()
+            ),
+            source: None,
+        })?;
+        let object_path = response
+            .path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: format!(
+                    "Object table '{}' response requires a non-empty path",
+                    identifier.full_name()
+                ),
+            })?
+            .to_string();
+        let mut schema_options = schema.options().clone();
+        schema_options.insert(PATH_OPTION.to_string(), object_path.clone());
+        let table_schema = TableSchema::new(schema_id, &schema).copy_with_options(schema_options);
+        let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
+            message: format!(
+                "Table {} response missing is_external",
+                identifier.full_name()
+            ),
+            source: None,
+        })?;
+
+        let file_io = Self::build_file_io(
+            identifier,
+            &object_path,
+            api,
+            &options,
+            data_token_enabled,
+            is_external,
+            local_cache,
+        )
+        .await?;
+
+        ObjectTable::try_new(file_io, identifier.clone(), &table_schema)
+    }
+
+    async fn build_file_io(
+        identifier: &Identifier,
+        path: &str,
+        api: Arc<RESTApi>,
+        options: &Options,
+        data_token_enabled: bool,
+        is_external: bool,
+        local_cache: Option<Arc<LocalCache>>,
+    ) -> Result<FileIO> {
+        if data_token_enabled && !is_external {
+            return Arc::new(RESTTokenFileIO::new(
+                identifier.clone(),
+                path.to_string(),
+                options.clone(),
+                api,
+                local_cache,
+            ))
+            .build_file_io()
+            .await;
+        }
+
+        let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
+        if let Some(local_cache) = local_cache {
+            builder = builder.with_local_cache(local_cache);
+        }
+        builder.build()
     }
 
     /// Create a `RESTSnapshotCommit` from this environment.

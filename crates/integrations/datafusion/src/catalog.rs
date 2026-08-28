@@ -40,7 +40,7 @@ use paimon::spec::TableType as PaimonTableType;
 use crate::error::to_datafusion_error;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::system_tables;
-use crate::table::PaimonTableProvider;
+use crate::table::{ObjectTableProvider, PaimonTableProvider};
 use crate::{BlobReaderRegistry, DynamicOptions};
 
 pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Send + Sync>;
@@ -665,6 +665,25 @@ impl SchemaProvider for PaimonSchemaProvider {
             .clone();
         await_with_runtime(async move {
             match catalog.load_table(&identifier).await {
+                Ok(paimon::catalog::LoadedTable::Object(table)) => {
+                    if branch.is_some() {
+                        return Err(plan_datafusion_err!(
+                            "branches are not supported for 'object-table' tables ('{}')",
+                            identifier.full_name()
+                        ));
+                    }
+                    let session_options = dynamic_options
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    paimon::spec::CoreOptions::new(&session_options)
+                        .ensure_engine_can_serve(&identifier.full_name())
+                        .map_err(to_datafusion_error)?;
+                    Ok(Some(Arc::new(ObjectTableProvider::try_new(
+                        table,
+                        schema_force_view_types,
+                    )?) as Arc<dyn TableProvider>))
+                }
                 Ok(paimon::catalog::LoadedTable::External(external)) => {
                     let declared = external.declared();
                     if branch.is_some() {
@@ -794,6 +813,10 @@ impl SchemaProvider for PaimonSchemaProvider {
                     )) as Arc<dyn TableProvider>))
                 }
                 Err(e) => Err(to_datafusion_error(e)),
+                Ok(_) => Err(plan_datafusion_err!(
+                    "catalog returned an unsupported loaded table kind for '{}'",
+                    identifier.full_name()
+                )),
             }
         })
         .await
@@ -855,6 +878,9 @@ impl SchemaProvider for PaimonSchemaProvider {
         block_on_with_runtime(
             async move {
                 match catalog.load_table(&identifier).await {
+                    Ok(paimon::catalog::LoadedTable::Object(_)) => {
+                        branch.is_none() && !has_system_suffix
+                    }
                     Ok(paimon::catalog::LoadedTable::External(external)) => {
                         let declared = external.declared();
                         // Paimon-only; `table()` rejects them here too.
@@ -910,6 +936,13 @@ impl SchemaProvider for PaimonSchemaProvider {
                     }
                     Err(e) => {
                         log::error!("failed to check table '{}': {e}", identifier);
+                        false
+                    }
+                    Ok(_) => {
+                        log::error!(
+                            "catalog returned an unsupported loaded table kind for '{}'",
+                            identifier
+                        );
                         false
                     }
                 }

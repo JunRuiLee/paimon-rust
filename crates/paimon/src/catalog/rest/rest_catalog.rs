@@ -220,6 +220,18 @@ impl Catalog for RESTCatalog {
         if let Some(schema) = response.schema.as_ref() {
             let options = crate::spec::CoreOptions::new(schema.options());
             let declared = options.table_type()?;
+            if declared == crate::spec::TableType::ObjectTable {
+                return RESTEnv::build_object_table(
+                    identifier,
+                    response,
+                    self.api.clone(),
+                    self.options.clone(),
+                    self.data_token_enabled,
+                    self.local_cache.clone(),
+                )
+                .await
+                .map(crate::catalog::LoadedTable::Object);
+            }
             if declared.requires_table_engine() {
                 return crate::catalog::LoadedTable::external(
                     declared,

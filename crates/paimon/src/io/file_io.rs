@@ -26,6 +26,8 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use opendal::raw::normalize_root;
 use opendal::Operator;
 use snafu::ResultExt;
@@ -223,42 +225,73 @@ impl FileIO {
 
     /// List all files recursively under the given directory path.
     pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
+        self.list_status_recursive_with_limit(path, None).await
+    }
+
+    pub(crate) async fn list_status_recursive_with_limit(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<FileStatus>> {
+        self.list_status_recursive_stream(path, limit)
+            .await?
+            .try_collect()
+            .await
+    }
+
+    pub(crate) async fn list_status_recursive_stream(
+        &self,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<BoxStream<'static, Result<FileStatus>>> {
+        if limit == Some(0) {
+            return Ok(futures::stream::empty().boxed());
+        }
+
         let (op, relative_path) = self.create(path).await?;
         // See `list_status`: `relative_path` is a byte-suffix of `path` except
         // for Windows local paths, where it only swaps separators (same length).
-        let base_path = &path[..path.len() - relative_path.len()];
+        let base_path = path[..path.len() - relative_path.len()].to_string();
         let list_path = normalize_root(relative_path.as_ref());
 
         let entries =
-            op.list_with(&list_path)
+            op.lister_with(&list_path)
                 .recursive(true)
                 .await
                 .context(IoUnexpectedSnafu {
                     message: format!("Failed to list files recursively in '{path}'"),
                 })?;
 
-        let mut statuses = Vec::new();
-        let list_path_normalized = list_path.trim_start_matches('/');
-        for entry in entries {
-            let entry_path = entry.path();
-            if entry_path.trim_start_matches('/') == list_path_normalized {
-                continue;
+        let path = path.to_string();
+        let list_path_normalized = list_path.trim_start_matches('/').to_string();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut entries = entries;
+            let mut emitted = 0usize;
+            while let Some(entry) = entries.try_next().await.context(IoUnexpectedSnafu {
+                message: format!("Failed to list files recursively in '{path}'"),
+            })? {
+                let entry_path = entry.path();
+                if entry_path.trim_start_matches('/') == list_path_normalized {
+                    continue;
+                }
+                let meta = entry.metadata();
+                if meta.is_dir() {
+                    continue;
+                }
+                yield FileStatus {
+                    size: meta.content_length(),
+                    is_dir: false,
+                    path: status_path(&base_path, entry_path),
+                    last_modified: meta
+                        .last_modified()
+                        .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
+                };
+                emitted += 1;
+                if limit.is_some_and(|limit| emitted >= limit) {
+                    break;
+                }
             }
-            let meta = entry.metadata();
-            if meta.is_dir() {
-                continue;
-            }
-            statuses.push(FileStatus {
-                size: meta.content_length(),
-                is_dir: false,
-                path: status_path(base_path, entry_path),
-                last_modified: meta
-                    .last_modified()
-                    .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
-            });
-        }
-
-        Ok(statuses)
+        }))
     }
 
     /// Check if exists.
@@ -794,10 +827,171 @@ impl OutputFile {
 mod file_action_test {
     use std::collections::BTreeSet;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::tempdir;
 
     use super::*;
     use bytes::Bytes;
+    use opendal::raw::{
+        oio, OpCopier, OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite,
+        RpCreateDir, RpPresign, RpRename, RpStat, Service, ServiceInfo, Servicer,
+    };
+    use opendal::{Capability, EntryMode, Metadata, OperationContext};
+
+    #[derive(Debug)]
+    struct CountingListProvider {
+        pulls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileIOProvider for CountingListProvider {
+        async fn create(&self, _path: &str) -> crate::Result<(Operator, String)> {
+            let service: Servicer = Arc::new(CountingListService {
+                pulls: Arc::clone(&self.pulls),
+            });
+            Ok((
+                Operator::from_parts(OperationContext::default(), service),
+                "objects/".to_string(),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingListService {
+        pulls: Arc<AtomicUsize>,
+    }
+
+    impl Service for CountingListService {
+        type Reader = ();
+        type Writer = ();
+        type Lister = CountingLister;
+        type Deleter = ();
+        type Copier = ();
+
+        fn info(&self) -> ServiceInfo {
+            ServiceInfo::with_scheme("counting")
+        }
+
+        fn capability(&self) -> Capability {
+            Capability {
+                list: true,
+                list_with_recursive: true,
+                ..Default::default()
+            }
+        }
+
+        async fn create_dir(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpCreateDir,
+        ) -> opendal::Result<RpCreateDir> {
+            Err(unsupported_test_operation())
+        }
+
+        async fn stat(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpStat,
+        ) -> opendal::Result<RpStat> {
+            Err(unsupported_test_operation())
+        }
+
+        fn read(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            Err(unsupported_test_operation())
+        }
+
+        fn write(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpWrite,
+        ) -> opendal::Result<Self::Writer> {
+            Err(unsupported_test_operation())
+        }
+
+        fn delete(&self, _ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
+            Err(unsupported_test_operation())
+        }
+
+        fn list(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpList,
+        ) -> opendal::Result<Self::Lister> {
+            Ok(CountingLister {
+                pulls: Arc::clone(&self.pulls),
+                next: 0,
+            })
+        }
+
+        fn copy(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpCopy,
+            _opts: OpCopier,
+        ) -> opendal::Result<Self::Copier> {
+            Err(unsupported_test_operation())
+        }
+
+        async fn rename(
+            &self,
+            _ctx: &OperationContext,
+            _from: &str,
+            _to: &str,
+            _args: OpRename,
+        ) -> opendal::Result<RpRename> {
+            Err(unsupported_test_operation())
+        }
+
+        async fn presign(
+            &self,
+            _ctx: &OperationContext,
+            _path: &str,
+            _args: OpPresign,
+        ) -> opendal::Result<RpPresign> {
+            Err(unsupported_test_operation())
+        }
+    }
+
+    fn unsupported_test_operation() -> opendal::Error {
+        opendal::Error::new(
+            opendal::ErrorKind::Unsupported,
+            "operation is not supported by the test service",
+        )
+    }
+
+    struct CountingLister {
+        pulls: Arc<AtomicUsize>,
+        next: usize,
+    }
+
+    impl oio::List for CountingLister {
+        async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
+            self.pulls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.next == 0 {
+                self.next += 1;
+                return Ok(Some(oio::Entry::new(
+                    "objects/first.txt",
+                    Metadata::new(EntryMode::FILE).with_content_length(1),
+                )));
+            }
+
+            Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "limited listing polled past the requested row",
+            ))
+        }
+    }
 
     fn setup_memory_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
@@ -908,6 +1102,39 @@ mod file_action_test {
         );
 
         file_io.delete_dir(dir_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_recursive_listing_stops_after_limit() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let file_io = setup_memory_file_io().with_provider(Arc::new(CountingListProvider {
+            pulls: Arc::clone(&pulls),
+        }));
+
+        let statuses = file_io
+            .list_status_recursive_with_limit("counting:/objects/", Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(pulls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_listing_stream_yields_before_polling_next_entry() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let file_io = setup_memory_file_io().with_provider(Arc::new(CountingListProvider {
+            pulls: Arc::clone(&pulls),
+        }));
+
+        let mut statuses = file_io
+            .list_status_recursive_stream("counting:/objects/", None)
+            .await
+            .unwrap();
+        let first = statuses.try_next().await.unwrap().unwrap();
+
+        assert!(first.path.ends_with("first.txt"));
+        assert_eq!(pulls.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
