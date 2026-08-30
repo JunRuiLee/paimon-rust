@@ -32,7 +32,7 @@ use crate::spec::{
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::global_index_build_common::same_extra_field_ids;
-use crate::table::index_file_path::IndexFileLocation;
+use crate::table::index_file_path::committed_index_file_path;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
@@ -720,18 +720,24 @@ impl TableCommit {
                     let _ = self.table.file_io().delete_file(&path).await;
                 }
             }
-            // An index file must be deleted where it was written: beside this
-            // bucket's data files when the table keeps index files there, at its
-            // external path when it has one, and under the table `index/`
-            // directory otherwise. Mirrors Java `FileStoreCommitImpl.abort`,
-            // which deletes through `indexFileFactory(partition, bucket)`.
-            let index_location = IndexFileLocation::BucketLocal {
-                table_path,
-                bucket_path: &bucket_path,
-                index_file_in_data_file_dir,
-            };
+            // An index file must be deleted where it was written: at its external
+            // path when it has one, under the table `index/` directory when it is a
+            // global index file, and beside this bucket's data files when the table
+            // keeps bucket-local index files there. Which of the last two applies
+            // is a property of the file, not of the message — a data-evolution
+            // index build is global while a deletion vector from the same table is
+            // bucket-local — so each file is classified rather than all of them
+            // assumed bucket-local, as Java `FileStoreCommitImpl.abort` does
+            // through `indexFileFactory(partition, bucket)`. Deleting is
+            // best-effort, so a wrong path leaks the file silently instead of
+            // failing.
             for file in &message.new_index_files {
-                let path = index_location.resolve(&file.file_name, file.external_path.as_deref());
+                let path = committed_index_file_path(
+                    table_path,
+                    &bucket_path,
+                    index_file_in_data_file_dir,
+                    file,
+                );
                 let _ = self.table.file_io().delete_file(&path).await;
             }
         }
@@ -5539,6 +5545,18 @@ mod tests {
             .await
             .unwrap();
 
+        // A same-named file in the other layout belongs to someone else. Abort
+        // resolves one path, so this one must survive.
+        let index_dir = format!("{table_path}/index");
+        let sentinel = format!("{index_dir}/index-in-bucket");
+        file_io.mkdirs(&format!("{index_dir}/")).await.unwrap();
+        file_io
+            .new_output(&sentinel)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+
         let mut message = CommitMessage::new(vec![], 0, vec![]);
         message.new_index_files = vec![IndexFileMeta {
             index_type: "HASH".to_string(),
@@ -5554,6 +5572,66 @@ mod tests {
         assert!(
             !file_io.exists(&index_path).await.unwrap(),
             "abort must remove an index file written into the bucket data-file directory"
+        );
+        assert!(
+            file_io.exists(&sentinel).await.unwrap(),
+            "abort must not touch a same-named file in the table index directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_deletes_a_global_index_file_when_index_files_live_in_the_bucket_dir() {
+        // A data-evolution index build writes a global index file under
+        // `<table>/index` even when `index-file-in-data-file-dir` is set, so
+        // resolving it as bucket-local leaves it behind — deleting is best-effort
+        // (`let _ =`), so the wrong path fails silently.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_abort_global_index_with_bucket_dir_option";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([(
+                "index-file-in-data-file-dir".to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+
+        let index_dir = format!("{table_path}/index");
+        let index_path = format!("{index_dir}/index-global-0");
+        file_io.mkdirs(&format!("{index_dir}/")).await.unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+
+        // A same-named file in the other layout belongs to someone else. Abort
+        // resolves one path, so this one must survive.
+        let bucket_dir = format!("{table_path}/bucket-0");
+        let sentinel = format!("{bucket_dir}/index-global-0");
+        file_io.mkdirs(&format!("{bucket_dir}/")).await.unwrap();
+        file_io
+            .new_output(&sentinel)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"other"))
+            .await
+            .unwrap();
+
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![test_global_index_file("index-global-0", 0, 0, 4)];
+        commit.abort(&[message]).await.unwrap();
+
+        assert!(
+            !file_io.exists(&index_path).await.unwrap(),
+            "abort must remove a global index file from the table index directory"
+        );
+        assert!(
+            file_io.exists(&sentinel).await.unwrap(),
+            "abort must not touch a same-named file in the bucket data-file directory"
         );
     }
 

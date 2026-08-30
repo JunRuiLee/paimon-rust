@@ -29,6 +29,12 @@
 //! The bucket-local fallback resolves against the bucket directory captured on
 //! the data split, never a path rebuilt from the table root, so custom data
 //! directories and postpone-bucket layouts are honored.
+//!
+//! A reader knows which of these it is asking for, because the mode follows the
+//! index kind it reads. Cleanup after a failed commit does not — see
+//! [`committed_index_file_path`].
+
+use crate::spec::IndexFileMeta;
 
 const INDEX_DIR: &str = "index";
 
@@ -82,9 +88,62 @@ impl IndexFileLocation<'_> {
     }
 }
 
+/// `"DEIX"` as a big-endian int, Java `DataEvolutionIndexSourceMeta`'s marker.
+/// `PrimaryKeyIndexSourceMeta` starts with its own version instead, so the marker
+/// tells the two apart — which is what Java added it for.
+const DATA_EVOLUTION_SOURCE_META_MAGIC: &[u8; 4] = b"DEIX";
+
+/// Whether an index file carried by a commit message is a global index file.
+///
+/// A `_GLOBAL_INDEX` on its own does not say — a source-backed primary-key index
+/// carries one too. The source metadata does: Java marks its own with
+/// `DataEvolutionIndexSourceMeta`'s magic, added for exactly this question, while
+/// `PrimaryKeyIndexSourceMeta` starts with its own version. A deletion vector or
+/// the dynamic-bucket hash index carries no `_GLOBAL_INDEX` at all.
+///
+/// Absent source metadata is global because the index builders in this crate
+/// write it that way, and they are the only producers of the global index files
+/// it commits. Java records that predate `_SOURCE_META` cannot reach here: a
+/// commit message is built by this crate's writers, never decoded from Java.
+fn is_global_index_file(file: &IndexFileMeta) -> bool {
+    file.global_index_meta
+        .as_ref()
+        .is_some_and(|meta| match meta.source_meta.as_deref() {
+            None => true,
+            Some(source_meta) => source_meta.starts_with(DATA_EVOLUTION_SOURCE_META_MAGIC),
+        })
+}
+
+/// Where an index file carried by a commit message was written.
+///
+/// Cleanup after a failed commit resolves index files this crate just wrote, and
+/// they are not all one layout: a data-evolution index build is global, while a
+/// deletion vector or the dynamic-bucket hash index is bucket-local. Each file
+/// is therefore classified on its own rather than the layout being taken from
+/// the message. Anything not recognizable as a global index file is bucket-local,
+/// which is what Java `FileStoreCommitImpl.abort` assumes for every index file.
+pub(crate) fn committed_index_file_path(
+    table_path: &str,
+    bucket_path: &str,
+    index_file_in_data_file_dir: bool,
+    file: &IndexFileMeta,
+) -> String {
+    let location = if is_global_index_file(file) {
+        IndexFileLocation::Global { table_path }
+    } else {
+        IndexFileLocation::BucketLocal {
+            table_path,
+            bucket_path,
+            index_file_in_data_file_dir,
+        }
+    };
+    location.resolve(&file.file_name, file.external_path.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::{GlobalIndexMeta, PrimaryKeyIndexSourceMeta};
 
     #[test]
     fn external_path_wins_over_every_mode() {
@@ -171,6 +230,141 @@ mod tests {
             assert_eq!(
                 loc.resolve("idx-0", None),
                 format!("{}/idx-0", loc.directory())
+            );
+        }
+    }
+
+    /// A committed index file with the given `_GLOBAL_INDEX` and `_SOURCE_META`.
+    fn committed_file(global_index_meta: Option<Option<Vec<u8>>>) -> IndexFileMeta {
+        IndexFileMeta {
+            index_type: "btree".to_string(),
+            file_name: "idx-0".to_string(),
+            file_size: 128,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            external_path: None,
+            global_index_meta: global_index_meta.map(|source_meta| GlobalIndexMeta {
+                row_range_start: 0,
+                row_range_end: 0,
+                index_field_id: 0,
+                extra_field_ids: None,
+                index_meta: None,
+                source_meta,
+            }),
+        }
+    }
+
+    fn committed_path(file: &IndexFileMeta) -> String {
+        committed_index_file_path(
+            "warehouse/db/tbl",
+            "warehouse/db/tbl/pt=1/bucket-3",
+            true,
+            file,
+        )
+    }
+
+    /// Java `DataEvolutionIndexSourceMeta.serialize`: magic, version, scan
+    /// snapshot id.
+    fn data_evolution_source_meta(scan_snapshot_id: i64) -> Vec<u8> {
+        let mut bytes = b"DEIX".to_vec();
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+        bytes.extend_from_slice(&scan_snapshot_id.to_be_bytes());
+        bytes
+    }
+
+    /// Java `PrimaryKeyIndexSourceMeta.serialize`: version, data level, source
+    /// count, then each source's `writeUTF` name and row count.
+    fn primary_key_source_meta(data_level: i32, source_name: &str, row_count: i64) -> Vec<u8> {
+        let mut bytes = 1i32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&data_level.to_be_bytes());
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+        bytes.extend_from_slice(&(source_name.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(source_name.as_bytes());
+        bytes.extend_from_slice(&row_count.to_be_bytes());
+        // A frame the classifier rejects has to be one a reader would accept,
+        // otherwise the test only proves that garbage is not global.
+        PrimaryKeyIndexSourceMeta::deserialize(&bytes).expect("a valid primary-key source frame");
+        bytes
+    }
+
+    #[test]
+    fn a_global_index_file_is_committed_under_the_table_index_directory() {
+        // This crate's index builders leave `_SOURCE_META` empty, and Java marks
+        // its own with `DataEvolutionIndexSourceMeta`'s `DEIX`. Both are global
+        // even when the table keeps index files in the data-file directory.
+        for source_meta in [None, Some(data_evolution_source_meta(7))] {
+            let file = committed_file(Some(source_meta));
+            assert_eq!(committed_path(&file), "warehouse/db/tbl/index/idx-0");
+        }
+    }
+
+    #[test]
+    fn a_source_backed_primary_key_index_file_is_committed_bucket_local() {
+        // Primary-key source metadata starts with its version, never `DEIX`.
+        let file = committed_file(Some(Some(primary_key_source_meta(1, "data-0.parquet", 3))));
+        assert_eq!(
+            committed_path(&file),
+            "warehouse/db/tbl/pt=1/bucket-3/idx-0"
+        );
+    }
+
+    #[test]
+    fn only_a_whole_data_evolution_marker_makes_source_metadata_global() {
+        // The marker is the whole four bytes, as in Java's length-checked
+        // big-endian comparison: a shorter or partial prefix is not it. Java's own
+        // marker test likewise looks no further than those four bytes, so a
+        // truncated frame that still carries them stays global.
+        for not_global in [vec![], b"D".to_vec(), b"DEI".to_vec(), b"XIED".to_vec()] {
+            let file = committed_file(Some(Some(not_global.clone())));
+            assert_eq!(
+                committed_path(&file),
+                "warehouse/db/tbl/pt=1/bucket-3/idx-0",
+                "{not_global:?} does not carry the marker"
+            );
+        }
+        let file = committed_file(Some(Some(b"DEIX".to_vec())));
+        assert_eq!(committed_path(&file), "warehouse/db/tbl/index/idx-0");
+    }
+
+    #[test]
+    fn an_index_file_without_global_index_meta_is_committed_bucket_local() {
+        // Deletion vectors and the dynamic-bucket hash index carry no
+        // `_GLOBAL_INDEX` at all.
+        let file = committed_file(None);
+        assert_eq!(
+            committed_path(&file),
+            "warehouse/db/tbl/pt=1/bucket-3/idx-0"
+        );
+    }
+
+    #[test]
+    fn a_committed_index_file_keeps_its_external_path_in_either_layout() {
+        let external = "s3://other-bucket/abs/idx-0";
+        for global_index_meta in [None, Some(None)] {
+            let mut file = committed_file(global_index_meta);
+            file.external_path = Some(external.to_string());
+            assert_eq!(committed_path(&file), external);
+        }
+    }
+
+    #[test]
+    fn committed_index_files_share_one_directory_without_the_bucket_dir_option() {
+        // Without the option every layout resolves under the table `index/`
+        // directory, so classification cannot change the outcome.
+        for global_index_meta in [
+            None,
+            Some(None),
+            Some(Some(primary_key_source_meta(1, "data-0.parquet", 3))),
+        ] {
+            let file = committed_file(global_index_meta);
+            assert_eq!(
+                committed_index_file_path(
+                    "warehouse/db/tbl",
+                    "warehouse/db/tbl/pt=1/bucket-3",
+                    false,
+                    &file,
+                ),
+                "warehouse/db/tbl/index/idx-0"
             );
         }
     }
