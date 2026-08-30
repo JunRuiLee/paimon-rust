@@ -109,6 +109,7 @@ mod write_builder;
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use audit_log_table::AuditLogTable;
+pub use blob_resolver::BlobReader;
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
