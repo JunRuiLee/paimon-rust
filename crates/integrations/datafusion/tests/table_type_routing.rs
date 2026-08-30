@@ -34,6 +34,23 @@ use tempfile::TempDir;
 const CATALOG: &str = "cat";
 const DB: &str = "shared_db";
 
+fn string_column_values(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..values.len())
+                .map(|row| values.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct TypedTestCatalog {
     inner: Arc<FileSystemCatalog>,
@@ -88,8 +105,14 @@ impl Catalog for TypedTestCatalog {
         if let Some(declared) = self.declared_types.get(identifier.object()) {
             if declared.requires_table_engine() {
                 let options = HashMap::new();
-                return LoadedTable::external(
+                let fields = vec![paimon::spec::DataField::new(
+                    0,
+                    "external_id".to_string(),
+                    paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+                )];
+                return LoadedTable::external_with_fields(
                     *declared,
+                    fields,
                     &paimon::spec::CoreOptions::new(&options),
                     &identifier.full_name(),
                 );
@@ -867,12 +890,95 @@ async fn an_external_type_without_an_engine_says_so() {
         .await
         .unwrap();
 
-    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.it")).await else {
-        panic!("an external table without an engine must not resolve");
-    };
+    let err = ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+        .expect("metadata-only planning should succeed")
+        .collect()
+        .await
+        .expect_err("an external table without an engine must not be readable");
     let msg = err.to_string();
     assert!(msg.contains("no table engine is registered"), "{msg}");
     assert!(msg.contains("iceberg-table"), "{msg}");
+}
+
+#[tokio::test]
+async fn unregistered_external_table_does_not_break_information_schema_columns() {
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let typed_catalog = Arc::new(TypedTestCatalog {
+        inner: fs_catalog,
+        declared_types: HashMap::from([("external".to_string(), TableType::IcebergTable)]),
+    });
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
+    ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
+        .await
+        .unwrap();
+    ctx.sql(&format!(
+        "CREATE TABLE {CATALOG}.{DB}.pt (id INT NOT NULL, name STRING)"
+    ))
+    .await
+    .unwrap();
+    ctx.sql("SET 'paimon.scan.version' = '1'").await.unwrap();
+
+    let provider = ctx.ctx().catalog(CATALOG).unwrap();
+    let schema = provider.schema(DB).unwrap();
+    assert!(
+        schema.table("external").await.unwrap().is_some(),
+        "metadata-only table loading should succeed without a registered engine"
+    );
+    assert!(
+        schema.table_exist("external"),
+        "table_exist must agree with the metadata-only table provider"
+    );
+
+    let show_tables = ctx
+        .sql("SHOW TABLES")
+        .await
+        .expect("SHOW TABLES must not load an external table engine")
+        .collect()
+        .await
+        .expect("SHOW TABLES must remain queryable");
+    let shown_names = string_column_values(&show_tables, "table_name");
+    assert!(
+        shown_names.contains(&"external".to_string()),
+        "{shown_names:?}"
+    );
+
+    let batches = ctx
+        .sql(&format!(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_catalog = '{CATALOG}' \
+               AND table_schema = '{DB}' \
+               AND table_name = 'pt' \
+             ORDER BY ordinal_position"
+        ))
+        .await
+        .expect("an unrelated unregistered engine table must not break planning")
+        .collect()
+        .await
+        .expect("information_schema.columns must remain queryable");
+    let names = string_column_values(&batches, "column_name");
+    assert_eq!(names, vec!["id", "name"]);
+
+    let external_columns = ctx
+        .sql(&format!(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_catalog = '{CATALOG}' \
+               AND table_schema = '{DB}' \
+               AND table_name = 'external'"
+        ))
+        .await
+        .expect("the external table schema should be available from catalog metadata")
+        .collect()
+        .await
+        .expect("the external table schema should not require an engine");
+    let external_names = string_column_values(&external_columns, "column_name");
+    assert_eq!(external_names, vec!["external_id"]);
 }
 
 async fn legacy_catalog_with_iceberg_table() -> (TempDir, Arc<LegacyTestCatalog>) {
@@ -928,9 +1034,13 @@ async fn a_legacy_catalog_cannot_serve_an_external_table_as_paimon() {
     let mut ctx = SQLContext::new();
     ctx.register_catalog(CATALOG, catalog).await.unwrap();
 
-    let Err(err) = ctx.sql(&format!("SELECT * FROM {CATALOG}.{DB}.it")).await else {
-        panic!("a legacy catalog must not serve an iceberg table as Paimon");
-    };
+    let err = ctx
+        .sql(&format!("SELECT * FROM {CATALOG}.{DB}.it"))
+        .await
+        .expect("catalog metadata should be sufficient for planning")
+        .collect()
+        .await
+        .expect_err("a legacy catalog must not serve an iceberg table as Paimon");
     let msg = err.to_string();
     assert!(msg.contains("no table engine is registered"), "{msg}");
     assert!(msg.contains("iceberg-table"), "{msg}");
@@ -961,7 +1071,7 @@ async fn a_legacy_catalog_refuses_every_destructive_statement() {
     let (_dir, ctx) = legacy_sql_context().await;
 
     for sql in [
-        format!("INSERT INTO {CATALOG}.{DB}.it VALUES (1)"),
+        format!("INSERT INTO {CATALOG}.{DB}.it VALUES (1, 1)"),
         format!("INSERT OVERWRITE {CATALOG}.{DB}.it PARTITION (pt = 1) VALUES (1)"),
         format!("UPDATE {CATALOG}.{DB}.it SET id = 2"),
         format!("DELETE FROM {CATALOG}.{DB}.it"),

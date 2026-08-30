@@ -278,17 +278,23 @@ pub enum LoadedTable {
 }
 
 /// What a caller needs to pick an engine for a table Paimon cannot construct.
-/// Only [`LoadedTable::external`] can build one, so the stored-metadata checks
-/// always run before a caller sees it.
+/// Only [`LoadedTable::external`] and [`LoadedTable::external_with_fields`] can
+/// build one, so the stored-metadata checks always run before a caller sees it.
 #[derive(Debug)]
 pub struct ExternalTableMetadata {
     declared: TableType,
+    fields: Option<Vec<crate::spec::DataField>>,
 }
 
 impl ExternalTableMetadata {
     /// The type the table's metadata declares.
     pub fn declared(&self) -> TableType {
         self.declared
+    }
+
+    /// The table fields returned by the catalog, when available.
+    pub fn fields(&self) -> Option<&[crate::spec::DataField]> {
+        self.fields.as_deref()
     }
 }
 
@@ -304,6 +310,26 @@ impl LoadedTable {
         options: &crate::spec::CoreOptions<'_>,
         full_name: &str,
     ) -> Result<Self> {
+        Self::external_impl(declared, None, options, full_name)
+    }
+
+    /// Like [`Self::external`], preserving catalog metadata for schema-only
+    /// consumers such as DataFusion's information schema.
+    pub fn external_with_fields(
+        declared: TableType,
+        fields: Vec<crate::spec::DataField>,
+        options: &crate::spec::CoreOptions<'_>,
+        full_name: &str,
+    ) -> Result<Self> {
+        Self::external_impl(declared, Some(fields), options, full_name)
+    }
+
+    fn external_impl(
+        declared: TableType,
+        fields: Option<Vec<crate::spec::DataField>>,
+        options: &crate::spec::CoreOptions<'_>,
+        full_name: &str,
+    ) -> Result<Self> {
         if !declared.requires_table_engine() {
             return Err(Error::Unsupported {
                 message: format!(
@@ -312,7 +338,7 @@ impl LoadedTable {
             });
         }
         options.ensure_engine_can_serve(full_name)?;
-        Ok(Self::External(ExternalTableMetadata { declared }))
+        Ok(Self::External(ExternalTableMetadata { declared, fields }))
     }
 }
 
@@ -402,7 +428,12 @@ pub trait Catalog: Send + Sync {
             .map(LoadedTable::Object);
         }
         if declared.requires_table_engine() {
-            return LoadedTable::external(declared, &options, &identifier.full_name());
+            return LoadedTable::external_with_fields(
+                declared,
+                table.schema().fields().to_vec(),
+                &options,
+                &identifier.full_name(),
+            );
         }
         Ok(LoadedTable::Paimon(Box::new(table)))
     }

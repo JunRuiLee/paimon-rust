@@ -389,8 +389,9 @@ impl Catalog for FileSystemCatalog {
             .map(crate::catalog::LoadedTable::Object);
         }
         if declared.requires_table_engine() {
-            return crate::catalog::LoadedTable::external(
+            return crate::catalog::LoadedTable::external_with_fields(
                 declared,
+                schema.fields().to_vec(),
                 &options,
                 &identifier.full_name(),
             );
