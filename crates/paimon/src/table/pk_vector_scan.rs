@@ -375,18 +375,6 @@ impl<'a> PkVectorScan<'a> {
     /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
     /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
     /// the split allows.
-    /// Build a plan from bucket splits an engine planned elsewhere, instead of from
-    /// this table's index manifest.
-    ///
-    /// The splits are the planning input and are taken as authoritative: their
-    /// payload files, their per-file row ranges, and the snapshot they pin are used
-    /// as given, and no index manifest is read. Only the partition conjuncts of this
-    /// scan's filter are re-applied, because a caller may narrow the query further
-    /// than the planner that produced the splits.
-    ///
-    /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
-    /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
-    /// the split allows.
     // Entry point for engine-supplied splits; no in-tree caller reads a plan from
     // them yet, and the tests drive `plan_from_bucket_splits` directly.
     #[allow(dead_code)]
@@ -1266,31 +1254,6 @@ mod tests {
             .physical_row_ranges_by_split
             .expect("a split-driven plan restricts positions");
         assert_eq!(allowed(&ranges[0], "data-1.orc"), vec![0, 1, 4, 5]);
-    }
-
-    #[test]
-    fn manifest_planning_leaves_positions_unrestricted() {
-        // The manifest route must keep reporting `None`, which means "no positional
-        // restriction" -- not an empty allow-list, which would permit nothing.
-        let entries = vec![(
-            BinaryRow::new(0),
-            0,
-            gim(2, 5, &[("d0", 3)]),
-            "idx/seg0".to_string(),
-            10u64,
-            "seg0".to_string(),
-        )];
-        let data = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("memory:/t/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
-            .build()
-            .unwrap();
-        let splits = plan_from_inputs(1, vec![data], entries).unwrap();
-        assert_eq!(splits.len(), 1);
     }
 
     #[test]

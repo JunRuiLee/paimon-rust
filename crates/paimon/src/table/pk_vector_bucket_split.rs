@@ -127,8 +127,8 @@ impl BucketVectorPayload {
             .expect("a decoded payload always carries source metadata")
     }
 
-    /// Consume the payload into the pieces a planner needs, so the source-metadata
-    /// blob and the index metadata move instead of being cloned.
+    /// Consume the payload into the pieces a planner needs, so its decoded metadata
+    /// moves out of the payload rather than being cloned out of it.
     ///
     /// Two decoded fields are deliberately left behind. `row_count` is the payload's
     /// own row count, which the read path derives from the source metadata instead.
