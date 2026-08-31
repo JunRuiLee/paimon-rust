@@ -3084,6 +3084,68 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
+    async fn a_dynamic_copy_cannot_move_where_a_written_hash_index_lands() {
+        // An index manifest records only a file name, so a write must place the
+        // hash index where a normally loaded table will look for it. A dynamic
+        // override of `index-file-in-data-file-dir` would break that pairing, so
+        // `copy_with_options` pins the option to the stored value.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_hash_index_layout_survives_a_copy";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["pt", "id"])
+            .option("changelog-producer", "input")
+            .option("index-file-in-data-file-dir", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_hash_index_layout_survives_a_copy"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let copied = table.copy_with_options(HashMap::from([(
+            "index-file-in-data-file-dir".to_string(),
+            "false".to_string(),
+        )]));
+
+        let mut table_write = TableWrite::new(&copied, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_partitioned_batch_with_value_kind(
+                vec!["a", "a"],
+                vec![1, 2],
+                vec![10, 20],
+                vec![0, 0],
+            ))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_index_files[0].index_type, "HASH");
+        let name = messages[0].new_index_files[0].file_name.clone();
+
+        assert!(
+            file_io
+                .exists(&format!("{table_path}/pt=a/bucket-0/{name}"))
+                .await
+                .unwrap(),
+            "the hash index must stay in the bucket data-file directory the stored option selects"
+        );
+        assert!(
+            !file_io
+                .exists(&format!("{table_path}/index/{name}"))
+                .await
+                .unwrap(),
+            "the override must not have moved it to the table index directory"
+        );
+    }
+
+    #[tokio::test]
     async fn test_default_changelog_producer_accepts_value_kind() {
         let file_io = test_file_io();
         let table_path = "memory:/test_default_changelog_value_kind";

@@ -3255,16 +3255,28 @@ mod tests {
         )
     }
 
+    /// A table whose schema *stores* `options`, as a catalog-loaded one would.
+    ///
+    /// Not `copy_with_options`: that applies dynamic overrides, and options fixed
+    /// at creation — `index-file-in-data-file-dir` among them — are pinned to the
+    /// stored value there, so a test configuring one has to persist it.
     fn test_table_with_options(
         file_io: &FileIO,
         table_path: &str,
         options: HashMap<String, String>,
     ) -> Table {
+        use crate::spec::{DataType, IntType, Schema, VarCharType};
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .options(options)
+            .build()
+            .unwrap();
         Table::new(
             file_io.clone(),
             Identifier::new("default", "test_table"),
             table_path.to_string(),
-            test_schema().copy_with_options(options),
+            TableSchema::new(0, &schema),
             None,
         )
     }

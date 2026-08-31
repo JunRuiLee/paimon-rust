@@ -30,7 +30,7 @@ use crate::spec::{
     CoreOptions, Schema, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
     TABLE_TYPE_OPTION,
 };
-use crate::table::{ObjectTable, SchemaManager, Table};
+use crate::table::{ObjectTable, SchemaManager, SnapshotManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opendal::raw::get_basename;
@@ -543,7 +543,26 @@ impl Catalog for FileSystemCatalog {
                 full_name: identifier.full_name(),
             })?;
 
-        reject_immutable_option_changes(current.options(), &changes)?;
+        // Only the index-layout option is snapshot-gated, so the listing a
+        // snapshot lookup costs is paid only when a change touches it. Java defers
+        // the same lookup through a `LazyField`.
+        let touches_snapshot_gated_option = changes.iter().any(|change| {
+            matches!(
+                change,
+                crate::spec::SchemaChange::SetOption { key, .. }
+                | crate::spec::SchemaChange::RemoveOption { key }
+                    if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+            )
+        });
+        let has_snapshots = if touches_snapshot_gated_option {
+            SnapshotManager::new(self.file_io.clone(), table_path.clone())
+                .get_latest_snapshot_id()
+                .await?
+                .is_some()
+        } else {
+            false
+        };
+        reject_immutable_option_changes(current.options(), &changes, has_snapshots)?;
 
         let new_schema = current
             .apply_changes(changes)
@@ -560,13 +579,31 @@ impl Catalog for FileSystemCatalog {
 /// this mirrors the subset this crate acts on:
 ///
 /// * `type` picks the reader, so flipping it strands a populated table behind a
-///   reader that cannot see its data. Only case-insensitive no-ops pass.
+///   reader that cannot see its data. Only case-insensitive no-ops pass, and a
+///   snapshot is not required: a format table holds data without ever writing
+///   one, so a snapshot check would not catch it. Java special-cases `type` the
+///   same way (`SchemaManager.generateTableSchema`).
 /// * `index-file-in-data-file-dir` picks the directory every bucket-local index
 ///   file is written to and read from, so flipping it hides every index file the
-///   table already has.
+///   table already has. Only files already written are at stake, so this follows
+///   Java in rejecting an actual change only once the table has snapshots, and in
+///   letting a `SetOption` that repeats the stored value through: Java compares
+///   the stored string literally, and reaches `checkAlterTableOption` only under
+///   `hasSnapshots && !unchanged`.
+///
+/// Gating on snapshot existence leaves one window open, in Java as much as here: a
+/// writer that started before the alter still holds the old layout, and a commit
+/// records the schema id it was built with without checking whether the latest
+/// schema moved, so it can publish the first snapshot after the layout was flipped
+/// under it. Closing it needs schema publication and snapshot commit to be ordered
+/// against each other — reading the latest schema once before committing is not
+/// enough, since the alter can land right after that read. A stricter alter is not
+/// the answer either: rejecting the change outright would take away the only
+/// post-creation point at which the layout can be chosen.
 fn reject_immutable_option_changes(
     current_options: &HashMap<String, String>,
     changes: &[crate::spec::SchemaChange],
+    has_snapshots: bool,
 ) -> Result<()> {
     let current_type = current_options
         .get(TABLE_TYPE_OPTION)
@@ -588,15 +625,31 @@ fn reject_immutable_option_changes(
                     message: format!("removing '{TABLE_TYPE_OPTION}' is not supported"),
                 });
             }
-            crate::spec::SchemaChange::SetOption { key, .. }
-            | crate::spec::SchemaChange::RemoveOption { key }
-                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION =>
+            crate::spec::SchemaChange::SetOption { key, value }
+                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+                    && has_snapshots
+                    && current_options.get(key.as_str()) != Some(value) =>
             {
                 return Err(Error::Unsupported {
                     message: format!(
-                        "changing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' is not supported: \
+                        "changing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' on a table with \
+                         snapshots is not supported: \
                          it selects the directory index files are written to, so the files \
                          already written would no longer be found"
+                    ),
+                });
+            }
+            crate::spec::SchemaChange::RemoveOption { key }
+                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION && has_snapshots =>
+            {
+                // Java rejects the reset whenever the table has snapshots, whether
+                // or not the option is currently set
+                // (`SchemaManager.checkResetTableOption`).
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "removing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' from a table with \
+                         snapshots is not supported: it selects the directory index files \
+                         are written to, so the files already written would no longer be found"
                     ),
                 });
             }
@@ -853,17 +906,36 @@ mod tests {
         catalog.get_table(&identifier).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_alter_table_cannot_change_where_index_files_live() {
-        use crate::spec::SchemaChange;
+    /// A table whose only snapshot exists so the immutable-option guard sees one.
+    async fn give_the_table_a_snapshot(catalog: &FileSystemCatalog, identifier: &Identifier) {
+        use crate::spec::{CommitKind, Snapshot};
+        let table_path = catalog.table_path(identifier);
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(1)
+            .schema_id(0)
+            .base_manifest_list("base-list".to_string())
+            .delta_manifest_list("delta-list".to_string())
+            .commit_user("test-user".to_string())
+            .commit_identifier(0)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000)
+            .build();
+        assert!(
+            SnapshotManager::new(catalog.file_io.clone(), table_path)
+                .commit_snapshot(&snapshot)
+                .await
+                .unwrap(),
+            "the fixture snapshot must be the table's first"
+        );
+    }
 
-        // The option selects the directory every bucket-local index file is written
-        // to and read from. Flipping it on a populated table would hide every index
-        // file already written, so it is fixed at creation, as in Java where it is
-        // annotated `@Immutable`.
-        let (_temp_dir, catalog) = create_test_catalog();
+    async fn create_table_for_alter(
+        catalog: &FileSystemCatalog,
+        options: HashMap<String, String>,
+    ) -> Identifier {
         catalog
-            .create_database("db1", false, HashMap::new())
+            .create_database("db1", true, HashMap::new())
             .await
             .unwrap();
         let schema = Schema::builder()
@@ -871,6 +943,7 @@ mod tests {
                 "id",
                 crate::spec::DataType::Int(crate::spec::IntType::new()),
             )
+            .options(options)
             .build()
             .unwrap();
         let identifier = Identifier::new("db1", "t");
@@ -878,12 +951,29 @@ mod tests {
             .create_table(&identifier, schema, false)
             .await
             .unwrap();
+        identifier
+    }
 
-        for change in [
-            SchemaChange::set_option(
+    #[tokio::test]
+    async fn test_alter_table_cannot_change_where_index_files_live_once_written() {
+        use crate::spec::SchemaChange;
+
+        // The option selects the directory every bucket-local index file is written
+        // to and read from, so flipping it once files exist would hide every one of
+        // them. Only files already written are at stake, so the guard follows Java
+        // in gating on snapshot existence rather than rejecting outright.
+        let (_temp_dir, catalog) = create_test_catalog();
+        let identifier = create_table_for_alter(
+            &catalog,
+            HashMap::from([(
                 "index-file-in-data-file-dir".to_string(),
                 "true".to_string(),
-            ),
+            )]),
+        )
+        .await;
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+
+        for change in [
             SchemaChange::set_option(
                 "index-file-in-data-file-dir".to_string(),
                 "false".to_string(),
@@ -896,6 +986,99 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
         }
+
+        // Repeating the stored value changes nothing, so Java lets it through and
+        // schema reconciliation stays idempotent.
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    "index-file-in-data-file-dir".to_string(),
+                    "true".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rejects_spelling_out_the_default_index_layout_once_written() {
+        use crate::spec::SchemaChange;
+
+        // Java compares the stored string and does not treat "the default, written
+        // out" as unchanged for this option: `isUnchangedNormalizedKey` special-cases
+        // only `type`, `primary-key` and `partition`. Setting `false` on a table that
+        // never stored the option is therefore a change, and is rejected once
+        // snapshots exist, even though it names the layout the table already uses.
+        let (_temp_dir, catalog) = create_test_catalog();
+        let identifier = create_table_for_alter(&catalog, HashMap::new()).await;
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+
+        let err = catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    "index-file-in-data-file-dir".to_string(),
+                    "false".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_can_choose_where_index_files_live_before_the_first_write() {
+        use crate::spec::SchemaChange;
+
+        // Nothing is written yet, so there is no file to strand: Java reaches
+        // `checkAlterTableOption` only once the table has snapshots, which lets a
+        // caller pick the layout through ALTER before the first write.
+        let (_temp_dir, catalog) = create_test_catalog();
+        let identifier = create_table_for_alter(&catalog, HashMap::new()).await;
+
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::set_option(
+                    "index-file-in-data-file-dir".to_string(),
+                    "true".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get_table(&identifier)
+                .await
+                .unwrap()
+                .schema()
+                .options()
+                .get("index-file-in-data-file-dir")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::remove_option(
+                    "index-file-in-data-file-dir".to_string(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!catalog
+            .get_table(&identifier)
+            .await
+            .unwrap()
+            .schema()
+            .options()
+            .contains_key("index-file-in-data-file-dir"));
     }
 
     #[tokio::test]

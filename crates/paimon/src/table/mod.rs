@@ -584,3 +584,60 @@ pub(crate) fn query_auth_table() -> Table {
         None,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::Table;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    /// The value every reader and writer of a bucket-local index file consults.
+    ///
+    /// Each consumer resolves its own path from it — deletion vectors in
+    /// `table_scan` and `data_evolution_writer`, primary-key ANN segments in
+    /// `pk_vector_scan`, full-text archives, the dynamic-bucket hash index, and
+    /// `TableCommit::abort` — and each of those resolutions is covered where it
+    /// lives. What a copy must not do is hand them a different value than the one
+    /// the files on disk were written under.
+    #[test]
+    fn a_dynamic_copy_reads_the_stored_index_layout() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let stored = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("index-file-in-data-file-dir", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "memory:/t".to_string(),
+            stored,
+            None,
+        );
+
+        let copied = table.copy_with_options(HashMap::from([(
+            "index-file-in-data-file-dir".to_string(),
+            "false".to_string(),
+        )]));
+        assert!(
+            copied.schema().core_options().index_file_in_data_file_dir(),
+            "a read through a copied table must resolve index files under the stored layout"
+        );
+
+        // The copy is otherwise a normal copy.
+        let copied = table.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "3".to_string(),
+        )]));
+        assert_eq!(
+            copied.schema().options().get("scan.snapshot-id"),
+            Some(&"3".to_string())
+        );
+    }
+}

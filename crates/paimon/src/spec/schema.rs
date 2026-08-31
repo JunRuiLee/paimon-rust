@@ -18,8 +18,9 @@
 use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
-    CHANGELOG_PRODUCER_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION,
-    TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION, TABLE_TYPE_OPTION,
+    CHANGELOG_PRODUCER_OPTION, INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET,
+    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
+    TABLE_TYPE_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -147,6 +148,15 @@ impl TableSchema {
     /// A stored `query-auth.enabled = true` can't be turned off by a dynamic
     /// override, and the declared `type` can't be changed by one: an override
     /// could re-route foreign data through the Paimon reader.
+    ///
+    /// `index-file-in-data-file-dir` can't be changed by one either. It selects
+    /// the directory every bucket-local index file is written to and read from,
+    /// while an index manifest records only the file name, so a copy carrying an
+    /// overridden value would write hash and deletion-vector index files where a
+    /// normally loaded table cannot find them. Java rejects such an override
+    /// outright in `AbstractFileStoreTable.checkImmutability`; this copy cannot
+    /// fail, so the stored value wins instead, and an absent one leaves the
+    /// default standing.
     pub fn copy_with_options(&self, mut extra: HashMap<String, String>) -> Self {
         if self.core_options().query_auth_enabled() {
             extra.insert(QUERY_AUTH_ENABLED_OPTION.to_string(), "true".to_string());
@@ -154,6 +164,13 @@ impl TableSchema {
         match self.options.get(TABLE_TYPE_OPTION) {
             Some(declared) => extra.insert(TABLE_TYPE_OPTION.to_string(), declared.clone()),
             None => extra.remove(TABLE_TYPE_OPTION),
+        };
+        match self.options.get(INDEX_FILE_IN_DATA_FILE_DIR_OPTION) {
+            Some(stored) => extra.insert(
+                INDEX_FILE_IN_DATA_FILE_DIR_OPTION.to_string(),
+                stored.clone(),
+            ),
+            None => extra.remove(INDEX_FILE_IN_DATA_FILE_DIR_OPTION),
         };
         let mut new_schema = self.clone();
         new_schema.options.extend(extra);
@@ -2435,6 +2452,65 @@ mod tests {
                 if message.contains("read.batch-size")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_dynamic_copy_cannot_move_where_index_files_live() {
+        // Every reader and writer of a bucket-local index file asks the schema for
+        // this option — the deletion-vector and hash-index writers included — and an
+        // index manifest records only a file name, so a copy that changed it would
+        // write files where a normally loaded table cannot find them.
+        let stored = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option(INDEX_FILE_IN_DATA_FILE_DIR_OPTION, "true")
+                .build()
+                .unwrap(),
+        );
+        let copied = stored.copy_with_options(HashMap::from([(
+            INDEX_FILE_IN_DATA_FILE_DIR_OPTION.to_string(),
+            "false".to_string(),
+        )]));
+        assert!(
+            copied.core_options().index_file_in_data_file_dir(),
+            "an override must not turn a stored bucket-local layout off"
+        );
+
+        // The default is equally load-bearing: turning it on for a table written
+        // without it would look for existing index files in the bucket directory.
+        let unset = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let copied = unset.copy_with_options(HashMap::from([(
+            INDEX_FILE_IN_DATA_FILE_DIR_OPTION.to_string(),
+            "true".to_string(),
+        )]));
+        assert!(
+            !copied.core_options().index_file_in_data_file_dir(),
+            "an override must not turn a defaulted layout on"
+        );
+        assert!(
+            !copied
+                .options()
+                .contains_key(INDEX_FILE_IN_DATA_FILE_DIR_OPTION),
+            "an absent option must stay absent rather than be pinned to a literal"
+        );
+
+        // Unrelated overrides still merge.
+        let copied = stored.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "7".to_string(),
+        )]));
+        assert_eq!(
+            copied.options().get("scan.snapshot-id"),
+            Some(&"7".to_string())
+        );
+        assert!(copied.core_options().index_file_in_data_file_dir());
     }
 
     #[test]
