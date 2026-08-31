@@ -322,4 +322,32 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.abort();
     }
+
+    #[tokio::test]
+    async fn test_blob_stream_reuses_refreshing_file_io() {
+        let table_directory = tempfile::tempdir().unwrap();
+        let file_path = table_directory.path().join("blob");
+        std::fs::write(&file_path, b"abcdefghij").unwrap();
+        let (options, api, requests, server) = token_api().await;
+        let token_file_io = Arc::new(RESTTokenFileIO::new(
+            Identifier::new("database", "table"),
+            table_directory.path().to_string_lossy().into_owned(),
+            options,
+            api,
+            None,
+        ));
+
+        let file_io = token_file_io.build_file_io().await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let uri = url::Url::from_file_path(file_path).unwrap().to_string();
+        let descriptor = BlobDescriptor::new(uri, 2, 4).serialize();
+        let mut stream = BlobReader::from_file_io(file_io)
+            .open_blob(&descriptor)
+            .unwrap();
+
+        assert_eq!(stream.read(2).await.unwrap(), b"cd");
+        assert_eq!(stream.read(2).await.unwrap(), b"ef");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
 }
