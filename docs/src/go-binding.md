@@ -39,6 +39,144 @@ go get github.com/apache/paimon-rust/bindings/go
 The native library is embedded and loaded automatically. Build with
 `CGO_ENABLED=1`.
 
+## Reading BlobDescriptor Values
+
+`BlobReader` reads serialized `BlobDescriptor` values without scanning a table.
+`ReadBlobs` resolves a batch in one call; `ReadBlob` handles one descriptor.
+
+```go
+package main
+
+import (
+    "database/sql"
+    "log"
+    "os"
+
+    paimon "github.com/apache/paimon-rust/bindings/go"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+    db, err := sql.Open("mysql", os.Getenv("STARROCKS_DSN"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    rows, err := db.Query("SELECT blob_descriptor FROM catalog.db.my_table")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+
+    var descriptors [][]byte
+    for rows.Next() {
+        var descriptor []byte
+        if err := rows.Scan(&descriptor); err != nil {
+            log.Fatal(err)
+        }
+        descriptors = append(descriptors, append([]byte(nil), descriptor...))
+    }
+    if err := rows.Err(); err != nil {
+        log.Fatal(err)
+    }
+
+    reader, err := paimon.NewBlobReader(map[string]string{
+        "fs.oss.accessKeyId":     os.Getenv("OSS_ACCESS_KEY_ID"),
+        "fs.oss.accessKeySecret": os.Getenv("OSS_ACCESS_KEY_SECRET"),
+        "fs.oss.endpoint":        os.Getenv("OSS_ENDPOINT"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer reader.Close()
+
+    blobs, err := reader.ReadBlobs(descriptors)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, blob := range blobs {
+        log.Printf("read %d bytes", len(blob))
+    }
+}
+```
+
+The descriptor contains only URI, offset, and length. Pass OSS/S3 credentials
+with the same FileIO option names used by catalogs. If StarRocks returns a hex
+or base64 string, decode it to the original descriptor bytes before calling
+`ReadBlobs`.
+
+Stream a large value without holding it all in memory:
+
+```go
+stream, err := reader.OpenBlob(descriptor)
+if err != nil {
+    log.Fatal(err)
+}
+defer stream.Close()
+if _, err := io.Copy(destination, stream); err != nil {
+    log.Fatal(err)
+}
+```
+
+For an HTTP byte range, seek relative to the descriptor and copy only that range:
+
+```go
+size, err := stream.Seek(0, io.SeekEnd)
+if err != nil || start < 0 || end < start || end >= size {
+    log.Fatal("invalid range")
+}
+if _, err := stream.Seek(start, io.SeekStart); err != nil {
+    log.Fatal(err)
+}
+if _, err := io.CopyN(w, stream, end-start+1); err != nil {
+    log.Fatal(err)
+}
+```
+
+`OpenBlob` is lazy and returns an `io.ReadSeekCloser`. `ReadBlobs` groups and
+merges ranges; separate streams are not merged.
+
+For DLF temporary data tokens, reuse a table's refreshing FileIO:
+
+```go
+catalog, err := paimon.NewCatalog(map[string]string{
+    "metastore":                  "rest",
+    "uri":                        os.Getenv("DLF_ENDPOINT"),
+    "warehouse":                  os.Getenv("DLF_CATALOG"),
+    "token.provider":             "dlf",
+    "dlf.region":                 os.Getenv("DLF_REGION"),
+    "dlf.oss-endpoint":           os.Getenv("DLF_OSS_ENDPOINT"),
+    "dlf.token-loader":           "ecs",
+    "dlf.token-ecs-role-name":    os.Getenv("DLF_ECS_ROLE"),
+    "data-token.enabled":         "true",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer catalog.Close()
+table, err := catalog.GetTable(paimon.NewIdentifier("db", "descriptor_table"))
+if err != nil {
+    log.Fatal(err)
+}
+defer table.Close()
+reader, err := table.NewBlobReader()
+if err != nil {
+    log.Fatal(err)
+}
+defer reader.Close()
+```
+
+The reader and its streams keep the table FileIO and refresh DLF data tokens
+before expiry. Set `dlf.oss-endpoint` when the server-provided endpoint is not
+reachable from the application. Static options passed to
+`paimon.NewBlobReader` are not refreshed.
+
+Reads are grouped by URI and nearby ranges are merged. The fixed limits are a
+64 KiB merge gap, 8 MiB merged span, 8 concurrent requests, and a 64 MiB
+per-reader admission budget. One larger range runs alone but may exceed that
+budget; use `OpenBlob` for large values. Results retain descriptor input order.
+
 ## Creating a Catalog
 
 Use `NewCatalog` with a map of options to create a catalog. The catalog type is determined by the `metastore` option (default: `filesystem`).

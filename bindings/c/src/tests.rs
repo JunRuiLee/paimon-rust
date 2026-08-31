@@ -40,9 +40,12 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
-use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharType};
+use paimon::spec::{
+    BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
+};
 use paimon::table::{SnapshotManager, Table};
 
+use crate::blob_reader::*;
 use crate::error::*;
 use crate::file_io::*;
 use crate::table::*;
@@ -3608,5 +3611,220 @@ fn vector_search_projection_unknown_column_errors_at_execute_read() {
         );
         paimon_error_free(result.error);
         unwrap_table(handle);
+    }
+}
+
+#[test]
+fn blob_reader_reads_batch_and_owns_output_buffers() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"abcdefghij").unwrap();
+    let uri = url::Url::from_file_path(file.path()).unwrap().to_string();
+    let mut descriptors = vec![
+        BlobDescriptor::new(uri.clone(), 3, -1).serialize(),
+        BlobDescriptor::new(uri.clone(), 1, 3).serialize(),
+        BlobDescriptor::new(uri, 5, 0).serialize(),
+    ];
+    let slices = descriptors
+        .iter()
+        .map(|value| paimon_byte_slice {
+            data: value.as_ptr(),
+            len: value.len(),
+        })
+        .collect::<Vec<_>>();
+
+    unsafe {
+        let created = paimon_blob_reader_new(ptr::null(), 0);
+        assert!(created.error.is_null());
+        assert!(!created.reader.is_null());
+
+        let result = paimon_blob_reader_read_blobs(created.reader, slices.as_ptr(), slices.len());
+        assert!(result.error.is_null());
+        assert_eq!(result.blobs.len, 3);
+
+        descriptors.clear();
+        paimon_blob_reader_free(created.reader);
+        let values = std::slice::from_raw_parts(result.blobs.data, result.blobs.len)
+            .iter()
+            .map(|value| std::slice::from_raw_parts(value.data, value.len).to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![b"defghij".to_vec(), b"bcd".to_vec(), Vec::new()]
+        );
+        paimon_bytes_array_free(result.blobs);
+    }
+}
+
+#[test]
+fn blob_reader_from_table_keeps_file_io_alive() {
+    let file_io = memory_file_io();
+    let uri = "memory:/blob_reader_from_table";
+    crate::runtime().block_on(async {
+        file_io
+            .new_output(uri)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"abcdefghij"))
+            .await
+            .unwrap();
+    });
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "blob_table"),
+        "memory:/blob_table".to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let table = unsafe { wrap_table(table) };
+    let descriptor = BlobDescriptor::new(uri.to_string(), 2, 4).serialize();
+    let descriptor_slice = paimon_byte_slice {
+        data: descriptor.as_ptr(),
+        len: descriptor.len(),
+    };
+
+    unsafe {
+        let created = paimon_table_new_blob_reader(table);
+        assert!(created.error.is_null());
+        assert!(!created.reader.is_null());
+        unwrap_table(table);
+
+        let result = paimon_blob_reader_read_blobs(created.reader, &descriptor_slice, 1);
+        assert!(result.error.is_null());
+        let values = std::slice::from_raw_parts(result.blobs.data, result.blobs.len);
+        assert_eq!(
+            std::slice::from_raw_parts(values[0].data, values[0].len),
+            b"cdef"
+        );
+
+        paimon_bytes_array_free(result.blobs);
+        paimon_blob_reader_free(created.reader);
+    }
+}
+
+#[test]
+fn blob_reader_handles_empty_and_error_batches() {
+    unsafe {
+        let null_table = paimon_table_new_blob_reader(ptr::null());
+        assert!(null_table.reader.is_null());
+        assert!(!null_table.error.is_null());
+        paimon_error_free(null_table.error);
+
+        let created = paimon_blob_reader_new(ptr::null(), 0);
+        assert!(created.error.is_null());
+
+        let empty = paimon_blob_reader_read_blobs(created.reader, ptr::null(), 0);
+        assert!(empty.error.is_null());
+        assert!(empty.blobs.data.is_null());
+        assert_eq!(empty.blobs.len, 0);
+        paimon_bytes_array_free(empty.blobs);
+
+        let invalid_bytes = [0_u8; 1];
+        let invalid_slice = paimon_byte_slice {
+            data: invalid_bytes.as_ptr(),
+            len: invalid_bytes.len(),
+        };
+        let invalid = paimon_blob_reader_read_blobs(created.reader, &invalid_slice, 1);
+        assert!(!invalid.error.is_null());
+        assert!(invalid.blobs.data.is_null());
+        paimon_error_free(invalid.error);
+
+        let null_slice = paimon_byte_slice {
+            data: ptr::null(),
+            len: 1,
+        };
+        let null_data = paimon_blob_reader_read_blobs(created.reader, &null_slice, 1);
+        assert!(!null_data.error.is_null());
+        assert!(null_data.blobs.data.is_null());
+        paimon_error_free(null_data.error);
+
+        paimon_blob_reader_free(created.reader);
+        paimon_blob_reader_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn blob_stream_reads_chunks_and_outlives_reader() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"abcdefghij").unwrap();
+    let uri = url::Url::from_file_path(file.path()).unwrap().to_string();
+    let descriptor = BlobDescriptor::new(uri, 2, 5).serialize();
+
+    unsafe {
+        let created = paimon_blob_reader_new(ptr::null(), 0);
+        assert!(created.error.is_null());
+        let opened =
+            paimon_blob_reader_open_blob(created.reader, descriptor.as_ptr(), descriptor.len());
+        assert!(opened.error.is_null());
+        assert!(!opened.stream.is_null());
+        paimon_blob_reader_free(created.reader);
+
+        let mut buffer = [0xFF_u8; 3];
+        let first = paimon_blob_stream_read(opened.stream, buffer.as_mut_ptr(), buffer.len());
+        assert!(first.error.is_null());
+        assert_eq!(first.bytes_read, 3);
+        assert_eq!(&buffer, b"cde");
+
+        let seek = paimon_blob_stream_seek(opened.stream, -2, 2);
+        assert!(seek.error.is_null());
+        assert_eq!(seek.position, 3);
+
+        buffer.fill(0xFF);
+        let second = paimon_blob_stream_read(opened.stream, buffer.as_mut_ptr(), buffer.len());
+        assert!(second.error.is_null());
+        assert_eq!(second.bytes_read, 2);
+        assert_eq!(&buffer[..2], b"fg");
+        assert_eq!(buffer[2], 0xFF);
+
+        let end = paimon_blob_stream_read(opened.stream, buffer.as_mut_ptr(), buffer.len());
+        assert!(end.error.is_null());
+        assert_eq!(end.bytes_read, 0);
+
+        paimon_blob_stream_free(opened.stream);
+        paimon_blob_stream_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn blob_stream_validates_handles_and_buffers() {
+    unsafe {
+        let null_reader = paimon_blob_reader_open_blob(ptr::null(), ptr::null(), 0);
+        assert!(null_reader.stream.is_null());
+        assert!(!null_reader.error.is_null());
+        paimon_error_free(null_reader.error);
+
+        let created = paimon_blob_reader_new(ptr::null(), 0);
+        let invalid = paimon_blob_reader_open_blob(created.reader, ptr::null(), 0);
+        assert!(invalid.stream.is_null());
+        assert!(!invalid.error.is_null());
+        paimon_error_free(invalid.error);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let uri = url::Url::from_file_path(file.path()).unwrap().to_string();
+        let descriptor = BlobDescriptor::new(uri, 0, 0).serialize();
+        let opened =
+            paimon_blob_reader_open_blob(created.reader, descriptor.as_ptr(), descriptor.len());
+        assert!(opened.error.is_null());
+
+        let null_buffer = paimon_blob_stream_read(opened.stream, ptr::null_mut(), 1);
+        assert!(!null_buffer.error.is_null());
+        paimon_error_free(null_buffer.error);
+
+        let zero = paimon_blob_stream_read(opened.stream, ptr::null_mut(), 0);
+        assert!(zero.error.is_null());
+        assert_eq!(zero.bytes_read, 0);
+
+        let null_stream = paimon_blob_stream_read(ptr::null_mut(), ptr::null_mut(), 0);
+        assert!(!null_stream.error.is_null());
+        paimon_error_free(null_stream.error);
+
+        let invalid_seek = paimon_blob_stream_seek(opened.stream, -1, 0);
+        assert!(!invalid_seek.error.is_null());
+        paimon_error_free(invalid_seek.error);
+
+        let null_seek = paimon_blob_stream_seek(ptr::null_mut(), 0, 0);
+        assert!(!null_seek.error.is_null());
+        paimon_error_free(null_seek.error);
+
+        paimon_blob_stream_free(opened.stream);
+        paimon_blob_reader_free(created.reader);
     }
 }

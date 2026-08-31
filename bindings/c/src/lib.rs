@@ -19,6 +19,7 @@
 // So it's type node can't meet camel case.
 #![allow(non_camel_case_types)]
 
+mod blob_reader;
 mod catalog;
 mod error;
 mod file_io;
