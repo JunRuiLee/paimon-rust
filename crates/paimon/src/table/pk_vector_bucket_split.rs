@@ -126,6 +126,39 @@ impl BucketVectorPayload {
             .as_deref()
             .expect("a decoded payload always carries source metadata")
     }
+
+    /// Consume the payload into the pieces a planner needs, so its decoded metadata
+    /// moves out of the payload rather than being cloned out of it.
+    ///
+    /// Two decoded fields are deliberately left behind. `row_count` is the payload's
+    /// own row count, which the read path derives from the source metadata instead.
+    /// `deletion_vectors_ranges` belongs to deletion-vector index files -- Java
+    /// builds a vector payload through the overload that leaves it null, and a read
+    /// takes its deletion vectors from the bucket's data split -- so a value here
+    /// describes something this payload is not, and is ignored rather than applied.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> BucketVectorPayloadParts {
+        BucketVectorPayloadParts {
+            index_type: self.index_type,
+            file_name: self.file_name,
+            file_size: self.file_size,
+            external_path: self.external_path,
+            global_index_meta: self.global_index_meta,
+        }
+    }
+}
+
+/// The owned pieces of a [`BucketVectorPayload`], produced by
+/// [`BucketVectorPayload::into_parts`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BucketVectorPayloadParts {
+    pub(crate) index_type: String,
+    pub(crate) file_name: String,
+    /// As decoded: Java writes a signed length, so a negative value is possible on
+    /// the wire and is rejected where it is converted, not here.
+    pub(crate) file_size: i64,
+    pub(crate) external_path: Option<String>,
+    pub(crate) global_index_meta: GlobalIndexMeta,
 }
 
 impl BucketVectorSearchSplit {
@@ -142,6 +175,19 @@ impl BucketVectorSearchSplit {
 
     pub fn row_ranges_by_file(&self) -> &IndexMap<String, Vec<RowRange>> {
         &self.row_ranges_by_file
+    }
+
+    /// Consume the split into its three parts, so a planner can take ownership of
+    /// the data split, the payloads and the row ranges without cloning them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DataSplit,
+        Vec<BucketVectorPayload>,
+        IndexMap<String, Vec<RowRange>>,
+    ) {
+        (self.data_split, self.payload_files, self.row_ranges_by_file)
     }
 
     /// Parse a Java `BucketVectorSearchSplit#serialize` message.
@@ -452,6 +498,49 @@ fn read_count(cur: &mut &[u8], element: &str) -> crate::Result<usize> {
         )));
     }
     Ok(count)
+}
+
+#[cfg(test)]
+impl BucketVectorSearchSplit {
+    /// Assemble a split directly, for tests that need shapes the decoder will not
+    /// produce -- a nested split that wrongly carries row ranges, two splits for one
+    /// bucket, a negative payload size. Production splits always come from
+    /// [`Self::deserialize`].
+    pub(crate) fn new_for_test(
+        data_split: DataSplit,
+        payload_files: Vec<BucketVectorPayload>,
+        row_ranges_by_file: IndexMap<String, Vec<RowRange>>,
+    ) -> Self {
+        Self {
+            data_split,
+            payload_files,
+            row_ranges_by_file,
+        }
+    }
+}
+
+#[cfg(test)]
+impl BucketVectorPayload {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test(
+        index_type: &str,
+        file_name: &str,
+        file_size: i64,
+        row_count: i64,
+        deletion_vectors_ranges: Option<IndexMap<String, DeletionVectorMeta>>,
+        external_path: Option<String>,
+        global_index_meta: GlobalIndexMeta,
+    ) -> Self {
+        Self {
+            index_type: index_type.to_string(),
+            file_name: file_name.to_string(),
+            file_size,
+            row_count,
+            deletion_vectors_ranges,
+            external_path,
+            global_index_meta,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -89,18 +89,30 @@ pub(crate) fn build_live_row_ids(
                 // file_offset). A missing/empty entry allows no rows.
                 Some(ranges) => {
                     if let Some(allowed) = ranges.get(source_file.file_name()) {
-                        for position in allowed.iter() {
-                            if position >= row_count {
-                                return Err(data_invalid(format!(
-                                    "residual position {position} is out of range for source file {} ({} rows)",
-                                    source_file.file_name(),
-                                    row_count
-                                )));
+                        // A producer that restricts only some files leaves the rest
+                        // unrestricted, and an adapter has to spell that out as an
+                        // explicit whole-file allow-list. Insert it as one range
+                        // rather than walking every position, which would cost one
+                        // insert per row of the file. `len` plus a maximum of
+                        // `row_count - 1` can only describe the full set, and it
+                        // subsumes the per-position bound check below.
+                        if allowed.len() == row_count && allowed.max() == Some(row_count - 1) {
+                            live.insert_range(file_offset..end);
+                        } else {
+                            for position in allowed.iter() {
+                                if position >= row_count {
+                                    return Err(data_invalid(format!(
+                                        "residual position {position} is out of range for source file {} ({} rows)",
+                                        source_file.file_name(),
+                                        row_count
+                                    )));
+                                }
+                                let global =
+                                    file_offset.checked_add(position).ok_or_else(|| {
+                                        data_invalid("vector residual position overflows u64")
+                                    })?;
+                                live.insert(global);
                             }
-                            let global = file_offset.checked_add(position).ok_or_else(|| {
-                                data_invalid("vector residual position overflows u64")
-                            })?;
-                            live.insert(global);
                         }
                     }
                 }
@@ -839,6 +851,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0]);
+    }
+
+    #[test]
+    fn test_whole_file_allow_list_matches_having_no_residual_at_all() {
+        // An adapter spells "unrestricted" out as an explicit whole-file allow-list.
+        // That has to land on the same live set the no-residual path produces, since
+        // it is the same statement said two ways.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let active = active_set(&["f0", "f1"]);
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[0, 1, 2]));
+        residual.insert("f1".to_string(), treemap(&[0, 1]));
+
+        let spelled_out = build_live_row_ids(&files, &active, &HashMap::new(), Some(&residual))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spelled_out.iter().collect::<Vec<u64>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn test_whole_file_allow_list_still_applies_the_deletion_vector() {
+        // The whole-file shortcut must not skip deletion vectors: f0 allows every
+        // row, but position 1 is deleted and has to stay out.
+        let files = vec![PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[1]));
+        let mut residual = HashMap::new();
+        residual.insert("f0".to_string(), treemap(&[0, 1, 2]));
+        let live = build_live_row_ids(&files, &active_set(&["f0"]), &dvs, Some(&residual))
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2]);
     }
 
     #[test]

@@ -877,6 +877,33 @@ mod tests {
             .await
     }
 
+    /// The byte ranges a read of `data` requests when limited to `row_selection`.
+    async fn read_ranges_with_row_selection(
+        data: Bytes,
+        read_fields: &[DataField],
+        row_selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<Vec<Range<u64>>> {
+        let file_size = data.len() as u64;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let _: Vec<RecordBatch> = MosaicFormatReader
+            .read_batch_stream(
+                Box::new(TrackingFileRead {
+                    data,
+                    calls: Arc::clone(&calls),
+                }),
+                file_size,
+                read_fields,
+                None,
+                None,
+                row_selection,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        let ranges = calls.lock().unwrap().clone();
+        Ok(ranges)
+    }
+
     async fn read_ranges_with_predicates(
         data: Bytes,
         read_fields: &[DataField],
@@ -1295,6 +1322,37 @@ mod tests {
         assert_eq!(
             in_reads, eq_reads,
             "an all-outside IN should not read row-group column data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_selection_skips_unselected_row_group_reads() {
+        // Three row groups of two rows. A selection inside the last one must not
+        // fetch the column data of the first two: this is what makes a narrow
+        // engine-supplied row range cheaper than reading the file and discarding
+        // rows afterwards, and it is granular to a row group, not to a row.
+        let fields = data_fields();
+        let projected = vec![fields[0].clone()];
+        let data = multi_row_group_mosaic(vec!["id".to_string()]);
+
+        let all = read_ranges_with_row_selection(data.clone(), &projected, None)
+            .await
+            .unwrap();
+        let last_only =
+            read_ranges_with_row_selection(data, &projected, Some(vec![RowRange::new(4, 5)]))
+                .await
+                .unwrap();
+
+        assert!(
+            last_only.len() < all.len(),
+            "a selection in one row group must request fewer ranges than a full read: \
+             {last_only:?} vs {all:?}"
+        );
+        let selected_bytes: u64 = last_only.iter().map(|r| r.end - r.start).sum();
+        let all_bytes: u64 = all.iter().map(|r| r.end - r.start).sum();
+        assert!(
+            selected_bytes < all_bytes,
+            "and fewer bytes: {selected_bytes} vs {all_bytes}"
         );
     }
 
