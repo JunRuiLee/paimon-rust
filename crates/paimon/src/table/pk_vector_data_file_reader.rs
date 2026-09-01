@@ -95,8 +95,10 @@ impl DataFilePkVectorReaderFactory {
     /// opened. Each surviving physical position (not NULL, not `is_excluded`) is
     /// scored against every query into that query's bounded heap; a NULL row is
     /// skipped but still advances the position so the position stays in lockstep
-    /// with `is_excluded`. The drained row count is checked against what was read
-    /// (both truncation and overrun fail loud).
+    /// with `is_excluded`. The read is checked against its selection: emitting more
+    /// or fewer rows than were selected fails loud. A selected read can only vouch
+    /// for the ranges it asked for, so unlike a full read it cannot notice a file
+    /// truncated somewhere else.
     ///
     /// `allowed_rows`, when given, limits the read to those file-local inclusive
     /// ranges — normalized, as the plan carries them. An engine-supplied bucket

@@ -58,14 +58,20 @@ pub(super) fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringT
     Ok(positions)
 }
 
-/// The whole of a file, for a file the message left unrestricted. A zero-row file
-/// gets no range rather than an empty one: `RowRange` is inclusive, so it cannot
-/// express "nothing".
-fn whole_file_range(row_count: i64) -> Vec<RowRange> {
-    if row_count > 0 {
-        vec![RowRange::new(0, row_count - 1)]
-    } else {
-        Vec::new()
+/// The whole of a file, for a file the message left unrestricted.
+///
+/// A zero-row file gets no range rather than an empty one: `RowRange` is inclusive,
+/// so it cannot express "nothing". An unknown count (`DataFileMeta::ROW_COUNT_UNKNOWN`,
+/// or anything else negative) is rejected rather than read as "nothing", which would
+/// silently drop the file from the search. Decoding only checks the count of a file
+/// the message lists ranges for, so this is where an omitted one is checked.
+fn whole_file_range(row_count: i64) -> crate::Result<Vec<RowRange>> {
+    match row_count {
+        0 => Ok(Vec::new()),
+        count if count > 0 => Ok(vec![RowRange::new(0, count - 1)]),
+        count => Err(data_invalid(format!(
+            "data file row count must be known and non-negative, got {count}"
+        ))),
     }
 }
 
@@ -558,7 +564,7 @@ fn plan_from_bucket_splits(
                         // Decoding checks each range's bounds but not their order or
                         // whether they overlap, and a read needs them normalized.
                         Some(ranges) => merge_row_ranges(ranges.clone()),
-                        None => whole_file_range(file.row_count),
+                        None => whole_file_range(file.row_count)?,
                     };
                     Ok((file.file_name.clone(), allowed))
                 })
@@ -1265,6 +1271,20 @@ mod tests {
             .physical_row_ranges_by_split
             .expect("a split-driven plan restricts positions");
         assert_eq!(allowed(&ranges[0], "data-1.orc"), vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn rejects_an_unknown_row_count_on_an_unlisted_file() {
+        // A file the message lists no ranges for is read as "the whole file", which
+        // needs a real row count. `ROW_COUNT_UNKNOWN` is -1, and reading that as "no
+        // rows" would drop the file from the search without a word; the decoder only
+        // checks the count of files it does carry ranges for.
+        let error = whole_file_range(DataFileMeta::ROW_COUNT_UNKNOWN)
+            .map(|_| ())
+            .expect_err("an unknown row count cannot stand in for the whole file");
+        assert!(error.to_string().contains("must be known"), "{error}");
+        assert!(whole_file_range(0).unwrap().is_empty());
+        assert_eq!(whole_file_range(3).unwrap(), vec![RowRange::new(0, 2)]);
     }
 
     #[test]
