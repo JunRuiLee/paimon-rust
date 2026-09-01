@@ -287,6 +287,7 @@ async fn build_table(vectors: &[[f32; DIM]]) -> (tempfile::TempDir, Table) {
         file_size: i64::try_from(index_file_size).unwrap(),
         row_count,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,
             row_range_end: row_count - 1,
@@ -730,14 +731,13 @@ async fn empty_snapshot_still_rejects_zero_limit() {
     );
 }
 
-/// A filter set on a batch `execute()` (the scored / data-evolution path) must
-/// fail loud rather than silently drop the predicate: that path never reads
-/// physical rows, so it cannot honor a residual filter. Mirrors the single-query
-/// `execute_scored` guard.
+/// A filter set on a batch `execute()` (the scored / data-evolution path) is
+/// accepted even when the snapshot is empty. The scalar pre-filter is evaluated
+/// before vector Top-K, and batch result arity is preserved when no rows match.
 // Gated off Windows for the same `file://` tempdir reason as `pk_vector_baseline_test`.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn batch_execute_with_filter_on_non_pk_vector_table_fails_loud() {
+async fn batch_execute_with_filter_on_empty_non_pk_vector_table_returns_empty() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let location = format!("file://{}", tmp.path().display());
     let file_io = FileIOBuilder::new("file").build().unwrap();
@@ -770,18 +770,16 @@ async fn batch_execute_with_filter_on_non_pk_vector_table_fails_loud() {
         .greater_or_equal("id", Datum::Int(1))
         .expect("build filter on id");
 
+    let queries = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
     let mut batch = table.new_batch_vector_search_builder();
-    let err = batch
+    let results = batch
         .with_vector_column(VECTOR_COLUMN)
-        .with_query_vectors(vec![vec![1.0, 0.0, 0.0, 0.0]])
+        .with_query_vectors(queries.clone())
         .with_limit(3)
         .with_filter(filter)
         .execute()
         .await
-        .expect_err("a filter on the data-evolution batch path must fail loud");
-    assert!(
-        err.to_string()
-            .contains("only supported on the primary-key vector path"),
-        "expected a filter-unsupported error, got: {err}"
-    );
+        .expect("the data-evolution batch path must accept scalar pre-filters");
+    assert_eq!(results.len(), queries.len());
+    assert!(results.iter().all(|result| result.is_empty()));
 }

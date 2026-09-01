@@ -53,6 +53,7 @@ pub(crate) mod global_index_scanner;
 mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
+pub(crate) mod index_file_path;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -154,13 +155,18 @@ pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
-pub use vector_search_builder::{BatchVectorSearchBuilder, VectorSearchBuilder};
+pub use vector_search_builder::{
+    BatchVectorSearchBuilder, PreparedVectorSearchFilter, VectorSearchBuilder,
+};
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
 use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
-use crate::spec::{CoreOptions, DataField, Snapshot, TableSchema};
+use crate::spec::{
+    CoreOptions, DataField, Snapshot, TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
+    SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
+};
 use std::collections::HashMap;
 
 /// Table represents a table in the catalog.
@@ -425,6 +431,50 @@ impl Table {
         }
     }
 
+    /// Create a read-only copy pinned to an already resolved snapshot.
+    ///
+    /// Replaces any selector that originally resolved the snapshot with an
+    /// explicit `scan.snapshot-id`, so every subsequent scan stage observes the
+    /// same snapshot. The snapshot's schema is loaded when it differs from the
+    /// current table schema.
+    pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
+        let mut options = self.schema.options().clone();
+        for selector in [
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_WATERMARK_OPTION,
+            SCAN_VERSION_OPTION,
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+        ] {
+            options.remove(selector);
+        }
+        options.insert(
+            SCAN_SNAPSHOT_ID_OPTION.to_string(),
+            snapshot.id().to_string(),
+        );
+
+        let schema = if snapshot.schema_id() == self.schema.id() {
+            self.schema.copy_with_replaced_options(options)
+        } else {
+            self.schema_manager
+                .schema(snapshot.schema_id())
+                .await?
+                .copy_with_replaced_options(options)
+        };
+        Ok(Self {
+            file_io: self.file_io.clone(),
+            identifier: self.identifier.clone(),
+            location: self.location.clone(),
+            schema,
+            schema_manager: self.schema_manager.clone(),
+            branch: self.branch.clone(),
+            branch_reference: self.branch_reference,
+            rest_env: self.rest_env.clone(),
+            time_traveled: true,
+            travel_snapshot: Some(snapshot.clone()),
+        })
+    }
+
     /// Create a copy of this table with extra options merged in, switching to
     /// the schema of the time-travelled snapshot when the merged options
     /// select one.
@@ -582,4 +632,61 @@ pub(crate) fn query_auth_table() -> Table {
         table_schema,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::Table;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+    /// The value every reader and writer of a bucket-local index file consults.
+    ///
+    /// Each consumer resolves its own path from it — deletion vectors in
+    /// `table_scan` and `data_evolution_writer`, primary-key ANN segments in
+    /// `pk_vector_scan`, full-text archives, the dynamic-bucket hash index, and
+    /// `TableCommit::abort` — and each of those resolutions is covered where it
+    /// lives. What a copy must not do is hand them a different value than the one
+    /// the files on disk were written under.
+    #[test]
+    fn a_dynamic_copy_reads_the_stored_index_layout() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let stored = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("index-file-in-data-file-dir", "true")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "t"),
+            "memory:/t".to_string(),
+            stored,
+            None,
+        );
+
+        let copied = table.copy_with_options(HashMap::from([(
+            "index-file-in-data-file-dir".to_string(),
+            "false".to_string(),
+        )]));
+        assert!(
+            copied.schema().core_options().index_file_in_data_file_dir(),
+            "a read through a copied table must resolve index files under the stored layout"
+        );
+
+        // The copy is otherwise a normal copy.
+        let copied = table.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "3".to_string(),
+        )]));
+        assert_eq!(
+            copied.schema().options().get("scan.snapshot-id"),
+            Some(&"3".to_string())
+        );
+    }
 }

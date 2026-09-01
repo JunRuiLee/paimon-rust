@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::{
+    file_index::{
+        file_index_reader::{EmptyFileIndexReader, FileIndexReader},
+        file_indexer_factory::FileIndexerFactory,
+    },
     io::{FileIO, FileRead, FileStatus, InputFile, OutputFile},
+    spec::{DataField, DataType},
     Error,
 };
 
@@ -329,12 +334,78 @@ fn calculate_head_length(
     Ok(total_length)
 }
 
+fn resolve_index_data_type(
+    fields_by_name: &HashMap<&str, &DataType>,
+    column_name: &str,
+) -> crate::Result<DataType> {
+    let nested_start = column_name.find('[').filter(|_| column_name.ends_with(']'));
+    let field_name = nested_start
+        .map(|index| &column_name[..index])
+        .unwrap_or(column_name);
+    let data_type = fields_by_name.get(field_name).copied().ok_or_else(|| {
+        format_invalid(format!(
+            "Column '{field_name}' for file index '{column_name}' was not found in schema"
+        ))
+    })?;
+
+    match (nested_start, data_type) {
+        (Some(_), DataType::Map(map_type)) => Ok(map_type.value_type().clone()),
+        (Some(_), data_type) => Err(format_invalid(format!(
+            "Nested file index '{column_name}' requires Map column '{field_name}', but found {data_type:?}"
+        ))),
+        (None, data_type) => Ok(data_type.clone()),
+    }
+}
+
 pub struct FileIndex {
     reader: Box<dyn FileRead>,
     header: HashMap<String, HashMap<String, IndexInfo>>,
 }
 
 impl FileIndex {
+    /// Constructs readers for the required columns described by this outer-format file.
+    #[allow(dead_code)]
+    pub(crate) async fn create_index_readers(
+        &self,
+        fields: &[DataField],
+        required_columns: &HashSet<String>,
+    ) -> crate::Result<HashMap<String, Vec<Box<dyn FileIndexReader>>>> {
+        let fields_by_name = fields
+            .iter()
+            .map(|field| (field.name(), field.data_type()))
+            .collect::<HashMap<&str, &DataType>>();
+        let mut readers = HashMap::with_capacity(required_columns.len());
+
+        for column_name in required_columns {
+            let Some(index_info) = self.header.get(column_name) else {
+                continue;
+            };
+            let mut column_readers = Vec::with_capacity(index_info.len());
+            for (identifier, info) in index_info {
+                if info.start_pos == EMPTY_INDEX_FLAG {
+                    column_readers.push(Box::new(EmptyFileIndexReader) as Box<dyn FileIndexReader>);
+                    continue;
+                }
+
+                let data_type = resolve_index_data_type(&fields_by_name, column_name)?;
+                let serialized = self
+                    .get_bytes_with_start_and_length(info)
+                    .await?
+                    .ok_or_else(|| {
+                        format_invalid(format!(
+                            "Non-empty file index '{identifier}' for column '{column_name}' had no payload"
+                        ))
+                    })?;
+                column_readers.push(FileIndexerFactory::create_reader(
+                    identifier, data_type, serialized,
+                )?);
+            }
+            readers.insert(column_name.clone(), column_readers);
+        }
+
+        Ok(readers)
+    }
+
     pub async fn get_column_index(
         &self,
         column_name: &str,
@@ -557,8 +628,21 @@ impl FileIndexFormatReader {
 mod file_index_format_tests {
 
     use super::*;
-    use bytes::Bytes;
-    use std::collections::HashMap;
+    use bytes::{Bytes, BytesMut};
+    use std::collections::{HashMap, HashSet};
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
+
+    use crate::common::Options;
+    use crate::file_index::file_index_predicate::FileIndexPredicate;
+    use crate::file_index::file_index_result::FileIndexResult;
+    use crate::file_index::file_indexer_factory::{
+        FileIndexerFactory, BITMAP_INDEX, BLOOM_FILTER_INDEX,
+    };
+    use crate::spec::{
+        BigIntType, Datum, IntType, MapType, Predicate, PredicateBuilder, PredicateOperator,
+        VarCharType,
+    };
 
     const JAVA_V1_SIMPLE: &str = concat!(
         "00054e4ed01a35ae000000010000002a0000000100016100000001000162",
@@ -579,6 +663,111 @@ mod file_index_format_tests {
         let output = file_io.new_output(path)?;
         output.write(Bytes::from(bytes)).await?;
         Ok(output.to_input_file())
+    }
+
+    struct TrackingFileRead {
+        data: Bytes,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[test]
+    fn test_resolve_index_data_type_matches_java_nested_name_rules() {
+        let value_type = DataType::BigInt(BigIntType::new());
+        let map_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::new(20).unwrap()),
+            value_type.clone(),
+        ));
+        let exact_unclosed_type = DataType::Int(IntType::new());
+        let plain_type = DataType::Int(IntType::new());
+        let fields_by_name = HashMap::from([
+            ("metrics", &map_type),
+            ("metrics[k", &exact_unclosed_type),
+            ("plain", &plain_type),
+        ]);
+
+        assert_eq!(
+            resolve_index_data_type(&fields_by_name, "metrics[k]").unwrap(),
+            value_type
+        );
+        assert_eq!(
+            resolve_index_data_type(&fields_by_name, "metrics[k").unwrap(),
+            exact_unclosed_type
+        );
+        assert!(matches!(
+            resolve_index_data_type(&fields_by_name, "metrics[k][nested]"),
+            Ok(DataType::BigInt(_))
+        ));
+        assert!(matches!(
+            resolve_index_data_type(&fields_by_name, "metrics[k][nested"),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+        assert!(matches!(
+            resolve_index_data_type(&fields_by_name, "plain[k]"),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_composition_reads_only_required_column_payloads() -> crate::Result<()> {
+        let data_type = DataType::Int(IntType::new());
+        let mut writer =
+            FileIndexerFactory::create_writer(BITMAP_INDEX, data_type.clone(), &Options::new())?;
+        writer.write(Some(&Datum::Int(1)))?;
+        let required_payload = writer.serialized_bytes()?;
+        let unrelated_payload = Bytes::from(vec![0; 1024]);
+        let required_end = required_payload.len() as u64;
+        let unrelated_end = required_end + unrelated_payload.len() as u64;
+        let mut data = BytesMut::with_capacity(unrelated_end as usize);
+        data.extend_from_slice(&required_payload);
+        data.extend_from_slice(&unrelated_payload);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let file_index = FileIndex {
+            reader: Box::new(TrackingFileRead {
+                data: data.freeze(),
+                ranges: Arc::clone(&ranges),
+            }),
+            header: HashMap::from([
+                (
+                    "required".to_string(),
+                    HashMap::from([(
+                        BITMAP_INDEX.to_string(),
+                        IndexInfo {
+                            start_pos: 0,
+                            length: required_end as i32,
+                        },
+                    )]),
+                ),
+                (
+                    "unrelated".to_string(),
+                    HashMap::from([(
+                        "unknown".to_string(),
+                        IndexInfo {
+                            start_pos: required_end as i32,
+                            length: unrelated_payload.len() as i32,
+                        },
+                    )]),
+                ),
+            ]),
+        };
+        let fields = [DataField::new(0, "required".to_string(), data_type)];
+        let required_columns = HashSet::from(["required".to_string()]);
+
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
+
+        assert_eq!(readers.len(), 1);
+        assert_eq!(readers["required"].len(), 1);
+        assert_eq!(*ranges.lock().unwrap(), vec![0..required_end]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -832,6 +1021,184 @@ mod file_index_format_tests {
         assert_eq!(column_indexes.get("b"), Some(&None));
         assert_eq!(column_indexes.get("c"), Some(&Some(Bytes::new())));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outer_format_builds_grouped_readers_and_evaluates_predicates() -> crate::Result<()>
+    {
+        let fields = vec![
+            DataField::new(0, "a".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "b".to_string(), DataType::BigInt(BigIntType::new())),
+            DataField::new(2, "empty".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let mut bloom_options = Options::new();
+        bloom_options.set("items", "10");
+        bloom_options.set("fpp", "0.1");
+
+        let mut bitmap = FileIndexerFactory::create_writer(
+            BITMAP_INDEX,
+            fields[0].data_type().clone(),
+            &Options::new(),
+        )?;
+        let mut bloom = FileIndexerFactory::create_writer(
+            BLOOM_FILTER_INDEX,
+            fields[0].data_type().clone(),
+            &bloom_options,
+        )?;
+        for value in [
+            Some(Datum::Int(1)),
+            Some(Datum::Int(2)),
+            None,
+            Some(Datum::Int(1)),
+        ] {
+            bitmap.write(value.as_ref())?;
+            bloom.write(value.as_ref())?;
+        }
+
+        let mut b_bloom = FileIndexerFactory::create_writer(
+            BLOOM_FILTER_INDEX,
+            fields[1].data_type().clone(),
+            &bloom_options,
+        )?;
+        b_bloom.write(Some(&Datum::Long(42)))?;
+
+        let indexes = HashMap::from([
+            (
+                "a".to_string(),
+                HashMap::from([
+                    (BITMAP_INDEX.to_string(), Some(bitmap.serialized_bytes()?)),
+                    (
+                        BLOOM_FILTER_INDEX.to_string(),
+                        Some(bloom.serialized_bytes()?),
+                    ),
+                ]),
+            ),
+            (
+                "b".to_string(),
+                HashMap::from([(
+                    BLOOM_FILTER_INDEX.to_string(),
+                    Some(b_bloom.serialized_bytes()?),
+                )]),
+            ),
+            (
+                "empty".to_string(),
+                HashMap::from([("unregistered-empty-index".to_string(), None)]),
+            ),
+        ]);
+
+        let output = write_column_indexes("memory:/tmp/composed_file_indexes", indexes).await?;
+        let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
+        let required_columns =
+            HashSet::from(["a".to_string(), "b".to_string(), "empty".to_string()]);
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
+        assert_eq!(readers.len(), 3);
+        assert_eq!(readers["a"].len(), 2);
+        assert_eq!(readers["b"].len(), 1);
+        assert_eq!(readers["empty"].len(), 1);
+
+        let predicate = FileIndexPredicate::new(readers);
+        let builder = PredicateBuilder::new(&fields);
+        assert_eq!(
+            predicate.evaluate(&builder.equal("a", Datum::Int(1))?),
+            FileIndexResult::Selection([0_u32, 3].into_iter().collect())
+        );
+        assert_eq!(
+            predicate.evaluate(&builder.equal("b", Datum::Long(43))?),
+            FileIndexResult::Skip
+        );
+        assert_eq!(
+            predicate.evaluate(&builder.equal("empty", Datum::Int(1))?),
+            FileIndexResult::Skip
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_outer_format_uses_map_value_type_for_nested_index() -> crate::Result<()> {
+        let value_type = DataType::BigInt(BigIntType::new());
+        let fields = [DataField::new(
+            0,
+            "metrics".to_string(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::new(20).unwrap()),
+                value_type.clone(),
+            )),
+        )];
+        let mut bloom_options = Options::new();
+        bloom_options.set("items", "10");
+        bloom_options.set("fpp", "0.1");
+        let mut bitmap =
+            FileIndexerFactory::create_writer(BITMAP_INDEX, value_type.clone(), &Options::new())?;
+        let mut bloom = FileIndexerFactory::create_writer(
+            BLOOM_FILTER_INDEX,
+            value_type.clone(),
+            &bloom_options,
+        )?;
+        for value in [Datum::Long(7), Datum::Long(8)] {
+            bitmap.write(Some(&value))?;
+            bloom.write(Some(&value))?;
+        }
+        let indexes = HashMap::from([(
+            "metrics[k]".to_string(),
+            HashMap::from([
+                (BITMAP_INDEX.to_string(), Some(bitmap.serialized_bytes()?)),
+                (
+                    BLOOM_FILTER_INDEX.to_string(),
+                    Some(bloom.serialized_bytes()?),
+                ),
+            ]),
+        )]);
+
+        let output = write_column_indexes("memory:/tmp/nested_map_file_indexes", indexes).await?;
+        let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
+        let required_columns = HashSet::from(["metrics[k]".to_string()]);
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
+        assert_eq!(readers["metrics[k]"].len(), 2);
+
+        let predicate = FileIndexPredicate::new(readers);
+        assert_eq!(
+            predicate.evaluate(&Predicate::Leaf {
+                column: "metrics[k]".to_string(),
+                index: 0,
+                data_type: value_type,
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Long(7)],
+            }),
+            FileIndexResult::Selection([0_u32].into_iter().collect())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_composition_rejects_unknown_non_empty_identifier() -> crate::Result<()> {
+        let indexes = HashMap::from([(
+            "a".to_string(),
+            HashMap::from([("unknown".to_string(), Some(Bytes::from_static(b"payload")))]),
+        )]);
+        let output = write_column_indexes("memory:/tmp/unknown_file_index", indexes).await?;
+        let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
+        let fields = [DataField::new(
+            0,
+            "a".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+
+        let required_columns = HashSet::from(["a".to_string()]);
+        let error = match file_index
+            .create_index_readers(&fields, &required_columns)
+            .await
+        {
+            Ok(_) => panic!("unknown identifier must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Unsupported { .. }));
         Ok(())
     }
 

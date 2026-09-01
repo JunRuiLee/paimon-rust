@@ -36,6 +36,9 @@ use crate::table::{BranchManager, SnapshotManager, TagManager};
 use futures::future::try_join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
+/// Name prefix of an index file, Java `FileStorePathFactory.INDEX_PREFIX`.
+const INDEX_FILE_PREFIX: &str = "index-";
+
 /// Per-scope aggregated summary of referenced files (deduplicated).
 ///
 /// Each row represents the unique referenced files for a scope:
@@ -665,7 +668,9 @@ fn is_partition_segment(segment: &str) -> bool {
     !key.is_empty()
 }
 
-fn is_data_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
+/// Whether `segments` names a file directly inside a bucket directory,
+/// `[<partition>/]bucket-N/<file>`, whatever kind of file it is.
+fn is_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
     if segments.len() != partition_depth + 2 {
         return false;
     }
@@ -674,7 +679,25 @@ fn is_data_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
         .iter()
         .all(|segment| is_partition_segment(segment))
         && is_bucket_dir_name(segments[partition_depth])
-        && !segments[partition_depth + 1].starts_with("index-")
+}
+
+/// An `index-` prefixed file in a bucket directory is an index file, not a data
+/// file: that is where `index-file-in-data-file-dir` puts them. Classification
+/// follows the physical form, not the current table option, so a file written
+/// under one setting is still recognized after the setting changes — same as Java
+/// `FileType.classify`, which maps any `index-*` basename to `BUCKET_INDEX`.
+fn is_bucket_index_file_name(file_name: &str) -> bool {
+    file_name.starts_with(INDEX_FILE_PREFIX)
+}
+
+fn is_data_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
+    is_file_in_bucket(segments, partition_depth)
+        && !is_bucket_index_file_name(segments[partition_depth + 1])
+}
+
+fn is_index_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
+    is_file_in_bucket(segments, partition_depth)
+        && is_bucket_index_file_name(segments[partition_depth + 1])
 }
 
 fn is_data_file_in_data_dir(
@@ -718,6 +741,7 @@ fn classify_physical_path(
         ["manifest", name] if is_manifest_file_name(name) => PhysicalFileKind::Manifest,
         ["statistics", _] => PhysicalFileKind::Statistics,
         ["index", _] => PhysicalFileKind::Index,
+        _ if is_index_file_in_bucket(&segments, partition_depth) => PhysicalFileKind::Index,
         _ => {
             if let Some(data_dir) = data_file_path_directory {
                 let data_dir = table_relative_path(table_location, data_dir).unwrap_or(data_dir);
@@ -1108,7 +1132,7 @@ mod tests {
         .await;
         write_test_file(
             &file_io,
-            &format!("{table_path}/bucket-0/index-should-not-be-data"),
+            &format!("{table_path}/bucket-0/index-in-bucket-dir"),
             "bucket index",
         )
         .await;
@@ -1158,7 +1182,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.manifest_file_count, 4);
-        assert_eq!(result.index_file_count, 1);
+        // `<table>/index/index-0` plus the `index-` prefixed file in a bucket
+        // directory, which `index-file-in-data-file-dir` puts there.
+        assert_eq!(result.index_file_count, 2);
+        assert_eq!(
+            result.index_file_size,
+            ("index".len() + "bucket index".len()) as i64
+        );
         assert_eq!(result.data_file_count, 3);
     }
 
@@ -1203,7 +1233,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.data_file_count, 1);
-        assert_eq!(result.index_file_count, 0);
+        // A bucket-local index file counts as an index file at any partition depth.
+        assert_eq!(result.index_file_count, 1);
+        assert_eq!(
+            result.index_file_size,
+            "partition bucket index".len() as i64
+        );
     }
 
     #[tokio::test]

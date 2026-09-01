@@ -44,11 +44,12 @@ use datafusion::prelude::SessionContext;
 use futures::{stream, TryStreamExt};
 use paimon::catalog::Catalog;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, Predicate, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
+use crate::filter_pushdown::analyze_filters;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::table::{datafusion_read_fields, PaimonTableProvider};
 use crate::table_function_args::{
@@ -262,10 +263,17 @@ impl TableProvider for VectorSearchTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(&self.schema(), projection)?;
+        let filter_analysis = analyze_filters(filters, self.inner.table().schema().fields(), true);
+        if filter_analysis.requires_residual {
+            return Err(DataFusionError::Plan(
+                "vector_search cannot apply a partially translated scalar pre-filter".to_string(),
+            ));
+        }
+        let pushed_predicate = filter_analysis.pushed_predicate;
 
         // An outer `LIMIT 0` needs no rows.
         if limit == Some(0) {
@@ -278,7 +286,7 @@ impl TableProvider for VectorSearchTableProvider {
         // small outer LIMIT doesn't read/materialize everything). All of this — search,
         // read and rank-order gather — runs at execution time in the exec's stream, so
         // planning / EXPLAIN stays cheap and the work is driven by the TaskContext.
-        Ok(Arc::new(VectorSearchExec::new(
+        let mut exec = VectorSearchExec::new(
             self.inner.table().clone(),
             self.column_name.clone(),
             self.query_vector.clone(),
@@ -286,17 +294,31 @@ impl TableProvider for VectorSearchTableProvider {
             limit,
             projection.cloned(),
             projected_schema,
-        )))
+        );
+        if let Some(filter) = pushed_predicate {
+            exec = exec.with_filter(filter);
+        }
+        Ok(Arc::new(exec))
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        let fields = self.inner.table().schema().fields();
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                let analysis = analyze_filters(std::slice::from_ref(*filter), fields, true);
+                if analysis.pushed_predicate.is_some() && !analysis.requires_residual {
+                    // Keep DataFusion's residual filter as a correctness backstop
+                    // while using the same predicate before vector Top-K.
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 }
 
@@ -315,6 +337,7 @@ struct VectorSearchExec {
     output_limit: Option<usize>,
     projection: Option<Vec<usize>>,
     output_schema: ArrowSchemaRef,
+    filter: Option<Predicate>,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -342,21 +365,45 @@ impl VectorSearchExec {
             output_limit,
             projection,
             output_schema,
+            filter: None,
             plan_properties,
         }
     }
 
+    fn with_filter(mut self, filter: Predicate) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
     async fn compute_batch(&self) -> DFResult<RecordBatch> {
+        let prepared_filter = match &self.filter {
+            Some(filter) => Some(
+                self.table
+                    .prepare_vector_search_filter(filter.clone())
+                    .await
+                    .map_err(to_datafusion_error)?,
+            ),
+            None => None,
+        };
+        let search_table = prepared_filter
+            .as_ref()
+            .map(|prepared| prepared.table())
+            .unwrap_or(&self.table);
+
         // Best-first row-ids from the index, searched at the full top-k so the ANN
         // recall is unchanged (data-evolution / global-index path; PK-vector tables are
         // unsupported here, as before).
         let mut search_result = await_with_runtime(async {
-            let mut builder = self.table.new_vector_search_builder();
+            let mut builder = self.table.new_batch_vector_search_builder();
             builder
                 .with_vector_column(&self.column_name)
-                .with_query_vector(self.query_vector.clone())
+                .with_query_vectors(vec![self.query_vector.clone()])
                 .with_limit(self.search_limit);
-            builder.execute_scored().await.map_err(to_datafusion_error)
+            if let Some(prepared) = &prepared_filter {
+                builder.with_prepared_filter(prepared.clone());
+            }
+            let mut results = builder.execute().await.map_err(to_datafusion_error)?;
+            Ok::<_, DataFusionError>(results.remove(0))
         })
         .await?;
 
@@ -376,10 +423,10 @@ impl VectorSearchExec {
 
         // Read the projected columns (+ internal `_ROW_ID`); the row-range scan yields
         // file order, realigned to relevance rank below.
-        let read_fields = projected_read_fields(&self.table, self.projection.as_ref())?;
+        let read_fields = projected_read_fields(search_table, self.projection.as_ref())?;
         let row_ranges = search_result.to_row_ranges().map_err(to_datafusion_error)?;
         let batches = await_with_runtime(async {
-            let mut read_builder = self.table.new_read_builder();
+            let mut read_builder = search_table.new_read_builder();
             read_builder
                 .with_read_type(read_fields)
                 .with_row_ranges(row_ranges);
@@ -406,8 +453,8 @@ impl DisplayAs for VectorSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "VectorSearchExec: column={}, search_limit={}, output_limit={:?}",
-            self.column_name, self.search_limit, self.output_limit
+            "VectorSearchExec: column={}, search_limit={}, output_limit={:?}, filter={:?}",
+            self.column_name, self.search_limit, self.output_limit, self.filter
         )
     }
 }

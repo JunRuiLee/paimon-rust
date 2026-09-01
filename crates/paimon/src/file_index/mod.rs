@@ -16,7 +16,7 @@
 // under the License.
 
 // Concrete readers/writers and predicate plumbing stay crate-private until
-// factory, data-writer, and scan integration land in later changes.
+// data-writer and scan integration land in later changes.
 #[allow(dead_code)]
 pub(crate) mod bitmap;
 #[allow(dead_code)]
@@ -28,5 +28,9 @@ pub(crate) mod file_index_predicate;
 pub(crate) mod file_index_reader;
 #[allow(dead_code)]
 pub(crate) mod file_index_result;
+#[allow(dead_code)]
+pub(crate) mod file_index_writer;
+#[allow(dead_code)]
+pub(crate) mod file_indexer_factory;
 
 pub use file_index_format::*;

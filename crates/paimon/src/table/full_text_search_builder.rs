@@ -31,6 +31,7 @@ use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_full_text_read::PrimaryKeyFullTextRead;
 use crate::table::pk_full_text_scan::PrimaryKeyFullTextScan;
 use crate::table::{
@@ -44,7 +45,6 @@ use roaring::RoaringTreemap;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
-const INDEX_DIR: &str = "index";
 const FULL_TEXT_INDEX_TYPE: &str = "full-text";
 const FULL_TEXT_INDEX_SEARCH_CONCURRENCY: usize = 8;
 
@@ -278,6 +278,10 @@ impl<'a> FullTextSearchBuilder<'a> {
             self.table.file_io().clone(),
             materialize_reader,
             self.table.location().trim_end_matches('/').to_string(),
+            self.table
+                .schema()
+                .core_options()
+                .index_file_in_data_file_dir(),
         );
         read.read(&plan, query_text, limit).await
     }
@@ -359,7 +363,10 @@ async fn evaluate_full_text_search(
             .map(|plan| {
                 let entry = plan.entry;
                 let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
-                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let path = IndexFileLocation::Global { table_path }.resolve(
+                    &entry.index_file.file_name,
+                    entry.index_file.external_path.as_deref(),
+                );
                 let file_name = entry.index_file.file_name.clone();
                 let query_text = search.query_text.clone();
                 let local_filter = plan.local_filter;
@@ -1014,6 +1021,7 @@ mod tests {
                 file_size: i64::try_from(index_bytes.len()).unwrap(),
                 row_count: 2,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: 100,
                     row_range_end: 101,
@@ -1095,6 +1103,7 @@ mod tests {
                 file_size: i64::try_from(index_bytes.len()).unwrap(),
                 row_count: 2,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: 100,
                     row_range_end: 101,
@@ -1272,6 +1281,7 @@ mod tests {
                 file_size: 0,
                 row_count: end - start + 1,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: start,
                     row_range_end: end,

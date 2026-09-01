@@ -971,6 +971,13 @@ CALL sys.create_global_index(
   index_type => 'multivalue',
   options => 'multivalue-index.dictionary-block-size=16kb,multivalue-index.compression=zstd,multivalue-index.compression-level=1'
 );
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'message',
+  index_type => 'fm',
+  options => 'fm-index.partition-size=16mb,fm-index.sa-sample-rate=32,fm-index.compression=lz4'
+);
 ```
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
@@ -987,6 +994,20 @@ are `btree-index.block-size`, `bitmap-index.dictionary-block-size`, or
 `*.compression` (`none`, `zstd`, `lz4`, or `lzo`) and `*.compression-level`
 options. Per-call options override table options. Bitmap and multivalue global
 indexes use Java-compatible bitmap files.
+
+FM global indexes support character-string columns and exact byte-substring
+`contains`, `IS NULL`, and `IS NOT NULL` predicates. They use the
+Java-compatible partitioned V1 format. `sorted-index.records-per-range` bounds
+the source rows streamed into each FM index file; `fm-index.partition-size` and
+`fm-index.partition-row-count` bound the encoded partitions within that file.
+Build options are
+`fm-index.partition-size`, `fm-index.partition-row-count`,
+`fm-index.sa-sample-rate`, `fm-index.compression`, and
+`fm-index.compression-level`. Scan-time table options are
+`fm-index.read-cache-size`, `fm-index.demand-page-size`, and
+`fm-index.locate-cost-ratio`. When locating a dense result would cost more than
+the configured ratio, the FM index safely declines evaluation and the normal
+source scan applies the predicate.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1118,7 +1139,7 @@ FROM paimon.my_db.items$table_indexes;
 
 ### drop_global_index
 
-Drop a committed sorted global index:
+Drop a committed global index:
 
 ```sql
 CALL sys.drop_global_index(
@@ -1129,8 +1150,8 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `lumina` (or `lumina-vector-ann`), and the vindex types `ivf-flat`,
-`ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
+`multivalue`, `fm`, `lumina` (or `lumina-vector-ann`), and the vindex types
+`ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
 ### create_lumina_index
@@ -1318,6 +1339,32 @@ The function performs ANN search across all matching vector index files for the
 target column, merges results, and returns the top-k rows ordered by relevance
 score. If no matching index is found, an empty result is returned.
 
+### Scalar Pre-Filters
+
+Add a `WHERE` clause to restrict the rows considered by vector Top-K. The
+predicate is evaluated before the vector index selects its nearest neighbors:
+
+```sql
+SELECT id, event_time
+FROM vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    '[1.0, 0.0, 0.0, 0.0]',
+    10
+)
+WHERE event_time >= TIMESTAMP '2026-08-01 00:00:00';
+```
+
+On data-evolution tables, Paimon resolves the predicate to matching global row
+IDs using a snapshot-pinned table read. Scalar global indexes such as BTree can
+narrow this read. The matching global row IDs are intersected with each vector
+index shard and passed to the vector backend as its row filter, so an excluded
+nearest neighbor does not consume one of the requested Top-K positions.
+
+Only predicates that can be translated completely to Paimon predicates are
+pushed into vector search. DataFusion keeps its residual filter for ordinary
+`vector_search` queries as an additional correctness check.
+
 ### Refine / Rerank
 
 Vector index search can optionally refine ANN results by reading the raw vectors
@@ -1399,6 +1446,28 @@ ORDER BY query_id, result_id;
 ```
 
 The query-vector column must have Arrow type `List<Float32>` or `FixedSizeList<Float32>`. Null query-vector rows produce no joined results, and null elements inside a vector are rejected. The lateral form returns the left row joined with the top-k matching rows from the target Paimon table for that row's query vector.
+
+Fully translatable target-table predicates are also applied before each lateral
+Top-K:
+
+```sql
+SELECT q.id AS query_id, r.id AS result_id
+FROM paimon.my_db.queries q
+CROSS JOIN LATERAL vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    q.embedding,
+    10
+) AS r
+WHERE r.event_time >= TIMESTAMP '2026-08-01 00:00:00'
+ORDER BY query_id, result_id;
+```
+
+For conjunctions, target-only predicates such as `r.event_time >= ...` are
+pushed into vector search. Predicates that reference the left relation or both
+sides remain normal join-result filters. Unsupported or inexact target
+predicates also remain post-Top-K residual filters, so they may return fewer
+than the requested number of rows.
 
 ### Supported Metrics
 
@@ -1985,8 +2054,8 @@ Columns:
 |---|---|---|
 | `partition` | STRING | Partition spec for the indexed data, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id covered by the index file |
-| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
-| `file_name` | STRING | Index file name under the table index directory |
+| `index_type` | STRING | Index type, such as `btree`, `bitmap`, `multivalue`, `fm`, `ivf-flat`, `lumina`, or `DELETION_VECTORS` |
+| `file_name` | STRING | Index file name. It resolves to the table `index/` directory, or to the bucket's data-file directory when `index-file-in-data-file-dir` is set; an index file with an external path is read from that path instead |
 | `file_size` | BIGINT | Index file size in bytes |
 | `row_count` | BIGINT | Number of rows covered by the index file |
 | `dv_ranges` | ARRAY | Deletion-vector ranges, only populated for deletion-vector metadata |
@@ -2003,7 +2072,8 @@ Files are classified by their table-relative path:
 - `manifest/manifest-*`, `manifest/manifest-list-*`, and `manifest/index-manifest-*` → manifest
 - `statistics/*` → manifest file counters for the current compatible output schema
 - `index/*` → index
-- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth, except names starting with `index-`
+- `<partition>/bucket-*/index-*` and `<partition>/bucket-postpone/index-*` → index, where `index-file-in-data-file-dir` puts them; classification follows the file's physical form, not the current option value
+- `<partition>/bucket-*/*` and `<partition>/bucket-postpone/*` → data, using the table's partition depth
 - unknown files are ignored by this summary
 
 ```sql
@@ -2174,7 +2244,7 @@ deletion vectors enabled.
 | `data-evolution.enabled` | `false` | Enables row-id-aware table evolution and partial-column writes. |
 | `global-index.enabled` | `true` | Enables global index metadata and global-index-aware reads. |
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
-| `sorted-index.records-per-range` | `100000` | Maximum row count per sorted global-index range; falls back to legacy `btree-index.records-per-range`. |
+| `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
 | `btree-index.compression` | `none` | BTree block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `btree-index.compression-level` | `1` | BTree compression level (used by codecs that support levels). |
@@ -2184,6 +2254,14 @@ deletion vectors enabled.
 | `multivalue-index.dictionary-block-size` | `16kb` | Target multivalue dictionary-block size. |
 | `multivalue-index.compression` | `none` | Multivalue dictionary/index block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `multivalue-index.compression-level` | `1` | Multivalue compression level (used by codecs that support levels). |
+| `fm-index.partition-size` | `16mb` | Maximum encoded symbol count targeted by each FM partition. A single encoded value must be smaller than this limit. |
+| `fm-index.partition-row-count` | `100000` | Maximum row count per FM partition. |
+| `fm-index.sa-sample-rate` | `32` | Power-of-two suffix-array sampling rate used by FM locate operations. |
+| `fm-index.compression` | `lz4` | FM block compression: `none`, `zstd`, `lz4`, or `lzo`. |
+| `fm-index.compression-level` | `1` | FM compression level (used by codecs that support levels). |
+| `fm-index.read-cache-size` | `64mb` | Scan-scoped decoded FM block cache size. |
+| `fm-index.demand-page-size` | `512kb` | Target compressed-block read-ahead size for FM demand paging. |
+| `fm-index.locate-cost-ratio` | `0.001` | Maximum estimated locate work as a fraction of indexed text; denser matches fall back to the source scan. |
 | `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |

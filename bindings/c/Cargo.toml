@@ -31,7 +31,13 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 doc = false
 
 [dependencies]
-paimon = { path = "../../crates/paimon" }
+paimon = { path = "../../crates/paimon", features = [
+    "storage-azdls",
+    "storage-cos",
+    "storage-gcs",
+    "storage-obs",
+    "storage-s3",
+] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 futures = "0.3"
 arrow = { workspace = true }
@@ -45,3 +51,5 @@ bytes = "1.7.1"
 # Test-only: the vector-search integration tests build a real primary-key vindex
 # IVF-flat ANN segment fixture in-process. Versions match crates/paimon.
 paimon-vindex-core = "0.4.0"
+tempfile = "3"
+url = "2.5.2"

@@ -62,6 +62,55 @@ pub unsafe extern "C" fn paimon_bytes_free(bytes: paimon_bytes) {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct paimon_byte_slice {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+pub struct paimon_bytes_array {
+    pub data: *mut paimon_bytes,
+    pub len: usize,
+}
+
+impl paimon_bytes_array {
+    pub fn empty() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    pub fn new(values: Vec<Vec<u8>>) -> Self {
+        if values.is_empty() {
+            return Self::empty();
+        }
+        let boxed = values
+            .into_iter()
+            .map(paimon_bytes::new)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let len = boxed.len();
+        let data = Box::into_raw(boxed) as *mut paimon_bytes;
+        Self { data, len }
+    }
+}
+
+/// # Safety
+/// `array` was returned by `paimon_blob_reader_read_blobs`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_bytes_array_free(array: paimon_bytes_array) {
+    if array.data.is_null() {
+        return;
+    }
+    let values = Box::from_raw(std::ptr::slice_from_raw_parts_mut(array.data, array.len));
+    for value in values.iter().copied() {
+        paimon_bytes_free(value);
+    }
+}
+
 /// Opaque wrapper around a heap-allocated Rust object.
 #[repr(C)]
 pub struct paimon_catalog {
@@ -117,6 +166,16 @@ pub struct paimon_file_cache_callbacks_v1 {
     >,
     /// Releases `context` after the last FileIO/table clone is dropped.
     pub destroy: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
+#[repr(C)]
+pub struct paimon_blob_reader {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_blob_stream {
+    pub inner: *mut c_void,
 }
 
 #[repr(C)]

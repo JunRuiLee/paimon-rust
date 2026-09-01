@@ -277,6 +277,7 @@ pub(crate) struct PrimaryKeyFullTextRead {
     file_io: FileIO,
     materialize_reader: DataFileReader,
     table_path: String,
+    index_file_in_data_file_dir: bool,
 }
 
 impl PrimaryKeyFullTextRead {
@@ -284,11 +285,13 @@ impl PrimaryKeyFullTextRead {
         file_io: FileIO,
         materialize_reader: DataFileReader,
         table_path: String,
+        index_file_in_data_file_dir: bool,
     ) -> Self {
         Self {
             file_io,
             materialize_reader,
             table_path,
+            index_file_in_data_file_dir,
         }
     }
 
@@ -344,6 +347,7 @@ impl PrimaryKeyFullTextRead {
                 &dvs,
                 &self.file_io,
                 &self.table_path,
+                self.index_file_in_data_file_dir,
                 split_index,
             )
             .await?;
@@ -686,6 +690,7 @@ mod read_tests {
             file_size: 1,
             row_count: total,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: 0,
@@ -904,7 +909,8 @@ mod read_tests {
             .unwrap()],
         };
 
-        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let read =
+            PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string(), false);
         let batches = collect(
             read.read(&plan, r#"{"match":{"query":"alpha"}}"#, 10)
                 .await
@@ -965,7 +971,8 @@ mod read_tests {
             .unwrap()],
         };
 
-        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let read =
+            PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string(), false);
         let batches = collect(
             read.read(&plan, r#"{"match":{"query":"alpha"}}"#, 10)
                 .await
@@ -994,7 +1001,8 @@ mod read_tests {
             )
             .unwrap()],
         };
-        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let read =
+            PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string(), false);
         let batches = collect(
             read.read(&plan, r#"{"match":{"query":"zeta"}}"#, 10)
                 .await
@@ -1029,7 +1037,8 @@ mod read_tests {
             .unwrap()],
         };
 
-        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let read =
+            PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string(), false);
         let route = read
             .search_route(&plan, r#"{"match":{"query":"alpha"}}"#, 10)
             .await
@@ -1079,7 +1088,8 @@ mod read_tests {
             .unwrap()],
         };
 
-        let read = PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string());
+        let read =
+            PrimaryKeyFullTextRead::new(file_io.clone(), reader, table_path.to_string(), false);
         let route = read
             .search_route(&plan, r#"{"match":{"query":"zeta"}}"#, 10)
             .await

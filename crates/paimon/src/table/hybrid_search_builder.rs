@@ -647,6 +647,7 @@ impl<'a> HybridSearchBuilder<'a> {
             table.file_io().clone(),
             materialize_reader,
             table.location().trim_end_matches('/').to_string(),
+            table.schema().core_options().index_file_in_data_file_dir(),
         );
         let result = read.search_route(&plan, query, route.limit).await?;
         let positions = result
@@ -1387,6 +1388,7 @@ mod pk_hybrid_tests {
             file_size: i64::try_from(vector_index_size).unwrap(),
             row_count,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: row_count - 1,
@@ -1420,6 +1422,7 @@ mod pk_hybrid_tests {
             file_size: 1,
             row_count,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: row_count - 1,

@@ -1568,6 +1568,7 @@ mod fulltext_tests {
             file_size: i64::try_from(index_bytes.len()).unwrap(),
             row_count: 5,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: 4,
@@ -1727,6 +1728,7 @@ mod vector_search_tests {
     };
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, DataType, FloatType, IntType, Schema, VarCharType};
     use paimon::table::BranchManager;
@@ -2279,6 +2281,17 @@ mod vector_search_tests {
     #[tokio::test]
     async fn test_vector_search_lateral_join_uses_query_vectors() {
         let (ctx, _catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("BTree index build SQL should execute");
         let query_batch = build_vector_batch(
             vec![10, 20],
             vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
@@ -2303,6 +2316,192 @@ mod vector_search_tests {
 
         let rows = extract_query_result_ids(&batches);
         assert_eq!(rows, vec![(10, 0), (10, 1), (20, 1), (20, 2)]);
+
+        let filtered = ctx
+            .sql(
+                "SELECT q.id AS query_id, r.id AS result_id \
+                 FROM paimon.default.queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+                 WHERE r.id = 2 \
+                 ORDER BY query_id, result_id",
+            )
+            .await
+            .expect("filtered lateral vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("filtered lateral vector_search query should execute");
+        assert_eq!(
+            extract_query_result_ids(&filtered),
+            vec![(10, 2), (20, 2)],
+            "the target-side filter must be applied before each lateral Top-K"
+        );
+
+        let mixed_filter = ctx
+            .sql(
+                "SELECT q.id AS query_id, r.id AS result_id \
+                 FROM paimon.default.queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+                 WHERE q.id = 10 AND r.id = 2 \
+                 ORDER BY query_id, result_id",
+            )
+            .await
+            .expect("mixed-filter lateral vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("mixed-filter lateral vector_search query should execute");
+        assert_eq!(
+            extract_query_result_ids(&mixed_filter),
+            vec![(10, 2)],
+            "target-only conjuncts must be pre-filtered while left conjuncts remain residual"
+        );
+
+        let cross_side_filter = ctx
+            .sql(
+                "SELECT q.id AS query_id, r.id AS result_id \
+                 FROM paimon.default.queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+                 WHERE r.id = 2 AND q.id = r.id * 5 \
+                 ORDER BY query_id, result_id",
+            )
+            .await
+            .expect("cross-side filtered lateral vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("cross-side filtered lateral vector_search query should execute");
+        assert_eq!(
+            extract_query_result_ids(&cross_side_filter),
+            vec![(10, 2)],
+            "cross-side conjuncts must remain residual"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lateral_vector_search_sequential_partitions_share_scalar_prefilter_snapshot() {
+        let (ctx, catalog, _tmp) = create_java_vindex_vector_search_context().await;
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("initial BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("initial BTree index build should execute");
+
+        let first_query_batch = build_vector_batch(vec![10], vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        let second_query_batch = build_vector_batch(vec![20], vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        let query_table = MemTable::try_new(
+            first_query_batch.schema(),
+            vec![vec![first_query_batch], vec![second_query_batch]],
+        )
+        .expect("Failed to create partitioned query vector table");
+        ctx.register_temp_table("paimon.default.refresh_queries", Arc::new(query_table))
+            .expect("Failed to register query vector table");
+
+        let dataframe = ctx
+            .sql(
+                "SELECT r.id \
+                 FROM paimon.default.refresh_queries q \
+                 CROSS JOIN LATERAL vector_search('paimon.default.test_java_vindex_vector', 'embedding', q.embedding, 1) AS r \
+                 WHERE r.id = 6",
+            )
+            .await
+            .expect("filtered lateral vector_search SQL should parse");
+        let physical_plan = dataframe
+            .create_physical_plan()
+            .await
+            .expect("physical plan should be created");
+        assert_eq!(
+            physical_plan.output_partitioning().partition_count(),
+            2,
+            "the regression requires sequential execution of two input partitions"
+        );
+
+        let task_context = ctx.ctx().task_ctx();
+        let first = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(0, Arc::clone(&task_context))
+                .expect("first partition should start"),
+        )
+        .await
+        .expect("first partition should finish");
+        assert!(extract_ids_in_order(&first).is_empty());
+
+        let identifier = Identifier::new("default", "test_java_vindex_vector");
+        let table = catalog
+            .get_table(&identifier)
+            .await
+            .expect("load vector target table");
+        let write_builder = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .expect("configure target append");
+        let mut writer = write_builder.new_write().expect("create target writer");
+        writer
+            .write_arrow_batch(&build_vector_batch(vec![6], vec![vec![1.0, 0.0, 0.0, 0.0]]))
+            .await
+            .expect("append target row");
+        let messages = writer
+            .prepare_commit()
+            .await
+            .expect("prepare target append");
+        write_builder
+            .new_commit()
+            .commit(messages)
+            .await
+            .expect("commit target append");
+
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'embedding', \
+             index_type => 'ivf-flat', \
+             options => 'ivf-flat.dimension=4,ivf-flat.nlist=1,ivf-flat.distance.metric=l2')",
+        )
+        .await
+        .expect("incremental vector index build SQL should parse")
+        .collect()
+        .await
+        .expect("incremental vector index build should execute");
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.test_java_vindex_vector', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("incremental BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("incremental BTree index build should execute");
+
+        let second = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(1, Arc::clone(&task_context))
+                .expect("second partition should start"),
+        )
+        .await
+        .expect("second partition should finish");
+        assert!(
+            extract_ids_in_order(&second).is_empty(),
+            "sequential partitions in one execution must use the same scalar-filter snapshot"
+        );
+
+        drop(task_context);
+        let refreshed = datafusion::physical_plan::common::collect(
+            physical_plan
+                .execute(1, ctx.ctx().task_ctx())
+                .expect("refreshed execution should start"),
+        )
+        .await
+        .expect("refreshed execution should finish");
+        assert_eq!(
+            extract_ids_in_order(&refreshed),
+            vec![6],
+            "a reused physical plan must refresh the scalar filter for a new execution"
+        );
     }
 
     // Manual run with a local Lumina native library:
@@ -2450,6 +2649,18 @@ mod vector_search_tests {
         .await
         .expect("vindex index build SQL should execute");
 
+        ctx.sql(
+            "CALL sys.create_global_index( \
+             table => 'default.vindex_build_query_e2e', \
+             index_column => 'id', \
+             index_type => 'btree')",
+        )
+        .await
+        .expect("BTree index build SQL should parse")
+        .collect()
+        .await
+        .expect("BTree index build SQL should execute");
+
         let index_batches = ctx
             .sql("SELECT index_type, row_count, row_range_start, row_range_end, index_field_name FROM paimon.default.`vindex_build_query_e2e$table_indexes` WHERE index_type = 'ivf-flat'")
             .await
@@ -2475,6 +2686,19 @@ mod vector_search_tests {
             .expect("vector_search query should execute");
         let ids = extract_ids(&search_batches);
         assert_eq!(ids, vec![0, 1]);
+
+        let filtered_batches = ctx
+            .sql("SELECT id FROM vector_search('paimon.default.vindex_build_query_e2e', 'embedding', '[1.0, 0.0]', 2) WHERE id >= 4")
+            .await
+            .expect("filtered vector_search SQL should parse")
+            .collect()
+            .await
+            .expect("filtered vector_search query should execute");
+        assert_eq!(
+            extract_ids_in_order(&filtered_batches),
+            vec![5, 4],
+            "the scalar predicate must be applied before vector Top-K without losing rank order"
+        );
     }
 }
 

@@ -26,7 +26,7 @@ use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_NPROBE: usize = 16;
@@ -421,16 +421,39 @@ fn search_vindex(
     Ok(Some(id_to_scores))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PreparedSearch {
     params: VectorSearchParams,
-    filter_bytes: Option<Vec<u8>>,
+    filter_bytes: Option<Arc<[u8]>>,
 }
 
+impl PreparedSearch {
+    fn same_batch_group(&self, other: &Self) -> bool {
+        self.params == other.params
+            && match (&self.filter_bytes, &other.filter_bytes) {
+                (Some(left), Some(right)) => {
+                    Arc::ptr_eq(left, right) || left.as_ref() == right.as_ref()
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+#[cfg(test)]
 fn prepare_search(
     metadata: &VectorIndexMetadata,
     options: &HashMap<String, String>,
     vector_search: &VectorSearch,
+) -> crate::Result<Option<PreparedSearch>> {
+    prepare_search_with_shared_filter(metadata, options, vector_search, None)
+}
+
+fn prepare_search_with_shared_filter(
+    metadata: &VectorIndexMetadata,
+    options: &HashMap<String, String>,
+    vector_search: &VectorSearch,
+    shared_filter_bytes: Option<&Arc<[u8]>>,
 ) -> crate::Result<Option<PreparedSearch>> {
     if vector_search.vector.len() != metadata.dimension {
         return Err(crate::Error::DataInvalid {
@@ -472,19 +495,15 @@ fn prepare_search(
         ),
     };
 
-    let filter_bytes = if let Some(include_ids) = &vector_search.include_row_ids {
+    let filter_bytes = if let Some(include_ids) = vector_search.effective_include_row_ids() {
         if include_ids.is_empty() {
             return Ok(None);
         }
         top_k = top_k.min(include_ids.len() as usize);
-        let mut bytes = Vec::new();
-        include_ids
-            .serialize_into(&mut bytes)
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to serialize vector search row-id filter: {}", e),
-                source: Some(Box::new(e)),
-            })?;
-        Some(bytes)
+        Some(match shared_filter_bytes {
+            Some(filter_bytes) => Arc::clone(filter_bytes),
+            None => serialize_row_id_filter(include_ids)?,
+        })
     } else {
         None
     };
@@ -494,6 +513,55 @@ fn prepare_search(
         params,
         filter_bytes,
     }))
+}
+
+fn serialize_row_id_filter(include_ids: &roaring::RoaringTreemap) -> crate::Result<Arc<[u8]>> {
+    let mut bytes = Vec::new();
+    include_ids
+        .serialize_into(&mut bytes)
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to serialize vector search row-id filter: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+    Ok(Arc::from(bytes))
+}
+
+fn shared_batch_include_row_ids(
+    vector_searches: &[VectorSearch],
+) -> Option<&Arc<roaring::RoaringTreemap>> {
+    let first = vector_searches.first()?.shared_include_row_ids.as_ref()?;
+    vector_searches
+        .iter()
+        .skip(1)
+        .all(|search| {
+            search
+                .shared_include_row_ids
+                .as_ref()
+                .is_some_and(|include_row_ids| Arc::ptr_eq(first, include_row_ids))
+        })
+        .then_some(first)
+}
+
+fn prepare_batch_searches(
+    metadata: &VectorIndexMetadata,
+    options: &HashMap<String, String>,
+    vector_searches: &[VectorSearch],
+) -> crate::Result<Vec<Option<PreparedSearch>>> {
+    let shared_filter_bytes = shared_batch_include_row_ids(vector_searches)
+        .filter(|include_row_ids| !include_row_ids.is_empty())
+        .map(|include_row_ids| serialize_row_id_filter(include_row_ids))
+        .transpose()?;
+    vector_searches
+        .iter()
+        .map(|search| {
+            prepare_search_with_shared_filter(
+                metadata,
+                options,
+                search,
+                shared_filter_bytes.as_ref(),
+            )
+        })
+        .collect()
 }
 
 fn execute_scalar_search(
@@ -537,11 +605,17 @@ fn search_batch_vindex(
         ..VindexBatchStats::default()
     });
 
-    for (index, search) in vector_searches.iter().enumerate() {
-        let Some(prepared) = prepare_search(metadata, options, search)? else {
+    for (index, prepared) in prepare_batch_searches(metadata, options, vector_searches)?
+        .into_iter()
+        .enumerate()
+    {
+        let Some(prepared) = prepared else {
             continue;
         };
-        if let Some((_, indices)) = groups.iter_mut().find(|(key, _)| key == &prepared) {
+        if let Some((_, indices)) = groups
+            .iter_mut()
+            .find(|(key, _)| key.same_batch_group(&prepared))
+        {
             indices.push(index);
         } else {
             groups.push((prepared, vec![index]));
@@ -1032,7 +1106,7 @@ mod tests {
         };
         let prepared = PreparedSearch {
             params: VectorSearchParams::new(10, 16),
-            filter_bytes: Some(vec![0; 128]),
+            filter_bytes: Some(Arc::from(vec![0; 128])),
         };
         let chunk_size = native_batch_chunk_size(&metadata, &prepared, 1);
         let full_chunk = native_batch_chunk_working_set_bytes(&metadata, &prepared, chunk_size);
@@ -1041,6 +1115,38 @@ mod tests {
         assert!(chunk_size > 2);
         assert!(full_chunk <= native_batch_memory_reservation(1));
         assert!(final_chunk < full_chunk);
+    }
+
+    #[test]
+    fn batch_preparation_serializes_shared_filter_once() {
+        let metadata = VectorIndexMetadata {
+            index_type: paimon_vindex_core::index::IndexType::IvfFlat,
+            dimension: TEST_DIMENSION,
+            nlist: 16,
+            metric: MetricType::L2,
+            total_vectors: 1_000_000,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let shared_filter = Arc::new(roaring::RoaringTreemap::from_iter(0..100_000));
+        let mut searches = vec![query(); 128];
+        for search in &mut searches {
+            search.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        }
+
+        let prepared = prepare_batch_searches(&metadata, &HashMap::new(), &searches).unwrap();
+        let first = prepared[0]
+            .as_ref()
+            .and_then(|search| search.filter_bytes.as_ref())
+            .expect("shared filter should be serialized");
+        assert!(prepared.iter().all(|search| {
+            search
+                .as_ref()
+                .and_then(|search| search.filter_bytes.as_ref())
+                .is_some_and(|filter| Arc::ptr_eq(first, filter))
+        }));
     }
 
     #[test]
@@ -1149,7 +1255,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(automatic != explicit);
+        assert_ne!(automatic.params, explicit.params);
         let explicit_params = explicit.params;
         assert_eq!(
             explicit_params.search_width,

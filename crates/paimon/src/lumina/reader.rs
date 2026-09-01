@@ -27,6 +27,65 @@ const MIN_SEARCH_LIST_SIZE: usize = 16;
 // C ABI returns int64_t -1 for invalid results, which casts to u64::MAX in Rust.
 const SENTINEL: u64 = u64::MAX;
 
+trait LuminaSearch {
+    fn search(
+        &self,
+        query: &[f32],
+        n: i32,
+        k: i32,
+        distances: &mut [f32],
+        labels: &mut [u64],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_filter(
+        &self,
+        query: &[f32],
+        n: i32,
+        k: i32,
+        distances: &mut [f32],
+        labels: &mut [u64],
+        filter_ids: &[u64],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()>;
+
+    fn get_count(&self) -> crate::Result<u64>;
+}
+
+impl LuminaSearch for LuminaSearcher {
+    fn search(
+        &self,
+        query: &[f32],
+        n: i32,
+        k: i32,
+        distances: &mut [f32],
+        labels: &mut [u64],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        LuminaSearcher::search(self, query, n, k, distances, labels, options)
+    }
+
+    fn search_with_filter(
+        &self,
+        query: &[f32],
+        n: i32,
+        k: i32,
+        distances: &mut [f32],
+        labels: &mut [u64],
+        filter_ids: &[u64],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        LuminaSearcher::search_with_filter(
+            self, query, n, k, distances, labels, filter_ids, options,
+        )
+    }
+
+    fn get_count(&self) -> crate::Result<u64> {
+        LuminaSearcher::get_count(self)
+    }
+}
+
 fn ensure_search_list_size(search_options: &mut HashMap<String, String>, top_k: usize) {
     if !search_options.contains_key("diskann.search.list_size") {
         let list_size = std::cmp::max((top_k as f64 * 1.5) as usize, MIN_SEARCH_LIST_SIZE);
@@ -285,8 +344,8 @@ impl LuminaVectorGlobalIndexReader {
     }
 }
 
-fn search_lumina(
-    searcher: &LuminaSearcher,
+fn search_lumina<S: LuminaSearch + ?Sized>(
+    searcher: &S,
     index_meta: &LuminaIndexMeta,
     search_options_base: &HashMap<String, String>,
     vector_search: &VectorSearch,
@@ -311,9 +370,9 @@ fn search_lumina(
         return Ok(None);
     }
 
-    let include_row_ids = &vector_search.include_row_ids;
+    let include_row_ids = vector_search.effective_include_row_ids();
 
-    let (distances, labels) = if let Some(ref include_ids) = include_row_ids {
+    let (distances, labels) = if let Some(include_ids) = include_row_ids {
         let filter_id_list: Vec<u64> = include_ids.iter().collect();
         if filter_id_list.is_empty() {
             return Ok(None);
@@ -358,8 +417,8 @@ fn search_lumina(
     Ok(Some(id_to_scores))
 }
 
-fn search_lumina_batch(
-    searcher: &LuminaSearcher,
+fn search_lumina_batch<S: LuminaSearch + ?Sized>(
+    searcher: &S,
     index_meta: &LuminaIndexMeta,
     search_options_base: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
@@ -367,23 +426,18 @@ fn search_lumina_batch(
     if vector_searches.is_empty() {
         return Ok(Vec::new());
     }
-    if vector_searches
-        .iter()
-        .any(|vector_search| vector_search.include_row_ids.is_some())
-    {
-        return vector_searches
-            .iter()
-            .map(|vector_search| {
-                search_lumina(searcher, index_meta, search_options_base, vector_search)
-            })
-            .collect();
-    }
 
     let limit = vector_searches[0].limit;
-    if vector_searches
+    let same_limit = vector_searches
         .iter()
-        .any(|vector_search| vector_search.limit != limit)
-    {
+        .all(|vector_search| vector_search.limit == limit);
+    let shared_filter = same_limit
+        .then(|| shared_batch_include_row_ids(vector_searches))
+        .flatten();
+    let has_filter = vector_searches
+        .iter()
+        .any(|vector_search| vector_search.effective_include_row_ids().is_some());
+    if has_filter && shared_filter.is_none() || !same_limit {
         return vector_searches
             .iter()
             .map(|vector_search| {
@@ -406,9 +460,18 @@ fn search_lumina_batch(
         }
     }
 
+    let filter_id_list =
+        shared_filter.map(|include_row_ids| include_row_ids.iter().collect::<Vec<_>>());
+    if filter_id_list.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(vec![None; vector_searches.len()]);
+    }
+
     let index_metric = index_meta.metric()?;
     let count = searcher.get_count()? as usize;
-    let effective_k = std::cmp::min(limit, count);
+    let effective_k = filter_id_list.as_ref().map_or_else(
+        || std::cmp::min(limit, count),
+        |ids| std::cmp::min(std::cmp::min(limit, count), ids.len()),
+    );
     if effective_k == 0 {
         return Ok(vec![None; vector_searches.len()]);
     }
@@ -422,14 +485,27 @@ fn search_lumina_batch(
     let mut labels = new_label_buffer(vector_searches.len() * effective_k);
     let mut search_opts: HashMap<String, String> = search_options_base.clone();
     ensure_search_list_size(&mut search_opts, effective_k);
-    searcher.search(
-        &query,
-        vector_searches.len() as i32,
-        effective_k as i32,
-        &mut distances,
-        &mut labels,
-        &search_opts,
-    )?;
+    if let Some(filter_ids) = filter_id_list {
+        search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
+        searcher.search_with_filter(
+            &query,
+            vector_searches.len() as i32,
+            effective_k as i32,
+            &mut distances,
+            &mut labels,
+            &filter_ids,
+            &search_opts,
+        )?;
+    } else {
+        searcher.search(
+            &query,
+            vector_searches.len() as i32,
+            effective_k as i32,
+            &mut distances,
+            &mut labels,
+            &search_opts,
+        )?;
+    }
 
     let mut results = Vec::with_capacity(vector_searches.len());
     for query_index in 0..vector_searches.len() {
@@ -448,6 +524,22 @@ fn search_lumina_batch(
         }
     }
     Ok(results)
+}
+
+fn shared_batch_include_row_ids(
+    vector_searches: &[VectorSearch],
+) -> Option<&std::sync::Arc<roaring::RoaringTreemap>> {
+    let first = vector_searches.first()?.shared_include_row_ids.as_ref()?;
+    vector_searches
+        .iter()
+        .skip(1)
+        .all(|vector_search| {
+            vector_search
+                .shared_include_row_ids
+                .as_ref()
+                .is_some_and(|include_row_ids| std::sync::Arc::ptr_eq(first, include_row_ids))
+        })
+        .then_some(first)
 }
 
 fn write_temp_index_file<S: Read + Seek>(stream: &mut S) -> crate::Result<PathBuf> {
@@ -498,8 +590,247 @@ impl Drop for LuminaVectorGlobalIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lumina::{KEY_DIMENSION, KEY_DISTANCE_METRIC};
     use crate::vector_search::GlobalIndexIOMeta;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq)]
+    struct FilteredSearchCall {
+        query: Vec<f32>,
+        n: i32,
+        k: i32,
+        filter_ids: Vec<u64>,
+    }
+
+    struct RecordingSearcher {
+        count: u64,
+        count_calls: AtomicUsize,
+        unfiltered_calls: Mutex<Vec<(Vec<f32>, i32, i32)>>,
+        filtered_calls: Mutex<Vec<FilteredSearchCall>>,
+    }
+
+    impl RecordingSearcher {
+        fn new(count: u64) -> Self {
+            Self {
+                count,
+                count_calls: AtomicUsize::new(0),
+                unfiltered_calls: Mutex::new(Vec::new()),
+                filtered_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LuminaSearch for RecordingSearcher {
+        fn search(
+            &self,
+            query: &[f32],
+            n: i32,
+            k: i32,
+            distances: &mut [f32],
+            labels: &mut [u64],
+            _options: &HashMap<String, String>,
+        ) -> crate::Result<()> {
+            self.unfiltered_calls
+                .lock()
+                .expect("unfiltered call lock")
+                .push((query.to_vec(), n, k));
+            for (index, (distance, label)) in
+                distances.iter_mut().zip(labels.iter_mut()).enumerate()
+            {
+                *distance = index as f32;
+                *label = index as u64;
+            }
+            Ok(())
+        }
+
+        fn search_with_filter(
+            &self,
+            query: &[f32],
+            n: i32,
+            k: i32,
+            distances: &mut [f32],
+            labels: &mut [u64],
+            filter_ids: &[u64],
+            _options: &HashMap<String, String>,
+        ) -> crate::Result<()> {
+            self.filtered_calls
+                .lock()
+                .expect("filtered call lock")
+                .push(FilteredSearchCall {
+                    query: query.to_vec(),
+                    n,
+                    k,
+                    filter_ids: filter_ids.to_vec(),
+                });
+            for (index, (distance, label)) in
+                distances.iter_mut().zip(labels.iter_mut()).enumerate()
+            {
+                *distance = index as f32;
+                *label = filter_ids[index % filter_ids.len()];
+            }
+            Ok(())
+        }
+
+        fn get_count(&self) -> crate::Result<u64> {
+            self.count_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.count)
+        }
+    }
+
+    fn test_index_meta(dim: usize) -> LuminaIndexMeta {
+        LuminaIndexMeta::new(HashMap::from([
+            (KEY_DIMENSION.to_string(), dim.to_string()),
+            (KEY_DISTANCE_METRIC.to_string(), "l2".to_string()),
+        ]))
+    }
+
+    #[test]
+    fn test_shared_filter_uses_one_lumina_batch_search() {
+        let searcher = RecordingSearcher::new(10);
+        let shared_filter = Arc::new(roaring::RoaringTreemap::from_iter([2, 4, 6]));
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::clone(&shared_filter));
+
+        let results = search_lumina_batch(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("shared filtered batch search should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert!(searcher
+            .unfiltered_calls
+            .lock()
+            .expect("unfiltered call lock")
+            .is_empty());
+        assert_eq!(
+            *searcher.filtered_calls.lock().expect("filtered call lock"),
+            vec![FilteredSearchCall {
+                query: vec![1.0, 0.0, 0.0, 1.0],
+                n: 2,
+                k: 2,
+                filter_ids: vec![2, 4, 6],
+            }]
+        );
+    }
+
+    #[test]
+    fn test_equal_but_distinct_filters_keep_scalar_fallback() {
+        let searcher = RecordingSearcher::new(10);
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::new(roaring::RoaringTreemap::from_iter([2, 4, 6])));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::new(roaring::RoaringTreemap::from_iter([2, 4, 6])));
+
+        search_lumina_batch(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("distinct filtered searches should succeed");
+
+        let calls = searcher.filtered_calls.lock().expect("filtered call lock");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.n == 1));
+    }
+
+    #[test]
+    fn test_mixed_filters_and_limits_keep_scalar_fallback() {
+        let shared_filter = Arc::new(roaring::RoaringTreemap::from_iter([2, 4, 6]));
+        let mut filtered = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        filtered.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let unfiltered = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        let mixed_searcher = RecordingSearcher::new(10);
+
+        search_lumina_batch(
+            &mixed_searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[filtered, unfiltered],
+        )
+        .expect("mixed filtered searches should succeed");
+
+        assert_eq!(
+            mixed_searcher
+                .filtered_calls
+                .lock()
+                .expect("filtered call lock")
+                .len(),
+            1
+        );
+        assert_eq!(
+            mixed_searcher
+                .unfiltered_calls
+                .lock()
+                .expect("unfiltered call lock")
+                .len(),
+            1
+        );
+
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 1, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(shared_filter);
+        let differing_limit_searcher = RecordingSearcher::new(10);
+
+        search_lumina_batch(
+            &differing_limit_searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("differing-limit filtered searches should succeed");
+
+        let calls = differing_limit_searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.iter().map(|call| call.k).collect::<Vec<_>>(), [1, 2]);
+        assert!(calls.iter().all(|call| call.n == 1));
+    }
+
+    #[test]
+    fn test_empty_shared_filter_skips_native_search() {
+        let searcher = RecordingSearcher::new(10);
+        let shared_filter = Arc::new(roaring::RoaringTreemap::new());
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::clone(&shared_filter));
+
+        let results = search_lumina_batch(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("empty shared filter should succeed");
+
+        assert_eq!(results, vec![None, None]);
+        assert_eq!(
+            searcher.count_calls.load(Ordering::Relaxed),
+            0,
+            "an empty shared filter should avoid all native searcher calls"
+        );
+        assert!(searcher
+            .unfiltered_calls
+            .lock()
+            .expect("unfiltered call lock")
+            .is_empty());
+        assert!(searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock")
+            .is_empty());
+    }
 
     #[test]
     fn test_convert_distance_to_score() {
