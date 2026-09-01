@@ -33,6 +33,7 @@ use crate::table::global_index_scanner::{
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
 use crate::table::index_file_path::IndexFileLocation;
+use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_data_file_reader::{
     append_batch_vectors, DataFilePkVectorReaderFactory,
 };
@@ -416,6 +417,131 @@ impl<'a> VectorSearchBuilder<'a> {
             .await
     }
 
+    /// Run this search over bucket splits an engine planned elsewhere, and
+    /// materialize the hits.
+    ///
+    /// The unit of work is Java's `BucketVectorSearchSplit` byte form: a planner
+    /// running in Paimon Java enumerates one split per bucket -- a bucket is never
+    /// divided, because the ANN current-segment decision needs the bucket's whole
+    /// active file set -- and ships each to a worker that calls this. The splits
+    /// are the plan: their payload files, their per-file row ranges and the
+    /// snapshot they pin are used as given, and this table's index manifest is not
+    /// read.
+    ///
+    /// Everything after planning is the ordinary primary-key vector read, so
+    /// search, optional refine, local Top-K and materialization stay identical to
+    /// [`execute_read`](Self::execute_read): output is the projected user columns
+    /// plus `__paimon_search_score`, best-first. The Top-K is local to the supplied
+    /// splits; a caller distributing one call per bucket merges the per-bucket
+    /// results itself.
+    ///
+    /// Only a primary-key vector column can be read this way. The data-evolution
+    /// route plans through the global index rather than through bucket splits, so
+    /// it is rejected rather than silently answered from a different plan.
+    pub async fn execute_read_for_bucket_splits(
+        &self,
+        split_bytes: &[&[u8]],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let query_vector =
+            self.query_vector
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vector must be set via with_query_vector()".to_string(),
+                })?;
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        let pk_col = if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+            if targets_pk_column {
+                core.primary_key_vector_index_column()?
+            } else {
+                return Err(bucket_split_route_error(vector_column));
+            }
+        } else {
+            return Err(bucket_split_route_error(vector_column));
+        };
+
+        // Decoding is the trust boundary: these bytes come from outside the
+        // process. Reject an empty request here rather than let it reach planning
+        // as "no splits", which cannot pin a snapshot.
+        if split_bytes.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "bucket-split read requires at least one split".to_string(),
+                source: None,
+            });
+        }
+        let splits = split_bytes
+            .iter()
+            .map(|bytes| BucketVectorSearchSplit::deserialize(bytes))
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Resolve the query parameters (and reject a query the search cannot answer
+        // correctly) before planning, exactly as the manifest route does.
+        let params = resolve_pk_vector_search_params(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &pk_col,
+            &[query_vector.as_slice()],
+            limit,
+        )?;
+        let plan = PkVectorScan::new(
+            self.table,
+            params.field_id,
+            params.index_type.clone(),
+            self.filter.clone(),
+        )
+        .plan_for_bucket_vector_splits(splits)?;
+
+        // Resolve the materialization read-type up front so an invalid projection
+        // fails loud even when the plan is empty and no rows will be read.
+        let read_type = self.resolve_materialize_read_type()?;
+
+        let mut candidates = search_pk_candidates_batch_with_plan(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &pk_col,
+            &[query_vector.as_slice()],
+            limit,
+            &plan,
+            &params,
+        )
+        .await?;
+        debug_assert_eq!(candidates.len(), 1);
+        let candidates = candidates.remove(0);
+
+        // A separate, predicate-free materialization reader projecting the user
+        // columns (the search reader projects only the vector column).
+        let materialize_reader = DataFileReader::new(
+            self.table.file_io().clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema().fields().to_vec(),
+            read_type,
+            Vec::new(),
+        );
+
+        Self::materialize_candidates(candidates, &plan.splits, params.metric, &materialize_reader)
+            .await
+    }
+
     /// Materialize the best-first data-evolution vector search hits into Arrow
     /// rows. The global-index search returns global `_ROW_ID`s and their scores; a
     /// subsequent row-range read materializes those rows, and each row's score is
@@ -777,6 +903,18 @@ struct PkVectorSearchParams {
     skip_exact_fallback: bool,
     refine_factor: usize,
     indexed_limit: usize,
+}
+
+/// A bucket split is a primary-key vector plan. The data-evolution route plans
+/// through the global index instead, so answering it here would silently use a
+/// different plan than the caller supplied.
+fn bucket_split_route_error(vector_column: &str) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!(
+            "bucket-split read requires a primary-key vector column, but '{vector_column}' is not one"
+        ),
+        source: None,
+    }
 }
 
 /// Resolve the query-level parameters and reject a query the search cannot answer

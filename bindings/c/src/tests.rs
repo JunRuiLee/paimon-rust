@@ -3175,6 +3175,89 @@ fn vector_search_pk_table_read_matches_rust() {
     }
 }
 
+/// The bucket-split terminal marshals an array of buffers, which the single-split
+/// terminal does not: a caller passing a null array, a zero count, or a null
+/// entry has made an input error, and it must be reported as one rather than
+/// reaching the decoder as corrupt data.
+#[test]
+fn vector_search_bucket_splits_reject_malformed_input() {
+    let path = "memory:/vsearch_pk_split_args";
+    let (query, vectors) = pk_fixture_smoke();
+    let table = build_pk_vector_table(path, &vectors);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        // No splits at all.
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
+            builder,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        paimon_vector_search_builder_free(builder);
+        assert!(!result.error.is_null(), "a null split array must error");
+        paimon_error_free(result.error);
+
+        // A count that does not match the (absent) arrays.
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
+            builder,
+            ptr::null(),
+            ptr::null(),
+            1,
+        );
+        paimon_vector_search_builder_free(builder);
+        assert!(!result.error.is_null(), "a null split array must error");
+        paimon_error_free(result.error);
+
+        // A null entry inside an otherwise valid array.
+        let bytes: Vec<u8> = vec![1, 2, 3, 4];
+        let ptrs: [*const u8; 2] = [bytes.as_ptr(), ptr::null()];
+        let lens: [usize; 2] = [bytes.len(), 0];
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
+            builder,
+            ptrs.as_ptr(),
+            lens.as_ptr(),
+            2,
+        );
+        paimon_vector_search_builder_free(builder);
+        assert!(!result.error.is_null(), "a null split entry must error");
+        paimon_error_free(result.error);
+
+        unwrap_table(handle);
+    }
+}
+
+/// Split bytes come from outside the process, so a buffer that is not a split
+/// must surface as an error, not a panic across the ABI boundary.
+#[test]
+fn vector_search_bucket_splits_reject_corrupt_bytes() {
+    let path = "memory:/vsearch_pk_split_corrupt";
+    let (query, vectors) = pk_fixture_smoke();
+    let table = build_pk_vector_table(path, &vectors);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let garbage: Vec<u8> = vec![0xAB; 64];
+        let ptrs: [*const u8; 1] = [garbage.as_ptr()];
+        let lens: [usize; 1] = [garbage.len()];
+        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
+        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
+            builder,
+            ptrs.as_ptr(),
+            lens.as_ptr(),
+            1,
+        );
+        paimon_vector_search_builder_free(builder);
+        assert!(!result.error.is_null(), "garbage bytes must error");
+        assert!(result.reader.is_null());
+        paimon_error_free(result.error);
+        unwrap_table(handle);
+    }
+}
+
 #[test]
 fn vector_search_append_table_read_matches_rust() {
     let path = "memory:/vsearch_append_read";

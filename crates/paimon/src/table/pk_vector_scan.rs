@@ -414,9 +414,6 @@ impl<'a> PkVectorScan<'a> {
     /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
     /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
     /// the split allows.
-    // Entry point for engine-supplied splits; no in-tree caller reads a plan from
-    // them yet, and the tests drive `plan_from_bucket_splits` directly.
-    #[allow(dead_code)]
     pub(crate) fn plan_for_bucket_vector_splits(
         &self,
         splits: Vec<BucketVectorSearchSplit>,
@@ -451,7 +448,6 @@ impl<'a> PkVectorScan<'a> {
 /// The `Table`-independent core of [`PkVectorScan::plan_for_bucket_vector_splits`],
 /// so planning from engine-supplied splits is testable the same way planning from a
 /// manifest is.
-#[cfg_attr(not(test), allow(dead_code))]
 fn plan_from_bucket_splits(
     index_type: &str,
     vector_field_id: i32,
