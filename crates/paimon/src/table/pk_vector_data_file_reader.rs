@@ -35,7 +35,7 @@ use futures::TryStreamExt;
 
 use crate::spec::{DataField, DataType};
 use crate::table::data_file_reader::DataFileReader;
-use crate::table::source::DataSplit;
+use crate::table::source::{DataSplit, RowRange};
 use crate::vindex::pkvector::bucket::BucketActiveFile;
 use crate::vindex::pkvector::exact::{drain_best_first, push_bounded, validate_query, WorstFirst};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
@@ -95,8 +95,15 @@ impl DataFilePkVectorReaderFactory {
     /// opened. Each surviving physical position (not NULL, not `is_excluded`) is
     /// scored against every query into that query's bounded heap; a NULL row is
     /// skipped but still advances the position so the position stays in lockstep
-    /// with `is_excluded`. The drained row count is checked against the file's
-    /// `DataFileMeta.row_count` (both truncation and overrun fail loud).
+    /// with `is_excluded`. The drained row count is checked against what was read
+    /// (both truncation and overrun fail loud).
+    ///
+    /// `allowed_rows`, when given, limits the read to those file-local inclusive
+    /// ranges — normalized, as the plan carries them. An engine-supplied bucket
+    /// split can restrict a large file to a handful of rows, and scoring is not the
+    /// expensive part: reading the rest of the file to have `is_excluded` reject it
+    /// afterwards is. `is_excluded` still applies on top, since it also folds in a
+    /// residual predicate and the deletion vector.
     pub(crate) async fn search_file(
         &self,
         file: &BucketActiveFile,
@@ -104,6 +111,7 @@ impl DataFilePkVectorReaderFactory {
         metric: VectorSearchMetric,
         exact_limit: usize,
         is_excluded: &(dyn Fn(i64) -> bool + Sync),
+        allowed_rows: Option<&[RowRange]>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         if exact_limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
@@ -129,21 +137,48 @@ impl DataFilePkVectorReaderFactory {
         let row_count = file_meta.row_count;
 
         let data_fields = self.reader.derive_data_fields(&file_meta).await?;
-        let mut stream = self.reader.read_single_file_stream(
-            &self.data_split,
-            file_meta,
-            data_fields,
-            None,
-            None,
-        )?;
+        // An empty selection permits nothing, so there is nothing to open.
+        if allowed_rows.is_some_and(|ranges| ranges.is_empty()) {
+            return Ok(vec![Vec::new(); queries.len()]);
+        }
+        let mut stream = match allowed_rows {
+            Some(ranges) => self.reader.read_single_file_stream_local_ranges(
+                &self.data_split,
+                file_meta,
+                data_fields,
+                None,
+                ranges.to_vec(),
+            )?,
+            None => self.reader.read_single_file_stream(
+                &self.data_split,
+                file_meta,
+                data_fields,
+                None,
+                None,
+            )?,
+        };
+        // Rows arrive in ascending physical order and the read emits exactly what
+        // was selected (no pushdown predicate, no deletion vector here), so walking
+        // the selection in step with the rows gives each row its file-local
+        // position: the whole file when nothing restricted it.
+        let mut selected: Box<dyn Iterator<Item = i64> + Send> = match allowed_rows {
+            Some(ranges) => {
+                let ranges: Vec<RowRange> = ranges.into();
+                Box::new(
+                    ranges
+                        .into_iter()
+                        .flat_map(|range| range.from()..=range.to()),
+                )
+            }
+            None => Box::new(0..row_count.max(0)),
+        };
 
         let mut heaps: Vec<BinaryHeap<WorstFirst>> = (0..queries.len())
             .map(|_| BinaryHeap::with_capacity(exact_limit + 1))
             .collect();
         // One reused buffer per batch; a NULL row leaves it untouched (and is not
-        // scored). `position` is the monotonic physical row counter across batches.
+        // scored) but still consumes its physical position.
         let mut batch_vectors: Vec<Option<Vec<f32>>> = Vec::new();
-        let mut position: i64 = 0;
         while let Some(batch) = stream.try_next().await? {
             batch_vectors.clear();
             append_batch_vectors(
@@ -153,13 +188,11 @@ impl DataFilePkVectorReaderFactory {
                 &mut batch_vectors,
             )?;
             for entry in &batch_vectors {
-                let pos = position;
-                position += 1;
-                if pos >= row_count {
+                let Some(pos) = selected.next() else {
                     return Err(data_invalid(
-                        "data file produced more rows than DataFileMeta.row_count",
+                        "data file produced more rows than the selection allows",
                     ));
-                }
+                };
                 let Some(vector) = entry else {
                     continue; // NULL row: not scored, position already advanced.
                 };
@@ -177,14 +210,10 @@ impl DataFilePkVectorReaderFactory {
             }
         }
 
-        if position > row_count {
+        // The overrun side is caught above, when the selection runs dry mid-batch.
+        if selected.next().is_some() {
             return Err(data_invalid(
-                "data file produced more rows than DataFileMeta.row_count",
-            ));
-        }
-        if position < row_count {
-            return Err(data_invalid(
-                "data file ended before DataFileMeta.row_count",
+                "data file ended before the selection was exhausted",
             ));
         }
 
@@ -432,6 +461,72 @@ mod integration_tests {
     /// the reference `exact_search` over an in-memory `ArrayReader` of the same
     /// data, including a NULL row and a residual/DV exclusion.
     #[tokio::test]
+    async fn test_search_file_only_reads_the_rows_the_plan_allows() {
+        // Five rows; the plan allows physical positions 3-4 only. The nearest rows to
+        // the origin are 0 and 1, so a result of 3 and 4 means the read never saw
+        // them — the exact fallback does not need a data predicate to be handed a
+        // narrow split, and reading the rest of the file to reject it afterwards is
+        // what this avoids.
+        //
+        // A full read cannot pass either: positions come from the selection, so five
+        // emitted rows against a two-row selection fails loudly.
+        let rows = vec![
+            Some(vec![0.0, 0.0]),
+            Some(vec![0.5, 0.0]),
+            Some(vec![5.0, 0.0]),
+            Some(vec![6.0, 0.0]),
+            Some(vec![7.0, 0.0]),
+        ];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_plan_ranges").await;
+        let active = BucketActiveFile {
+            file_name: file_name.clone(),
+            row_count: rows.len() as i64,
+        };
+        let query = [0.0f32, 0.0];
+
+        let results = factory
+            .search_file(
+                &active,
+                &[&query],
+                VectorSearchMetric::L2,
+                5,
+                &|_| false,
+                Some(&[RowRange::new(3, 4)]),
+            )
+            .await
+            .unwrap();
+        let positions: Vec<i64> = results[0].iter().map(|hit| hit.row_position).collect();
+        assert_eq!(positions, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_search_file_reads_nothing_for_an_empty_selection() {
+        let rows = vec![Some(vec![0.0, 0.0]), Some(vec![1.0, 0.0])];
+        let (factory, file_name) =
+            build_factory(&rows, rows.len() as i64, "memory:/pkvdfr_empty_selection").await;
+        let active = BucketActiveFile {
+            file_name,
+            row_count: rows.len() as i64,
+        };
+        let query = [0.0f32, 0.0];
+
+        let results = factory
+            .search_file(
+                &active,
+                &[&query],
+                VectorSearchMetric::L2,
+                5,
+                &|_| false,
+                Some(&[]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "one query in, one result list out");
+        assert!(results[0].is_empty());
+    }
+
+    #[tokio::test]
     async fn search_file_matches_exact_search_reference() {
         use crate::vindex::pkvector::exact::exact_search;
         use crate::vindex::pkvector::reader::test_support::ArrayReader;
@@ -454,7 +549,14 @@ mod integration_tests {
         let query = [0.0f32, 0.0];
 
         let streamed = factory
-            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &is_excluded)
+            .search_file(
+                &active,
+                &[&query],
+                VectorSearchMetric::L2,
+                2,
+                &is_excluded,
+                None,
+            )
             .await
             .unwrap();
 
@@ -498,7 +600,14 @@ mod integration_tests {
         let query = [0.0f32, 0.0];
 
         let streamed = factory
-            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &|_| false)
+            .search_file(
+                &active,
+                &[&query],
+                VectorSearchMetric::L2,
+                2,
+                &|_| false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -549,6 +658,7 @@ mod integration_tests {
                 VectorSearchMetric::L2,
                 2,
                 &is_excluded,
+                None,
             )
             .await
             .unwrap();
@@ -556,11 +666,25 @@ mod integration_tests {
 
         // Each query searched alone must equal its slot in the batch.
         let only_q0 = factory
-            .search_file(&active, &[&q0], VectorSearchMetric::L2, 2, &is_excluded)
+            .search_file(
+                &active,
+                &[&q0],
+                VectorSearchMetric::L2,
+                2,
+                &is_excluded,
+                None,
+            )
             .await
             .unwrap();
         let only_q1 = factory
-            .search_file(&active, &[&q1], VectorSearchMetric::L2, 2, &is_excluded)
+            .search_file(
+                &active,
+                &[&q1],
+                VectorSearchMetric::L2,
+                2,
+                &is_excluded,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(batch[0], only_q0[0]);
@@ -588,7 +712,14 @@ mod integration_tests {
         };
         let query = [0.0f32, 0.0];
         let err = factory
-            .search_file(&active, &[&query], VectorSearchMetric::L2, 2, &|_| false)
+            .search_file(
+                &active,
+                &[&query],
+                VectorSearchMetric::L2,
+                2,
+                &|_| false,
+                None,
+            )
             .await
             .expect_err("row-count truncation must fail loud");
         assert!(err.to_string().contains("ended before"), "got: {err}");
@@ -609,7 +740,14 @@ mod integration_tests {
         // Wrong dimension.
         let bad_dim = [1.0f32];
         let err = factory
-            .search_file(&present, &[&bad_dim], VectorSearchMetric::L2, 2, &|_| false)
+            .search_file(
+                &present,
+                &[&bad_dim],
+                VectorSearchMetric::L2,
+                2,
+                &|_| false,
+                None,
+            )
             .await
             .expect_err("dimension mismatch must fail loud");
         assert!(err.to_string().contains("dimension"), "got: {err}");
@@ -617,9 +755,14 @@ mod integration_tests {
         // Non-finite element.
         let bad_finite = [f32::NAN, 0.0];
         let err = factory
-            .search_file(&present, &[&bad_finite], VectorSearchMetric::L2, 2, &|_| {
-                false
-            })
+            .search_file(
+                &present,
+                &[&bad_finite],
+                VectorSearchMetric::L2,
+                2,
+                &|_| false,
+                None,
+            )
             .await
             .expect_err("non-finite query must fail loud");
         assert!(err.to_string().contains("finite"), "got: {err}");
@@ -631,7 +774,14 @@ mod integration_tests {
         };
         let query = [0.0f32, 0.0];
         let err = factory
-            .search_file(&missing, &[&query], VectorSearchMetric::L2, 2, &|_| false)
+            .search_file(
+                &missing,
+                &[&query],
+                VectorSearchMetric::L2,
+                2,
+                &|_| false,
+                None,
+            )
             .await
             .expect_err("absent file must be rejected");
         assert!(matches!(err, crate::Error::DataInvalid { .. }));

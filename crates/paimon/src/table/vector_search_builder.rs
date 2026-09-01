@@ -1217,8 +1217,12 @@ async fn search_pk_raw_candidates_batch_with_plan(
     // per-query bounded heaps (all queries share one stream).
     let reader_for_factory = reader.clone();
     let vector_field_for_factory = vector_field.clone();
+    // The plan's own per-file selection, so an exact fallback reads only the rows an
+    // engine-supplied split allows. `is_excluded` still rejects on top of it, but it
+    // cannot un-read a row.
+    let physical_for_factory = plan.physical_row_ranges_by_split.clone();
     let factory = as_split_exact_file_search(
-        move |_split_index: usize,
+        move |split_index: usize,
               split: &PkVectorSearchSplit,
               file: &BucketActiveFile,
               queries: &[&[f32]],
@@ -1234,11 +1238,24 @@ async fn search_pk_raw_candidates_batch_with_plan(
                 row_count: file.row_count,
             };
             let owned_queries: Vec<Vec<f32>> = queries.iter().map(|q| q.to_vec()).collect();
+            let allowed_rows = physical_for_factory.as_ref().and_then(|per_split| {
+                per_split
+                    .get(split_index)
+                    .and_then(|per_file| per_file.get(&active.file_name))
+                    .cloned()
+            });
             Box::pin(async move {
                 let factory = DataFilePkVectorReaderFactory::new(reader, data_split, vector_field)?;
                 let query_refs: Vec<&[f32]> = owned_queries.iter().map(|q| q.as_slice()).collect();
                 factory
-                    .search_file(&active, &query_refs, metric, exact_limit, is_excluded)
+                    .search_file(
+                        &active,
+                        &query_refs,
+                        metric,
+                        exact_limit,
+                        is_excluded,
+                        allowed_rows.as_deref(),
+                    )
                     .await
             })
         },
@@ -7382,6 +7399,61 @@ mod residual_positions_tests {
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_only_evaluates_the_rows_the_plan_allows() {
+        // ids [1,2,3,4,5]; the plan allows positions 3-4 only. `id > 2` matches 2,3,4
+        // over the whole file, so a result of 3,4 is the plan's restriction taking
+        // effect *before* evaluation: position 2 is never seen.
+        //
+        // This also cannot pass under a full read. The scan walks the selection in
+        // step with the emitted rows, so a read that emitted all five would run the
+        // selection dry and fail loudly rather than return a filtered answer.
+        let (reader, split, active) = build_reader_and_split(
+            "memory:/rpf_plan_ranges",
+            &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
+        )
+        .await;
+        let allowed = HashMap::from([("part-0.mosaic".to_string(), vec![RowRange::new(3, 4)])]);
+        let map = residual_positions_by_file(
+            &reader,
+            &split,
+            &active,
+            &residual_id_gt(2),
+            Some(&allowed),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_residual_does_not_read_a_file_the_plan_excludes() {
+        // A file the plan lists no rows for is registered empty and never opened. The
+        // empty entry is what tells the search the file contributes nothing; an
+        // absent one would mean the same, but then the map would not cover the split.
+        let (reader, split, active) = build_reader_and_split(
+            "memory:/rpf_plan_excludes",
+            &[("part-0.mosaic", vec![1, 2, 3], 0)],
+        )
+        .await;
+        for allowed in [
+            HashMap::from([("part-0.mosaic".to_string(), Vec::new())]),
+            HashMap::new(),
+        ] {
+            let map = residual_positions_by_file(
+                &reader,
+                &split,
+                &active,
+                &residual_id_gt(0),
+                Some(&allowed),
+            )
+            .await
+            .unwrap();
+            assert!(map.contains_key("part-0.mosaic"));
+            assert!(sorted(&map["part-0.mosaic"]).is_empty());
+        }
     }
 
     #[tokio::test]
