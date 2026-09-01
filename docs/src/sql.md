@@ -1339,6 +1339,32 @@ The function performs ANN search across all matching vector index files for the
 target column, merges results, and returns the top-k rows ordered by relevance
 score. If no matching index is found, an empty result is returned.
 
+### Scalar Pre-Filters
+
+Add a `WHERE` clause to restrict the rows considered by vector Top-K. The
+predicate is evaluated before the vector index selects its nearest neighbors:
+
+```sql
+SELECT id, event_time
+FROM vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    '[1.0, 0.0, 0.0, 0.0]',
+    10
+)
+WHERE event_time >= TIMESTAMP '2026-08-01 00:00:00';
+```
+
+On data-evolution tables, Paimon resolves the predicate to matching global row
+IDs using a snapshot-pinned table read. Scalar global indexes such as BTree can
+narrow this read. The matching global row IDs are intersected with each vector
+index shard and passed to the vector backend as its row filter, so an excluded
+nearest neighbor does not consume one of the requested Top-K positions.
+
+Only predicates that can be translated completely to Paimon predicates are
+pushed into vector search. DataFusion keeps its residual filter for ordinary
+`vector_search` queries as an additional correctness check.
+
 ### Refine / Rerank
 
 Vector index search can optionally refine ANN results by reading the raw vectors
@@ -1420,6 +1446,28 @@ ORDER BY query_id, result_id;
 ```
 
 The query-vector column must have Arrow type `List<Float32>` or `FixedSizeList<Float32>`. Null query-vector rows produce no joined results, and null elements inside a vector are rejected. The lateral form returns the left row joined with the top-k matching rows from the target Paimon table for that row's query vector.
+
+Fully translatable target-table predicates are also applied before each lateral
+Top-K:
+
+```sql
+SELECT q.id AS query_id, r.id AS result_id
+FROM paimon.my_db.queries q
+CROSS JOIN LATERAL vector_search(
+    'paimon.my_db.items',
+    'embedding',
+    q.embedding,
+    10
+) AS r
+WHERE r.event_time >= TIMESTAMP '2026-08-01 00:00:00'
+ORDER BY query_id, result_id;
+```
+
+For conjunctions, target-only predicates such as `r.event_time >= ...` are
+pushed into vector search. Predicates that reference the left relation or both
+sides remain normal join-result filters. Unsupported or inexact target
+predicates also remain post-Top-K residual filters, so they may return fewer
+than the requested number of rows.
 
 ### Supported Metrics
 

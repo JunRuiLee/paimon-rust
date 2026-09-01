@@ -63,10 +63,15 @@ pub(crate) trait FileIOProvider: std::fmt::Debug + Send + Sync {
 
 #[derive(Clone)]
 pub struct FileIO {
+    /// Private identity shared by clones, but not by independently built storage backends.
+    storage_lineage: Arc<StorageLineage>,
     storage: Arc<Storage>,
     cache: Option<Arc<LocalCache>>,
     provider: Option<Arc<dyn FileIOProvider>>,
 }
+
+#[derive(Debug)]
+struct StorageLineage;
 
 impl std::fmt::Debug for FileIO {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,6 +84,10 @@ impl std::fmt::Debug for FileIO {
 }
 
 impl FileIO {
+    pub(crate) fn shares_storage_lineage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage_lineage, &other.storage_lineage)
+    }
+
     /// Attach an externally managed block cache.
     ///
     /// `block_size` controls the aligned ranges presented to the cache.
@@ -533,6 +542,7 @@ impl FileIOBuilder {
         let cache = self.cache.clone();
         let storage = Storage::build(self)?;
         Ok(FileIO {
+            storage_lineage: Arc::new(StorageLineage),
             storage: Arc::new(storage),
             cache,
             provider: None,
@@ -1252,6 +1262,16 @@ mod file_action_test {
 
         assert!(file_io_1.exists(path).await.unwrap());
         assert!(!file_io_2.exists(path).await.unwrap());
+    }
+
+    #[test]
+    fn test_storage_lineage_is_shared_only_by_file_io_clones() {
+        let file_io = setup_memory_file_io();
+        let clone = file_io.clone();
+        let independent = setup_memory_file_io();
+
+        assert!(file_io.shares_storage_lineage(&clone));
+        assert!(!file_io.shares_storage_lineage(&independent));
     }
 
     #[tokio::test]
