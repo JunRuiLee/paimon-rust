@@ -43,7 +43,7 @@ use crate::table::pk_vector_orchestrator::{
 use crate::table::pk_vector_position_read::{
     PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
 };
-use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
+use crate::table::pk_vector_scan::{positions_in_ranges, PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::source::DataSplit;
 use crate::table::{
@@ -883,14 +883,19 @@ fn resolve_pk_vector_search_params(
 /// searched, so a narrowed plan can never be searched under limits computed for a
 /// wider one.
 /// Combine the two per-split row allow-lists a search can be handed: the physical
-/// positions an engine-supplied plan restricts each file to, and the positions a
-/// residual data predicate leaves behind.
+/// rows an engine-supplied plan restricts each file to, and the positions a residual
+/// data predicate leaves behind.
 ///
 /// Both sides list what is permitted, and both read a file's absence as "no rows
 /// allowed", so combining them intersects files as well as positions. Either side
 /// alone passes through unchanged; neither side means no positional restriction.
+///
+/// This is where the plan's ranges become positions: the search kernel tests
+/// membership, while a read is limited by the ranges themselves. When the residual
+/// was evaluated over those same ranges the intersection cannot remove anything, and
+/// is kept as the invariant that says so.
 fn intersect_row_allow_lists(
-    physical: Option<&[HashMap<String, RoaringTreemap>]>,
+    physical: Option<&[HashMap<String, Vec<RowRange>>]>,
     residual: Option<Vec<HashMap<String, RoaringTreemap>>>,
     split_count: usize,
 ) -> crate::Result<Option<Vec<HashMap<String, RoaringTreemap>>>> {
@@ -907,7 +912,17 @@ fn intersect_row_allow_lists(
     }
     match (physical, residual) {
         (None, residual) => Ok(residual),
-        (Some(physical), None) => Ok(Some(physical.to_vec())),
+        (Some(physical), None) => Ok(Some(
+            physical
+                .iter()
+                .map(|per_file| {
+                    per_file
+                        .iter()
+                        .map(|(file, ranges)| Ok((file.clone(), positions_in_ranges(ranges)?)))
+                        .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+        )),
         (Some(physical), Some(residual)) => {
             if residual.len() != split_count {
                 return Err(crate::Error::DataInvalid {
@@ -925,14 +940,15 @@ fn intersect_row_allow_lists(
                     .map(|(physical, residual)| {
                         physical
                             .iter()
-                            .filter_map(|(file, allowed)| {
-                                residual
-                                    .get(file)
-                                    .map(|kept| (file.clone(), allowed & kept))
+                            .filter(|(file, _)| residual.contains_key(file.as_str()))
+                            .map(|(file, ranges)| {
+                                let allowed = positions_in_ranges(ranges)?;
+                                let kept = &residual[file.as_str()];
+                                Ok((file.clone(), allowed & kept))
                             })
-                            .collect()
+                            .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
                     })
-                    .collect(),
+                    .collect::<crate::Result<Vec<_>>>()?,
             ))
         }
     }
@@ -1159,13 +1175,21 @@ async fn search_pk_raw_candidates_batch_with_plan(
                     Vec::new(),
                 );
                 let mut per_split = Vec::with_capacity(plan.splits.len());
-                for split in &plan.splits {
+                for (index, split) in plan.splits.iter().enumerate() {
+                    // The plan's selection for this split, so the residual is
+                    // evaluated over the rows an engine-supplied split allows rather
+                    // than over the whole file.
+                    let allowed_rows = plan
+                        .physical_row_ranges_by_split
+                        .as_ref()
+                        .and_then(|per_split| per_split.get(index));
                     per_split.push(
                         residual_positions_by_file(
                             &residual_reader,
                             &split.data_split,
                             &split.active_files,
                             &file_predicates,
+                            allowed_rows,
                         )
                         .await?,
                     );
@@ -2208,11 +2232,16 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
 /// row-collecting half of Java `PrimaryKeyVectorRead`'s `executeFilter`: the
 /// predicate is NOT pushed down (a pushed filter would drop rows before their
 /// position could be recovered). Instead `reader` projects only the residual
-/// columns and carries no pushdown predicate; every physical row is scanned in
-/// file order, the residual is evaluated here at the Arrow level, and each
-/// surviving row's file-local 0-based position is its running ordinal in the scan.
-/// This needs no `_ROW_ID` and no `first_row_id` — real primary-key tables never
-/// write one.
+/// columns and carries no pushdown predicate, the residual is evaluated here at the
+/// Arrow level, and each surviving row's file-local 0-based position is recovered
+/// from the selection the read was limited to. This needs no `_ROW_ID` and no
+/// `first_row_id` — real primary-key tables never write one.
+///
+/// `allowed_rows` is the plan's per-file physical selection, when it has one. The
+/// residual is evaluated over exactly those rows: an engine-supplied bucket split
+/// can restrict a huge file to a handful of ranges, and reading the whole file only
+/// to discard everything outside them afterwards would defeat the split. With no
+/// selection every physical row is scanned, as before.
 ///
 /// Every *active* data file in the split gets an entry, possibly empty. The
 /// bucket search treats an absent entry and an empty entry identically (the file
@@ -2229,6 +2258,7 @@ async fn residual_positions_by_file(
     split: &DataSplit,
     active_files: &[BucketActiveFile],
     residual: &FilePredicates,
+    allowed_rows: Option<&HashMap<String, Vec<RowRange>>>,
 ) -> crate::Result<HashMap<String, RoaringTreemap>> {
     let scan_fields = reader.read_type().to_vec();
     let active_names: HashSet<&str> = active_files.iter().map(|f| f.file_name.as_str()).collect();
@@ -2239,16 +2269,48 @@ async fn residual_positions_by_file(
         if !active_names.contains(file_meta.file_name.as_str()) {
             continue;
         }
+        let selection = match allowed_rows {
+            // A plan that lists nothing for a file permits nothing from it, whether
+            // the list is empty or the file is absent: both sides of the eventual
+            // intersection read absence that way. Registering it empty says so and
+            // costs no read.
+            Some(by_file) => match by_file.get(&file_meta.file_name) {
+                Some(ranges) if !ranges.is_empty() => Some(ranges.clone()),
+                _ => {
+                    out.entry(file_meta.file_name.clone()).or_default();
+                    continue;
+                }
+            },
+            None => None,
+        };
         let data_fields = reader.derive_data_fields(file_meta).await?;
-        let mut stream =
-            reader.read_single_file_stream(split, file_meta.clone(), data_fields, None, None)?;
+        let mut stream = match selection.clone() {
+            Some(ranges) => reader.read_single_file_stream_local_ranges(
+                split,
+                file_meta.clone(),
+                data_fields,
+                None,
+                ranges,
+            )?,
+            None => {
+                reader.read_single_file_stream(split, file_meta.clone(), data_fields, None, None)?
+            }
+        };
         // Register the file up front so a file whose rows all fail the residual
         // still appears in the map (empty set).
         let positions = out.entry(file_meta.file_name.clone()).or_default();
-        // The scan has no row selection and no DV, so rows arrive in physical file
-        // order with no gaps: each row's file-local 0-based position is its running
-        // ordinal `base + row_index`.
-        let mut base: u64 = 0;
+        // Rows arrive in ascending physical order, and the read emitted exactly what
+        // was selected (no pushdown predicate, no deletion vector), so walking the
+        // selection in step with the rows recovers each row's file-local position.
+        let mut selected: Box<dyn Iterator<Item = u64> + Send> = match &selection {
+            Some(ranges) => Box::new(
+                ranges
+                    .clone()
+                    .into_iter()
+                    .flat_map(|range| (range.from() as u64)..=(range.to() as u64)),
+            ),
+            None => Box::new(0..file_meta.row_count.max(0) as u64),
+        };
         while let Some(batch) = stream.try_next().await? {
             let num_rows = batch.num_rows();
             let mask = evaluate_predicates_mask(
@@ -2257,24 +2319,34 @@ async fn residual_positions_by_file(
                 &residual.file_fields,
                 &scan_fields,
             )?;
-            match mask {
-                Some(mask) => {
-                    for row_index in 0..num_rows {
-                        // NULL follows the same NULL -> false convention the Arrow
-                        // filter kernel applies, so a null mask slot drops the row.
-                        if mask.is_valid(row_index) && mask.value(row_index) {
-                            positions.insert(base + row_index as u64);
-                        }
-                    }
-                }
-                // No predicate contributed a mask (identity) -> keep every row.
-                None => {
-                    for row_index in 0..num_rows {
-                        positions.insert(base + row_index as u64);
-                    }
+            for row_index in 0..num_rows {
+                let position = selected.next().ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "residual scan of '{}' emitted more rows than the selection allows",
+                        file_meta.file_name
+                    ),
+                    source: None,
+                })?;
+                let keep = match &mask {
+                    // NULL follows the same NULL -> false convention the Arrow filter
+                    // kernel applies, so a null mask slot drops the row.
+                    Some(mask) => mask.is_valid(row_index) && mask.value(row_index),
+                    // No predicate contributed a mask (identity) -> keep every row.
+                    None => true,
+                };
+                if keep {
+                    positions.insert(position);
                 }
             }
-            base += num_rows as u64;
+        }
+        if selected.next().is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "residual scan of '{}' emitted fewer rows than the selection allows",
+                    file_meta.file_name
+                ),
+                source: None,
+            });
         }
     }
     Ok(out)
@@ -7306,7 +7378,7 @@ mod residual_positions_tests {
             &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
         )
         .await;
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2), None)
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
@@ -7318,7 +7390,7 @@ mod residual_positions_tests {
         let (reader, split, active) =
             build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)])
                 .await;
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(100))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(100), None)
             .await
             .unwrap();
         assert!(map.contains_key("part-0.mosaic"));
@@ -7329,7 +7401,7 @@ mod residual_positions_tests {
     async fn test_residual_matches_all_yields_full_set() {
         let (reader, split, active) =
             build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0), None)
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
@@ -7347,7 +7419,7 @@ mod residual_positions_tests {
             ],
         )
         .await;
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(3))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(3), None)
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
@@ -7390,7 +7462,7 @@ mod residual_positions_tests {
             .with_data_files(metas)
             .build()
             .unwrap();
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2), None)
             .await
             .unwrap();
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
@@ -7406,7 +7478,7 @@ mod residual_positions_tests {
         // recovered from each row's ordinal in the scan, so the residual still
         // works: ids [1,2,3] with id > 0 -> all match -> local positions [0,1,2].
         let (reader, split, active) = build_reader_and_split_no_first_row_id().await;
-        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0))
+        let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0), None)
             .await
             .expect("missing first_row_id must not fail the residual read");
         assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
@@ -7459,6 +7531,21 @@ mod residual_positions_tests {
             .collect()
     }
 
+    /// The plan side carries ranges, so its fixtures are built from the positions
+    /// each file allows and coalesced the way the planner normalizes them.
+    fn range_allow_list(entries: &[(&str, &[u64])]) -> HashMap<String, Vec<RowRange>> {
+        entries
+            .iter()
+            .map(|(file, positions)| {
+                let ranges = positions
+                    .iter()
+                    .map(|p| RowRange::new(*p as i64, *p as i64))
+                    .collect();
+                ((*file).to_string(), merge_row_ranges(ranges))
+            })
+            .collect()
+    }
+
     fn listed(map: &HashMap<String, RoaringTreemap>, file: &str) -> Vec<u64> {
         map.get(file)
             .map(|positions| positions.iter().collect())
@@ -7472,7 +7559,7 @@ mod residual_positions_tests {
 
     #[test]
     fn one_side_alone_passes_through() {
-        let physical = vec![allow_list(&[("d0", &[1, 2])])];
+        let physical = vec![range_allow_list(&[("d0", &[1, 2])])];
         let only_physical = intersect_row_allow_lists(Some(&physical), None, 1)
             .unwrap()
             .expect("a plan restriction survives on its own");
@@ -7490,7 +7577,7 @@ mod residual_positions_tests {
         // `d0`: both list positions, so only the shared ones survive. `d1`: the
         // residual kept nothing there, and its absence means "no rows", so the file
         // must not come back unrestricted from the plan side.
-        let physical = vec![allow_list(&[("d0", &[1, 2, 3]), ("d1", &[0, 1])])];
+        let physical = vec![range_allow_list(&[("d0", &[1, 2, 3]), ("d1", &[0, 1])])];
         let residual = vec![allow_list(&[("d0", &[2, 3, 4])])];
         let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
             .unwrap()
@@ -7501,7 +7588,7 @@ mod residual_positions_tests {
 
     #[test]
     fn rejects_allow_lists_that_do_not_cover_every_split() {
-        let physical = vec![allow_list(&[("d0", &[1])])];
+        let physical = vec![range_allow_list(&[("d0", &[1])])];
         let error = intersect_row_allow_lists(Some(&physical), None, 2)
             .map(|_| ())
             .expect_err("an allow-list per split is what makes the index meaningful");

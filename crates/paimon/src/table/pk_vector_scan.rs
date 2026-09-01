@@ -34,7 +34,7 @@ use crate::table::bucket_filter::split_partition_and_data_predicates;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
-use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile, RowRange};
+use crate::table::source::{merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, RowRange};
 use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
 
@@ -44,9 +44,9 @@ const INDEX_DIR: &str = "index";
 /// (`BinaryRow` is not hashable) paired with the bucket number.
 type BucketKey = (Vec<u8>, i32);
 
-/// Expand inclusive row ranges into the positions they allow.
-#[cfg_attr(not(test), allow(dead_code))]
-fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
+/// Expand inclusive row ranges into the positions they allow. Only the search
+/// kernel's membership tests need this; a read is limited by the ranges themselves.
+pub(super) fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
     let mut positions = RoaringTreemap::new();
     for range in ranges {
         let from = u64::try_from(range.from())
@@ -58,16 +58,15 @@ fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
     Ok(positions)
 }
 
-/// Every position in a file, for a file the message left unrestricted.
-#[cfg_attr(not(test), allow(dead_code))]
-fn positions_in_whole_file(row_count: i64) -> crate::Result<RoaringTreemap> {
-    let rows = u64::try_from(row_count)
-        .map_err(|_| data_invalid("data file row count must not be negative"))?;
-    let mut positions = RoaringTreemap::new();
-    if rows > 0 {
-        positions.insert_range(0..=rows - 1);
+/// The whole of a file, for a file the message left unrestricted. A zero-row file
+/// gets no range rather than an empty one: `RowRange` is inclusive, so it cannot
+/// express "nothing".
+fn whole_file_range(row_count: i64) -> Vec<RowRange> {
+    if row_count > 0 {
+        vec![RowRange::new(0, row_count - 1)]
+    } else {
+        Vec::new()
     }
-    Ok(positions)
 }
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
@@ -234,14 +233,17 @@ pub(crate) struct PkVectorScanPlan {
     // at all (never written), which also yields empty `splits`.
     pub snapshot_id: i64,
     pub splits: Vec<PkVectorSearchSplit>,
-    // Per-split allow-list of physical row positions, indexed parallel to `splits`:
-    // only the positions listed for a data file may produce candidates from it.
+    // Per-split allow-list of physical rows, indexed parallel to `splits`: only the
+    // rows listed for a data file may produce candidates from it. Ranges rather than
+    // materialized positions, because this is what a read is limited to — expanding
+    // a whole-file range of a large file into positions costs memory no reader needs.
+    // Each list is normalized: sorted, non-overlapping, inclusive, file-local.
     // Populated when the plan was built from engine-supplied bucket splits, which
     // carry row ranges the engine's own planner already resolved. `None` for a plan
     // read from this table's index manifest, which places no positional restriction
     // of its own -- distinct from `Some` of an empty allow-list, which permits
     // nothing.
-    pub physical_row_ranges_by_split: Option<Vec<HashMap<String, RoaringTreemap>>>,
+    pub physical_row_ranges_by_split: Option<Vec<HashMap<String, Vec<RowRange>>>>,
 }
 
 pub(crate) struct PkVectorScan<'a> {
@@ -553,12 +555,14 @@ fn plan_from_bucket_splits(
                 .iter()
                 .map(|file| {
                     let allowed = match listed.and_then(|ranges| ranges.get(&file.file_name)) {
-                        Some(ranges) => positions_in_ranges(ranges)?,
-                        None => positions_in_whole_file(file.row_count)?,
+                        // Decoding checks each range's bounds but not their order or
+                        // whether they overlap, and a read needs them normalized.
+                        Some(ranges) => merge_row_ranges(ranges.clone()),
+                        None => whole_file_range(file.row_count),
                     };
                     Ok((file.file_name.clone(), allowed))
                 })
-                .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
+                .collect::<crate::Result<HashMap<String, Vec<RowRange>>>>()
         })
         .collect::<crate::Result<Vec<_>>>()?;
 
@@ -1223,9 +1227,16 @@ mod tests {
         )
     }
 
-    fn allowed(map: &HashMap<String, RoaringTreemap>, file: &str) -> Vec<u64> {
+    /// The positions a file's normalized ranges allow, for assertions that read
+    /// better as a row list than as ranges.
+    fn allowed(map: &HashMap<String, Vec<RowRange>>, file: &str) -> Vec<u64> {
         map.get(file)
-            .map(|positions| positions.iter().collect())
+            .map(|ranges| {
+                positions_in_ranges(ranges)
+                    .expect("planned ranges are in range")
+                    .iter()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

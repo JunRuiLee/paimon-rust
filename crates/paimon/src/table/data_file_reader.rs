@@ -600,6 +600,28 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         local_positions: Vec<i64>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_single_file_stream_local_ranges(
+            split,
+            file_meta,
+            data_fields,
+            dv,
+            coalesce_positions_to_local_ranges(&local_positions),
+        )
+    }
+
+    /// As [`Self::read_single_file_stream_local`], but the selection is already a
+    /// list of file-local inclusive ranges: sorted ascending, non-overlapping, and
+    /// within `[0, file_meta.row_count)`. A caller that already holds ranges — an
+    /// engine-supplied bucket split does — hands them over directly rather than
+    /// expanding them into positions this would only coalesce back.
+    pub(super) fn read_single_file_stream_local_ranges(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        local_ranges: Vec<RowRange>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         // Local-position selection is only sound against a predicate-free reader: a
         // row-filtering predicate drops arbitrary selected rows and desyncs the
         // caller's position/score cursor. Guard the invariant here (not only at the
@@ -666,12 +688,10 @@ impl DataFileReader {
             }
         };
 
-        // Interpret `local_positions` directly as file-local ranges (no
-        // `to_local_row_ranges`, no `first_row_id`), then fold the DV in.
-        // `merge_row_selection` intersects the selection with the file's
-        // non-deleted ranges, so the reader emits exactly the selected, non-deleted
-        // rows in ascending physical order.
-        let local_ranges = coalesce_positions_to_local_ranges(&local_positions);
+        // Interpret the ranges directly as file-local (no `to_local_row_ranges`, no
+        // `first_row_id`), then fold the DV in. `merge_row_selection` intersects the
+        // selection with the file's non-deleted ranges, so the reader emits exactly
+        // the selected, non-deleted rows in ascending physical order.
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), Some(&local_ranges));
 
