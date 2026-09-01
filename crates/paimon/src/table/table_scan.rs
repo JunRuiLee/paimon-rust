@@ -34,13 +34,14 @@ use super::stats_filter::{
 use super::{find_field_id_by_name, Table};
 use crate::io::FileIO;
 use crate::spec::{
-    avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
-    DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
+    avro::SharedSchemaCache, bucket_path, BinaryRow, BucketFunctionType, CoreOptions, DataField,
+    DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
     ManifestEntry, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::split_for_batch;
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::merge_tree_split_generator::{
     merge_tree_split_for_batch, KeyComparator, SplitGroup,
 };
@@ -58,7 +59,6 @@ use std::sync::Arc;
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
-const INDEX_DIR: &str = "index";
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
 #[derive(Debug, Default)]
@@ -445,16 +445,42 @@ fn retain_index_manifest_entry_for_scan(
         }))
 }
 
-/// Builds a map from (partition, bucket) to (data_file_name -> DeletionFile) from index manifest entries.
-/// Only considers ADD entries with index_type "DELETION_VECTORS" and their deletion_vectors_ranges.
+/// A deletion-vector entry whose on-disk path is not resolved yet.
+///
+/// A deletion vector is an index file, so it follows the same layout rules as
+/// every other index file: an explicit external path wins, otherwise it lives
+/// beside its bucket's data files when the table keeps index files in the
+/// data-file directory, and under the table `index/` directory otherwise. The
+/// bucket directory is only known once a split's bucket path is computed, so
+/// resolution is deferred until then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedDeletionFile {
+    file_name: String,
+    external_path: Option<String>,
+    offset: i64,
+    length: i64,
+    cardinality: Option<i64>,
+}
+
+impl UnresolvedDeletionFile {
+    fn resolve(&self, location: &IndexFileLocation<'_>) -> DeletionFile {
+        DeletionFile::new(
+            location.resolve(&self.file_name, self.external_path.as_deref()),
+            self.offset,
+            self.length,
+            self.cardinality,
+        )
+    }
+}
+
+/// Builds a map from (partition, bucket) to (data_file_name -> deletion vector) from index manifest
+/// entries. Only considers ADD entries with index_type "DELETION_VECTORS" and their
+/// deletion_vectors_ranges. Paths stay unresolved; see [`UnresolvedDeletionFile`].
 fn build_deletion_files_map(
     index_entries: &[crate::spec::IndexManifestEntry],
-    table_path: &str,
-) -> HashMap<PartitionBucket, HashMap<String, DeletionFile>> {
+) -> HashMap<PartitionBucket, HashMap<String, UnresolvedDeletionFile>> {
     use crate::spec::FileKind;
-    let table_path = table_path.trim_end_matches('/');
-    let index_path_prefix = format!("{table_path}/{INDEX_DIR}");
-    let mut map: HashMap<PartitionBucket, HashMap<String, DeletionFile>> =
+    let mut map: HashMap<PartitionBucket, HashMap<String, UnresolvedDeletionFile>> =
         HashMap::with_capacity(index_entries.len());
     for entry in index_entries {
         if entry.kind != FileKind::Add {
@@ -468,17 +494,17 @@ fn build_deletion_files_map(
             _ => continue,
         };
         let key = PartitionBucket::new(entry.partition.clone(), entry.bucket);
-        let dv_path = format!("{}/{}", index_path_prefix, entry.index_file.file_name);
         let per_bucket = map.entry(key).or_default();
         for (data_file_name, meta) in ranges {
             per_bucket.insert(
                 data_file_name.clone(),
-                DeletionFile::new(
-                    dv_path.clone(),
-                    meta.offset as i64,
-                    meta.length as i64,
-                    meta.cardinality,
-                ),
+                UnresolvedDeletionFile {
+                    file_name: entry.index_file.file_name.clone(),
+                    external_path: entry.index_file.external_path.clone(),
+                    offset: meta.offset as i64,
+                    length: meta.length as i64,
+                    cardinality: meta.cardinality,
+                },
             );
         }
     }
@@ -1908,9 +1934,12 @@ impl<'a> PaimonTableScan<'a> {
 
         // The index manifest was read before data manifests so global-index row
         // ranges can prune manifest I/O. Reuse it here for deletion vectors.
-        let deletion_files_map = index_entries
-            .as_deref()
-            .map(|entries| build_deletion_files_map(entries, base_path));
+        let deletion_files_map = index_entries.as_deref().map(build_deletion_files_map);
+        let index_file_in_data_file_dir = self
+            .table
+            .schema()
+            .core_options()
+            .index_file_in_data_file_dir();
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
         let can_push_down_limit = self.can_push_down_limit_hint(effective_row_ranges.as_deref());
@@ -1923,11 +1952,18 @@ impl<'a> PaimonTableScan<'a> {
 
         'groups: for ((partition, bucket), (total_buckets, data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
-            let bucket_path = if let Some(ref computer) = partition_computer {
-                let partition_path = computer.generate_partition_path(&partition_row)?;
-                format!("{base_path}/{partition_path}{}", bucket_dir_name(bucket))
-            } else {
-                format!("{base_path}/{}", bucket_dir_name(bucket))
+            let bucket_path = bucket_path(
+                base_path,
+                partition_computer.as_ref(),
+                &partition_row,
+                bucket,
+            )?;
+            // Deletion vectors are index files, so they resolve against this bucket's
+            // directory, now that it is known.
+            let dv_location = IndexFileLocation::BucketLocal {
+                table_path: base_path,
+                bucket_path: &bucket_path,
+                index_file_in_data_file_dir,
             };
 
             // Original `partition` Vec consumed by PartitionBucket for DV map lookup.
@@ -2053,7 +2089,11 @@ impl<'a> PaimonTableScan<'a> {
                 let data_deletion_files = per_bucket_deletion_map.map(|per_bucket| {
                     file_group
                         .iter()
-                        .map(|f| per_bucket.get(&f.file_name).cloned())
+                        .map(|f| {
+                            per_bucket
+                                .get(&f.file_name)
+                                .map(|unresolved| unresolved.resolve(&dv_location))
+                        })
                         .collect::<Vec<Option<DeletionFile>>>()
                 });
 
@@ -4242,22 +4282,122 @@ mod tests {
                         cardinality: Some(33),
                     },
                 )])),
+                external_path: None,
                 global_index_meta: None,
             },
         }];
 
-        let map = super::build_deletion_files_map(&entries, "file:/tmp/table");
+        let map = super::build_deletion_files_map(&entries);
 
         let by_bucket = map
             .get(&super::PartitionBucket::new(vec![1, 2, 3], 7))
             .expect("partition bucket should exist");
-        let deletion_file = by_bucket
+        let unresolved = by_bucket
+            .get("data-file.parquet")
+            .expect("deletion file should exist");
+
+        // Default layout: no external path, index files not in the data-file dir.
+        assert_eq!(
+            unresolved.resolve(&super::IndexFileLocation::BucketLocal {
+                table_path: "file:/tmp/table",
+                bucket_path: "file:/tmp/table/bucket-7",
+                index_file_in_data_file_dir: false,
+            }),
+            DeletionFile::new("file:/tmp/table/index/index-file".into(), 11, 22, Some(33))
+        );
+    }
+
+    #[test]
+    fn test_deletion_vector_paths_follow_index_file_layout() {
+        let dv = super::UnresolvedDeletionFile {
+            file_name: "index-file".into(),
+            external_path: None,
+            offset: 11,
+            length: 22,
+            cardinality: Some(33),
+        };
+
+        // Index files under the table index directory (the default).
+        assert_eq!(
+            dv.resolve(&super::IndexFileLocation::BucketLocal {
+                table_path: "file:/tmp/table",
+                bucket_path: "file:/tmp/table/pt=1/bucket-7",
+                index_file_in_data_file_dir: false,
+            })
+            .path(),
+            "file:/tmp/table/index/index-file"
+        );
+
+        // Index files kept beside the bucket's data files.
+        assert_eq!(
+            dv.resolve(&super::IndexFileLocation::BucketLocal {
+                table_path: "file:/tmp/table",
+                bucket_path: "file:/tmp/table/pt=1/bucket-7",
+                index_file_in_data_file_dir: true,
+            })
+            .path(),
+            "file:/tmp/table/pt=1/bucket-7/index-file"
+        );
+    }
+
+    #[test]
+    fn test_deletion_vector_external_path_wins_over_both_layouts() {
+        let dv = super::UnresolvedDeletionFile {
+            file_name: "index-file".into(),
+            external_path: Some("s3://other/dv/index-file".into()),
+            offset: 0,
+            length: 1,
+            cardinality: None,
+        };
+
+        for index_file_in_data_file_dir in [false, true] {
+            assert_eq!(
+                dv.resolve(&super::IndexFileLocation::BucketLocal {
+                    table_path: "file:/tmp/table",
+                    bucket_path: "file:/tmp/table/bucket-0",
+                    index_file_in_data_file_dir,
+                })
+                .path(),
+                "s3://other/dv/index-file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_deletion_files_map_carries_external_path() {
+        let entries = vec![IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![9],
+            bucket: 2,
+            index_file: IndexFileMeta {
+                index_type: "DELETION_VECTORS".into(),
+                file_name: "index-file".into(),
+                file_size: 128,
+                row_count: 1,
+                deletion_vectors_ranges: Some(indexmap::IndexMap::from([(
+                    "data-file.parquet".into(),
+                    DeletionVectorMeta {
+                        offset: 1,
+                        length: 2,
+                        cardinality: None,
+                    },
+                )])),
+                external_path: Some("s3://other/dv/index-file".into()),
+                global_index_meta: None,
+            },
+        }];
+
+        let map = super::build_deletion_files_map(&entries);
+        let dv = map
+            .get(&super::PartitionBucket::new(vec![9], 2))
+            .expect("partition bucket should exist")
             .get("data-file.parquet")
             .expect("deletion file should exist");
 
         assert_eq!(
-            deletion_file,
-            &DeletionFile::new("file:/tmp/table/index/index-file".into(), 11, 22, Some(33))
+            dv.external_path.as_deref(),
+            Some("s3://other/dv/index-file")
         );
     }
 
@@ -4274,6 +4414,7 @@ mod tests {
                 file_size: 1,
                 row_count: 1,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: None,
             },
         };
@@ -4335,6 +4476,7 @@ mod tests {
                 file_size: 1,
                 row_count: 1,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: (index_type == "btree").then_some(GlobalIndexMeta {
                     row_range_start: 0,
                     row_range_end: 0,
@@ -4393,6 +4535,7 @@ mod tests {
                 file_size: 1,
                 row_count: 1,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: 0,
                     row_range_end: 0,

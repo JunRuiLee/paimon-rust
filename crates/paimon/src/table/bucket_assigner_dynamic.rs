@@ -22,10 +22,11 @@
 
 use crate::io::FileIO;
 use crate::spec::{
-    batch_hash_codes, batch_to_serialized_bytes, DataField, IndexFileMeta, IndexManifest,
-    IndexManifestEntry, EMPTY_SERIALIZED_ROW,
+    batch_hash_codes, batch_to_serialized_bytes, bucket_path_under, BinaryRow, DataField,
+    IndexFileMeta, IndexManifest, IndexManifestEntry, PartitionComputer, EMPTY_SERIALIZED_ROW,
 };
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssigner, PartitionBucketKey};
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::SnapshotManager;
 use crate::Result;
 use arrow_array::RecordBatch;
@@ -96,6 +97,7 @@ impl HashIndexFile {
                 .try_into()
                 .expect("hash index row count exceeds i32::MAX"),
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: None,
         })
     }
@@ -155,6 +157,48 @@ impl DynamicBucketIndexMaintainer {
 // PartitionIndex
 // ---------------------------------------------------------------------------
 
+/// Where one partition's hash index files live.
+///
+/// A hash index is an index file, so it sits beside its bucket's data files when
+/// the table keeps index files in the data-file directory, and under the table
+/// `index/` directory otherwise. Reads and writes resolve through the same value
+/// so a file written here is found again.
+struct HashIndexLayout<'a> {
+    table_path: &'a str,
+    /// Partition directory, already terminated by `/`, or empty when unpartitioned.
+    partition_path: &'a str,
+    index_file_in_data_file_dir: bool,
+}
+
+impl HashIndexLayout<'_> {
+    /// This layout as the shared resolver's bucket-local mode. The bucket
+    /// directory is passed in so the resolver can borrow it.
+    fn location<'b>(&'b self, bucket_path: &'b str) -> IndexFileLocation<'b> {
+        IndexFileLocation::BucketLocal {
+            table_path: self.table_path,
+            bucket_path,
+            index_file_in_data_file_dir: self.index_file_in_data_file_dir,
+        }
+    }
+
+    fn bucket_path(&self, bucket: i32) -> String {
+        bucket_path_under(self.table_path, self.partition_path, bucket)
+    }
+
+    /// The directory a new hash index file for `bucket` is written into.
+    fn directory(&self, bucket: i32) -> String {
+        let bucket_path = self.bucket_path(bucket);
+        self.location(&bucket_path).directory()
+    }
+
+    /// The path of an existing hash index file recorded for `bucket`.
+    fn resolve(&self, bucket: i32, file_name: &str, external_path: Option<&str>) -> String {
+        let bucket_path = self.bucket_path(bucket);
+        self.location(&bucket_path)
+            .resolve(file_name, external_path)
+    }
+}
+
 /// Per-partition index that maps key hashes to bucket ids.
 ///
 /// Also maintains per-bucket index files via embedded `DynamicBucketIndexMaintainer`s,
@@ -194,7 +238,7 @@ impl PartitionIndex {
     /// the hash→bucket mapping and bucket row counts.
     async fn load(
         file_io: &FileIO,
-        index_dir: &str,
+        layout: &HashIndexLayout<'_>,
         entries: &[IndexManifestEntry],
         target_bucket_row_number: i64,
     ) -> Result<Self> {
@@ -207,7 +251,11 @@ impl PartitionIndex {
                 continue;
             }
             let bucket = entry.bucket;
-            let path = format!("{index_dir}/{}", entry.index_file.file_name);
+            let path = layout.resolve(
+                bucket,
+                &entry.index_file.file_name,
+                entry.index_file.external_path.as_deref(),
+            );
             let hashes = HashIndexFile::read(file_io, &path).await?;
             let count = hashes.len() as i64;
             for &h in &hashes {
@@ -292,13 +340,14 @@ impl PartitionIndex {
     async fn prepare_commit(
         &mut self,
         file_io: &FileIO,
-        index_dir: &str,
+        layout: &HashIndexLayout<'_>,
     ) -> Result<Vec<(i32, Vec<IndexFileMeta>)>> {
         let mut result = Vec::new();
         let buckets: Vec<i32> = self.bucket_maintainers.keys().copied().collect();
         for bucket in buckets {
             if let Some(maintainer) = self.bucket_maintainers.get_mut(&bucket) {
-                let files = maintainer.prepare_commit(file_io, index_dir).await?;
+                let index_dir = layout.directory(bucket);
+                let files = maintainer.prepare_commit(file_io, &index_dir).await?;
                 if !files.is_empty() {
                     result.push((bucket, files));
                 }
@@ -328,9 +377,16 @@ pub(crate) struct DynamicBucketAssigner {
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
     is_overwrite: bool,
+    /// Builds the partition directory of a bucket, so a hash index kept in the
+    /// data-file directory is written and read in the same place. Yields an empty
+    /// path for an unpartitioned table.
+    partition_computer: PartitionComputer,
+    /// Whether the table stores index files in the data-file (bucket) directory.
+    index_file_in_data_file_dir: bool,
 }
 
 impl DynamicBucketAssigner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         partition_field_indices: Vec<usize>,
         primary_key_indices: Vec<usize>,
@@ -339,6 +395,8 @@ impl DynamicBucketAssigner {
         file_io: FileIO,
         table_location: String,
         is_overwrite: bool,
+        partition_computer: PartitionComputer,
+        index_file_in_data_file_dir: bool,
     ) -> Self {
         Self {
             partition_field_indices,
@@ -350,6 +408,8 @@ impl DynamicBucketAssigner {
             table_location,
             cached_index_entries: None,
             is_overwrite,
+            partition_computer,
+            index_file_in_data_file_dir,
         }
     }
 
@@ -386,6 +446,14 @@ impl DynamicBucketAssigner {
         Ok(())
     }
 
+    /// The partition directory of a bucket, terminated by `/`, or empty when the
+    /// table is unpartitioned.
+    fn partition_path(&self, partition_bytes: &[u8]) -> Result<String> {
+        let partition_row = BinaryRow::from_serialized_bytes(partition_bytes)?;
+        self.partition_computer
+            .generate_partition_path(&partition_row)
+    }
+
     /// Load partition index from cached index manifest entries.
     async fn load_partition_index(&self, partition_bytes: &[u8]) -> Result<PartitionIndex> {
         let entries = self.cached_index_entries.as_deref().unwrap_or(&[]);
@@ -396,10 +464,15 @@ impl DynamicBucketAssigner {
             .collect();
 
         if !partition_entries.is_empty() {
-            let index_dir = format!("{}/index", self.table_location);
+            let partition_path = self.partition_path(partition_bytes)?;
+            let layout = HashIndexLayout {
+                table_path: self.table_location.trim_end_matches('/'),
+                partition_path: &partition_path,
+                index_file_in_data_file_dir: self.index_file_in_data_file_dir,
+            };
             return PartitionIndex::load(
                 &self.file_io,
-                &index_dir,
+                &layout,
                 &partition_entries,
                 self.target_bucket_row_number,
             )
@@ -458,13 +531,23 @@ impl BucketAssigner for DynamicBucketAssigner {
     async fn prepare_commit_index(
         &mut self,
         file_io: &FileIO,
-        index_dir: &str,
     ) -> Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>> {
         let mut result = HashMap::new();
+        let table_path = self.table_location.trim_end_matches('/').to_string();
+        let index_file_in_data_file_dir = self.index_file_in_data_file_dir;
         let partition_keys: Vec<Vec<u8>> = self.partition_indexes.keys().cloned().collect();
-        for partition_bytes in partition_keys {
+        let mut partition_paths = Vec::with_capacity(partition_keys.len());
+        for partition_bytes in &partition_keys {
+            partition_paths.push(self.partition_path(partition_bytes)?);
+        }
+        for (partition_bytes, partition_path) in partition_keys.into_iter().zip(partition_paths) {
+            let layout = HashIndexLayout {
+                table_path: &table_path,
+                partition_path: &partition_path,
+                index_file_in_data_file_dir,
+            };
             if let Some(partition_index) = self.partition_indexes.get_mut(&partition_bytes) {
-                let bucket_files = partition_index.prepare_commit(file_io, index_dir).await?;
+                let bucket_files = partition_index.prepare_commit(file_io, &layout).await?;
                 for (bucket, idx_files) in bucket_files {
                     result.insert((partition_bytes.clone(), bucket), idx_files);
                 }
@@ -556,6 +639,81 @@ mod tests {
     }
 
     // -- HashIndexFile tests --
+
+    /// Reads and writes resolve through the same layout, so a hash index written
+    /// under one configuration is found again; an explicit external path wins.
+    #[tokio::test]
+    async fn test_hash_index_layout_round_trips_read_and_write() {
+        for index_file_in_data_file_dir in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let table_path = format!("file://{}", tmp.path().display());
+            let file_io = FileIO::from_url(&table_path).unwrap().build().unwrap();
+            let layout = super::HashIndexLayout {
+                table_path: &table_path,
+                partition_path: "pt=1/",
+                index_file_in_data_file_dir,
+            };
+
+            // Write where this layout says, then read it back through the same layout.
+            let dir = layout.directory(3);
+            file_io.mkdirs(&dir).await.unwrap();
+            let hashes = vec![7i32, 8, 9];
+            let meta = HashIndexFile::write(&file_io, &dir, &hashes).await.unwrap();
+            let entries = vec![IndexManifestEntry {
+                version: 1,
+                kind: crate::spec::FileKind::Add,
+                partition: EMPTY_SERIALIZED_ROW.to_vec(),
+                bucket: 3,
+                index_file: meta,
+            }];
+            let loaded = PartitionIndex::load(&file_io, &layout, &entries, 100)
+                .await
+                .unwrap();
+            for hash in &hashes {
+                assert_eq!(loaded.hash_to_bucket.get(hash), Some(&3));
+            }
+
+            let expected_dir = if index_file_in_data_file_dir {
+                format!("{table_path}/pt=1/bucket-3")
+            } else {
+                format!("{table_path}/index")
+            };
+            assert_eq!(dir, expected_dir);
+        }
+    }
+
+    /// An external path wins over both layouts.
+    #[tokio::test]
+    async fn test_hash_index_external_path_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table_path = format!("file://{}", tmp.path().display());
+        let file_io = FileIO::from_url(&table_path).unwrap().build().unwrap();
+        let external_dir = format!("{table_path}/elsewhere");
+        file_io.mkdirs(&external_dir).await.unwrap();
+        let mut index_file = HashIndexFile::write(&file_io, &external_dir, &[42i32])
+            .await
+            .unwrap();
+        index_file.external_path = Some(format!("{external_dir}/{}", index_file.file_name));
+
+        for index_file_in_data_file_dir in [false, true] {
+            let layout = super::HashIndexLayout {
+                table_path: &table_path,
+                partition_path: "pt=1/",
+                index_file_in_data_file_dir,
+            };
+            let entries = vec![IndexManifestEntry {
+                version: 1,
+                kind: crate::spec::FileKind::Add,
+                partition: EMPTY_SERIALIZED_ROW.to_vec(),
+                bucket: 5,
+                index_file: index_file.clone(),
+            }];
+            let loaded = PartitionIndex::load(&file_io, &layout, &entries, 100)
+                .await
+                .unwrap();
+            assert_eq!(loaded.hash_to_bucket.get(&42), Some(&5));
+        }
+    }
 
     #[tokio::test]
     async fn test_hash_index_roundtrip() {

@@ -99,6 +99,7 @@ impl LuminaIndexBuildBuilder<'_> {
             file_size,
             row_count,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,

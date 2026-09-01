@@ -329,7 +329,7 @@ impl TableWrite {
                 merge_engine,
             )))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(DynamicBucketAssigner::new(
+            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
                 partition_field_indices,
                 primary_key_indices.clone(),
                 schema.fields().to_vec(),
@@ -337,7 +337,12 @@ impl TableWrite {
                 table.file_io().clone(),
                 table.location().to_string(),
                 is_overwrite,
-            ))
+                // The same computer this writer already built: a hash index kept in
+                // the data-file directory must land in the directory the writer and
+                // the reader both derive, so both must agree on partition naming.
+                partition_computer.clone(),
+                core_options.index_file_in_data_file_dir(),
+            )))
         } else if total_buckets == POSTPONE_BUCKET {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_field_indices,
@@ -830,11 +835,7 @@ impl TableWrite {
 
         // Collect index files from bucket assigner
         let file_io = self.table.file_io();
-        let index_dir = format!("{}/index", self.table.location());
-        let mut index_files_by_key = self
-            .bucket_assigner
-            .prepare_commit_index(file_io, &index_dir)
-            .await?;
+        let mut index_files_by_key = self.bucket_assigner.prepare_commit_index(file_io).await?;
 
         let mut messages = Vec::new();
         for (partition_bytes, bucket, files) in results {
@@ -3080,6 +3081,68 @@ pub(in crate::table) mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[tokio::test]
+    async fn a_dynamic_copy_cannot_move_where_a_written_hash_index_lands() {
+        // An index manifest records only a file name, so a write must place the
+        // hash index where a normally loaded table will look for it. A dynamic
+        // override of `index-file-in-data-file-dir` would break that pairing, so
+        // `copy_with_options` pins the option to the stored value.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_hash_index_layout_survives_a_copy";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("pt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .primary_key(["pt", "id"])
+            .option("changelog-producer", "input")
+            .option("index-file-in-data-file-dir", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_hash_index_layout_survives_a_copy"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let copied = table.copy_with_options(HashMap::from([(
+            "index-file-in-data-file-dir".to_string(),
+            "false".to_string(),
+        )]));
+
+        let mut table_write = TableWrite::new(&copied, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&make_partitioned_batch_with_value_kind(
+                vec!["a", "a"],
+                vec![1, 2],
+                vec![10, 20],
+                vec![0, 0],
+            ))
+            .await
+            .unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_index_files[0].index_type, "HASH");
+        let name = messages[0].new_index_files[0].file_name.clone();
+
+        assert!(
+            file_io
+                .exists(&format!("{table_path}/pt=a/bucket-0/{name}"))
+                .await
+                .unwrap(),
+            "the hash index must stay in the bucket data-file directory the stored option selects"
+        );
+        assert!(
+            !file_io
+                .exists(&format!("{table_path}/index/{name}"))
+                .await
+                .unwrap(),
+            "the override must not have moved it to the table index directory"
+        );
     }
 
     #[tokio::test]

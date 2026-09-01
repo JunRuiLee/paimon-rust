@@ -426,6 +426,7 @@ async fn build_table_with_first_row_id(
         file_size: i64::try_from(index_file_size).unwrap(),
         row_count,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,
             row_range_end: row_count - 1,
@@ -1273,6 +1274,7 @@ async fn pk_vector_refine_factor_matches_exact_ground_truth() {
         file_size: i64::try_from(index_file_size).unwrap(),
         row_count,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: 0,
             row_range_end: row_count - 1,

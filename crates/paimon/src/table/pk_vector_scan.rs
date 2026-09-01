@@ -23,15 +23,24 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::spec::{
-    should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, GlobalIndexMeta, IndexManifest,
-    Predicate, PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
+    should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, IndexManifest, Predicate,
+    PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
 };
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{DataSplit, DataSplitBuilder, DeletionFile};
 use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
 
-const INDEX_DIR: &str = "index";
+/// A payload whose bucket-local path is resolved in planning Phase C, once the
+/// owning bucket's data split (and directory) is known.
+struct UnresolvedAnnSegment {
+    source_meta: PrimaryKeyIndexSourceMeta,
+    file_name: String,
+    external_path: Option<String>,
+    file_size: u64,
+    index_meta: Vec<u8>,
+}
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -294,22 +303,44 @@ impl<'a> PkVectorScan<'a> {
                     continue;
                 }
                 let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
-                let resolved_path =
-                    format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
                 let file_size = u64::try_from(entry.index_file.file_size)
                     .map_err(|_| data_invalid("index file size must not be negative"))?;
+                let source_meta =
+                    PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim).map_err(|_| {
+                        data_invalid(format!(
+                            "index file {} is not active",
+                            entry.index_file.file_name
+                        ))
+                    })?;
                 entries.push((
                     partition,
                     entry.bucket,
-                    gim,
-                    resolved_path,
-                    file_size,
-                    entry.index_file.file_name.clone(),
+                    UnresolvedAnnSegment {
+                        source_meta,
+                        file_name: entry.index_file.file_name.clone(),
+                        external_path: entry.index_file.external_path.clone(),
+                        file_size,
+                        // The Lumina reader consumes this as its serialized index
+                        // metadata; the vindex reader ignores it and loads metadata
+                        // from the segment file bytes. Absent value defaults to empty.
+                        index_meta: gim.index_meta.clone().unwrap_or_default(),
+                    },
                 ));
             }
         }
 
-        let splits = plan_from_inputs(snapshot_id, data_splits, entries)?;
+        let index_file_in_data_file_dir = self
+            .table
+            .schema()
+            .core_options()
+            .index_file_in_data_file_dir();
+        let splits = plan_from_inputs(
+            snapshot_id,
+            data_splits,
+            entries,
+            table_path,
+            index_file_in_data_file_dir,
+        )?;
         Ok(PkVectorScanPlan {
             snapshot_id,
             splits,
@@ -320,32 +351,22 @@ impl<'a> PkVectorScan<'a> {
 /// Pure planning core, drivable without a live snapshot: group ANN payloads and
 /// data splits by `(partition, bucket)`, then assemble one search split per
 /// bucket that has data. Index-only buckets are dropped, not errored.
-#[allow(clippy::type_complexity)]
 fn plan_from_inputs(
     snapshot_id: i64,
     data_splits: Vec<DataSplit>,
-    index_entries: Vec<(BinaryRow, i32, GlobalIndexMeta, String, u64, String)>,
+    index_entries: Vec<(BinaryRow, i32, UnresolvedAnnSegment)>,
+    table_path: &str,
+    index_file_in_data_file_dir: bool,
 ) -> crate::Result<Vec<PkVectorSearchSplit>> {
     type Key = (Vec<u8>, i32);
 
-    // Phase A: group ANN payloads by (partition, bucket).
-    let mut segments_by_bucket: BTreeMap<Key, Vec<BucketAnnSegment>> = BTreeMap::new();
-    for (partition, bucket, gim, path, file_size, file_name) in index_entries {
-        let source_meta = PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim)
-            .map_err(|_| data_invalid(format!("index file {file_name} is not active")))?;
+    // Phase A: group unresolved ANN payloads by (partition, bucket). The on-disk
+    // path is resolved in Phase C, once the bucket's data split (and thus its
+    // bucket directory) is known.
+    let mut payloads_by_bucket: BTreeMap<Key, Vec<UnresolvedAnnSegment>> = BTreeMap::new();
+    for (partition, bucket, payload) in index_entries {
         let key = (partition.to_serialized_bytes(), bucket);
-        segments_by_bucket
-            .entry(key)
-            .or_default()
-            .push(BucketAnnSegment {
-                source_meta,
-                path,
-                file_size,
-                // The Lumina reader consumes this as its serialized index
-                // metadata; the vindex reader ignores it and loads metadata from
-                // the segment file bytes. Absent value defaults to an empty vec.
-                index_meta: gim.index_meta.clone().unwrap_or_default(),
-            });
+        payloads_by_bucket.entry(key).or_default().push(payload);
     }
 
     // Phase B: group data splits by (partition, bucket).
@@ -358,14 +379,28 @@ fn plan_from_inputs(
         acc.add(split)?;
     }
 
-    // Phase C: assemble one split per bucket that has data.
+    // Phase C: assemble one split per bucket that has data, resolving each
+    // payload's path against the bucket directory now that it is known.
     let mut out = Vec::new();
     for (key, acc) in accum_by_bucket {
         let data_split = acc.build()?;
-        let ann_segments = current_ann_segments(
-            data_split.data_files(),
-            segments_by_bucket.remove(&key).unwrap_or_default(),
-        )?;
+        let location = IndexFileLocation::BucketLocal {
+            table_path,
+            bucket_path: data_split.bucket_path(),
+            index_file_in_data_file_dir,
+        };
+        let resolved_segments: Vec<BucketAnnSegment> = payloads_by_bucket
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| BucketAnnSegment {
+                source_meta: p.source_meta,
+                path: location.resolve(&p.file_name, p.external_path.as_deref()),
+                file_size: p.file_size,
+                index_meta: p.index_meta,
+            })
+            .collect();
+        let ann_segments = current_ann_segments(data_split.data_files(), resolved_segments)?;
         let active_files: Vec<BucketActiveFile> = data_split
             .data_files()
             .iter()
@@ -381,7 +416,7 @@ fn plan_from_inputs(
             active_files,
         });
     }
-    // Index-only buckets left in segments_by_bucket are intentionally dropped.
+    // Index-only buckets left in payloads_by_bucket are intentionally dropped.
     Ok(out)
 }
 
@@ -491,19 +526,45 @@ mod tests {
         }
     }
 
+    /// An unresolved ANN payload as the manifest loop builds one.
+    fn payload(
+        file_name: &str,
+        gim: GlobalIndexMeta,
+        external_path: Option<&str>,
+    ) -> UnresolvedAnnSegment {
+        UnresolvedAnnSegment {
+            source_meta: PrimaryKeyIndexSourceMeta::from_global_index_meta(&gim).unwrap(),
+            file_name: file_name.to_string(),
+            external_path: external_path.map(str::to_string),
+            file_size: 10,
+            index_meta: gim.index_meta.clone().unwrap_or_default(),
+        }
+    }
+
     #[test]
     fn drops_index_only_bucket_without_error() {
         // Payload for (part=[], bucket 0) but NO data split -> no split, no error.
         let entries = vec![(
             BinaryRow::new(0),
             0,
-            gim(2, 5, &[("d0", 3)]),
-            "idx/seg0".to_string(),
-            10u64,
-            "seg0".to_string(),
+            payload("seg0", gim(2, 5, &[("d0", 3)]), None),
         )];
-        let splits = plan_from_inputs(1, Vec::new(), entries).unwrap();
+        let splits = plan_from_inputs(1, Vec::new(), entries, "memory:/t", false).unwrap();
         assert!(splits.is_empty());
+    }
+
+    /// One split whose bucket directory is not derivable from the table root, so a
+    /// resolved segment path proves the split's own bucket path was used.
+    fn bucket_split(bucket_path: &str) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path.to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -511,29 +572,58 @@ mod tests {
         let entries = vec![(
             BinaryRow::new(0),
             0,
-            gim(2, 5, &[("d0", 3)]),
-            "idx/seg0".to_string(),
-            10u64,
-            "seg0".to_string(),
+            payload("seg0", gim(2, 5, &[("d0", 3)]), None),
         )];
-        let data = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("memory:/t/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
-            .build()
-            .unwrap();
-        let splits = plan_from_inputs(1, vec![data], entries).unwrap();
+        let data = bucket_split("memory:/t/bucket-0");
+        let splits = plan_from_inputs(1, vec![data], entries, "memory:/t", false).unwrap();
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].ann_segments.len(), 1);
         let seg = &splits[0].ann_segments[0];
-        assert_eq!(seg.path, "idx/seg0");
+        assert_eq!(seg.path, "memory:/t/index/seg0");
         assert_eq!(seg.file_size, 10);
         assert_eq!(seg.source_meta.resolve(0).unwrap(), ("d0".to_string(), 0));
         assert_eq!(splits[0].active_files.len(), 1); // d0 is COMPACT + level>0
         assert_eq!(splits[0].active_files[0].file_name, "d0");
+    }
+
+    #[test]
+    fn ann_segment_resolves_into_the_split_bucket_directory() {
+        // The reported failure: a table with `index-file-in-data-file-dir` keeps its
+        // ANN segments beside the bucket's data files, and the search opened
+        // `<table>/index/<name>` instead. The directory must come from the split, so
+        // a bucket path that is not derivable from the table root still resolves.
+        let entries = vec![(
+            BinaryRow::new(0),
+            0,
+            payload("seg0", gim(2, 5, &[("d0", 3)]), None),
+        )];
+        let data = bucket_split("s3://elsewhere/t/pt=1/bucket-0");
+        let splits = plan_from_inputs(1, vec![data], entries, "memory:/t", true).unwrap();
+        assert_eq!(
+            splits[0].ann_segments[0].path,
+            "s3://elsewhere/t/pt=1/bucket-0/seg0"
+        );
+    }
+
+    #[test]
+    fn ann_segment_external_path_wins_over_both_layouts() {
+        for index_file_in_data_file_dir in [false, true] {
+            let entries = vec![(
+                BinaryRow::new(0),
+                0,
+                payload("seg0", gim(2, 5, &[("d0", 3)]), Some("s3://other/ann/seg0")),
+            )];
+            let data = bucket_split("memory:/t/bucket-0");
+            let splits = plan_from_inputs(
+                1,
+                vec![data],
+                entries,
+                "memory:/t",
+                index_file_in_data_file_dir,
+            )
+            .unwrap();
+            assert_eq!(splits[0].ann_segments[0].path, "s3://other/ann/seg0");
+        }
     }
 
     #[test]
@@ -584,7 +674,7 @@ mod tests {
             .with_data_files(vec![dfm("d0", 3, 5, Some(1))])
             .build()
             .unwrap();
-        assert!(plan_from_inputs(1, vec![data], Vec::new()).is_err());
+        assert!(plan_from_inputs(1, vec![data], Vec::new(), "memory:/t", false).is_err());
     }
 
     #[test]
@@ -609,7 +699,9 @@ mod tests {
             .with_data_files(vec![dfm("dup", 3, 5, Some(1))])
             .build()
             .unwrap();
-        assert!(plan_from_inputs(1, vec![split_a, split_b], Vec::new()).is_err());
+        assert!(
+            plan_from_inputs(1, vec![split_a, split_b], Vec::new(), "memory:/t", false).is_err()
+        );
     }
 
     #[test]
@@ -628,7 +720,7 @@ mod tests {
             .with_data_deletion_files(vec![None, Some(dv)])
             .build()
             .unwrap();
-        let splits = plan_from_inputs(1, vec![data], Vec::new()).unwrap();
+        let splits = plan_from_inputs(1, vec![data], Vec::new(), "memory:/t", false).unwrap();
         assert_eq!(splits.len(), 1);
         let dvs = splits[0]
             .data_split

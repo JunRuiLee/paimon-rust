@@ -289,6 +289,7 @@ mod tests {
                 file_size: 1,
                 row_count: 1,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: None,
             },
             version: 1,

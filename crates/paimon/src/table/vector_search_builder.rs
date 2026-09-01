@@ -32,6 +32,7 @@ use crate::table::global_index_scanner::{
     deleted_row_ranges_for_data_evolution_dvs, search_limit_with_deleted_rows,
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
+use crate::table::index_file_path::IndexFileLocation;
 use crate::table::pk_vector_data_file_reader::{
     append_batch_vectors, DataFilePkVectorReaderFactory,
 };
@@ -77,7 +78,6 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const INDEX_DIR: &str = "index";
 const RAW_SCORE_MATRIX_MIN_QUERY_COUNT: usize = 4;
 const RAW_SCORE_MATRIX_TARGET_ELEMENTS: usize = 1 << 20;
 const RAW_TOP_K_MIN_PARTITION_SIZE: usize = 1 << 12;
@@ -1884,7 +1884,8 @@ async fn evaluate_batch_vector_search(
                 let global_meta = entry.index_file.global_index_meta.as_ref().unwrap();
                 let backend = VectorIndexBackend::from_index_type(&entry.index_file.index_type)
                     .expect("filtered vector index type");
-                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let path = IndexFileLocation::Global { table_path }
+                    .resolve(&entry.index_file.file_name, entry.index_file.external_path.as_deref());
                 let file_name = entry.index_file.file_name.clone();
                 let file_size = entry.index_file.file_size as u64;
                 let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
@@ -3182,7 +3183,10 @@ async fn resolve_raw_vector_metric(
                         }
                     }
                 }
-                let path = format!("{table_path}/{INDEX_DIR}/{}", entry.index_file.file_name);
+                let path = IndexFileLocation::Global { table_path }.resolve(
+                    &entry.index_file.file_name,
+                    entry.index_file.external_path.as_deref(),
+                );
                 let input = file_io.new_input(&path)?;
                 let read_error = |e| crate::Error::DataInvalid {
                     message: format!(
@@ -4803,6 +4807,7 @@ mod tests {
                 file_size: 100,
                 row_count: 10,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: None,
             },
             version: 1,
@@ -6222,6 +6227,7 @@ mod tests {
             file_size: i64::try_from(index_file_size).unwrap(),
             row_count,
             deletion_vectors_ranges: None,
+            external_path: None,
             global_index_meta: Some(GlobalIndexMeta {
                 row_range_start: 0,
                 row_range_end: row_count - 1,
@@ -6746,6 +6752,7 @@ mod tests {
                 file_size: 100,
                 row_count: 10,
                 deletion_vectors_ranges: None,
+                external_path: None,
                 global_index_meta: Some(GlobalIndexMeta {
                     row_range_start: 0,
                     row_range_end: 9,

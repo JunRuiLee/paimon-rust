@@ -19,7 +19,7 @@ use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_string_field,
+    read_nullable_string_field, read_string_field,
 };
 use super::schema::{skip_nullable_field, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
@@ -38,6 +38,7 @@ impl AvroRecordDecode for IndexManifestEntry {
         let mut file_size: Option<i64> = None;
         let mut row_count: Option<i64> = None;
         let mut deletion_vectors_ranges: Option<IndexMap<String, DeletionVectorMeta>> = None;
+        let mut external_path: Option<String> = None;
         let mut global_index_meta: Option<GlobalIndexMeta> = None;
 
         for field in &writer_schema.fields {
@@ -65,6 +66,9 @@ impl AvroRecordDecode for IndexManifestEntry {
                 "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
                     deletion_vectors_ranges = decode_nullable_dv_ranges(cursor, field.nullable)?;
                 }
+                "_EXTERNAL_PATH" => {
+                    external_path = read_nullable_string_field(cursor, field.nullable)?;
+                }
                 "_GLOBAL_INDEX" => {
                     global_index_meta =
                         decode_nullable_global_index(cursor, field.nullable, &field.schema)?;
@@ -84,6 +88,7 @@ impl AvroRecordDecode for IndexManifestEntry {
                 file_size: file_size.unwrap_or(0),
                 row_count: row_count.unwrap_or(0),
                 deletion_vectors_ranges,
+                external_path,
                 global_index_meta,
             },
         })

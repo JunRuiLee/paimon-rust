@@ -726,6 +726,7 @@ async fn test_abort_on_build_error_removes_completed_index_files() {
         file_size: 15,
         row_count: 1,
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: None,
     }];
 
@@ -903,6 +904,7 @@ async fn commit_synthetic_lumina_index(table: &Table, field_id: i32, start: i64,
         file_size: 1,
         row_count: (end - start + 1),
         deletion_vectors_ranges: None,
+        external_path: None,
         global_index_meta: Some(GlobalIndexMeta {
             row_range_start: start,
             row_range_end: end,

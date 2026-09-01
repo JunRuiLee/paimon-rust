@@ -56,7 +56,6 @@ use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering
 type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync>;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
-const INDEX_DIR: &str = "index";
 
 #[cfg(test)]
 #[derive(Default)]
@@ -265,6 +264,7 @@ impl GlobalIndexScanner {
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
                 row_range_end: global_meta.row_range_end,
+                external_path: entry.index_file.external_path.clone(),
                 meta: parsed_meta,
             };
 
