@@ -122,6 +122,27 @@ fn compare_scores(a: f32, b: f32) -> std::cmp::Ordering {
     }
 }
 
+/// Turn an include-set into the dense id array Lumina's filtered search takes.
+///
+/// Mirrors Java `LuminaVectorGlobalIndexReader.toScopedIds`: an include-set above
+/// `Integer.MAX_VALUE` is refused BEFORE the array is allocated, because that array
+/// is 8 bytes per id and the set can hold one id per live row of the segment.
+fn to_scoped_ids(include_row_ids: &roaring::RoaringTreemap) -> crate::Result<Vec<u64>> {
+    let cardinality = include_row_ids.len();
+    if cardinality > i32::MAX as u64 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "include_row_ids cardinality ({cardinality}) exceeds {}",
+                i32::MAX
+            ),
+            source: None,
+        });
+    }
+    let mut ids = Vec::with_capacity(cardinality as usize);
+    ids.extend(include_row_ids.iter());
+    Ok(ids)
+}
+
 /// Allocate the label buffer for one native search, filled with [`SENTINEL`].
 ///
 /// [`SENTINEL`] is the "no result" marker (the C ABI's `-1`), and
@@ -373,7 +394,7 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
     let include_row_ids = vector_search.effective_include_row_ids();
 
     let (distances, labels) = if let Some(include_ids) = include_row_ids {
-        let filter_id_list: Vec<u64> = include_ids.iter().collect();
+        let filter_id_list: Vec<u64> = to_scoped_ids(include_ids)?;
         if filter_id_list.is_empty() {
             return Ok(None);
         }
@@ -460,14 +481,26 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
         }
     }
 
-    let filter_id_list =
-        shared_filter.map(|include_row_ids| include_row_ids.iter().collect::<Vec<_>>());
-    if filter_id_list.as_ref().is_some_and(Vec::is_empty) {
+    // An include-set that permits nothing can match nothing, whatever the index
+    // holds. Answered from the set itself, so no native call is made at all.
+    if shared_filter.is_some_and(|filter| filter.is_empty()) {
         return Ok(vec![None; vector_searches.len()]);
     }
 
-    let index_metric = index_meta.metric()?;
+    // Java's order, which decides what an empty or unreadable index reports:
+    // `index.size()` first, then the dense filter, and the metric only on the way
+    // out. An empty index has nothing to return whatever the filter says, so
+    // converting first would report an oversized filter instead, and reading the
+    // metric first would report a malformed one.
     let count = searcher.get_count()? as usize;
+    if count == 0 {
+        return Ok(vec![None; vector_searches.len()]);
+    }
+    let filter_id_list = shared_filter
+        .map(|include_row_ids| to_scoped_ids(include_row_ids))
+        .transpose()?;
+    let index_metric = index_meta.metric()?;
+
     let effective_k = filter_id_list.as_ref().map_or_else(
         || std::cmp::min(limit, count),
         |ids| std::cmp::min(std::cmp::min(limit, count), ids.len()),
@@ -589,6 +622,25 @@ impl Drop for LuminaVectorGlobalIndexReader {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn to_scoped_ids_refuses_a_set_larger_than_the_dense_array_can_index() {
+        // Java's own limit for this exact quantity at this exact seam
+        // (`LuminaVectorGlobalIndexReader.toScopedIds`). The array is 8 bytes per id,
+        // and the set can hold one id per live row of the segment, so the refusal has
+        // to come BEFORE the allocation.
+        let mut small = roaring::RoaringTreemap::new();
+        small.insert_range(0..=9u64);
+        assert_eq!(to_scoped_ids(&small).unwrap().len(), 10);
+
+        let mut over = roaring::RoaringTreemap::new();
+        over.insert_range(0..=(i32::MAX as u64 + 1));
+        let error = to_scoped_ids(&over)
+            .map(|_| ())
+            .expect_err("a set this size cannot be handed to the backend");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
     use super::*;
     use crate::lumina::{KEY_DIMENSION, KEY_DISTANCE_METRIC};
     use crate::vector_search::GlobalIndexIOMeta;
@@ -795,6 +847,46 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls.iter().map(|call| call.k).collect::<Vec<_>>(), [1, 2]);
         assert!(calls.iter().all(|call| call.n == 1));
+    }
+
+    #[test]
+    fn an_empty_index_returns_empty_before_the_filter_is_sized() {
+        // Java's order: `index.size()` decides first, so an index holding nothing
+        // returns nothing whatever the filter says. Sizing the dense filter first
+        // would turn this into an oversized-filter error instead.
+        let searcher = RecordingSearcher::new(0);
+        let mut oversized = roaring::RoaringTreemap::new();
+        oversized.insert_range(0..=(i32::MAX as u64 + 1));
+        let shared_filter = Arc::new(oversized);
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::clone(&shared_filter));
+
+        let results = search_lumina_batch(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("an empty index reports no hits, not an oversized filter");
+
+        assert_eq!(results, vec![None, None]);
+        assert_eq!(
+            searcher.count_calls.load(Ordering::Relaxed),
+            1,
+            "the index size is what the answer came from"
+        );
+        assert!(searcher
+            .unfiltered_calls
+            .lock()
+            .expect("unfiltered call lock")
+            .is_empty());
+        assert!(searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock")
+            .is_empty());
     }
 
     #[test]
