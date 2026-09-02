@@ -31,6 +31,7 @@ use datafusion::arrow::array::{
     new_empty_array, Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, ListArray,
     RecordBatch, UInt32Array,
 };
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::common::stats::Precision;
@@ -1066,9 +1067,24 @@ async fn read_target_rows(
         row_id_to_index.insert(row_id, row as u32);
     }
 
-    let target_columns = (0..target_schema.fields().len())
-        .map(|index| Arc::clone(batch.column(index)))
-        .collect::<Vec<_>>();
+    // Paimon reads use storage Arrow types (for example `Utf8`), while the
+    // DataFusion provider schema may expose view types such as `Utf8View`.
+    let target_columns = target_schema
+        .fields()
+        .iter()
+        .map(|field| -> DFResult<ArrayRef> {
+            let index = batch
+                .schema()
+                .index_of(field.name())
+                .map_err(DataFusionError::from)?;
+            let column = batch.column(index);
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column.as_ref(), field.data_type()).map_err(DataFusionError::from)
+            }
+        })
+        .collect::<DFResult<Vec<_>>>()?;
     let target_batch = RecordBatch::try_new(target_schema.clone(), target_columns)
         .map_err(DataFusionError::from)?;
     Ok((target_batch, row_id_to_index))

@@ -2082,9 +2082,8 @@ mod vector_search_tests {
         assert_eq!(extract_ids_in_order(&limited), vec![2, 5]);
     }
 
-    /// Regression: a result containing a string column must not fail on the provider's
-    /// `Utf8View` schema vs the Paimon read's `Utf8` — the gather casts to the output
-    /// schema (the plain scan path did this via `to_datafusion_batch`).
+    /// Regression: direct and lateral vector search results containing a string column
+    /// must align the Paimon read's `Utf8` arrays with the provider's `Utf8View` schema.
     #[tokio::test]
     async fn test_vector_search_casts_string_column() {
         let (ctx, catalog, _tmp) = create_empty_vector_search_context().await;
@@ -2189,6 +2188,43 @@ mod vector_search_tests {
         let mut ids = extract_ids_in_order(&batches);
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
+
+        let query_batch = build_vector_batch(vec![10], vec![vec![0.0, 1.0]]);
+        let query_table = MemTable::try_new(query_batch.schema(), vec![vec![query_batch]])
+            .expect("Failed to create query vector table");
+        ctx.register_temp_table("paimon.default.string_queries", Arc::new(query_table))
+            .expect("Failed to register query vector table");
+
+        let lateral_batches = ctx
+            .sql(
+                "SELECT r.id, r.name \
+                 FROM paimon.default.string_queries q \
+                 CROSS JOIN LATERAL vector_search( \
+                     'paimon.default.vindex_string_e2e', \
+                     'embedding', \
+                     q.embedding, \
+                     2 \
+                 ) AS r",
+            )
+            .await
+            .expect("lateral vector search SQL should parse")
+            .collect()
+            .await
+            .expect("lateral vector search with a string column should execute");
+        let mut lateral_ids = extract_ids_in_order(&lateral_batches);
+        lateral_ids.sort();
+        assert_eq!(lateral_ids, vec![1, 2]);
+        let mut lateral_names = lateral_batches
+            .iter()
+            .flat_map(|batch| {
+                let names = batch.column_by_name("name").expect("Expected name column");
+                (0..batch.num_rows())
+                    .map(|row| string_value(names.as_ref(), row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        lateral_names.sort();
+        assert_eq!(lateral_names, vec!["one", "two"]);
     }
 
     #[tokio::test]
