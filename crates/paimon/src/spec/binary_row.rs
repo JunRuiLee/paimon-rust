@@ -765,6 +765,11 @@ pub fn serialize_binary_array_long(values: &[Option<i64>]) -> Vec<u8> {
     data
 }
 
+/// Largest string body the writer keeps in an element's own 8-byte slot
+/// (Java `BinarySection.MAX_FIX_PART_DATA_SIZE`): seven bytes of content plus the
+/// marker byte that carries the length.
+const MAX_INLINE_STRING_LEN: usize = 7;
+
 /// Reverse of [`serialize_binary_array_str`].
 pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
     let n = read_binary_array_len(data)?;
@@ -774,32 +779,67 @@ pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
     // reservation and the loop, so a forged large count (with or without
     // element slots) cannot amplify memory before per-element validation.
     check_binary_array_fits(n, header, data.len())?;
+    let fixed_part = round_to_word(header + n * 8);
+    if fixed_part > data.len() {
+        return Err(bin_arr_err(
+            "string array element region exceeds buffer length",
+        ));
+    }
+    // The writer's cursor starts after the fixed part and advances by each body's
+    // word-padded length, so a body starts exactly where the previous one left the
+    // cursor and the buffer ends at the last one. An inline body lives in the
+    // element's own slot and does not move the cursor. Requiring exactly that
+    // leaves no layout the writer cannot emit: no gap, no trailing bytes, and no
+    // two elements sharing a body -- which would let a small array drive a decode
+    // many times its own size, since every element is cloned into a `String`.
+    let mut next = fixed_part;
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
+        // Every schema that reaches here declares non-null elements, so a set bit
+        // is not writer output. Java would read it as null; reading the slot as a
+        // value would yield a string that was never written.
+        if data.get(4 + k / 8).is_some_and(|b| b & (1 << (k % 8)) != 0) {
+            return Err(bin_arr_err("string element must not be null"));
+        }
         let eo = header + k * 8;
         let slot = data
             .get(eo..eo + 8)
             .ok_or_else(|| bin_arr_err("string element slot out of range"))?;
         let marker = slot[7];
         let bytes = if marker & 0x80 != 0 {
+            // The marker's seven length bits can claim up to 127 bytes, well past
+            // the slot the content has to fit in.
             let len = (marker & 0x7F) as usize;
-            slot.get(..len)
-                .ok_or_else(|| bin_arr_err("inline string length out of range"))?
+            if len > MAX_INLINE_STRING_LEN {
+                return Err(bin_arr_err("inline string length exceeds its slot"));
+            }
+            &slot[..len]
         } else {
             let encoded = u64::from_le_bytes(slot.try_into().unwrap());
             let var_off = (encoded >> 32) as usize;
             let len = (encoded & 0xFFFF_FFFF) as usize;
+            if var_off != next {
+                return Err(bin_arr_err(
+                    "string element body must start where the previous element ended",
+                ));
+            }
             let end = var_off
                 .checked_add(len)
                 .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?;
-            data.get(var_off..end)
-                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?
+            let bytes = data
+                .get(var_off..end)
+                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?;
+            next = round_to_word(end);
+            bytes
         };
         out.push(
             std::str::from_utf8(bytes)
                 .map_err(|_| bin_arr_err("string element is not valid UTF-8"))?
                 .to_string(),
         );
+    }
+    if next != data.len() {
+        return Err(bin_arr_err("string array has bytes after its last element"));
     }
     Ok(out)
 }
@@ -2331,6 +2371,132 @@ mod tests {
     #[test]
     fn binary_array_str_rejects_truncated() {
         assert!(deserialize_binary_array_str(&[1, 0]).is_err()); // < 4 header bytes
+    }
+
+    /// A string array's fixed part: 4-byte count, a 4-byte null word for up to 32
+    /// elements, then one 8-byte slot per element, word-padded. The variable-length
+    /// part starts there, which is where the writer's cursor starts.
+    fn str_array_fixed_part(n: usize) -> usize {
+        round_to_word(binary_array_header(n) + n * 8)
+    }
+
+    /// Point element `k`'s slot at a body of `len` bytes at `offset`, the pointer
+    /// form the writer uses for anything longer than 7 bytes.
+    fn set_str_pointer(data: &mut [u8], n: usize, k: usize, offset: usize, len: usize) {
+        let slot = binary_array_header(n) + k * 8;
+        let encoded = ((offset as u64) << 32) | (len as u64);
+        data[slot..slot + 8].copy_from_slice(&encoded.to_le_bytes());
+    }
+
+    /// An inline element is written into the fixed part and leaves the writer's
+    /// cursor alone, so an all-inline array is exactly its fixed part long. Pinning
+    /// that here keeps the cursor walk from over-rejecting the legal layout.
+    #[test]
+    fn binary_array_str_all_inline_is_exactly_its_fixed_part() {
+        let values = vec!["".to_string(), "1234567".to_string(), "ab".to_string()];
+        let bytes = serialize_binary_array_str(&values);
+        assert_eq!(bytes.len(), str_array_fixed_part(values.len()));
+        assert_eq!(deserialize_binary_array_str(&bytes).unwrap(), values);
+    }
+
+    /// The writer never points two elements at one body. Accepting it would let a
+    /// small array drive a decode many times its own size, since every element is
+    /// cloned into a `String` of its own.
+    #[test]
+    fn binary_array_str_rejects_aliased_elements() {
+        let n = 2;
+        let first_body = str_array_fixed_part(n);
+        let mut data = vec![0u8; first_body + 16];
+        data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+        data[first_body..first_body + 16].copy_from_slice(b"AAAAAAAABBBBBBBB");
+        set_str_pointer(&mut data, n, 0, first_body, 8);
+        set_str_pointer(&mut data, n, 1, first_body, 8);
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("must start where the previous"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The writer leaves no gap between bodies either, so a body one word late is
+    /// as much a forgery as one that overlaps.
+    #[test]
+    fn binary_array_str_rejects_a_gap_before_an_element() {
+        let n = 1;
+        let fixed_part = str_array_fixed_part(n);
+        // The body itself is inside the buffer, so this can only fail on the gap.
+        let mut data = vec![0u8; fixed_part + 16];
+        data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+        data[fixed_part + 8..fixed_part + 16].copy_from_slice(b"AAAAAAAA");
+        set_str_pointer(&mut data, n, 0, fixed_part + 8, 8);
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("must start where the previous"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The array ends where its last element ends, so trailing bytes are a layout
+    /// the writer cannot emit.
+    #[test]
+    fn binary_array_str_rejects_trailing_bytes() {
+        let mut data = serialize_binary_array_str(&["12345678".to_string()]);
+        data.push(0);
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("after its last element"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A body addressed inside the fixed part reads the array's own header as a
+    /// value. Those bytes are valid UTF-8, so without the cursor walk this returns
+    /// a garbage string instead of an error.
+    #[test]
+    fn binary_array_str_rejects_a_body_in_the_fixed_part() {
+        let n = 1;
+        let mut data = vec![0u8; str_array_fixed_part(n)];
+        data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+        set_str_pointer(&mut data, n, 0, 0, 8);
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("must start where the previous"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Every call site declares non-null elements, so a set null bit cannot come
+    /// from the writer. Java's reader would return null for it; reading the slot as
+    /// if it held a value yields a string that was never written.
+    #[test]
+    fn binary_array_str_rejects_a_set_null_bit() {
+        let mut data = serialize_binary_array_str(&["hello".to_string()]);
+        data[4] |= 1;
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("string element must not be null"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The inline marker carries 7 length bits, so it can claim up to 127 bytes
+    /// while the writer emits at most 7 -- a length of 8 would read the marker
+    /// byte itself as content.
+    #[test]
+    fn binary_array_str_rejects_an_inline_length_past_the_slot() {
+        let n = 1;
+        let mut data = vec![0u8; str_array_fixed_part(n)];
+        data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+        let slot = binary_array_header(n);
+        data[slot..slot + 7].copy_from_slice(b"aaaaaaa");
+        data[slot + 7] = 0x80 | 8;
+        let error = deserialize_binary_array_str(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("inline string length"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
