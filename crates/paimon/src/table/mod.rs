@@ -134,6 +134,7 @@ pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
+pub use pk_vector_indexed_split_read::PkVectorIndexedSplit;
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};
 pub use postpone_fixed_bucket_write::{
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite,

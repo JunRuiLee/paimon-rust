@@ -37,10 +37,12 @@ use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_data_file_reader::{
     append_batch_vectors, DataFilePkVectorReaderFactory,
 };
-use crate::table::pk_vector_indexed_split_read::{expand_ranges, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_indexed_split_read::{
+    expand_ranges, PkVectorIndexedSplit, PkVectorIndexedSplitRead,
+};
 use crate::table::pk_vector_orchestrator::{
-    as_split_exact_file_search, build_indexed_splits, merge_candidates, OrchestratorSearchResult,
-    PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+    as_split_exact_file_search, build_indexed_splits, merge_candidates, validate_finite_scores,
+    OrchestratorSearchResult, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
@@ -301,6 +303,10 @@ impl<'a> VectorSearchBuilder<'a> {
     /// to `cols` (plus the always-appended `__paimon_search_score`). Without this
     /// call `execute_read` materializes every user table column. Only affects
     /// `execute_read`; the search-only paths ignore it.
+    /// Applies to [`execute_read`](Self::execute_read) only.
+    /// [`search_for_bucket_splits`](Self::search_for_bucket_splits) REJECTS a projection
+    /// set here rather than dropping it: that route returns which rows matched, and the
+    /// read that follows owns the columns.
     pub fn with_projection(&mut self, cols: &[&str]) -> &mut Self {
         self.projection = Some(cols.iter().map(|c| c.to_string()).collect());
         self
@@ -418,8 +424,19 @@ impl<'a> VectorSearchBuilder<'a> {
             .await
     }
 
-    /// Run this search over bucket splits an engine planned elsewhere, and
-    /// materialize the hits.
+    /// Search bucket splits an engine planned elsewhere, and return WHAT the search
+    /// found -- not the rows.
+    ///
+    /// Step one of the two-step primary-key vector read, mirroring Java
+    /// `PrimaryKeyVectorRead.read(plan)`. Reading the rows is step two and belongs
+    /// to the caller's own read: hand these splits to
+    /// [`TableRead::to_arrow_indexed`](crate::table::TableRead::to_arrow_indexed)
+    /// with whatever projection the caller wants.
+    ///
+    /// One [`PkVectorIndexedSplit`] per data file the search selected rows from, in
+    /// ascending `(partition, bucket, file)` order, each carrying that file's
+    /// selected physical positions and their scores. Same shape as Java's
+    /// `IndexedSplit`, which is what its `PrimaryKeyVectorResult` hands to the scan.
     ///
     /// The unit of work is Java's `BucketVectorSearchSplit` byte form: a planner
     /// running in Paimon Java enumerates one split per bucket -- a bucket is never
@@ -429,23 +446,54 @@ impl<'a> VectorSearchBuilder<'a> {
     /// snapshot they pin are used as given, and this table's index manifest is not
     /// read.
     ///
-    /// Everything after planning is the ordinary primary-key vector read, so
-    /// search, optional refine, local Top-K and materialization stay identical to
-    /// [`execute_read`](Self::execute_read): output is the projected user columns
-    /// plus `__paimon_search_score`, best-first. The Top-K is local to the supplied
-    /// splits; a caller distributing one call per bucket merges the per-bucket
-    /// results itself.
+    /// Search, optional refine and local Top-K all happen here, as they do in Java's
+    /// `createResult`. The Top-K is local to the supplied splits: a caller distributing
+    /// one call per bucket does its own global merge. It can read [`scores`] here to
+    /// decide, without materializing anything, whether a bucket is worth reading at
+    /// all -- but a split cannot be trimmed (construction is crate-private), so the
+    /// splits it does read come back whole and the final Top-K happens on the rows,
+    /// over `__paimon_search_score`. Java merges its candidates before building
+    /// splits; a caller here cannot, because it holds splits rather than candidates.
     ///
-    /// Only a primary-key vector column can be read this way. The data-evolution
-    /// route plans through the global index rather than through bucket splits, so
-    /// it is rejected rather than silently answered from a different plan.
-    pub async fn execute_read_for_bucket_splits(
+    /// [`scores`]: PkVectorIndexedSplit::scores
+    ///
+    /// This builder's [`with_filter`](Self::with_filter) still applies: it is the
+    /// pre-Top-K scalar residual and must run before the search. Its
+    /// [`with_projection`](Self::with_projection) does NOT -- projection belongs to
+    /// the read.
+    ///
+    /// The splits are NOT in best-first order and the read does not reorder them:
+    /// rows come back in physical order carrying `__paimon_search_score`, and a
+    /// caller wanting them ranked sorts on that column. Java does the same -- its
+    /// read emits physical order and `VectorSearchProcedure` sorts afterwards.
+    ///
+    /// Only a primary-key vector column can be searched this way. The
+    /// data-evolution route plans through the global index rather than through
+    /// bucket splits, so it is rejected rather than silently answered from a
+    /// different plan.
+    pub async fn search_for_bucket_splits(
         &self,
         split_bytes: &[&[u8]],
-    ) -> crate::Result<ArrowRecordBatchStream> {
+    ) -> crate::Result<Vec<PkVectorIndexedSplit>> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
+
+        // The read owns the projection on this route, so one set here would be dropped.
+        // Refuse rather than drop it: this method already refuses a `row_filter_factory`
+        // on the read for exactly that reason, and quietly returning different columns
+        // than a caller asked for is the failure that reasoning is meant to prevent.
+        // `Some(vec![])` counts -- "project nothing" is still an instruction.
+        if self.projection.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "with_projection does not apply to a bucket-split search: it \
+                          returns which rows matched, not their columns. Set the \
+                          projection on the read builder whose TableRead::to_arrow_indexed \
+                          consumes these splits"
+                    .to_string(),
+                source: None,
+            });
+        }
         let vector_column =
             self.vector_column
                 .as_deref()
@@ -481,7 +529,7 @@ impl<'a> VectorSearchBuilder<'a> {
         // as "no splits", which cannot pin a snapshot.
         if split_bytes.is_empty() {
             return Err(crate::Error::DataInvalid {
-                message: "bucket-split read requires at least one split".to_string(),
+                message: "bucket-split search requires at least one split".to_string(),
                 source: None,
             });
         }
@@ -509,10 +557,6 @@ impl<'a> VectorSearchBuilder<'a> {
         )
         .plan_for_bucket_vector_splits(splits)?;
 
-        // Resolve the materialization read-type up front so an invalid projection
-        // fails loud even when the plan is empty and no rows will be read.
-        let read_type = self.resolve_materialize_read_type()?;
-
         let mut candidates = search_pk_candidates_batch_with_plan(
             self.table,
             &self.options,
@@ -528,19 +572,11 @@ impl<'a> VectorSearchBuilder<'a> {
         debug_assert_eq!(candidates.len(), 1);
         let candidates = candidates.remove(0);
 
-        // A separate, predicate-free materialization reader projecting the user
-        // columns (the search reader projects only the vector column).
-        let materialize_reader = DataFileReader::new(
-            self.table.file_io().clone(),
-            self.table.schema_manager().clone(),
-            self.table.schema().id(),
-            self.table.schema().fields().to_vec(),
-            read_type,
-            Vec::new(),
-        );
-
-        Self::materialize_candidates(candidates, &plan.splits, params.metric, &materialize_reader)
-            .await
+        let splits = build_indexed_splits(candidates, &plan.splits, params.metric)?;
+        // The scores go out to a caller that ranks on them, so this is where a
+        // non-finite one has to stop.
+        validate_finite_scores(&splits)?;
+        Ok(splits)
     }
 
     /// Materialize the best-first data-evolution vector search hits into Arrow
