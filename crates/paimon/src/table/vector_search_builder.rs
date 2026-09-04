@@ -92,6 +92,23 @@ enum VectorIndexBackend {
     Vindex,
 }
 
+fn take_only_result<T>(results: Vec<T>, operation: &str) -> crate::Result<T> {
+    let mut results = results.into_iter();
+    let result = results
+        .next()
+        .ok_or_else(|| crate::Error::UnexpectedError {
+            message: format!("{operation} returned no result for one query"),
+            source: None,
+        })?;
+    if results.next().is_some() {
+        return Err(crate::Error::UnexpectedError {
+            message: format!("{operation} returned more than one result for one query"),
+            source: None,
+        });
+    }
+    Ok(result)
+}
+
 impl VectorIndexBackend {
     fn from_index_type(index_type: &str) -> Option<Self> {
         if is_lumina_index_type(index_type) {
@@ -368,10 +385,8 @@ impl<'a> VectorSearchBuilder<'a> {
         if let Some(filter) = &self.filter {
             batch_builder.with_filter(filter.clone());
         }
-        let mut results = batch_builder.execute().await?;
-
-        debug_assert_eq!(results.len(), 1);
-        Ok(results.remove(0))
+        let results = batch_builder.execute().await?;
+        take_only_result(results, "vector search")
     }
 
     /// Run the vector search and materialize the matching rows as Arrow batches,
@@ -557,7 +572,7 @@ impl<'a> VectorSearchBuilder<'a> {
         )
         .plan_for_bucket_vector_splits(splits)?;
 
-        let mut candidates = search_pk_candidates_batch_with_plan(
+        let candidates = search_pk_candidates_batch_with_plan(
             self.table,
             &self.options,
             self.filter.as_ref(),
@@ -569,8 +584,7 @@ impl<'a> VectorSearchBuilder<'a> {
             &params,
         )
         .await?;
-        debug_assert_eq!(candidates.len(), 1);
-        let candidates = candidates.remove(0);
+        let candidates = take_only_result(candidates, "bucket-split vector search")?;
 
         let splits = build_indexed_splits(candidates, &plan.splits, params.metric)?;
         // The scores go out to a caller that ranks on them, so this is where a
@@ -691,7 +705,7 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        let (mut candidates, plan, metric) = plan_and_search_pk_candidates_batch(
+        let (candidates, plan, metric) = plan_and_search_pk_candidates_batch(
             self.table,
             &self.options,
             self.filter.as_ref(),
@@ -701,8 +715,11 @@ impl<'a> VectorSearchBuilder<'a> {
             limit,
         )
         .await?;
-        debug_assert_eq!(candidates.len(), 1);
-        Ok((candidates.remove(0), plan, metric))
+        Ok((
+            take_only_result(candidates, "planned vector search")?,
+            plan,
+            metric,
+        ))
     }
 
     /// Plan + search the primary-key vector route and return the best-first
@@ -4525,6 +4542,13 @@ mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::{Arc, Mutex, Once};
+
+    #[test]
+    fn take_only_result_rejects_bad_batch_arity() {
+        assert_eq!(take_only_result(vec![7], "test").unwrap(), 7);
+        assert!(take_only_result::<i32>(Vec::new(), "test").is_err());
+        assert!(take_only_result(vec![1, 2], "test").is_err());
+    }
 
     const VECTOR_SEARCH_LOG_TARGET: &str = "paimon::vector_search";
     static VECTOR_SEARCH_TEST_LOGGER: VectorSearchTestLogger = VectorSearchTestLogger;

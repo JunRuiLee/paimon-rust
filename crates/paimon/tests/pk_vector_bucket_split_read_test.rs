@@ -709,6 +709,11 @@ async fn indexed_read_type_matches_the_rows_that_come_back() {
 /// way of saying "no rows of this file", as distinct from omitting it entirely.
 fn with_empty_row_range(bytes: &[u8], file: &str) -> Vec<u8> {
     let head = bytes.len() - 4;
+    assert_eq!(
+        i32::from_be_bytes(bytes[head..].try_into().unwrap()),
+        0,
+        "fixture split was expected to carry no row ranges; regenerate and revisit"
+    );
     let mut out = Vec::with_capacity(bytes.len() + file.len() + 8);
     out.extend_from_slice(&bytes[..head]);
     out.extend_from_slice(&1i32.to_be_bytes()); // rangeFileCount
